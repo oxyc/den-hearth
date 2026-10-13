@@ -1,0 +1,382 @@
+//! Runtime configuration, all from the environment.
+//!
+//! Env: PORT, SCOUT_ORIGINS, REMUX_SCOUT_KEY, SCOUT_INSTALL_URL, SUBTITLE_ORIGINS, ORIGIN_ALIASES, BROWSER_KEY_HASHES,
+//!      REMUX_URL_KEY,
+//!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, UPLINK_MBPS, SESSION_IDLE_SECS,
+//!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
+//!      METRICS_TOKEN, LOG_REQUESTS, LOG_IDENTITY,
+//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL, SEGMENTS_KEY, SEGMENTS_DAILY_CAP.
+
+use std::env;
+use std::path::PathBuf;
+use std::time::Duration;
+
+pub struct Config {
+    pub port: u16,
+    /// `SCOUT_ORIGINS` — the only origins (`scheme://host[:port]`) a browser's scoped scout URL may point
+    /// at. This list is the SSRF guard on `POST /remux/session {scout}`; empty refuses every such URL.
+    pub scout_origins: Vec<String>,
+    /// `REMUX_SCOUT_KEY` — the service key sent to scout as `X-Den-Remux-Key`. A scope=availability
+    /// scout config lists and plays only for a caller presenting it.
+    pub scout_key: Option<String>,
+    /// `SCOUT_INSTALL_URL` — the fallback when a request names no scout: a den-scout install of this
+    /// service's own, sealed config included, with no trailing slash. A secret: it lists and plays
+    /// anything, so it is never logged and never leaves the process.
+    pub scout_install_url: Option<String>,
+    /// `SUBTITLE_ORIGINS` — the only origins a request's den-subtitles install, and the subtitle URLs it
+    /// answers with, may be on. Empty turns subtitles off.
+    pub subtitle_origins: Vec<String>,
+    /// `ORIGIN_ALIASES` — public origin → LAN origin (`https://d-scout.oxy.fi=http://192.168.86.193:8080,…`).
+    /// scout and den-subtitles are on this box, so an install URL or play URL on a public name is fetched at
+    /// the LAN address: two services on one box must not need the WAN, Cloudflare and the tunnel between
+    /// them, and this service never holds the Access token the public names ask for (oxyc/den#15).
+    pub origin_aliases: Vec<(String, String)>,
+    /// `BROWSER_KEY_HASHES` — SHA-256 of each browser's key. Only hashes live in the env file, so the
+    /// file on the box cannot be replayed as a key.
+    pub browser_key_hashes: Vec<[u8; 32]>,
+    /// MAC key for the cookie and the session URLs, derived from `REMUX_URL_KEY`. Rotating it logs
+    /// every browser out and kills every session URL at once.
+    pub url_key: Vec<u8>,
+    /// No `REMUX_URL_KEY` was set, so `url_key` is random for this process: every restart logs the
+    /// browsers out. Reported by /health.
+    pub url_key_ephemeral: bool,
+    pub max_sessions: usize,
+    /// `MAX_SESSIONS_PER_INSTALL` — sessions one scout install may play at once without a login (default
+    /// 2), under `MAX_SESSIONS`: one household, or one leaked install URL, cannot take every slot.
+    pub max_sessions_per_install: usize,
+    /// `MAX_ACTIVE_REMUXES` — ffmpeg producers allowed to run or hold an ahead window. Logical sessions beyond this
+    /// wait fairly without owning a process.
+    pub max_active_remuxes: usize,
+    /// A producer stopped on a full ahead window is reaped once its session itself has gone this long with no
+    /// request — never earlier, even under contention: see `should_reap_parked` (session.rs). Its session and
+    /// finished GOPs remain.
+    pub producer_idle: Duration,
+    pub session_idle: Duration,
+    /// `UPLINK_MBPS` — the box's own upload, megabits a second, for sessions away from home: a copy's fit-check
+    /// then weighs what every other remote session already needs off the same link, not just what this one
+    /// measured for itself. `None` (unset) leaves every session's own measurement as the whole budget, as before.
+    pub uplink_bps: Option<u64>,
+    /// How long a session replacing another mid-film may go without serving a segment before it is taken as
+    /// abandoned (`AppState::reserve`): `REPLACE_GRACE_SECS`, not set from the environment.
+    pub replace_grace: Duration,
+    pub scratch_dir: PathBuf,
+    pub scratch_max_bytes: u64,
+    pub ffmpeg: String,
+    /// `MAX_TRANSCODES` — active producers transcoding on the GPU at once (default 1; 0 turns transcoding off).
+    /// Logical transcode sessions queue without owning the GPU.
+    pub max_transcodes: usize,
+    /// `VAAPI_DEVICE` — the GPU's render node.
+    pub vaapi_device: PathBuf,
+    /// `TRUSTED_PROXIES` — proxies (comma-separated IPs) whose `X-Forwarded-For` names the visitor, for the
+    /// per-visitor limit on logins and new sessions. `tailscale serve` connects from its host's address.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// `PUBLIC_SESSION_PROXY` — the one den-edge container address allowed to mark a session as public.
+    pub public_session_proxy: Option<std::net::IpAddr>,
+    /// `WEB_ORIGINS` — pages on another origin that may log in and start sessions here (comma-separated): the Den
+    /// web app on its public name, whose player plays from this service's tailnet address (oxyc/den#15). Session
+    /// files are readable from anywhere already; these two routes answer CORS for these origins only.
+    pub web_origins: Vec<String>,
+    /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off (404).
+    pub metrics_token: Option<String>,
+    /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`).
+    pub log_requests: bool,
+    /// `LOG_IDENTITY` — on unless set to `0` or `false`. Decision and summary lines (which release, which
+    /// audio/subtitle language, its size) always carry it; off drops just those fields, keeping the rest —
+    /// the session id, `rid`, codecs, channel counts, segment/second counts, end reason — which never say
+    /// what title is playing.
+    pub log_identity: bool,
+    /// `EDGE_SECRET` — the secret den-edge presents as `x-den-edge-secret` to name a guest grant's sessions
+    /// (`x-den-owner`) and to end them (`/remux/admin/kill`). Unset turns both off. Never logged.
+    pub edge_secret: Option<String>,
+    /// `GUEST_MAX_SESSIONS` — sessions one grant may play at once (default 2, at most 8); past it, its oldest ends.
+    pub guest_max_sessions: usize,
+    /// `EDGE_REPORT_URL` — den-edge's own base URL, if set: where a guest grant's session reports how long it
+    /// played when it ends (`session::report_usage`), so den-edge's "your guests" list can show plays and hours
+    /// without ever being told a title. `None` turns the report off; a grant's session still ends the same.
+    pub edge_report_url: Option<String>,
+    /// `SEGMENTS_KEY` — the key that lets `POST /segments/scan` go without a scout install of its own, presented as
+    /// `X-Den-Segments-Key` (then `SCOUT_INSTALL_URL` is used). Unset, a scan is accepted only with a valid `scout`.
+    /// Never logged.
+    pub segments_key: Option<String>,
+    /// `SEGMENTS_DAILY_CAP` — episodes fingerprinted per UTC day at most (default 300).
+    pub segments_daily_cap: u32,
+}
+
+fn env_opt(key: &str) -> Option<String> {
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// `LOG_REQUESTS`: off when unset, empty, or exactly `0`; on for any other value — the rule every Den
+/// addon reads it by.
+pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// `LOG_IDENTITY`: on unless it is exactly `0` or `false` (either case) — the one flag here that
+/// defaults to on, since every decision line already names a release today and turning that off is
+/// the exception, not the rule.
+pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
+    !matches!(v.map(str::to_ascii_lowercase).as_deref(), Some("0") | Some("false"))
+}
+
+/// `BROWSER_KEY_HASHES`: comma-separated 64-character hex digests. A malformed entry is said once and
+/// skipped rather than failing the boot — the other browsers should keep working.
+pub(crate) fn parse_key_hashes(raw: &str) -> Vec<[u8; 32]> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let parsed = crate::auth::parse_hex32(s);
+            if parsed.is_none() {
+                eprintln!(
+                    "warning: BROWSER_KEY_HASHES has an entry that is not 64 hex characters; skipping it"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// `SCOUT_ORIGINS`: comma-separated `scheme://host[:port]`, normalised to lower case without a trailing
+/// slash. An entry with a path, query or credentials is said once and skipped: an origin list that
+/// quietly admitted more than it names would not be a guard.
+pub(crate) fn parse_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let o = s.trim_end_matches('/').to_ascii_lowercase();
+            let ok = o.split_once("://").is_some_and(|(scheme, host)| {
+                matches!(scheme, "http" | "https") && !host.is_empty() && !host.contains(['/', '?', '#', '@'])
+            });
+            if !ok {
+                eprintln!("warning: SCOUT_ORIGINS entry {s:?} is not scheme://host[:port]; skipping it");
+            }
+            ok.then_some(o)
+        })
+        .collect()
+}
+
+/// `TRUSTED_PROXIES`: comma-separated IP addresses. A malformed entry is said once and skipped.
+pub(crate) fn parse_proxies(raw: &str) -> Vec<std::net::IpAddr> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let parsed = s.parse().ok();
+            if parsed.is_none() {
+                eprintln!("warning: TRUSTED_PROXIES entry {s:?} is not an IP address; skipping it");
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// `ORIGIN_ALIASES`: comma-separated `<public origin>=<LAN origin>` pairs, each side as `parse_origins` reads
+/// it. A malformed pair is said once and skipped.
+pub(crate) fn parse_aliases(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| {
+            let parsed = pair.split_once('=').and_then(|(public, lan)| {
+                let one = |o: &str| parse_origins(o).into_iter().next();
+                Some((one(public)?, one(lan)?))
+            });
+            if parsed.is_none() {
+                eprintln!(
+                    "warning: ORIGIN_ALIASES entry {pair:?} is not <public origin>=<LAN origin>; skipping it"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// `url` at its LAN address when it is on a public origin in `aliases`; anything else as it is. The path
+/// and query are kept, so a sealed config segment or a ticket goes along unchanged.
+pub fn local(url: &str, aliases: &[(String, String)]) -> String {
+    for (public, lan) in aliases {
+        if let Some(rest) = url.strip_prefix(public.as_str()) {
+            if rest.is_empty() || rest.starts_with(['/', '?']) {
+                return format!("{lan}{rest}");
+            }
+        }
+    }
+    url.to_string()
+}
+
+/// Below this the cap cannot hold one window of a 4K session, and every job would sit paused.
+const MIN_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a session stands with no request (`SESSION_IDLE_SECS` unset): long past a connection that drops for a few
+/// minutes and comes back, so a player picks up where it was rather than starting over. The public gate's grant for
+/// it is refreshed every 30 s while the session exists, so the two don't part.
+pub const SESSION_IDLE_SECS: u64 = 600;
+/// Raised 2 -> 4 alongside `DEFAULT_MAX_ACTIVE_REMUXES` below (render-env on `den` master): the box already
+/// runs both at 4.
+pub const DEFAULT_MAX_SESSIONS: usize = 4;
+/// A copy-remux is one ffmpeg thread (`-threads 1`) doing no decode or encode, so it costs little: the
+/// container's own 512 MB idles at a couple of megabytes. The GPU transcode path has its own, separate
+/// ceiling (`MAX_TRANSCODES`). Pausing for a full ahead window gives the slot straight back regardless of this
+/// cap (`Job::pause`), so it only ever bounds jobs actually RUNNING at once, not every session merely holding
+/// one a few segments ahead of its player.
+pub const DEFAULT_MAX_ACTIVE_REMUXES: usize = 4;
+/// How recently a session must have been asked of to count as actively watched: below this, a STOPPED job's
+/// process is kept around rather than killed (`supervise`'s own housekeeping), and a RUNNING one's permit is
+/// never taken for a passing contender (`Session::reap_for_contention`) — only a job whose own session has
+/// gone quiet this long is ever a sound victim either way.
+pub const DEFAULT_PRODUCER_IDLE_SECS: u64 = 30;
+
+/// How long a mid-film replacement has to serve its first segment before it is ended as abandoned: a start is
+/// admitted at most 30 s of pre-buffer (`LONG_PREBUFFER`), and the first segment is asked for long before that.
+pub const REPLACE_GRACE_SECS: u64 = 60;
+
+impl Config {
+    pub fn from_env() -> Config {
+        let (url_key, url_key_ephemeral) = match env_opt("REMUX_URL_KEY") {
+            // Hashed, so any length the operator typed is a valid key of a fixed size.
+            Some(k) => (crate::auth::sha256(k.as_bytes()).to_vec(), false),
+            None => {
+                eprintln!(
+                    "warning: REMUX_URL_KEY is unset — using a random key, so every restart logs the browsers out"
+                );
+                (crate::auth::random_bytes::<32>().to_vec(), true)
+            }
+        };
+        Config {
+            port: env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8095),
+            scout_origins: parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
+            scout_key: env_opt("REMUX_SCOUT_KEY"),
+            scout_install_url: env_opt("SCOUT_INSTALL_URL").map(|u| u.trim_end_matches('/').to_string()),
+            subtitle_origins: parse_origins(&env_opt("SUBTITLE_ORIGINS").unwrap_or_default()),
+            origin_aliases: parse_aliases(&env_opt("ORIGIN_ALIASES").unwrap_or_default()),
+            browser_key_hashes: parse_key_hashes(&env_opt("BROWSER_KEY_HASHES").unwrap_or_default()),
+            url_key,
+            url_key_ephemeral,
+            max_sessions: env_opt("MAX_SESSIONS")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(DEFAULT_MAX_SESSIONS),
+            max_sessions_per_install: env_opt("MAX_SESSIONS_PER_INSTALL")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(2),
+            max_active_remuxes: env_opt("MAX_ACTIVE_REMUXES")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(DEFAULT_MAX_ACTIVE_REMUXES),
+            producer_idle: Duration::from_secs(
+                env_opt("PRODUCER_IDLE_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|s| *s >= 1)
+                    .unwrap_or(DEFAULT_PRODUCER_IDLE_SECS),
+            ),
+            uplink_bps: env_opt("UPLINK_MBPS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|m| *m > 0)
+                .map(|m| m * 1_000_000),
+            // Floored: an idle window shorter than a player's pause-and-resume would kill sessions
+            // that are merely paused.
+            session_idle: Duration::from_secs(
+                env_opt("SESSION_IDLE_SECS")
+                    .and_then(|v| v.parse().ok())
+                    .filter(|s| *s >= 30)
+                    .unwrap_or(SESSION_IDLE_SECS),
+            ),
+            replace_grace: Duration::from_secs(REPLACE_GRACE_SECS),
+            scratch_dir: env_opt("SCRATCH_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/cache")),
+            scratch_max_bytes: env_opt("SCRATCH_MAX_BYTES")
+                .and_then(|v| v.parse().ok())
+                .filter(|b| *b >= MIN_SCRATCH_BYTES)
+                .unwrap_or(1024 * 1024 * 1024),
+            ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
+            max_transcodes: env_opt("MAX_TRANSCODES").and_then(|v| v.parse().ok()).unwrap_or(1),
+            vaapi_device: env_opt("VAAPI_DEVICE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128")),
+            trusted_proxies: parse_proxies(&env_opt("TRUSTED_PROXIES").unwrap_or_default()),
+            public_session_proxy: env_opt("PUBLIC_SESSION_PROXY").and_then(|value| value.parse().ok()),
+            web_origins: parse_origins(&env_opt("WEB_ORIGINS").unwrap_or_default()),
+            metrics_token: env_opt("METRICS_TOKEN"),
+            log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
+            log_identity: log_identity_on(env::var("LOG_IDENTITY").ok().as_deref()),
+            edge_secret: env_opt("EDGE_SECRET"),
+            guest_max_sessions: env_opt("GUEST_MAX_SESSIONS")
+                .and_then(|v| v.parse().ok())
+                .filter(|n| (1..=8).contains(n))
+                .unwrap_or(2),
+            edge_report_url: env_opt("EDGE_REPORT_URL").map(|u| u.trim_end_matches('/').to_string()),
+            segments_key: env_opt("SEGMENTS_KEY"),
+            segments_daily_cap: env_opt("SEGMENTS_DAILY_CAP").and_then(|v| v.parse().ok()).unwrap_or(300),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scout_origins_admit_only_bare_origins() {
+        let o = parse_origins(
+            "http://192.168.86.193:8080/, HTTPS://Scout.lan ,http://x/path,ftp://y,http://u@z,",
+        );
+        assert_eq!(o, ["http://192.168.86.193:8080", "https://scout.lan"]);
+    }
+
+    #[test]
+    fn a_public_name_is_fetched_at_its_lan_address() {
+        let a = parse_aliases(
+            "https://d-scout.oxy.fi=http://192.168.86.193:8080, HTTPS://D-Subs.oxy.fi/=http://192.168.86.193:8093,junk",
+        );
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(local("https://d-scout.oxy.fi/c2VhbGVk", &a), "http://192.168.86.193:8080/c2VhbGVk");
+        assert_eq!(
+            local("https://d-subs.oxy.fi/c/subtitle/9.vtt?lang=fin", &a),
+            "http://192.168.86.193:8093/c/subtitle/9.vtt?lang=fin"
+        );
+        assert_eq!(
+            local("https://d-scout.oxy.fi.evil/x", &a),
+            "https://d-scout.oxy.fi.evil/x",
+            "a longer host is not the name"
+        );
+        assert_eq!(local("https://cdn.debrid/f.mkv", &a), "https://cdn.debrid/f.mkv");
+    }
+
+    #[test]
+    fn trusted_proxies_are_addresses() {
+        let p = parse_proxies("192.168.86.149, ::1,pve,,10.0.0.1/8");
+        assert_eq!(p, ["192.168.86.149".parse::<std::net::IpAddr>().unwrap(), "::1".parse().unwrap()]);
+    }
+
+    #[test]
+    fn log_requests_follows_the_fleet_rule() {
+        assert!(!log_requests_on(None));
+        assert!(!log_requests_on(Some("")));
+        assert!(!log_requests_on(Some("0")));
+        assert!(log_requests_on(Some("1")));
+        assert!(log_requests_on(Some("true")));
+    }
+
+    #[test]
+    fn log_identity_defaults_on() {
+        assert!(log_identity_on(None), "unset: on");
+        assert!(log_identity_on(Some("1")));
+        assert!(log_identity_on(Some("anything else")));
+        assert!(!log_identity_on(Some("0")));
+        assert!(!log_identity_on(Some("false")));
+        assert!(!log_identity_on(Some("FALSE")), "case-insensitive");
+    }
+
+    #[test]
+    fn a_bad_key_hash_is_skipped_not_fatal() {
+        let good = "a".repeat(64);
+        let parsed = parse_key_hashes(&format!("{good}, nothex, ,{}", "B".repeat(64)));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], [0xaa; 32]);
+        assert_eq!(parsed[1], [0xbb; 32]);
+    }
+}

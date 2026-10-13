@@ -1,0 +1,581 @@
+//! The HLS playlists: a VOD media playlist whose segments start on the file's real keyframes, and a
+//! one-variant master.
+//!
+//! Cut points are "the first keyframe at or after n × target" — Jellyfin's approach for copied video.
+//! With the video copied, a segment can only begin on a keyframe, and a playlist that promised any
+//! other boundary would be lying about where each segment starts.
+
+pub const TARGET_SECS: f64 = 6.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Segment {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Segment boundaries from the keyframe times (seconds, ascending). The first segment starts at 0
+/// whatever the first keyframe says; the last runs to `duration`.
+///
+/// After a cut the next target is the first multiple of `target` past that cut, not the previous
+/// target plus one: a file with a keyframe only every 20 s would otherwise owe several targets at
+/// once and cut a run of one-GOP segments to catch up.
+pub fn segments(keyframes: &[f64], duration: f64, target: f64) -> Vec<Segment> {
+    let mut cuts = vec![0.0];
+    let mut next = target;
+    for &k in keyframes {
+        if k <= 0.0 || k >= duration {
+            continue;
+        }
+        if k + 1e-9 >= next {
+            cuts.push(k);
+            next = ((k / target).floor() + 1.0) * target;
+        }
+    }
+    cuts.iter()
+        .enumerate()
+        .map(|(i, &start)| Segment { start, end: cuts.get(i + 1).copied().unwrap_or(duration) })
+        .collect()
+}
+
+/// [`segments`] with the segment a player opens on split at the file's nearby keyframes. ffmpeg already writes one
+/// file per GOP; exposing those first GOPs lets playback begin after one has arrived instead of withholding it until
+/// the ordinary six-second segment is complete. Later segments keep the ordinary target and its low request rate.
+///
+/// `start` is backed up by the same one second as the producer (`session::START_SLACK`): native players sometimes ask
+/// for the segment immediately before an `EXT-X-START`, and that request should get the short path too.
+pub fn segments_for_start(keyframes: &[f64], duration: f64, target: f64, start: f64) -> Vec<Segment> {
+    let ordinary = segments(keyframes, duration, target);
+    let point = (start - 1.0).max(0.0).min(duration);
+    let Some(window) = ordinary.iter().find(|s| s.start <= point && point < s.end) else { return ordinary };
+    let mut cuts: Vec<f64> = ordinary.iter().map(|s| s.start).collect();
+    // Include every GOP boundary from the one at/before the backed-up start through the first one after the actual
+    // start. Ordinarily this is one extra cut; including the preceding boundary keeps a resume near a normal cut safe.
+    let before = keyframes.iter().copied().take_while(|k| *k <= point + 1e-9).last().unwrap_or_else(|| {
+        // Segment zero names the media timeline from zero even when the first encoded frame is a few milliseconds
+        // later. That first keyframe is its beginning, not a useful 0-to-first-frame bootstrap segment.
+        keyframes.first().copied().unwrap_or(window.start)
+    });
+    for k in keyframes.iter().copied().filter(|k| *k > window.start && *k < window.end) {
+        let first_frame_of_zero = window.start == 0.0 && (k - before).abs() < 1e-9;
+        if k + 1e-9 >= before && !first_frame_of_zero {
+            cuts.push(k);
+        }
+        if k > start + 1e-9 && !first_frame_of_zero {
+            break;
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    cuts.iter()
+        .enumerate()
+        .map(|(i, &start)| Segment { start, end: cuts.get(i + 1).copied().unwrap_or(duration) })
+        .collect()
+}
+
+/// `EXT-X-INDEPENDENT-SEGMENTS` where every segment decodes without the one before it (`MediaInfo::closed_gops`):
+/// a segment that opens on a CRA carries leading pictures that reference the segment before, and saying otherwise
+/// tells a player it may start decoding anywhere without it.
+fn independent(closed_gops: bool) -> &'static str {
+    match closed_gops {
+        true => "#EXT-X-INDEPENDENT-SEGMENTS\n",
+        false => "",
+    }
+}
+
+/// Each segment's bytes, from the file's byte index (`MediaInfo::byte_index`): the bytes between the indexed keyframes
+/// its bounds fall on, and past the last one the index's average rate. Scaled to add up to `size` where that is known:
+/// what the session delivers (its video and the one audio track it plays), or else the whole file. `None` from an
+/// index of fewer than two keyframes.
+pub fn segment_bytes(segs: &[Segment], index: &[(f64, u64)], size: Option<u64>) -> Option<Vec<f64>> {
+    let (first, last) = (*index.first()?, *index.last()?);
+    if last.0 <= first.0 || last.1 <= first.1 {
+        return None;
+    }
+    let rate = (last.1 - first.1) as f64 / (last.0 - first.0);
+    let at = |t: f64| match index.partition_point(|(k, _)| *k <= t + 1e-6) {
+        0 => first.1 as f64,
+        i if i == index.len() => last.1 as f64 + (t - last.0) * rate,
+        i => index[i - 1].1 as f64,
+    };
+    let bytes: Vec<f64> = segs.iter().map(|s| (at(s.end) - at(s.start)).max(0.0)).collect();
+    let total: f64 = bytes.iter().sum();
+    match size {
+        Some(size) if total > 0.0 => Some(bytes.iter().map(|b| b * size as f64 / total).collect()),
+        _ => Some(bytes),
+    }
+}
+
+/// How far ahead a player buffers: `secs` of media, and — where it caps it — `bytes`. hls.js holds both; Safari's
+/// native player about thirty seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Buffer {
+    pub secs: f64,
+    pub bytes: Option<u64>,
+}
+
+/// The bits a second a link must carry for a player that starts at segment `from` to wait at most `prebuffer`
+/// seconds and then never run dry, holding no more than `buffer` ahead. The larger of two terms:
+///
+/// - From the start: segment k is fetched by the time the bytes up to its end, C(k+1), have come at rate R, and plays
+///   from T(k), so the wait is the largest C(k+1)/R − T(k); within `prebuffer` when R ≥ C(k+1) / (prebuffer + T(k)).
+/// - Over any stretch j..k: a player can't fetch segment j before its play head is within `buffer.secs` of it, and
+///   segment k has to be in by T(k), so the stretch's bits come in `buffer.secs` + T(k) − T(j). Where the buffer is
+///   also capped in bytes, the lead it starts the stretch with is at most that many: the rest of the stretch comes in
+///   T(k) − T(j). A heavy scene past a cheap opening is what this catches: the cheap start builds no lead a buffer
+///   can hold on to.
+pub fn needed_rate(segs: &[Segment], bytes: &[f64], from: usize, prebuffer: f64, buffer: Buffer) -> f64 {
+    let n = segs.len().min(bytes.len());
+    let (mut fetched, mut need) = (0.0, 0.0f64);
+    for k in from..n {
+        fetched += bytes[k] * 8.0;
+        need = need.max(fetched / (prebuffer + segs[k].start - segs[from].start));
+    }
+    need.max(stretch_rate(segs, &bytes[..n], from, buffer))
+}
+
+/// `needed_rate`'s second term: the most any stretch of segments from `from` on asks of a link with `buffer` ahead.
+fn stretch_rate(segs: &[Segment], bytes: &[f64], from: usize, buffer: Buffer) -> f64 {
+    let cap = buffer.bytes.map(|b| b as f64 * 8.0);
+    let mut need = 0.0f64;
+    for j in from..bytes.len() {
+        let mut bits = 0.0;
+        for k in j..bytes.len() {
+            bits += bytes[k] * 8.0;
+            let span = segs[k].start - segs[j].start;
+            need = need.max(bits / (buffer.secs + span));
+            if let Some(cap) = cap.filter(|_| span > 0.0) {
+                need = need.max((bits - cap) / span);
+            }
+        }
+    }
+    need
+}
+
+/// How long a player at `rate` bits a second must wait before it starts at segment `from` so that it never runs dry
+/// after (`needed_rate`'s bucket, the other way round) — infinite where no wait would do, a stretch asking more of the
+/// link than `buffer` lets a player hold ahead for.
+pub fn startup_delay(segs: &[Segment], bytes: &[f64], from: usize, rate: f64, buffer: Buffer) -> f64 {
+    let n = segs.len().min(bytes.len());
+    if stretch_rate(segs, &bytes[..n], from, buffer) > rate {
+        return f64::INFINITY;
+    }
+    let (mut fetched, mut wait) = (0.0, 0.0f64);
+    for k in from..n {
+        fetched += bytes[k] * 8.0;
+        wait = wait.max(fetched / rate - (segs[k].start - segs[from].start));
+    }
+    wait
+}
+
+/// The media playlist. VOD, so the player knows the whole timeline up front and can seek anywhere
+/// before a single segment exists. A `start` past zero is a resume: `EXT-X-START` with `PRECISE=YES`
+/// has a native HLS player (Safari's) begin there instead of at zero and then seeking.
+pub fn media(segs: &[Segment], start: f64, closed_gops: bool) -> String {
+    let target = segs.iter().map(|s| s.end - s.start).fold(0.0, f64::max).ceil().max(1.0) as u64;
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n{}",
+        independent(closed_gops)
+    );
+    if start > 0.0 {
+        out.push_str(&format!("#EXT-X-START:TIME-OFFSET={start:.3},PRECISE=YES\n"));
+    }
+    out.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
+    for (i, s) in segs.iter().enumerate() {
+        out.push_str(&format!("#EXTINF:{:.6},\nseg{i}.m4s\n", s.end - s.start));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
+/// The audio in the variant's segments.
+pub enum Audio<'a> {
+    /// The track re-encoded to AAC-LC stereo.
+    Aac,
+    /// The track re-encoded to AAC-LC 5.1 or 7.1: its channels, 6 or 8, and its language.
+    AacSurround { channels: u32, language: Option<&'a str> },
+    /// A track copied as it is: `ec-3`, `ac-3` or `fLaC`, with its channel count and language.
+    Copy { codec: &'static str, channels: u32, language: Option<&'a str> },
+}
+
+/// Dolby Vision kept in a copied variant, named as RFC 8216bis and Apple's devices read it: a profile 8 base
+/// layer's `hvc1…` stays in CODECS with `dvh1.08.LL/<brand>` in SUPPLEMENTAL-CODECS; profile 5, which has no base
+/// layer, is its own `dvh1.05.LL` in CODECS and has none. VIDEO-RANGE is what the picture is: PQ, HLG or SDR. A
+/// copied HDR AV1 or HEVC is named the same way, by its range alone.
+pub struct DolbyVision {
+    pub supplemental: Option<String>,
+    pub range: &'static str,
+}
+
+/// The master playlist: one variant — the copied video plus its audio — and a WebVTT rendition per
+/// `(language, name)` in `subs`, most wanted first. They are all opt-in: the browser or Cast receiver applies the
+/// viewer's choice, and an unset preference really means subtitles off.
+///
+/// Copied and multichannel AAC audio is also named by an AUDIO rendition with no URI — its media is in the variant's own segments —
+/// so the player learns its CHANNELS, which CODECS does not carry. Stereo AAC, which every player assumes, is not.
+///
+/// FRAME-RATE is named wherever the file says it: Safari passes over a VIDEO-RANGE=PQ variant without one, with no
+/// error, and plays nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn master(
+    video_codecs: &str,
+    dolby_vision: Option<&DolbyVision>,
+    audio: &Audio<'_>,
+    bandwidth: u64,
+    average: u64,
+    resolution: Option<(u32, u32)>,
+    frame_rate: Option<f64>,
+    subs: &[(String, String)],
+    closed_gops: bool,
+) -> String {
+    let res = resolution.filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| format!(",RESOLUTION={w}x{h}"));
+    let rate = frame_rate.filter(|f| *f > 0.0 && *f < 1000.0).map(|f| format!(",FRAME-RATE={f:.3}"));
+    let mut out = format!("#EXTM3U\n#EXT-X-VERSION:7\n{}", independent(closed_gops));
+    let (audio_codec, rendition) = match audio {
+        Audio::Aac => ("mp4a.40.2", None),
+        Audio::AacSurround { channels, language } => ("mp4a.40.2", Some((*channels, language))),
+        Audio::Copy { codec, channels, language } => (*codec, Some((*channels, language))),
+    };
+    if let Some((channels, language)) = rendition {
+        let (name, lang) = match language {
+            Some(l) => (crate::lang::name(l), format!(",LANGUAGE=\"{l}\"")),
+            None => ("Audio".to_string(), String::new()),
+        };
+        out.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{name}\"{lang},DEFAULT=YES,AUTOSELECT=YES,\
+             CHANNELS=\"{channels}\"\n"
+        ));
+    }
+    for (i, (lang, name)) in subs.iter().enumerate() {
+        out.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\",LANGUAGE=\"{lang}\",\
+             DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"sub{i}.m3u8\"\n"
+        ));
+    }
+    let dv = dolby_vision.map_or_else(String::new, |dv| {
+        let supplemental =
+            dv.supplemental.as_deref().map(|s| format!(",SUPPLEMENTAL-CODECS=\"{s}\"")).unwrap_or_default();
+        format!("{supplemental},VIDEO-RANGE={}", dv.range)
+    });
+    out.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={average},CODECS=\"{video_codecs},{audio_codec}\"{dv}{}{}{}{}\n\
+         media.m3u8\n",
+        res.unwrap_or_default(),
+        rate.unwrap_or_default(),
+        if rendition.is_none() { "" } else { ",AUDIO=\"audio\"" },
+        if subs.is_empty() { "" } else { ",SUBTITLES=\"subs\"" }
+    ));
+    out
+}
+
+/// A subtitle rendition's playlist: one WebVTT segment spanning the film.
+pub fn subtitle_media(duration: f64, n: usize) -> String {
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXTINF:{duration:.6},\nsub{n}.vtt\n#EXT-X-ENDLIST\n",
+        duration.ceil().max(1.0) as u64
+    )
+}
+
+/// A subtitle rendition's playlist made of the release's own track: one WebVTT segment per video segment, so a player
+/// asks for the cues around where it is and the session need have read no further than the video has.
+pub fn subtitle_segments(segs: &[Segment], n: usize) -> String {
+    let target = segs.iter().map(|s| s.end - s.start).fold(0.0, f64::max).ceil().max(1.0) as u64;
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n"
+    );
+    for (i, s) in segs.iter().enumerate() {
+        out.push_str(&format!("#EXTINF:{:.6},\nsub{n}_{i}.vtt\n", s.end - s.start));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
+/// BANDWIDTH and AVERAGE-BANDWIDTH from the file's size and duration. The average is honest; the peak
+/// is a guess (a quarter over, plus the AAC we add). It is left below what a busy stretch really carries on purpose:
+/// hls.js buffers ahead `8 × maxBufferSize / BANDWIDTH` seconds (at least `maxBufferLength`), so naming a CRF encode's
+/// real peak, three or four times its average, would shrink the very buffer that carries it through that stretch.
+/// Whether a link can carry the release is `needed_rate`'s question, asked before a release is chosen. `None` size
+/// assumes a 1080p WEB-DL.
+pub fn bandwidth(size: Option<u64>, duration: f64) -> (u64, u64) {
+    let avg = match size {
+        Some(s) if duration > 0.0 => (s as f64 * 8.0 / duration) as u64,
+        _ => 8_000_000,
+    };
+    (avg + avg / 4 + 192_000, avg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// h264.mkv's keyframes, as ffprobe reports them (testdata/README.md).
+    const KF: [f64; 11] = [0.0, 2.5, 5.0, 8.0, 10.5, 13.0, 16.0, 19.5, 22.0, 24.0, 27.5];
+
+    #[test]
+    fn cuts_land_on_the_first_keyframe_at_or_after_each_target() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        // 6 → 8, then 12 → 13, 18 → 19.5, 24 → 24; 30 is past the last keyframe.
+        assert_eq!(starts, [0.0, 8.0, 13.0, 19.5, 24.0]);
+        assert_eq!(segs.last().unwrap().end, 30.021);
+        for w in segs.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "no gap and no overlap");
+        }
+        for s in &segs[1..] {
+            assert!(KF.contains(&s.start), "every boundary but the first is a real keyframe");
+        }
+    }
+
+    #[test]
+    fn only_the_opening_window_is_split_into_gops() {
+        let segs = segments_for_start(&KF, 30.021, TARGET_SECS, 0.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 2.5, 8.0, 13.0, 19.5, 24.0]);
+        assert_eq!(segs[0].end, 2.5, "first playable bytes need one GOP rather than eight seconds");
+        assert_eq!(segs[1].end, 8.0, "the rest of the opening window is one ordinary segment");
+        assert_eq!(segs.last().unwrap().end, 30.021);
+    }
+
+    #[test]
+    fn a_nonzero_first_timestamp_does_not_make_an_empty_bootstrap_segment() {
+        let segs = segments_for_start(&[0.021, 2.521, 8.021, 13.021], 19.0, TARGET_SECS, 0.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 2.521, 8.021, 13.021]);
+    }
+
+    #[test]
+    fn a_resume_gets_a_short_segment_at_both_sides_of_its_start() {
+        let segs = segments_for_start(&KF, 30.021, TARGET_SECS, 18.8);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 8.0, 13.0, 16.0, 19.5, 24.0]);
+        let containing = segs.iter().find(|s| s.start <= 18.8 && 18.8 < s.end).unwrap();
+        assert_eq!((containing.start, containing.end), (16.0, 19.5));
+    }
+
+    #[test]
+    fn sparse_keyframes_do_not_cause_a_run_of_catch_up_cuts() {
+        let segs = segments(&[0.0, 20.0, 21.0, 22.0, 26.0], 40.0, 6.0);
+        let starts: Vec<f64> = segs.iter().map(|s| s.start).collect();
+        assert_eq!(starts, [0.0, 20.0, 26.0], "21 and 22 are not owed a target");
+    }
+
+    #[test]
+    fn a_file_whose_first_keyframe_is_late_still_starts_at_zero() {
+        let segs = segments(&[0.5, 7.0], 10.0, 6.0);
+        assert_eq!(segs[0].start, 0.0);
+        assert_eq!(segs[1].start, 7.0);
+    }
+
+    #[test]
+    fn segment_sizes_come_from_the_index_and_add_up_to_the_file() {
+        let segs = segments(&[0.0, 6.0, 12.0], 15.0, 6.0);
+        let index = [(0.0, 100), (6.0, 700), (12.0, 1300)];
+        // Past the last keyframe, the index's own 100 bytes a second.
+        assert_eq!(segment_bytes(&segs, &index, None), Some(vec![600.0, 600.0, 300.0]));
+        assert_eq!(segment_bytes(&segs, &index, Some(3000)), Some(vec![1200.0, 1200.0, 600.0]));
+        assert_eq!(segment_bytes(&segs, &index[..1], Some(3000)), None, "one keyframe is no index");
+        assert_eq!(segment_bytes(&segs, &[], None), None);
+    }
+
+    #[test]
+    fn the_rate_needed_and_the_wait_at_a_rate_are_one_bucket() {
+        let segs = segments(&[0.0, 6.0, 12.0], 15.0, 6.0);
+        let bytes = [600.0, 600.0, 300.0];
+        let deep = Buffer { secs: 1e9, bytes: None };
+        // 4800 bits in by 10 s, 9600 by 16 s, 12000 by 22 s: the second is the tightest.
+        assert_eq!(needed_rate(&segs, &bytes, 0, 10.0, deep), 600.0);
+        assert!((startup_delay(&segs, &bytes, 0, 600.0, deep) - 10.0).abs() < 1e-9);
+        assert!(startup_delay(&segs, &bytes, 0, 1200.0, deep) <= 4.0 + 1e-9);
+        // From the second segment only its own bytes count, and they have its whole time.
+        assert_eq!(needed_rate(&segs, &bytes, 1, 10.0, deep), 4800.0 / 10.0);
+    }
+
+    #[test]
+    fn a_heavy_stretch_needs_what_a_limited_buffer_can_carry_it_with() {
+        // Ten cheap segments, then ten heavy ones: 6 s each, 0.1 and 5 Mbit.
+        let keyframes: Vec<f64> = (0..20).map(|i| i as f64 * 6.0).collect();
+        let segs = segments(&keyframes, 120.0, 6.0);
+        let bytes: Vec<f64> = (0..20).map(|i| if i < 10 { 12_500.0 } else { 625_000.0 }).collect();
+        let deep = Buffer { secs: 1e9, bytes: None };
+        let short = Buffer { secs: 30.0, bytes: None };
+        // An endless buffer: 51 Mbit must be in by the last segment's start (114 s) plus 10.
+        let unlimited = needed_rate(&segs, &bytes, 0, 10.0, deep);
+        assert!((unlimited - 51e6 / 124.0).abs() < 1.0, "{unlimited}");
+        // Thirty seconds ahead: the ten heavy segments' 50 Mbit come in 30 s + 54 s.
+        let held = needed_rate(&segs, &bytes, 0, 10.0, short);
+        assert!((held - 50e6 / 84.0).abs() < 1.0, "{held}");
+        assert_eq!(startup_delay(&segs, &bytes, 0, 500_000.0, short), f64::INFINITY, "no wait carries it");
+        assert!(startup_delay(&segs, &bytes, 0, 600_000.0, short).is_finite());
+        // A byte cap tighter than the seconds: 1 MB of lead, and the 50 Mbit less 8 Mbit in the 54 s.
+        let capped = Buffer { secs: 1e9, bytes: Some(1_000_000) };
+        let at_cap = needed_rate(&segs, &bytes, 0, 10.0, capped);
+        assert!((at_cap - 42e6 / 54.0).abs() < 1.0, "{at_cap}");
+    }
+
+    #[test]
+    fn the_media_playlist_sums_to_the_duration() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let m = media(&segs, 0.0, true);
+        assert!(!m.contains("EXT-X-START"), "a start from zero names no start point");
+        let total: f64 = m
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|v| v.trim_end_matches(',').parse::<f64>().unwrap())
+            .sum();
+        assert!((total - 30.021).abs() < 1e-5, "EXTINF sums to {total}");
+        assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(m.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(m.trim_end().ends_with("#EXT-X-ENDLIST"));
+        // The longest segment is the first, 0 → 8 (no keyframe between 6 and 8); the target covers it.
+        assert!(m.contains("#EXT-X-TARGETDURATION:8\n"), "{m}");
+        assert_eq!(m.matches(".m4s").count(), segs.len());
+        assert!(m.contains("seg0.m4s") && m.contains("seg4.m4s"));
+    }
+
+    #[test]
+    fn a_resume_names_its_start_point() {
+        let m = media(&segments(&KF, 30.021, TARGET_SECS), 14.25, true);
+        let start = "#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-START:TIME-OFFSET=14.250,PRECISE=YES\n#EXT-X-MAP";
+        assert!(m.contains(start), "{m}");
+    }
+
+    #[test]
+    fn only_closed_gops_are_named_independent_segments() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let open = media(&segs, 0.0, false);
+        assert!(!open.contains("INDEPENDENT"), "{open}");
+        assert!(open.contains("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP"), "{open}");
+        let master_open = master("hvc1.2.4.L120.90", None, &Audio::Aac, 1, 1, None, None, &[], false);
+        assert!(master_open.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:"), "{master_open}");
+        assert!(media(&segs, 0.0, true).contains("#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n"));
+    }
+
+    #[test]
+    fn the_master_names_both_codecs() {
+        let (peak, avg) = bandwidth(Some(3_750_000), 30.0);
+        assert_eq!(avg, 1_000_000);
+        assert!(peak > avg);
+        let m = master(
+            "hvc1.1.6.L93.B0",
+            None,
+            &Audio::Aac,
+            peak,
+            avg,
+            Some((320, 180)),
+            Some(24000.0 / 1001.0),
+            &[],
+            true,
+        );
+        assert!(m.contains("CODECS=\"hvc1.1.6.L93.B0,mp4a.40.2\""), "{m}");
+        assert!(m.contains("RESOLUTION=320x180,FRAME-RATE=23.976\n"), "{m}");
+        assert!(m.contains(&format!("BANDWIDTH={peak},AVERAGE-BANDWIDTH={avg}")));
+        assert!(m.ends_with("media.m3u8\n"));
+        assert!(!m.contains("SUBTITLES") && !m.contains("TYPE=AUDIO") && !m.contains("AUDIO=\""));
+        assert!(!master("avc1.64001e", None, &Audio::Aac, 1, 1, None, None, &[], true).contains("RESOLUTION"));
+        assert!(!m.contains("VIDEO-RANGE"), "nothing kept, nothing named");
+    }
+
+    #[test]
+    fn kept_dolby_vision_is_named_beside_or_as_its_codec() {
+        let p81 = DolbyVision { supplemental: Some("dvh1.08.06/db1p".into()), range: "PQ" };
+        let m = master("hvc1.2.4.L153.B0", Some(&p81), &Audio::Aac, 1, 1, None, None, &[], true);
+        let supplemental = ",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",VIDEO-RANGE=PQ\n";
+        assert!(m.contains(&format!("CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\"{supplemental}")), "{m}");
+        let p5 = DolbyVision { supplemental: None, range: "PQ" };
+        let m = master("dvh1.05.06", Some(&p5), &Audio::Aac, 1, 1, None, None, &[], true);
+        assert!(m.contains("CODECS=\"dvh1.05.06,mp4a.40.2\",VIDEO-RANGE=PQ\n"), "{m}");
+        assert!(!m.contains("SUPPLEMENTAL"), "{m}");
+    }
+
+    #[test]
+    fn copied_dolby_audio_is_named_with_its_channels() {
+        let eac3 = Audio::Copy { codec: "ec-3", channels: 6, language: Some("eng") };
+        let m = master("hvc1.2.4.L150.B0", None, &eac3, 1, 1, None, None, &[], true);
+        assert!(
+            m.contains(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
+            ),
+            "{m}"
+        );
+        assert!(m.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
+        assert!(!m.contains("URI="), "the audio is in the variant's own segments: {m}");
+        let ac3 = Audio::Copy { codec: "ac-3", channels: 2, language: None };
+        let m = master("avc1.640028", None, &ac3, 1, 1, None, None, &[], true);
+        assert!(m.contains("NAME=\"Audio\",DEFAULT=YES") && m.contains(",ac-3\""), "{m}");
+    }
+
+    #[test]
+    fn aac_5_1_is_named_with_its_channels_and_stereo_is_not() {
+        let surround = Audio::AacSurround { channels: 6, language: Some("swe") };
+        let m = master("avc1.640028", None, &surround, 1, 1, None, None, &[], true);
+        assert!(
+            m.contains(
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Swedish\",LANGUAGE=\"swe\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"
+            ),
+            "{m}"
+        );
+        assert!(m.contains("CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
+        let stereo = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &[], true);
+        assert_eq!(
+            stereo,
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1,CODECS=\"avc1.640028,mp4a.40.2\"\nmedia.m3u8\n",
+            "stereo is as it always was"
+        );
+    }
+
+    #[test]
+    fn aac_7_1_and_copied_flac_are_named_with_their_channels() {
+        let aac71 = Audio::AacSurround { channels: 8, language: Some("eng") };
+        let m = master("vp09.00.41.08", None, &aac71, 1, 1, None, None, &[], true);
+        assert!(m.contains("LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"8\"\n"), "{m}");
+        assert!(m.contains("CODECS=\"vp09.00.41.08,mp4a.40.2\",AUDIO=\"audio\"\nmedia.m3u8"), "{m}");
+        let flac = Audio::Copy { codec: "fLaC", channels: 6, language: None };
+        let hdr = DolbyVision { supplemental: None, range: "PQ" };
+        let m = master("vp09.02.51.10.01.09.16.09.00", Some(&hdr), &flac, 1, 1, None, None, &[], true);
+        assert!(m.contains("NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\"\n"), "{m}");
+        assert!(
+            m.contains(
+                "CODECS=\"vp09.02.51.10.01.09.16.09.00,fLaC\",VIDEO-RANGE=PQ,AUDIO=\"audio\"\nmedia.m3u8"
+            ),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn subtitles_are_renditions_of_one_group() {
+        let subs = [("en".to_string(), "English".to_string()), ("fi".to_string(), "Finnish".to_string())];
+        let m = master("avc1.640028", None, &Audio::Aac, 1, 1, None, None, &subs, true);
+        assert!(m.contains("TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Finnish\",LANGUAGE=\"fi\""), "{m}");
+        assert!(m.contains("URI=\"sub1.m3u8\""));
+        assert!(m.contains("LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES"), "{m}");
+        assert!(m.contains("LANGUAGE=\"fi\",DEFAULT=NO,AUTOSELECT=YES"), "{m}");
+        assert_eq!(m.matches("DEFAULT=YES").count(), 0, "subtitles stay off until selected");
+        assert!(m.contains(",SUBTITLES=\"subs\"\nmedia.m3u8"), "{m}");
+        let s = subtitle_media(30.021, 1);
+        assert!(
+            s.contains("#EXT-X-TARGETDURATION:31\n") && s.contains("#EXTINF:30.021000,\nsub1.vtt\n"),
+            "{s}"
+        );
+        assert!(s.ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn an_own_subtitle_track_is_a_segment_for_each_video_segment() {
+        let segs = segments(&KF, 30.021, TARGET_SECS);
+        let s = subtitle_segments(&segs, 2);
+        assert!(s.contains("#EXT-X-PLAYLIST-TYPE:VOD\n") && s.ends_with("#EXT-X-ENDLIST\n"), "{s}");
+        assert_eq!(s.matches(".vtt").count(), segs.len(), "{s}");
+        assert!(s.contains("#EXTINF:8.000000,\nsub2_0.vtt\n#EXTINF:5.000000,\nsub2_1.vtt\n"), "{s}");
+        assert!(s.contains("sub2_4.vtt\n"), "{s}");
+        let total: f64 = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|v| v.trim_end_matches(',').parse::<f64>().unwrap())
+            .sum();
+        assert!((total - 30.021).abs() < 1e-5, "the same timeline as the video: {total}");
+        assert!(s.contains("#EXT-X-TARGETDURATION:8\n"), "{s}");
+    }
+}

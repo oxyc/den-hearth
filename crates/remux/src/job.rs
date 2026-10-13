@@ -1,0 +1,1047 @@
+//! One ffmpeg run: a release, from one keyframe onward, remuxed into one fMP4 file per GOP.
+//!
+//! # Why one file per GOP
+//!
+//! The playlist is fixed before any segment exists, with boundaries on the file's real keyframes. With
+//! the video copied, ffmpeg's hls muxer cuts at the first keyframe at least `-hls_time` past the
+//! START OF THE RUN — so a run started at a seek point cuts at different keyframes than one started at
+//! zero, and the playlist would describe segments no restarted run produces. `-hls_time 0` makes it cut
+//! at every keyframe instead, which no start point can shift. The session joins consecutive GOP files
+//! into the playlist's segments (several moof/mdat pairs in one segment is valid fMP4 HLS).
+//!
+//! # Why these flags
+//!
+//! Each was settled by running ffmpeg 9 against the fixtures (README, "Segment alignment"):
+//! - `-copyts -start_at_zero`: timestamps stay on the source's timeline, so a GOP's position does not
+//!   depend on where its run started.
+//! - `-hls_segment_options movflags=+frag_discont+skip_sidx`, `-avoid_negative_ts disabled`: without
+//!   them the mp4 muxer rebases each run to zero and records the offset in that run's `init.mp4` edit
+//!   list, so GOPs from two runs cannot share one init. With them `tfdt` is absolute and every run
+//!   writes a byte-identical init. `skip_sidx` also keeps a per-GOP `sidx` out of the joined segment.
+//! - `-ss K+0.135 -noaccurate_seek`: see [`seek_for`].
+//! - `-hls_flags temp_file`: a GOP file appears under its final name only once it is complete.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+
+/// How far past a keyframe to aim `-ss`. ffmpeg backs an input seek off by `3/23` s (0.1304) for
+/// formats that seek by decode time when a stream has B-frames — Matroska does, MP4 does not — so an
+/// exact `-ss K` lands on the keyframe BEFORE K. That is not a harmless extra GOP: a first fragment
+/// with no audio in it makes the mp4 muxer rebase the audio to zero, desyncing it by K seconds.
+/// Aiming 0.135 s past K lands on K whether or not ffmpeg backs off.
+pub const SEEK_PAST: f64 = 0.135;
+/// A keyframe with another one closer than this cannot be landed on reliably by the aim above; the
+/// session restarts from an earlier one instead.
+pub const MIN_SEEK_GAP: f64 = 0.15;
+
+/// `-ss` for a run that must start exactly on the keyframe at `k`, or `None` for the start of the file.
+pub fn seek_for(k: f64) -> Option<f64> {
+    (k > 0.0).then_some(k + SEEK_PAST)
+}
+
+const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+const STDERR_TAIL: usize = 2048;
+
+/// What happens to the video.
+pub enum Video {
+    Copy {
+        /// The sample entry to write: `hvc1` for HEVC (Safari plays HEVC in fMP4 only under it, not `hev1`), `dvh1`
+        /// for Dolby Vision profile 5 kept as it is; `None` leaves the muxer's own: `avc1` for H.264, `av01` for AV1,
+        /// `vp09` for VP9.
+        tag: Option<&'static str>,
+        dovi: Dovi,
+    },
+    /// Decoded, scaled (and tone-mapped, for HDR) on the GPU and encoded to H.264 there, over VAAPI — for
+    /// a player that cannot take the release's HEVC. `-force_key_frames source` puts an output keyframe on
+    /// every source keyframe, so the GOPs, and the playlist cut on them, are the ones a copy would make.
+    Transcode {
+        device: String,
+        /// The output size, inside the preset's; 0 × 0 when the source's is unknown, which leaves ffmpeg to scale it
+        /// to the preset's lines.
+        width: u32,
+        height: u32,
+        tonemap: bool,
+        preset: Preset,
+    },
+}
+
+/// What a copy does with the video's Dolby Vision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dovi {
+    /// The video carries none.
+    Absent,
+    /// Drop it — its RPU and enhancement-layer units, and its configuration record, so no `dvcC` is written —
+    /// leaving the base layer: HDR10 (or SDR, HLG), which a browser plays where a profile 7 or 8 stream it would
+    /// refuse is not.
+    Strip,
+    /// Keep it, RPU and configuration record, for a player that shows it. The mp4 muxer writes the `dvcC`/`dvvC`
+    /// box only below its default strictness, hence `-strict unofficial`.
+    Keep,
+}
+
+/// A transcode's H.264: High, level 4.1 — what every H.264 player takes, up to 1920 × 1080.
+pub const TRANSCODE_CODECS: &str = "avc1.640029";
+
+/// A transcode's size and rate: the picture fitted inside `width` × `height`, `bitrate` on average, `peak` at most —
+/// as the master playlist's BANDWIDTH counts it and as ffmpeg is told it — over a `buffer` of rate control.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Preset {
+    pub width: u32,
+    pub height: u32,
+    pub bitrate: u64,
+    pub peak: u64,
+    pub buffer: u64,
+}
+
+/// What every transcode was before a player could name its link: 1080p at 8 Mbit/s.
+pub const HD1080: Preset =
+    Preset { width: 1920, height: 1080, bitrate: 8_000_000, peak: 12_000_000, buffer: 16_000_000 };
+/// For a link that can't carry that: 720p at 3 Mbit/s, about what streaming services give 720p.
+pub const HD720: Preset =
+    Preset { width: 1280, height: 720, bitrate: 3_000_000, peak: 4_500_000, buffer: 6_000_000 };
+/// 540p at 1.5 Mbit/s, for a link that can't carry 720p.
+pub const SD540: Preset =
+    Preset { width: 960, height: 540, bitrate: 1_500_000, peak: 2_250_000, buffer: 3_000_000 };
+
+/// The most audio a session adds to its video: AAC 5.1.
+const AUDIO_MAX: u64 = 384_000;
+/// A transcode's peak over its average, which `h264_vaapi`'s rate control holds it to (`-maxrate`), over a buffer of
+/// twice the average (`-bufsize`).
+const PEAK_RATIO: f64 = 1.5;
+
+/// The transcode for a player's `maxBitrate` (bits a second): as sharp as the link allows, resolution kept before
+/// bitrate. Each size's rate comes down, to the most whose peak fits the link with the most audio beside it — a link
+/// that carries only a transcode's average starves in every scene that asks for its peak — until it reaches that
+/// size's floor: 1080p down to 4 Mbit/s, about what streaming services give 1080p; then 720p down to 2; then 540p down
+/// to 1. 1080p at 8 Mbit/s where nothing is said. `None` for a link below the last floor: no transcode fits it.
+pub fn preset_for(max_bitrate: Option<u64>) -> Option<Preset> {
+    let Some(max) = max_bitrate else { return Some(HD1080) };
+    let fits = (max.saturating_sub(AUDIO_MAX) as f64 / PEAK_RATIO) as u64;
+    [(HD1080, 4_000_000), (HD720, 2_000_000), (SD540, 1_000_000)].into_iter().find_map(|(size, floor)| {
+        let bitrate = size.bitrate.min(fits);
+        (bitrate >= floor).then(|| Preset {
+            bitrate,
+            peak: (bitrate as f64 * PEAK_RATIO) as u64,
+            buffer: bitrate * 2,
+            ..size
+        })
+    })
+}
+
+impl Preset {
+    /// Seconds a player on a link of `rate` bits a second buffers before this plays through: its rate control's
+    /// buffer, the most it can run ahead of `peak`, delivered at the link's rate.
+    pub fn head_start(&self, rate: u64) -> f64 {
+        self.buffer as f64 / rate.max(1) as f64
+    }
+}
+
+/// What happens to the audio track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AudioOut {
+    /// Copied as it is — E-AC-3, AC-3 or FLAC, for a player that plays them in fMP4 HLS.
+    Copy,
+    /// Re-encoded to AAC-LC stereo, which every player takes.
+    Stereo,
+    /// Re-encoded to AAC-LC 5.1, for a player that plays multichannel AAC, from a track of six channels or more.
+    /// `-ac 6` hands the encoder 5.1 whatever the source's layout: swresample folds 7.1 down to it.
+    Surround,
+    /// Re-encoded to AAC-LC 7.1, for a player that plays 8-channel AAC, from a track of eight channels or more.
+    Surround71,
+}
+
+impl AudioOut {
+    /// The AAC encoder's bits a second: 64 kbit/s a channel. `None` for a copy, whose rate is the track's own.
+    pub fn aac_bitrate(self) -> Option<u64> {
+        match self {
+            AudioOut::Copy => None,
+            AudioOut::Stereo => Some(192_000),
+            AudioOut::Surround => Some(384_000),
+            AudioOut::Surround71 => Some(512_000),
+        }
+    }
+
+    /// The channels the session's audio carries, from the source track's.
+    pub fn channels(self, source: u32) -> u32 {
+        match self {
+            AudioOut::Copy => source,
+            AudioOut::Stereo => 2,
+            AudioOut::Surround => 6,
+            AudioOut::Surround71 => 8,
+        }
+    }
+}
+
+pub struct Spec<'a> {
+    pub input: &'a str,
+    pub seek: Option<f64>,
+    pub video: Video,
+    /// Which audio track, counting audio tracks only.
+    pub audio: usize,
+    pub audio_out: AudioOut,
+    /// The release's own text subtitle tracks to write as WebVTT beside the video, counting subtitle tracks of every
+    /// kind: each is a second output of the same run (see [`text_file`]).
+    pub text: &'a [usize],
+    pub dir: &'a Path,
+}
+
+/// Where a run writes subtitle track `n` as WebVTT. ffmpeg's webvtt muxer appends a cue as each packet is read, so the
+/// file grows while the run does, and `-copyts` keeps its cue times on the source's timeline, whatever the run's start.
+pub fn text_file(dir: &Path, n: usize) -> PathBuf {
+    dir.join(format!("t{n}.vtt"))
+}
+
+/// The ffmpeg command line. Pure, so the flags the alignment depends on are pinned by a test.
+pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> =
+        ["-nostdin", "-hide_banner", "-nostats", "-loglevel", "error"].map(String::from).to_vec();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    if spec.input.starts_with("http://") || spec.input.starts_with("https://") {
+        // A debrid CDN drops a connection that has sat idle while the run was paused; reconnect
+        // resumes it with a Range request at the offset ffmpeg had reached.
+        a.extend(s(&["-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "5"]));
+        a.extend(s(&["-rw_timeout", "30000000", "-user_agent", crate::user_agent()]));
+    }
+    if spec.input.starts_with("https://") {
+        // ffmpeg does not verify TLS peers unless asked.
+        a.extend(s(&["-tls_verify", "1"]));
+        if let Some(ca) = ca_file {
+            a.extend(s(&["-ca_file", ca]));
+        }
+    }
+    // One thread for the audio decoder, the filter graph and the AAC encoder: the video is copied, and
+    // AAC — stereo or 5.1 — keeps one core far from busy.
+    a.extend(s(&["-threads", "1", "-copyts", "-start_at_zero", "-noaccurate_seek"]));
+    if let Video::Transcode { device, .. } = &spec.video {
+        // Decoded frames stay on the GPU for the scaler and encoder.
+        a.extend(s(&["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]));
+    }
+    if let Some(ss) = spec.seek {
+        a.extend(["-ss".to_string(), format!("{ss:.6}")]);
+    }
+    a.extend(s(&["-i", spec.input, "-map", "0:V:0"]));
+    a.push("-map".into());
+    a.push(format!("0:a:{}", spec.audio));
+    match &spec.video {
+        Video::Copy { tag, dovi } => {
+            a.extend(s(&["-c:v", "copy"]));
+            if let Some(tag) = tag {
+                a.extend(s(&["-tag:v", tag]));
+            }
+            match dovi {
+                // dovi_rpu drops the configuration record (and a frame's last RPU); filter_units every Dolby
+                // Vision unit — 62 the RPU, 63 the enhancement layer, several of which a profile 7 frame carries.
+                Dovi::Strip => a.extend(s(&["-bsf:v", "dovi_rpu=strip=1,filter_units=remove_types=62|63"])),
+                Dovi::Keep => a.extend(s(&["-strict", "unofficial"])),
+                Dovi::Absent => {}
+            }
+        }
+        Video::Transcode { width, height, tonemap, preset, .. } => {
+            let size = match width {
+                0 => format!("w=-2:h={}", preset.height),
+                w => format!("w={w}:h={height}"),
+            };
+            let scale = format!("scale_vaapi={size}:format=nv12");
+            let vf = match tonemap {
+                true => format!("tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,{scale}"),
+                false => scale,
+            };
+            a.extend(["-vf".to_string(), vf]);
+            // The output says it is SDR because `tonemap_vaapi` says so on every frame it makes. Naming the
+            // colours here as well (`-colorspace bt709` and its two) instead breaks the graph — "Error
+            // reinitializing filters!", and the encoder never opens.
+            a.extend(s(&["-c:v", "h264_vaapi", "-profile:v", "high", "-level:v", "4.1"]));
+            let [rate, peak, buffer] = [preset.bitrate, preset.peak, preset.buffer].map(|b| b.to_string());
+            a.extend(s(&["-b:v", &rate, "-maxrate", &peak, "-bufsize", &buffer]));
+            // Keyframes where the source has them, and no others the encoder would add on its own.
+            a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
+        }
+    }
+    // No encoder priming to account for with a copy: the packets keep the source's timestamps, as the copied video's do.
+    let channels = match spec.audio_out {
+        AudioOut::Copy => None,
+        AudioOut::Stereo => Some("2"),
+        AudioOut::Surround => Some("6"),
+        AudioOut::Surround71 => Some("8"),
+    };
+    match (channels, spec.audio_out.aac_bitrate()) {
+        (Some(ac), Some(rate)) => {
+            a.extend(s(&["-c:a", "aac", "-ac", ac, "-b:a", &format!("{}k", rate / 1000)]));
+        }
+        _ => a.extend(s(&["-c:a", "copy"])),
+    }
+    a.extend(s(&["-threads", "1", "-filter_threads", "1"]));
+    a.extend(s(&["-max_muxing_queue_size", "1024", "-avoid_negative_ts", "disabled"]));
+    a.extend(s(&["-f", "hls", "-hls_time", "0", "-hls_segment_type", "fmp4"]));
+    a.extend(s(&["-hls_segment_options", "movflags=+frag_discont+skip_sidx"]));
+    a.extend(s(&["-hls_fmp4_init_filename", "init.mp4", "-hls_flags", "temp_file"]));
+    a.extend(s(&["-hls_playlist_type", "event", "-hls_list_size", "0", "-start_number", "0"]));
+    a.push("-hls_segment_filename".into());
+    a.push(spec.dir.join("g%d.m4s").to_string_lossy().into_owned());
+    a.push(spec.dir.join("gops.m3u8").to_string_lossy().into_owned());
+    // One more output per subtitle track, in the same run: the demuxer reads every subtitle block already, interleaved
+    // with the video it copies, so the text costs no read of its own. Written packet by packet (`-flush_packets`),
+    // not at the end, so a cue is readable as soon as its block is.
+    for n in spec.text {
+        a.extend(s(&["-map", &format!("0:s:{n}"), "-c:s", "webvtt", "-flush_packets", "1"]));
+        a.extend(s(&["-avoid_negative_ts", "disabled", "-f", "webvtt"]));
+        a.push(text_file(spec.dir, *n).to_string_lossy().into_owned());
+    }
+    a
+}
+
+/// The GOP files ffmpeg's own playlist lists as finished, with their durations. It rewrites that file
+/// by rename after each GOP, so a read never sees half of it.
+pub fn parse_gops(text: &str) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    let mut dur = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(v) = line.strip_prefix("#EXTINF:") {
+            dur = v.split(',').next().and_then(|d| d.trim().parse::<f64>().ok());
+        } else if !line.is_empty() && !line.starts_with('#') {
+            // Our own ffmpeg's names, but they become paths: nothing that could leave the directory.
+            if let Some(d) =
+                dur.take().filter(|_| line.starts_with('g') && line.ends_with(".m4s") && !line.contains('/'))
+            {
+                out.push((line.to_string(), d));
+            }
+        }
+    }
+    out
+}
+
+/// The init segment of a Dolby Vision copy whose source names no Dolby Vision, with the sample entry a real
+/// profile 5 file has: `dvh1` over the `hvcC`, then a `dvcC` (rpu_present, no enhancement layer, base layer present,
+/// no base-layer compatibility). ffmpeg's mp4 muxer writes that box only from the source's side data, so it is added
+/// here — inside stsd, growing each box above it. Nothing points at bytes that move only in a fragmented init, whose
+/// sample tables are empty; any other layout is refused rather than left with wrong offsets.
+pub fn add_dovi_record(init: &[u8], profile: u8, level: u8) -> Result<Vec<u8>, String> {
+    let mut record = Vec::with_capacity(24);
+    record.extend_from_slice(&24u32.to_be_bytes());
+    record.extend_from_slice(b"dvcC");
+    // dv_version_major 1, minor 0; profile (7 bits) and level (6 bits); rpu, no el, bl; compatibility id 0.
+    record.extend_from_slice(&[1, 0, profile << 1 | level >> 5, (level & 0x1f) << 3 | 0b101, 0]);
+    record.resize(24, 0);
+    let path = [*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"];
+    walk_boxes(init, &path, &record)?.ok_or_else(|| "no HEVC sample entry in the init segment".to_string())
+}
+
+/// One box at the start of `b`: its four-character code, its body, and the whole box's length. 32-bit sizes only: a
+/// zero (to the end) or a 64-bit size is not something ffmpeg writes for an init.
+fn box_at(b: &[u8]) -> Result<([u8; 4], &[u8], usize), String> {
+    let size = u32::from_be_bytes(b.get(..4).ok_or("truncated box")?.try_into().unwrap()) as usize;
+    let kind: [u8; 4] = b.get(4..8).ok_or("truncated box")?.try_into().unwrap();
+    if size < 8 || size > b.len() {
+        return Err(format!("box {} of {size} bytes in {}", String::from_utf8_lossy(&kind), b.len()));
+    }
+    Ok((kind, &b[8..size], size))
+}
+
+fn boxed(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(&kind);
+    out.extend_from_slice(body);
+    out
+}
+
+/// `data`'s boxes with the ones along `path` rewritten: `None` when nothing in it reached an HEVC sample entry.
+fn walk_boxes(data: &[u8], path: &[[u8; 4]], record: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (mut out, mut at, mut changed) = (Vec::with_capacity(data.len() + record.len()), 0, false);
+    while at < data.len() {
+        let (kind, body, size) = box_at(&data[at..])?;
+        let whole = &data[at..at + size];
+        if kind == path[0] {
+            let inner = if path.len() == 1 {
+                patch_stsd(body, record)?
+            } else {
+                if path[0] == *b"stbl" {
+                    no_chunk_offsets(body)?;
+                }
+                walk_boxes(body, &path[1..], record)?
+            };
+            if let Some(inner) = inner {
+                out.extend(boxed(kind, &inner));
+                (at, changed) = (at + size, true);
+                continue;
+            }
+        }
+        out.extend_from_slice(whole);
+        at += size;
+    }
+    Ok(changed.then_some(out))
+}
+
+/// A sample table with no chunk offsets to fix: what a fragmented init has.
+fn no_chunk_offsets(stbl: &[u8]) -> Result<(), String> {
+    let mut at = 0;
+    while at < stbl.len() {
+        let (kind, body, size) = box_at(&stbl[at..])?;
+        if matches!(&kind, b"stco" | b"co64") && body.get(4..8) != Some(&[0, 0, 0, 0]) {
+            return Err("the init segment has chunk offsets".into());
+        }
+        at += size;
+    }
+    Ok(())
+}
+
+/// The body of `stsd` with its HEVC entry renamed `dvh1` and given `record`; `None` for a sample description with
+/// no HEVC entry (the audio track's).
+fn patch_stsd(stsd: &[u8], record: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    // Version and flags, entry count; then the entries, each a VisualSampleEntry's 78 bytes before its child boxes.
+    const ENTRY_HEADER: usize = 78;
+    let mut out = stsd.get(..8).ok_or("truncated stsd")?.to_vec();
+    let (mut at, mut changed) = (8, false);
+    while at < stsd.len() {
+        let (kind, body, size) = box_at(&stsd[at..])?;
+        if matches!(&kind, b"hvc1" | b"hev1" | b"dvh1" | b"dvhe") {
+            let mut has_record = false;
+            let mut child = ENTRY_HEADER;
+            while child < body.len() {
+                let (k, _, s) = box_at(body.get(child..).ok_or("truncated sample entry")?)?;
+                has_record |= matches!(&k, b"dvcC" | b"dvvC");
+                child += s;
+            }
+            let mut entry = body.to_vec();
+            if !has_record {
+                entry.extend_from_slice(record);
+            }
+            out.extend(boxed(*b"dvh1", &entry));
+            changed = true;
+        } else {
+            out.extend_from_slice(&stsd[at..at + size]);
+        }
+        at += size;
+    }
+    Ok(changed.then_some(out))
+}
+
+pub struct Job {
+    pub id: u32,
+    pub dir: PathBuf,
+    /// The keyframe this run started on.
+    pub start: f64,
+    /// Where the next GOP starts: `start` plus every duration read so far.
+    pub next_start: f64,
+    /// GOPs already taken from ffmpeg's playlist.
+    pub read: usize,
+    /// The subtitle tracks this run writes (`Spec::text`).
+    pub text: Vec<usize>,
+    pub stopped: bool,
+    /// `Some(true)` once ffmpeg has exited cleanly (it reached the end), `Some(false)` on a failure.
+    pub exit: Option<bool>,
+    pub pid: u32,
+    /// The bytes of the GOPs it has written, counted as the session takes them.
+    pub bytes: u64,
+    began: Instant,
+    /// Since when it has been stopped, and how long it was stopped before that: time paused is no time pulling.
+    paused_since: Option<Instant>,
+    paused: Duration,
+    child: Child,
+    stderr: Option<tokio::task::JoinHandle<String>>,
+    permit: Option<crate::state::ProducerPermit>,
+}
+
+/// A run's pull, as one log line: how much of the film it made, how fast while it ran, and why it is over.
+/// `running` and `paused` are seconds; `bytes` is what it wrote, which for a copy is about what it read — the video
+/// is copied as it is, and only the audio is re-encoded.
+fn pull_summary(id: u32, start: f64, media: f64, bytes: u64, running: f64, paused: f64, why: &str) -> String {
+    let mb = bytes as f64 / 1e6;
+    let rate = match running > 0.0 {
+        true => format!("{:.1}x realtime, {:.1} Mbit/s", media / running, bytes as f64 * 8.0 / 1e6 / running),
+        false => "not run".to_string(),
+    };
+    format!(
+        "job {id} from {start:.1}s: {media:.1}s of media, {mb:.1} MB in {running:.1}s running ({rate}), \
+         paused {paused:.0}s, {why}"
+    )
+}
+
+impl Job {
+    pub fn spawn(
+        ffmpeg: &str,
+        id: u32,
+        start: f64,
+        spec: &Spec<'_>,
+        permit: crate::state::ProducerPermit,
+    ) -> std::io::Result<Job> {
+        std::fs::create_dir_all(spec.dir)?;
+        let ca = Path::new(CA_BUNDLE).exists().then_some(CA_BUNDLE);
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(args(spec, ca))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Its own process group, so pausing and killing reach everything it runs.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn()?;
+        let pid = child.id().unwrap_or(0);
+        register_group(pid);
+        // Drained concurrently so a chatty failure cannot block ffmpeg on a full pipe; only the tail
+        // is kept, for the one line logged if the run fails.
+        let stderr = child.stderr.take().map(|mut pipe| {
+            tokio::spawn(async move {
+                let mut tail = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = pipe.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > STDERR_TAIL {
+                        tail.drain(..tail.len() - STDERR_TAIL);
+                    }
+                }
+                String::from_utf8_lossy(&tail).into_owned()
+            })
+        });
+        Ok(Job {
+            id,
+            dir: spec.dir.to_path_buf(),
+            start,
+            next_start: start,
+            read: 0,
+            text: spec.text.to_vec(),
+            stopped: false,
+            exit: None,
+            pid,
+            bytes: 0,
+            began: Instant::now(),
+            paused_since: None,
+            paused: Duration::ZERO,
+            child,
+            stderr,
+            permit: Some(permit),
+        })
+    }
+
+    /// The run's pull so far (`pull_summary`), ending for `why`.
+    pub fn pull_line(&self, why: &str) -> String {
+        let paused = self.paused + self.paused_since.map_or(Duration::ZERO, |t| t.elapsed());
+        let running = self.began.elapsed().saturating_sub(paused);
+        let media = self.next_start - self.start;
+        pull_summary(self.id, self.start, media, self.bytes, running.as_secs_f64(), paused.as_secs_f64(), why)
+    }
+
+    /// Has ffmpeg exited? Reaps it if so.
+    pub fn poll_exit(&mut self) -> Option<bool> {
+        if self.exit.is_none() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit = Some(status.success());
+                self.permit = None;
+                unregister_group(self.pid);
+            }
+        }
+        self.exit
+    }
+
+    /// Stop ffmpeg where it is: no CPU, no reads. The window ahead of the player is full.
+    ///
+    /// Gives its `MAX_ACTIVE_REMUXES` permit back too: a SIGSTOPped process costs no CPU and little memory, so
+    /// the cap only needs to bound what is actually RUNNING at once, not every session merely holding a
+    /// paused one a few segments ahead of its player. `resume` has to be handed a fresh permit for exactly
+    /// this reason — one has to be had again from the same pool before this can run any more.
+    pub fn pause(&mut self) {
+        if self.exit.is_none() && !self.stopped {
+            signal_group(self.pid, libc::SIGSTOP);
+            self.stopped = true;
+            self.paused_since = Some(Instant::now());
+            self.permit = None;
+        }
+    }
+
+    /// Whether this job is paused and could run again given a permit — never true once it has exited.
+    pub fn resumable(&self) -> bool {
+        self.exit.is_none() && self.stopped
+    }
+
+    pub fn resume(&mut self, permit: crate::state::ProducerPermit) {
+        if self.resumable() {
+            signal_group(self.pid, libc::SIGCONT);
+            self.stopped = false;
+            self.permit = Some(permit);
+            if let Some(since) = self.paused_since.take() {
+                self.paused += since.elapsed();
+            }
+        }
+    }
+
+    pub fn parked_for(&self) -> Option<Duration> {
+        (self.exit.is_none() && self.stopped)
+            .then(|| self.paused_since.map_or(Duration::ZERO, |at| at.elapsed()))
+    }
+
+    /// The tail of ffmpeg's stderr, once it has exited.
+    pub fn take_stderr(&mut self) -> Option<tokio::task::JoinHandle<String>> {
+        self.stderr.take()
+    }
+
+    /// Kill the run, reap it, and drop the partial GOP it was writing.
+    pub async fn stop(mut self) {
+        if self.exit.is_none() {
+            // A stopped process dies of SIGKILL as readily as a running one.
+            kill_group(self.pid);
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+            self.exit = Some(false);
+            unregister_group(self.pid);
+        }
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().ends_with(".tmp") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // Only while it has not been reaped: once it has, the pid can belong to someone else.
+        if self.exit.is_none() {
+            kill_group(self.pid);
+            unregister_group(self.pid);
+        }
+    }
+}
+
+/// Every live ffmpeg's process group, so shutdown can kill them without depending on drop order —
+/// den-reel's registry, for the same reason.
+static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn register_group(pgid: u32) {
+    if pgid > 1 && pgid <= i32::MAX as u32 {
+        LIVE_GROUPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(pgid);
+    }
+}
+
+pub(crate) fn unregister_group(pgid: u32) {
+    if let Some(set) = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        set.remove(&pgid);
+    }
+}
+
+/// SIGKILL every ffmpeg still running. Returns how many groups it signalled.
+pub fn kill_live_groups() -> usize {
+    let taken = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    for p in &taken {
+        kill_group(*p);
+    }
+    taken.len()
+}
+
+pub fn live_groups() -> usize {
+    LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len())
+}
+
+fn kill_group(pgid: u32) {
+    signal_group(pgid, libc::SIGKILL);
+}
+
+fn signal_group(pgid: u32, sig: libc::c_int) {
+    // 0 is our own group and 1 would make kill(-1) "every process we may signal"; above i32::MAX the
+    // negation is a single unrelated pid. None of them is reachable from child.id().
+    if pgid > 1 && pgid <= i32::MAX as u32 {
+        unsafe { libc::kill(-(pgid as i32), sig) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_runs_pull_line_says_how_fast_it_made_the_film_while_it_ran() {
+        assert_eq!(
+            pull_summary(2, 75.3, 41.2, 23_100_000, 5.0, 60.4, "replaced"),
+            "job 2 from 75.3s: 41.2s of media, 23.1 MB in 5.0s running (8.2x realtime, 37.0 Mbit/s), \
+             paused 60s, replaced"
+        );
+        assert_eq!(
+            pull_summary(0, 0.0, 0.0, 0, 0.0, 0.0, "session ended"),
+            "job 0 from 0.0s: 0.0s of media, 0.0 MB in 0.0s running (not run), paused 0s, session ended"
+        );
+    }
+
+    #[test]
+    fn the_alignment_flags_are_all_there() {
+        let dir = Path::new("/scratch/s-x/j1");
+        let spec = Spec {
+            input: "https://cdn.example/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
+            audio: 1,
+            audio_out: AudioOut::Stereo,
+            text: &[],
+            dir,
+        };
+        let a = args(&spec, Some(CA_BUNDLE));
+        let joined = a.join(" ");
+        assert!(!joined.contains("-bsf"), "{joined}");
+        let dovi = Spec { video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Strip }, ..spec };
+        let d = args(&dovi, None).join(" ");
+        assert!(
+            d.contains("-tag:v hvc1 -bsf:v dovi_rpu=strip=1,filter_units=remove_types=62|63 "),
+            "the base layer alone, with no dvcC"
+        );
+        for want in [
+            "-copyts -start_at_zero -noaccurate_seek -ss 13.135000 -i https://cdn.example/f.mkv",
+            "-map 0:V:0 -map 0:a:1 -c:v copy -tag:v hvc1 -c:a aac -ac 2 -b:a 192k",
+            "-avoid_negative_ts disabled",
+            "-f hls -hls_time 0 -hls_segment_type fmp4",
+            "-hls_segment_options movflags=+frag_discont+skip_sidx",
+            "-hls_flags temp_file",
+            "-tls_verify 1 -ca_file /etc/ssl/certs/ca-certificates.crt",
+            "-hls_segment_filename /scratch/s-x/j1/g%d.m4s /scratch/s-x/j1/gops.m3u8",
+        ] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        assert!(a.iter().position(|x| x == "-ss") < a.iter().position(|x| x == "-i"), "-ss is an input seek");
+    }
+
+    #[test]
+    fn a_transcode_stays_on_the_gpu_and_keeps_the_source_keyframes() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Transcode {
+                device: "/dev/dri/renderD128".into(),
+                width: 1920,
+                height: 800,
+                tonemap: true,
+                preset: HD1080,
+            },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let a = args(&spec, None);
+        let joined = a.join(" ");
+        for want in [
+            "-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -ss 13.135000 -i /f.mkv",
+            "-vf tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,scale_vaapi=w=1920:h=800:format=nv12",
+            "-c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 8000000 -maxrate 12000000 -bufsize 16000000",
+            "-force_key_frames source",
+            "-f hls -hls_time 0",
+        ] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        assert!(!joined.contains("-tag:v") && !joined.contains("-c:v copy"));
+        let sdr = Spec {
+            video: Video::Transcode {
+                device: "/d".into(),
+                width: 1280,
+                height: 720,
+                tonemap: false,
+                preset: HD720,
+            },
+            ..spec
+        };
+        let sdr_args = args(&sdr, None).join(" ");
+        assert!(sdr_args.contains("-vf scale_vaapi=w=1280:h=720:format=nv12 "));
+        assert!(sdr_args.contains("-b:v 3000000 -maxrate 4500000 -bufsize 6000000"), "{sdr_args}");
+        let unknown = Spec {
+            video: Video::Transcode {
+                device: "/d".into(),
+                width: 0,
+                height: 0,
+                tonemap: false,
+                preset: HD1080,
+            },
+            ..sdr
+        };
+        assert!(args(&unknown, None).join(" ").contains("-vf scale_vaapi=w=-2:h=1080:format=nv12 "));
+    }
+
+    /// A fragmented init as ffmpeg writes it, cut down: ftyp, then moov with a video and an audio trak.
+    fn init_with(entry: &[u8; 4], stco_count: u32) -> Vec<u8> {
+        let mut visual = vec![0u8; 78];
+        visual[7] = 1; // data_reference_index
+        visual.extend(boxed(*b"hvcC", &[1, 2, 3, 4, 5]));
+        let video_entry = boxed(*entry, &visual);
+        let audio_entry = boxed(*b"mp4a", &[0u8; 28]);
+        let trak = |entry: Vec<u8>| {
+            let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+            stsd.extend(entry);
+            let mut stbl = boxed(*b"stsd", &stsd);
+            let mut stco = vec![0, 0, 0, 0];
+            stco.extend(stco_count.to_be_bytes());
+            stbl.extend(boxed(*b"stco", &stco));
+            let minf = boxed(*b"minf", &boxed(*b"stbl", &stbl));
+            boxed(*b"trak", &boxed(*b"mdia", &minf))
+        };
+        let mut moov = trak(video_entry);
+        moov.extend(trak(audio_entry));
+        moov.extend(boxed(*b"mvex", &[0u8; 8]));
+        let mut file = boxed(*b"ftyp", b"iso5\0\0\0\0iso5");
+        file.extend(boxed(*b"moov", &moov));
+        file
+    }
+
+    /// Every box in `b` walked to the end, recursing into `into`: the sizes all add up or this panics.
+    fn walk_clean(b: &[u8], into: &[&[u8; 4]], seen: &mut Vec<String>) {
+        let mut at = 0;
+        while at < b.len() {
+            let (kind, body, size) = box_at(&b[at..]).unwrap();
+            seen.push(String::from_utf8_lossy(&kind).into_owned());
+            if into.iter().any(|k| **k == kind) {
+                walk_clean(body, into, seen);
+            } else if &kind == b"stsd" {
+                walk_clean(&body[8..], &[], seen);
+            } else if &kind == b"dvh1" {
+                walk_clean(&body[78..], &[], seen);
+            }
+            at += size;
+        }
+        assert_eq!(at, b.len());
+    }
+
+    #[test]
+    fn a_recordless_profile5_init_gets_dvh1_and_a_dvcc_with_every_size_above_it_fixed() {
+        for entry in [b"hvc1", b"dvh1"] {
+            let init = init_with(entry, 0);
+            let patched = add_dovi_record(&init, 5, 6).unwrap();
+            assert_eq!(patched.len(), init.len() + 24);
+            let mut seen = Vec::new();
+            walk_clean(&patched, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"], &mut seen);
+            assert_eq!(seen.iter().filter(|k| *k == "dvh1").count(), 1);
+            assert!(!seen.contains(&"hvc1".to_string()));
+            let dvcc = patched.windows(4).position(|w| w == b"dvcC").unwrap() - 4;
+            assert_eq!(
+                &patched[dvcc..dvcc + 24],
+                &[
+                    0,
+                    0,
+                    0,
+                    24,
+                    b'd',
+                    b'v',
+                    b'c',
+                    b'C',
+                    1,
+                    0,
+                    5 << 1,
+                    6 << 3 | 0b101,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            );
+            assert_eq!(
+                crate::probe::dovi_config(&patched[dvcc + 8..dvcc + 24]),
+                Some(crate::probe::DolbyVision { profile: 5, compat: 0, level: 6 })
+            );
+            assert!(seen.contains(&"hvcC".to_string()) && seen.contains(&"mp4a".to_string()));
+            assert_eq!(
+                add_dovi_record(&patched, 5, 6).unwrap(),
+                patched,
+                "a record already there stays as it is"
+            );
+        }
+    }
+
+    /// ffmpeg's own init for a kept profile 5 copy of a source with no Dolby Vision record: patched, it is still one
+    /// walkable file, with `dvh1`, the `hvcC` ffmpeg wrote and the `dvcC` added (`DOVI_INIT_OUT` keeps the file, to
+    /// hand to ffprobe or a player).
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn ffmpegs_init_takes_the_dovi_record() {
+        let dir = std::env::temp_dir().join(format!("den-remux-dovi-{}", std::process::id()));
+        let input = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/hevc.mkv");
+        let spec = Spec {
+            input,
+            seek: None,
+            video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[],
+            dir: &dir,
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = std::process::Command::new("ffmpeg").args(args(&spec, None)).status().unwrap();
+        assert!(status.success());
+        let init = std::fs::read(dir.join("init.mp4")).unwrap();
+        let patched = add_dovi_record(&init, 5, 6).unwrap();
+        let mut seen = Vec::new();
+        walk_clean(&patched, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"], &mut seen);
+        for want in ["dvh1", "hvcC", "dvcC"] {
+            assert!(seen.contains(&want.to_string()), "{want} in {seen:?}");
+        }
+        if let Ok(out) = std::env::var("DOVI_INIT_OUT") {
+            std::fs::write(out, &patched).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_init_this_cannot_patch_safely_is_refused() {
+        assert!(add_dovi_record(&init_with(b"hvc1", 3), 5, 6).unwrap_err().contains("chunk offsets"));
+        assert!(add_dovi_record(&boxed(*b"ftyp", b"iso5"), 5, 6).is_err(), "no moov");
+        let mut cut = init_with(b"hvc1", 0);
+        cut.truncate(cut.len() - 5);
+        assert!(add_dovi_record(&cut, 5, 6).is_err());
+    }
+
+    #[test]
+    fn a_transcode_keeps_1080p_and_brings_its_rate_down_to_fit_the_link() {
+        assert_eq!(preset_for(None), Some(HD1080), "nothing said: as before");
+        assert_eq!(preset_for(Some(50_000_000)), Some(HD1080));
+        assert_eq!(preset_for(Some(12_384_000)), Some(HD1080), "a 12 Mbit/s peak and 5.1 AAC");
+        // The link a remote viewer on 6.6 Mbit/s measured: still 1080p, at about 4.1 Mbit/s, its peak inside the link.
+        let remote = preset_for(Some(6_600_000)).unwrap();
+        assert_eq!((remote.width, remote.height), (1920, 1080));
+        assert!(remote.bitrate <= 4_500_000 && remote.bitrate >= 4_000_000, "{remote:?}");
+        assert!(remote.peak + 384_000 <= 6_600_000, "{remote:?}");
+        assert!(remote.head_start(6_600_000) <= 30.0, "its head start fits the cap");
+        // Below 1080p's 4 Mbit/s floor, 720p; below 720p's 2, 540p; below 540p's 1, nothing.
+        assert_eq!(preset_for(Some(6_383_999)).map(|p| p.height), Some(720));
+        assert_eq!(preset_for(Some(6_384_000)).map(|p| p.height), Some(1080));
+        assert_eq!(preset_for(Some(3_383_999)).map(|p| p.height), Some(540));
+        assert_eq!(preset_for(Some(1_884_000)).map(|p| (p.height, p.bitrate)), Some((540, 1_000_000)));
+        assert_eq!(preset_for(Some(1_883_999)), None, "below the floor no transcode fits");
+    }
+
+    #[test]
+    fn the_start_of_the_file_is_not_a_seek_and_file_inputs_get_no_http_flags() {
+        assert_eq!(seek_for(0.0), None);
+        let spec = Spec {
+            input: "/tmp/f.mkv",
+            seek: None,
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let a = args(&spec, None);
+        assert!(!a.iter().any(|x| x == "-ss" || x == "-reconnect" || x == "-tls_verify" || x == "-tag:v"));
+    }
+
+    #[test]
+    fn the_releases_own_subtitles_are_more_outputs_of_the_same_run() {
+        let dir = Path::new("/scratch/s-x/j1");
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[3, 1],
+            dir,
+        };
+        let a = args(&spec, None);
+        let joined = a.join(" ");
+        // Counting subtitle tracks of every kind, each written as WebVTT as its packets are read, after the HLS output
+        // that is the run's own.
+        let hls = "-hls_segment_filename /scratch/s-x/j1/g%d.m4s /scratch/s-x/j1/gops.m3u8";
+        let first = "-map 0:s:3 -c:s webvtt -flush_packets 1 -avoid_negative_ts disabled -f webvtt /scratch/s-x/j1/t3.vtt";
+        let second = "-map 0:s:1 -c:s webvtt -flush_packets 1 -avoid_negative_ts disabled -f webvtt /scratch/s-x/j1/t1.vtt";
+        assert!(joined.ends_with(&format!("{hls} {first} {second}")), "{joined}");
+        assert_eq!(text_file(dir, 3), Path::new("/scratch/s-x/j1/t3.vtt"));
+        assert_eq!(a.iter().filter(|x| *x == "-copyts").count(), 1, "one timeline for every output");
+        let none = Spec { text: &[], ..spec };
+        assert!(!args(&none, None).join(" ").contains("webvtt"));
+    }
+
+    #[test]
+    fn kept_dolby_vision_keeps_its_configuration_record() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: None,
+            video: Video::Copy { tag: Some("dvh1"), dovi: Dovi::Keep },
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(joined.contains("-c:v copy -tag:v dvh1 -strict unofficial -c:a aac"), "{joined}");
+        assert!(!joined.contains("-bsf"), "the RPU stays: {joined}");
+    }
+
+    #[test]
+    fn dolby_audio_for_a_player_that_plays_it_is_copied() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
+            audio: 2,
+            audio_out: AudioOut::Copy,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(joined.contains("-map 0:a:2 -c:v copy -tag:v hvc1 -c:a copy -threads 1"), "{joined}");
+        assert!(!joined.contains("aac") && !joined.contains("-ac 2"), "{joined}");
+        let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
+        assert!(joined.contains(alignment), "the same alignment: {joined}");
+    }
+
+    #[test]
+    fn surround_for_a_player_that_plays_it_is_aac_5_1() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Absent },
+            audio: 1,
+            audio_out: AudioOut::Surround,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(
+            joined.contains("-map 0:a:1 -c:v copy -tag:v hvc1 -c:a aac -ac 6 -b:a 384k -threads 1"),
+            "{joined}"
+        );
+        let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
+        assert!(joined.contains(alignment), "the same alignment: {joined}");
+        assert_eq!(
+            [AudioOut::Copy, AudioOut::Stereo, AudioOut::Surround, AudioOut::Surround71]
+                .map(|o| o.channels(8)),
+            [8, 2, 6, 8],
+            "7.1 copied or kept 7.1 keeps its eight, converted otherwise comes down to two or six"
+        );
+    }
+
+    #[test]
+    fn seven_one_for_a_player_that_plays_it_is_aac_7_1() {
+        let spec = Spec {
+            input: "/f.mkv",
+            seek: seek_for(13.0),
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
+            audio: 1,
+            audio_out: AudioOut::Surround71,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        assert!(joined.contains("-map 0:a:1 -c:v copy -c:a aac -ac 8 -b:a 512k -threads 1"), "{joined}");
+    }
+
+    #[test]
+    fn ffmpegs_playlist_yields_finished_gops_only() {
+        let text = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+                    #EXTINF:2.500000,\ng0.m4s\n#EXTINF:3.000000,\ng1.m4s\n#EXTINF:1.0,\n../escape.m4s\n";
+        assert_eq!(parse_gops(text), vec![("g0.m4s".to_string(), 2.5), ("g1.m4s".to_string(), 3.0)]);
+        assert!(parse_gops("").is_empty());
+    }
+}
