@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Self-contained binaries for a resource-constrained homelab. opt-level 3 (speed): the serve/stream
+# path wants the fast codegen (time-to-first-frame). Fat LTO + one codegen unit + strip keep it small.
+# panic=unwind (the default): a panic in one request task unwinds just that connection (tokio catches
+# it) instead of aborting the whole server. The same profile den-reel, den-subtitles and den-remux
+# each carried in their own manifest before the workspace took it over.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

@@ -40,11 +40,3 @@ encoding_rs = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
-
-# Self-contained binary for a resource-constrained homelab. panic=unwind (default): a panic in one
-# request task unwinds just that connection (tokio catches it) instead of aborting the whole server.
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true

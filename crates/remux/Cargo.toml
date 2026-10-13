@@ -46,11 +46,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
-
-# The same release profile as den-reel: fast codegen, fat LTO, one codegen unit, stripped. panic=unwind
-# (the default) so a panic in one request unwinds that connection rather than the whole server.
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true

@@ -1,0 +1,7 @@
+# The same settings as den-reel, den-subtitles and den-remux (each crate keeps its own copy, and rustfmt
+# uses the nearest one); this one covers the crates written here.
+edition = "2021"
+max_width = 110
+
+# Keep short structs, calls and matches on one line instead of exploding them one field per line.
+use_small_heuristics = "Max"
