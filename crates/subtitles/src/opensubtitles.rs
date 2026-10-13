@@ -1,0 +1,1340 @@
+//! OpenSubtitles REST client (api.opensubtitles.com). The API-consumer key is the user's own BYOK key
+//! (`UserConfig::opensubtitles_key`, entered at /configure and carried — sealed — in the install URL);
+//! no OpenSubtitles credential lives in the addon environment. We cache the fetched SRT under our own
+//! stable URL so a given file resolves fast and dodges the per-IP anonymous download cap.
+//!
+//! The one thing that makes subtitles well-synced is passing the file's `moviehash`: OpenSubtitles
+//! flags results authored against that exact encode with `moviehash_match`, and those are correct by
+//! construction. The Den app computes the OSHash of the playing file and sends it as `videoHash`;
+//! we forward it straight through and float the matches to the top.
+
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::OwnedSemaphorePermit;
+
+use crate::ratelimit::{self, Pauses};
+
+/// OpenSubtitles asks every API consumer for `User-Agent: <app name> v<version>`, so this one keeps
+/// that form rather than the `den-subtitles/<version>` the shared client sends everywhere else.
+fn user_agent() -> String {
+    format!("den-subtitles v{}", crate::release_version())
+}
+
+/// One search hit, with the metadata needed to rank fit-to-stream and to show detail in the app
+/// picker. (De)serializable so a whole search result caches as JSON and rebuilds into a response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subtitle {
+    pub file_id: i64,
+    pub lang: String,
+    /// True when this subtitle was matched to the exact file by hash → already in sync.
+    pub hash_match: bool,
+    /// Download count — a tie-breaker when several subs share a language and none is a hash match.
+    pub downloads: i64,
+    /// The uploader's release string (e.g. "Fight.Club.1999.1080p.BluRay.x264-GROUP") — matched
+    /// against the playing file's name to judge fit.
+    pub release: String,
+    pub hd: bool,
+    /// Frame rate the sub was timed against (0 when unknown) — shown for context.
+    pub fps: f64,
+    pub from_trusted: bool,
+    /// Machine/AI-translated subs are low quality — demoted to the bottom of the ranking.
+    pub machine_translated: bool,
+    pub ai_translated: bool,
+    /// OpenSubtitles' own flag for a track that captions only the OTHER language's dialogue — e.g.
+    /// English cues over Arabic in an otherwise-Hebrew show. Correct where it has cues at all, and
+    /// silent for every scene in the show's main language, which is most of the runtime. Demoted for
+    /// the same reason the Apple TV demotes a muxed "forced" track (see that app's `subtitleRank`):
+    /// nothing upstream of `rank` otherwise tells this apart from a full dialogue track, so den-remux's
+    /// "serve the first English hit" picked it, read as subtitles that are "there for half the
+    /// episode" and silent in exactly the scenes spoken in the main language.
+    ///
+    /// `#[serde(default)]`: this field landed after `SearchEntry`'s cache format did, and the cache
+    /// holds entries up to `SEARCH_TTL + SEARCH_STALE_GRACE` (six hours fresh, kept a week past that)
+    /// — long enough to outlive a deploy. Without a default, every cached entry written before this
+    /// field existed fails to deserialize on the first read after the field was added, which happened
+    /// to be invisible here (a parse failure is read as a cache miss, so it just re-searches) but is
+    /// not a reason to leave a field one deploy away from silently losing old entries.
+    #[serde(default)]
+    pub foreign_parts_only: bool,
+    /// OpenSubtitles' own flag for a track made for deaf/hard-of-hearing viewers — sound cues
+    /// transcribed alongside dialogue. Not ranked against (a full HI track is still a full
+    /// dialogue track), but a deciding factor worth naming in the decision log: see `ranking_factors`.
+    /// `#[serde(default)]` for the same cache-compatibility reason as `foreign_parts_only` above.
+    #[serde(default)]
+    pub hearing_impaired: bool,
+    /// 0–10 community rating.
+    pub ratings: f64,
+}
+
+/// Live API root. A field rather than a literal so the two-hop download flow — the API call, then
+/// the CDN link it hands back — can be driven against a local server in tests.
+pub const API: &str = "https://api.opensubtitles.com/api/v1";
+
+/// Longest a daily download quota is held for. The quota is a day; a reset further out than that is
+/// a misread, not a reason to stop downloading for longer.
+const MAX_QUOTA_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// What OpenSubtitles has told us about its limits, per credential, shared by every request.
+#[derive(Default)]
+pub struct Limits {
+    /// A 429 (or a 503 naming a wait), or a window it says is used up. The whole API — every title,
+    /// search and download — for this API key.
+    pub api: Pauses,
+    /// The daily download quota (a 406). Downloads only, for this key and user: searching costs no
+    /// quota and carries on.
+    pub downloads: Pauses,
+    /// The CDN does not tell us the scope of a refusal. Treat it conservatively as process-wide: that
+    /// may pause unrelated users briefly, but prevents them spending `/download` credits only to hit
+    /// the same known-refusing CDN from this server's egress.
+    pub cdn: Pauses,
+}
+
+pub struct Client<'a> {
+    pub http: &'a reqwest::Client,
+    pub api_key: &'a str,
+    /// Optional service-account bearer (raises the download quota above anonymous).
+    pub token: Option<&'a str>,
+    pub api_base: &'a str,
+    pub limits: &'a Limits,
+}
+
+impl<'a> Client<'a> {
+    /// The rate limit is the API key's.
+    fn api_limit_key(&self) -> u64 {
+        ratelimit::key("opensubtitles", self.api_key)
+    }
+
+    /// The download quota is the user's when a token names one, and the key's otherwise.
+    fn quota_key(&self) -> u64 {
+        ratelimit::key("opensubtitles-downloads", &format!("{}\n{}", self.api_key, self.token.unwrap_or("")))
+    }
+
+    fn cdn_limit_key(&self) -> u64 {
+        ratelimit::key("opensubtitles-cdn", "global")
+    }
+
+    /// Why this credential must not ask for a download right now, or `None`.
+    ///
+    /// Checked by the caller before `download` rather than inside it, because a refusal made without
+    /// asking says nothing about the FILE and must not be remembered against it the way a real
+    /// failure is.
+    pub fn download_paused(&self) -> Option<DownloadError> {
+        if let Some(left) = self.limits.api.remaining(self.api_limit_key()) {
+            return Some(DownloadError::Unavailable(format!(
+                "opensubtitles rate limited, {}s left",
+                left.as_secs()
+            )));
+        }
+        if let Some(left) = self.limits.cdn.remaining(self.cdn_limit_key()) {
+            return Some(DownloadError::Unavailable(format!(
+                "opensubtitles CDN rate limited, {}s left",
+                left.as_secs()
+            )));
+        }
+        let left = self.limits.downloads.remaining(self.quota_key())?;
+        Some(DownloadError::Unavailable(format!("download quota reached, {}s left", left.as_secs())))
+    }
+
+    /// Record what an API response said about this key's rate limit. Only a success ends a pause;
+    /// any other answer leaves it as it was.
+    fn observe(
+        &self,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        observed: ratelimit::Observation,
+    ) {
+        let key = self.api_limit_key();
+        let now = SystemTime::now();
+        if ratelimit::throttled(status, headers) {
+            self.limits.api.limited(key, ratelimit::retry_after(headers, now));
+        } else if status.is_success() {
+            self.limits.api.answered(key, observed);
+            // Answered, and told the window is spent: the next call would be the 429.
+            if let Some(wait) = ratelimit::exhausted_for(headers, now) {
+                self.limits.api.hold(key, wait);
+            }
+        }
+    }
+
+    /// Search by IMDb id (+ optional episode) and optional file hash. Results are ordered
+    /// hash-matches-first, then by download count.
+    pub async fn search(
+        &self,
+        imdb_id: &str,
+        season: Option<i64>,
+        episode: Option<i64>,
+        languages: &str,
+        moviehash: Option<&str>,
+    ) -> Result<Vec<Subtitle>, String> {
+        // The imdb id goes in as digits only (no "tt").
+        let imdb_num = imdb_id.trim_start_matches("tt");
+        let mut query: Vec<(String, String)> =
+            vec![("imdb_id".into(), imdb_num.into()), ("languages".into(), languages.to_string())];
+        if let Some(s) = season {
+            query.push(("season_number".into(), s.to_string()));
+        }
+        if let Some(e) = episode {
+            query.push(("episode_number".into(), e.to_string()));
+        }
+        if let Some(h) = moviehash {
+            query.push(("moviehash".into(), h.to_string()));
+        }
+        // Admission is shared by the key across titles. Re-check the pause after waiting: a request
+        // ahead of us may have learned about a 429 while this one was queued.
+        let key = self.api_limit_key();
+        let _permit = self.limits.api.acquire(key).await;
+        // A rate limit is the key's, so a 429 on one title holds every other title too.
+        if let Some(left) = self.limits.api.remaining(self.api_limit_key()) {
+            return Err(format!("opensubtitles rate limited, {}s left", left.as_secs()));
+        }
+        let observed = self.limits.api.begin(key);
+
+        let resp = self
+            .http
+            .get(format!("{}/subtitles", self.api_base))
+            .header("Api-Key", self.api_key)
+            .header("User-Agent", user_agent())
+            .query(&query)
+            .send()
+            .await
+            .map_err(|e| format!("search failed: {e}"))?;
+        self.observe(resp.status(), resp.headers(), observed);
+        if !resp.status().is_success() {
+            return Err(format!("opensubtitles search {}", resp.status()));
+        }
+        let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
+        // Returned unranked (and cached that way — the ranking is filename-specific, so the handler
+        // ranks per request against the playing file).
+        Ok(parse_search(&v))
+    }
+
+    /// Resolve a `file_id` to a temporary download link, then fetch the subtitle text.
+    ///
+    /// The error says whether the FILE is the problem or the service is. Callers that remember a
+    /// file id — the pinned translation source — need to stop remembering it on the first and keep
+    /// it on the second, and the two are otherwise indistinguishable from a message.
+    ///
+    /// `lang` is the subtitle's declared language, when the caller knows it — a hint for working out
+    /// the file's encoding (see `fetch::subtitle_text`).
+    ///
+    /// `allow_sparse`: the caller has already established that every candidate for this language is
+    /// sparse (see `handle_subtitle_file`'s strict pass), so a real-but-incomplete track is better
+    /// than nothing and is returned `Ok` instead of refused. A cue-less body, an expired link or a
+    /// service-level failure is refused either way — "sparse" only ever describes a file with real,
+    /// correctly-timed cues that don't cover enough of it, never one of those.
+    ///
+    /// `dub_flagged` (the caller's own `foreign_parts_only`/`looks_dubbed` read, from the search
+    /// result — this layer never sees a release string) makes a file sparse outright, regardless of
+    /// its own density. `fullest_sibling_cues` is `addon::judge_sparse`'s per-episode running max,
+    /// read before this call and updated by the caller after it; see `srt::looks_incomplete`.
+    #[cfg(test)]
+    pub async fn download(
+        &self,
+        file_id: i64,
+        lang: Option<&str>,
+        allow_sparse: bool,
+        dub_flagged: bool,
+        fullest_sibling_cues: Option<usize>,
+    ) -> Result<String, DownloadError> {
+        let permit = self.admit_download().await?;
+        self.download_admitted(file_id, lang, allow_sparse, dub_flagged, fullest_sibling_cues, &permit).await
+    }
+
+    /// Enter the bounded API window and re-check every shared pause after waiting. A caller may do
+    /// this before spawning a request-independent worker, so cancellation while queued stays free.
+    pub async fn admit_download(&self) -> Result<OwnedSemaphorePermit, DownloadError> {
+        let api_key = self.api_limit_key();
+        let permit = self.limits.api.acquire(api_key).await;
+        if let Some(paused) = self.download_paused() {
+            return Err(paused);
+        }
+        Ok(permit)
+    }
+
+    /// Download after admission. The owner keeps `permit` alive through its cache write, bounding the
+    /// complete paid producer rather than only the API response headers.
+    pub async fn download_admitted(
+        &self,
+        file_id: i64,
+        lang: Option<&str>,
+        allow_sparse: bool,
+        dub_flagged: bool,
+        fullest_sibling_cues: Option<usize>,
+        _permit: &OwnedSemaphorePermit,
+    ) -> Result<String, DownloadError> {
+        let api_key = self.api_limit_key();
+        // Admission and dispatch are separate scheduling points. A sibling may receive a 429 between
+        // them, so observe it here as well as before returning the permit.
+        if let Some(paused) = self.download_paused() {
+            return Err(paused);
+        }
+        let observed = self.limits.api.begin(api_key);
+        let mut req = self
+            .http
+            .post(format!("{}/download", self.api_base))
+            .header("Api-Key", self.api_key)
+            .header("User-Agent", user_agent())
+            // `sub_format` asked for rather than assumed. `srt::parse` is an SRT parser and nothing
+            // downstream handles ASS or WebVTT, so the format was already load-bearing — it was just
+            // whatever the endpoint happened to default to.
+            .json(&serde_json::json!({ "file_id": file_id, "sub_format": "srt" }));
+        if let Some(t) = self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| DownloadError::Unavailable(format!("download request failed: {e}")))?;
+        self.observe(resp.status(), resp.headers(), observed);
+        if !resp.status().is_success() {
+            let code = resp.status();
+            // The daily quota is spent. Every other file would get the same 406 until it resets, so
+            // downloads stop for the key, until the reset the body names.
+            if code == reqwest::StatusCode::NOT_ACCEPTABLE {
+                let body: Option<Value> = crate::fetch::capped_json(resp, 64 * 1024).await.ok();
+                let wait = quota_wait(body.as_ref(), SystemTime::now());
+                self.limits.downloads.hold(self.quota_key(), wait);
+            }
+            return Err(DownloadError::from_status(code, format!("opensubtitles download {code}")));
+        }
+        let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY)
+            .await
+            .map_err(DownloadError::Unavailable)?;
+        let link =
+            v["link"].as_str().ok_or_else(|| DownloadError::Unavailable("no download link".to_string()))?;
+        // The link is OpenSubtitles-supplied and points at their CDN — cap the fetched body.
+        let cdn_key = self.cdn_limit_key();
+        let _cdn_permit = self.limits.cdn.acquire(cdn_key).await;
+        if let Some(left) = self.limits.cdn.remaining(cdn_key) {
+            return Err(DownloadError::Unavailable(format!(
+                "opensubtitles CDN rate limited, {}s left",
+                left.as_secs()
+            )));
+        }
+        let cdn_observed = self.limits.cdn.begin(cdn_key);
+        let resp = self
+            .http
+            .get(link)
+            .send()
+            .await
+            // `without_url`: reqwest's Display prints the URL it failed on, and this one is the
+            // one-shot download link — a bearer capability that would land in the container log.
+            .map_err(|e| DownloadError::Unavailable(format!("fetch link failed: {}", e.without_url())))?;
+        // The API call above is status-checked and this one was not, so a CDN 403/404/429 (an
+        // expired or rate-limited link) returned its HTML error page AS the subtitle — cached under
+        // the file id for 60 days and served `immutable`. One transient blip, one track that
+        // silently shows nothing forever.
+        if ratelimit::throttled(resp.status(), resp.headers())
+            || resp.status().is_server_error()
+            // A timeout or an origin asking an early request to be retried is about this attempt,
+            // never evidence that the subtitle file is bad. Letting either reach `Suspect` would
+            // promote two ordinary transport refusals into a seven-day shared `Gone` marker.
+            || matches!(
+                resp.status(),
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_EARLY
+            )
+        {
+            let code = resp.status();
+            let stated = ratelimit::throttled(code, resp.headers())
+                .then(|| ratelimit::retry_after(resp.headers(), SystemTime::now()))
+                .flatten();
+            self.limits.cdn.limited(cdn_key, stated);
+            return Err(DownloadError::Unavailable(format!("subtitle CDN {code}")));
+        }
+        if !resp.status().is_success() {
+            // `Suspect`, not `from_status`: a 404 here is an expired one-shot capability URL far
+            // more often than a missing file, and only the API's verdict is trusted to unpin.
+            let code = resp.status();
+            return Err(DownloadError::Suspect(format!("subtitle link {code}")));
+        }
+        self.limits.cdn.answered(cdn_key, cdn_observed);
+        let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_SUBTITLE_BODY)
+            .await
+            .map_err(DownloadError::Unavailable)?;
+        let (body, converted) = crate::fetch::subtitle_text(bytes, lang);
+        // Once per download: the result is cached, so this never repeats per request.
+        if let Some(encoding) = converted {
+            eprintln!("subtitle: file {file_id} was {}, converted to UTF-8", encoding.name());
+        }
+        // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
+        // enough. Anything with no cue in it cannot be one.
+        //
+        // `Suspect`: an interstitial served as a 200 and a genuinely cue-less upload look identical
+        // from here. The credit is already spent, so it is worth remembering either way — but not
+        // worth unpinning on, which is what the caller does with a repeat.
+        if !crate::srt::has_a_cue(&body) {
+            return Err(DownloadError::Suspect("subtitle link returned no cues".to_string()));
+        }
+        // Real cues are not proof of a complete transcript either. A sub made for a DUBBED release,
+        // or an unflagged foreign-parts-only track, has correctly-timed cues — just only over the
+        // scenes the dub or the main dialogue doesn't need translating, which is a small, uneven
+        // fraction of the runtime. `rank` already pushes a FLAGGED one of either shape to the bottom,
+        // and `dub_flagged` (the caller's own read of that same flag) is decisive here regardless of
+        // density; `fullest_sibling_cues` catches the one OpenSubtitles' own metadata didn't flag (the
+        // Fauda file this was found from: an English sub for a DUBBED release, with no
+        // `foreign_parts_only` set, next to a full sibling that proves the episode has more to it).
+        //
+        // `Suspect`, the same as a cue-less body: one sparse read could be a genuinely quiet stretch
+        // in an otherwise full track, so it is not trusted to unpin on its own, but a repeat escalates
+        // it to `Gone` the same way — see `remember_failure`. Unless the caller has already
+        // established nothing better exists for this language (`allow_sparse`), in which case a real
+        // track beats none and this is handed back rather than refused.
+        let cues = crate::srt::parse(&body);
+        if (dub_flagged || crate::srt::looks_incomplete(&cues, fullest_sibling_cues)) && !allow_sparse {
+            // The density numbers that made the call, appended in the same `key=value` shape the
+            // decision log uses for a SERVED body (`serve_line`) — `stats()` below reads them back
+            // out, so a sparse refusal is as diagnosable from the journal as a served one, without
+            // spending a second download credit to re-measure it. A dub-flagged file still carries
+            // them (when it has any cues to measure) even though the flag alone was decisive.
+            let detail = crate::srt::stats(&cues)
+                .map(|s| {
+                    format!(
+                        " cues={} span_s={} cues_per_min={:.1} max_gap_s={}",
+                        s.count,
+                        s.span_ms / 1000,
+                        s.per_minute,
+                        s.max_gap_ms / 1000
+                    )
+                })
+                .unwrap_or_default();
+            let why = if dub_flagged {
+                "is a flagged dub/foreign-parts track"
+            } else {
+                "has too few cues for its span"
+            };
+            return Err(DownloadError::Suspect(format!("file {file_id} {why}, sparse{detail}")));
+        }
+        Ok(body)
+    }
+}
+
+/// Why a subtitle could not be fetched, split by whether the FILE or the SERVICE is at fault.
+///
+/// The distinction is what lets a remembered file id be forgotten at the right time. A 404 says the
+/// upload is gone and whatever named it should stop; a 429 says the viewer is out of downloads for
+/// today, and forgetting the file over that throws away a choice that was fine — so the replacement
+/// costs another metered credit, out of the allowance that just ran out.
+#[derive(Debug)]
+pub enum DownloadError {
+    /// The API says this id does not exist. Authoritative, true for everyone, and the only verdict
+    /// trusted to drop a source pin shared by every install.
+    Gone(String),
+    /// The API handed us a link and what came back was not a subtitle — a CDN 404 on the one-shot
+    /// URL, or an interstitial served as a 200. Usually transient, occasionally a bad upload, and
+    /// not distinguishable from here. Retrying immediately will not help either way, so it is
+    /// remembered; but a single one of these must not unpin anything.
+    Suspect(String),
+    /// Quota, rate limit, a revoked key, transport. About one credential, not about the file.
+    Unavailable(String),
+}
+
+impl DownloadError {
+    /// The API's own verdict on the id: 404 and 410 name the file. Everything else — 401/403 (key),
+    /// 406/429 (quota), 5xx — is the service, and a file id must survive all of them.
+    ///
+    /// Only for the API call. A 404 on the CDN link that follows means an expired one-shot URL, not
+    /// a missing file, so that site reports `Suspect`.
+    fn from_status(status: reqwest::StatusCode, message: String) -> DownloadError {
+        match status.as_u16() {
+            404 | 410 => DownloadError::Gone(message),
+            _ => DownloadError::Unavailable(message),
+        }
+    }
+
+    pub fn message(self) -> String {
+        match self {
+            DownloadError::Gone(m) | DownloadError::Suspect(m) | DownloadError::Unavailable(m) => m,
+        }
+    }
+
+    /// A stable, short token for the decision log — `message()` is free text for a human, this is
+    /// for grep. `Suspect` covers three distinct shapes, named so an incident reads as what actually
+    /// failed rather than one undifferentiated `suspect`:
+    /// - `sparse` — real cues, too few for the span (the Fauda shape): probably the wrong release.
+    /// - `no_cues` — the download parsed to zero cues: an interstitial served as a 200, or a
+    ///   genuinely empty upload.
+    /// - `expired_link` — the CDN returned a non-2xx on the one-shot download link: almost always an
+    ///   expired or rate-limited capability URL, rarely a missing file (see `download`'s `Suspect`
+    ///   there, which deliberately does not trust the API's own 404/410 verdict for this hop).
+    ///
+    /// `m.contains("no_cues")`/`"sparse"`/`"expired_link"` also matches the `(remembered: <tag>)`
+    /// shape `remembered_failure` reconstructs when it answers a backed-off repeat from the negative
+    /// cache rather than the live API — same tag either way, so the decision log reads identically
+    /// whether this request spent a credit or not.
+    pub fn reason_tag(&self) -> &'static str {
+        match self {
+            DownloadError::Gone(_) => "gone",
+            DownloadError::Suspect(m) => {
+                if m.contains("too few cues") || m.contains("sparse") {
+                    "sparse"
+                } else if m.contains("no cues") || m.contains("no_cues") {
+                    "no_cues"
+                } else if m.starts_with("subtitle link ") || m.contains("expired_link") {
+                    "expired_link"
+                } else {
+                    "suspect"
+                }
+            }
+            DownloadError::Unavailable(_) => "unavailable",
+        }
+    }
+
+    /// The cue-density numbers `download`'s sparse check measured, read back out of the message it
+    /// embedded them in — `None` for every other refusal, and for a `sparse` one reconstructed from
+    /// the negative cache (`remembered_failure` never re-measures, so it never has them to embed).
+    /// Lets a refused `serve` line carry the same `cues`/`span_s`/`cues_per_min`/`max_gap_s` fields a
+    /// served one does, without holding onto the downloaded body just to log it.
+    pub fn stats(&self) -> Option<crate::srt::Stats> {
+        let DownloadError::Suspect(m) = self else { return None };
+        let rest = m.split_once(" cues=")?.1;
+        let mut parts = rest.split_whitespace();
+        let count = parts.next()?.parse().ok()?;
+        let span_s: u64 = parts.next()?.strip_prefix("span_s=")?.parse().ok()?;
+        let per_minute: f64 = parts.next()?.strip_prefix("cues_per_min=")?.parse().ok()?;
+        let max_gap_s: u64 = parts.next()?.strip_prefix("max_gap_s=")?.parse().ok()?;
+        Some(crate::srt::Stats { count, span_ms: span_s * 1000, per_minute, max_gap_ms: max_gap_s * 1000 })
+    }
+}
+
+/// How long a spent download quota lasts: until the `reset_time_utc` OpenSubtitles names, or, when the
+/// body does not say, the end of the UTC day. Bounded by a day either way.
+fn quota_wait(body: Option<&Value>, now: SystemTime) -> Duration {
+    body.and_then(|v| v["reset_time_utc"].as_str())
+        .and_then(ratelimit::iso_utc)
+        .map(|at| ratelimit::until(at, now))
+        .filter(|wait| !wait.is_zero())
+        .unwrap_or_else(|| ratelimit::until_utc_midnight(now))
+        .min(MAX_QUOTA_PAUSE)
+}
+
+fn parse_search(v: &Value) -> Vec<Subtitle> {
+    let Some(items) = v["data"].as_array() else { return Vec::new() };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let attrs = &item["attributes"];
+        // A multi-file entry is a multi-CD release, and only one part of it can be served. Taking
+        // the first looked fine everywhere it shows — full release string, hash match, quality
+        // flags — and then stopped partway through the film, which is the failure that never
+        // reports itself. Skip it and let a complete subtitle win instead.
+        let files = attrs["files"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let [file] = files else { continue };
+        let Some(file_id) = file["file_id"].as_i64() else { continue };
+        out.push(Subtitle {
+            file_id,
+            lang: attrs["language"].as_str().unwrap_or("").to_string(),
+            hash_match: attrs["moviehash_match"].as_bool().unwrap_or(false),
+            downloads: attrs["download_count"].as_i64().unwrap_or(0),
+            release: attrs["release"].as_str().unwrap_or("").to_string(),
+            hd: attrs["hd"].as_bool().unwrap_or(false),
+            fps: attrs["fps"].as_f64().unwrap_or(0.0),
+            from_trusted: attrs["from_trusted"].as_bool().unwrap_or(false),
+            machine_translated: attrs["machine_translated"].as_bool().unwrap_or(false),
+            ai_translated: attrs["ai_translated"].as_bool().unwrap_or(false),
+            foreign_parts_only: attrs["foreign_parts_only"].as_bool().unwrap_or(false),
+            hearing_impaired: attrs["hearing_impaired"].as_bool().unwrap_or(false),
+            ratings: attrs["ratings"].as_f64().unwrap_or(0.0),
+        });
+    }
+    out
+}
+
+/// Score a subtitle's fit to the playing file. A hash match is decisive — UNLESS the track is
+/// foreign-parts-only, which stays behind a full track whatever its hash or release fit, for the same
+/// reason `text_score` demotes it. Otherwise release/filename overlap dominates (same encode ⇒ same
+/// timing), with trust/ratings/downloads as tie-breakers. Machine/AI-translated subs are pushed below
+/// everything, foreign-parts-only tracks included.
+pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
+    const HASH: i64 = 1_000_000;
+    let mut score = text_score(s);
+    if s.hash_match {
+        score += HASH;
+    }
+    if let Some(f) = filename {
+        score += release_fit(f, &s.release);
+    }
+    score
+}
+
+/// How good this subtitle is as TEXT — everything in `fit_score` except the two terms that are
+/// about which encode is playing (the hash match and the release-name overlap).
+///
+/// This is what you want when choosing something to TRANSLATE. The translated text is the same text
+/// whatever the encode, and the timing is corrected afterwards by the sync ladder, so letting the
+/// hash steer the pick would resolve every encode of one film to its own source — and the source
+/// pin, which is what keeps a title's languages reading from one file, would be taken off each
+/// encode by the next. Every flip is another metered download.
+pub fn text_score(s: &Subtitle) -> i64 {
+    const JUNK: i64 = 2_000_000; // demote machine/AI below even a no-info sub
+                                 // A foreign-parts-only track is accurate where it has cues, so it must not sink as far as a
+                                 // machine-translated one: between a real full track and JUNK, never tied to either.
+    const PARTIAL: i64 = 1_500_000;
+    let mut score = 0i64;
+    if s.from_trusted {
+        score += 400;
+    }
+    score += (s.ratings.clamp(0.0, 10.0) * 100.0) as i64; // 0..1000
+    score += (((s.downloads.max(0) as f64).ln_1p()) * 60.0) as i64; // ~0..700
+    if s.machine_translated || s.ai_translated {
+        score -= JUNK;
+    }
+    // Downloads and ratings reward exactly the wrong thing here: a foreign-parts track is the ONLY
+    // English subtitle for an otherwise-subtitled-elsewhere scene, so everyone who needs it at all
+    // downloads it, and it is often hash-matched to the release that burned those scenes in. Nothing
+    // about its popularity says it covers the dialogue a full track does — it never does, by
+    // definition — so it is demoted on its own flag rather than left to outscore a full track on
+    // downloads or a hash match.
+    //
+    // A DUBBED release is the same shape of problem under a different name: its English sub (made
+    // for THAT release) captions only the lines the dub leaves in the original language, which is
+    // the Fauda case this was found from — OpenSubtitles never set `foreign_parts_only` on that file,
+    // but its release string said "DUBBED" and that was decisive. Nothing else here reads `release`
+    // for content, only for filename overlap, so this is the one place it gets to veto a pick.
+    if s.foreign_parts_only || looks_dubbed(&s.release) {
+        score -= PARTIAL;
+    }
+    score
+}
+
+/// Does this release string say it was authored against a DUBBED release — an English (or other)
+/// soundtrack replaced, with the original dialogue gone? A subtitle built for one captions only
+/// whatever the dub still leaves in another language, which is a small, scene-dependent fraction of
+/// the runtime. Whole-word, case-insensitive: "dubbed" and "dub" as their own release tokens, not as
+/// a substring of an unrelated word (a release group or title could contain "dub" by coincidence).
+///
+/// `pub(crate)`: `addon.rs` carries the same verdict to the client as `looksDubbed`, so a caller
+/// that already knows its own audio language (den-remux does) can rank this track against an
+/// embedded one rather than trust `rank`'s language-blind ordering alone.
+pub(crate) fn looks_dubbed(release: &str) -> bool {
+    tokenize(release).iter().any(|t| t == "dubbed" || t == "dub")
+}
+
+/// Order subtitles for the picker: grouped by language, best-fit first within each language. The
+/// app's own dedupe-keep-first then naturally keeps the optimal sub per language.
+pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
+    subs.sort_by(|a, b| {
+        a.lang.cmp(&b.lang).then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
+    });
+}
+
+/// Compact, log-safe tokens saying why `rank` placed `s` where it did — the deciding factors behind
+/// `fit_score`/`text_score`, named rather than scored, for the decision log. No secret ever reaches
+/// this: a `Subtitle` carries none of the install's credentials.
+///
+/// This is the line that would have shown the Fauda bug at a glance: an English file for a DUBBED
+/// release ranked first, with `looks_dubbed` sitting right there in its factors.
+pub fn ranking_factors(s: &Subtitle, filename: Option<&str>) -> Vec<&'static str> {
+    let mut factors = Vec::new();
+    if s.hash_match {
+        factors.push("hash_match");
+    }
+    if filename.is_some_and(|f| release_fit(f, &s.release) > 0) {
+        factors.push("release_match");
+    }
+    if s.downloads > 0 {
+        factors.push("downloads");
+    }
+    if s.machine_translated || s.ai_translated {
+        factors.push("machine_translated");
+    }
+    if s.foreign_parts_only {
+        factors.push("foreign_parts_only");
+    }
+    if looks_dubbed(&s.release) {
+        factors.push("looks_dubbed");
+    }
+    if s.hearing_impaired {
+        factors.push("hearing_impaired");
+    }
+    factors
+}
+
+/// Significant release tokens shared between the file name and a sub's release string imply the same
+/// encode (hence the same timing). Weight resolution/source/codec, and reward a matching group tag.
+fn release_fit(filename: &str, release: &str) -> i64 {
+    if release.is_empty() {
+        return 0;
+    }
+    let f = tokenize(filename);
+    let r = tokenize(release);
+    let mut score = 0i64;
+    for (tok, weight) in SIGNIFICANT {
+        if f.iter().any(|t| t == tok) && r.iter().any(|t| t == tok) {
+            score += weight;
+        }
+    }
+    // The release group (the tag after the last '-') is the strongest same-encode signal.
+    if let (Some(gf), Some(gr)) = (release_group(filename), release_group(release)) {
+        if gf == gr {
+            score += 3000;
+        }
+    }
+    score
+}
+
+/// Resolution/source/codec tokens and their weights (higher = stronger same-encode evidence).
+const SIGNIFICANT: &[(&str, i64)] = &[
+    ("2160p", 800),
+    ("1080p", 800),
+    ("720p", 800),
+    ("480p", 800),
+    ("bluray", 600),
+    ("blu", 600),
+    ("bdrip", 600),
+    ("brrip", 600),
+    ("remux", 600),
+    ("web", 500),
+    ("webrip", 500),
+    ("webdl", 500),
+    ("hdtv", 500),
+    ("dvdrip", 500),
+    ("hdrip", 500),
+    ("x264", 200),
+    ("x265", 200),
+    ("h264", 200),
+    ("h265", 200),
+    ("hevc", 200),
+    ("avc", 200),
+];
+
+/// Lowercase alphanumeric tokens.
+fn tokenize(s: &str) -> Vec<String> {
+    s.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The release group tag — the single token after the last '-'. Rejects a hyphen that's part of the
+/// *title* (e.g. "Spider-Man.2002.1080p.BluRay.x264" → tail "Man.2002.1080p…" has dots → not a
+/// group), which would otherwise force a bogus group match between unrelated encodes.
+fn release_group(s: &str) -> Option<String> {
+    // Strip a trailing file extension so "…-GROUP.mkv" → "…-GROUP".
+    let stem = match s.rsplit_once('.') {
+        Some((head, ext))
+            if (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            head
+        }
+        _ => s,
+    };
+    let tail = stem.rsplit_once('-')?.1;
+    // A real group tag is one token — any '.' or space means the '-' was inside the title/metadata.
+    if tail.is_empty() || tail.contains('.') || tail.contains(' ') {
+        return None;
+    }
+    Some(tail.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A multi-file entry is a multi-CD release. Only one part can ever be served, and serving it
+    /// looks completely normal in the picker — full release string, quality flags, hash match —
+    /// then stops partway through the film. A complete subtitle is a better answer than a fragment
+    /// that never says it is one.
+    #[test]
+    fn a_multi_cd_entry_is_not_offered_as_a_whole_subtitle() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "download_count": 9999, "release": "Old.DVDRip.CD1-CD2",
+                "files": [{"file_id": 10}, {"file_id": 11}]}},
+            {"attributes": {"language": "en", "download_count": 5, "release": "Complete.1080p",
+                "files": [{"file_id": 12}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert_eq!(subs.len(), 1, "a two-CD entry was offered as a subtitle");
+        assert_eq!(subs[0].file_id, 12, "the complete subtitle should be the one that survives");
+
+        // And an entry with no files at all is not one either.
+        let empty = json!({"data": [{"attributes": {"language": "en", "files": []}}]});
+        assert!(parse_search(&empty).is_empty());
+    }
+
+    #[test]
+    fn parses_results() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "moviehash_match": false, "download_count": 10,
+                "release": "Fight.Club.1999.1080p.BluRay.x264-AMIABLE", "files": [{"file_id": 1}]}},
+            {"attributes": {"language": "en", "moviehash_match": false, "download_count": 999,
+                "release": "Fight.Club.720p.WEB", "ai_translated": true, "files": [{"file_id": 2}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].release, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+        assert!(!subs[0].foreign_parts_only, "unset must default to false, not an absent-field panic");
+    }
+
+    #[test]
+    fn parses_foreign_parts_only() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "download_count": 1, "foreign_parts_only": true,
+                "release": "Fauda.S01E01.NF.WEB-DL", "files": [{"file_id": 1}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert!(subs[0].foreign_parts_only);
+    }
+
+    #[test]
+    fn ranks_hash_then_stream_fit_and_demotes_machine() {
+        let hashed = sub(1, "en", true, 5, "whatever");
+        let fits = sub(2, "en", false, 5, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+        let popular_junk = sub_ai(3, "en", 99999, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+        let filename = Some("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv");
+        // hash match beats a perfect release match
+        assert!(fit_score(&hashed, filename) > fit_score(&fits, filename));
+        // a release/group match beats an unrelated sub
+        assert!(fit_score(&fits, filename) > fit_score(&sub(9, "en", false, 5, "Random.CAM"), filename));
+        // machine/AI is demoted below a plain sub despite huge downloads
+        assert!(fit_score(&popular_junk, filename) < fit_score(&sub(9, "en", false, 0, ""), filename));
+    }
+
+    /// The Fauda report: a guest's English subtitles "showed for half the episode". A
+    /// foreign-parts-only track only has cues over the OTHER language's dialogue (e.g. the Arabic in
+    /// an otherwise-Hebrew show), so a full dialogue track must win whatever the foreign-parts track's
+    /// hash match, downloads, or trust — mirroring the Apple TV's forced-track demotion (den
+    /// `subtitleRank`, commit cc933c0f) for the equivalent muxed-track flag.
+    #[test]
+    fn a_foreign_parts_only_track_never_beats_a_full_one() {
+        let mut foreign_parts = sub(1, "en", true, 50000, "Fauda.S01E01.NF.WEB-DL.DUAL-SMURF");
+        foreign_parts.foreign_parts_only = true;
+        foreign_parts.from_trusted = true;
+        foreign_parts.ratings = 9.0;
+        // No hash match, no trust, no downloads, no release fit at all — the worst a full track can
+        // look — and it must still outrank the foreign-parts one on every signal.
+        let plain_full = sub(2, "en", false, 0, "");
+        let filename = Some("Fauda.S01E01.NF.WEB-DL.DUAL.DDP2.0.H.264-SMURF.mkv");
+        assert!(
+            fit_score(&plain_full, filename) > fit_score(&foreign_parts, filename),
+            "a foreign-parts-only hash match outranked a plain full track"
+        );
+        // It still beats having nothing, the way SDH alone beats no subtitles on the TV.
+        assert!(fit_score(&foreign_parts, filename) > i64::MIN);
+
+        // And `rank`, which groups by language then sorts by fit, puts it last within "en".
+        let mut subs = vec![foreign_parts.clone(), plain_full.clone()];
+        rank(&mut subs, filename);
+        assert_eq!(subs[0].file_id, plain_full.file_id, "the full track must be ranked first");
+    }
+
+    fn sub(id: i64, lang: &str, hash: bool, dl: i64, release: &str) -> Subtitle {
+        Subtitle {
+            file_id: id,
+            lang: lang.into(),
+            hash_match: hash,
+            downloads: dl,
+            release: release.into(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            foreign_parts_only: false,
+            hearing_impaired: false,
+            ratings: 0.0,
+        }
+    }
+    fn sub_ai(id: i64, lang: &str, dl: i64, release: &str) -> Subtitle {
+        Subtitle { ai_translated: true, ..sub(id, lang, false, dl, release) }
+    }
+
+    #[test]
+    fn release_group_ignores_hyphens_in_titles() {
+        // A hyphen in the title must NOT be read as a release group.
+        assert_eq!(release_group("Spider-Man.2002.1080p.BluRay.x264.mkv"), None);
+        assert_eq!(release_group("Spider-Man.2002.480p.DVDRip"), None);
+        // A real trailing group tag still resolves (with or without extension).
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE"), Some("amiable".into()));
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv"), Some("amiable".into()));
+    }
+
+    #[test]
+    fn spiderman_no_false_group_match() {
+        // The correct 1080p encode must outrank a wrong 480p one that shares the bogus "man" token.
+        let filename = Some("Spider-Man.2002.1080p.BluRay.x264-AMIABLE.mkv");
+        let correct = sub(1, "en", false, 5, "Spider-Man.2002.1080p.BluRay.x264-AMIABLE");
+        let wrong = sub(2, "en", false, 5, "Spider-Man.2002.480p.DVDRip");
+        assert!(fit_score(&correct, filename) > fit_score(&wrong, filename));
+    }
+
+    /// The exact case the decision log exists for: a DUBBED release's English file, named in the
+    /// factors it is ranked on rather than buried in a score.
+    #[test]
+    fn ranking_factors_names_the_fauda_shape() {
+        let mut dubbed = sub(1, "en", true, 5, "Fauda.S01E01.DUBBED.WEB-DL");
+        dubbed.foreign_parts_only = false;
+        let filename = Some("Fauda.S01E01.DUBBED.WEB-DL.mkv");
+        let factors = ranking_factors(&dubbed, filename);
+        assert!(factors.contains(&"hash_match"), "{factors:?}");
+        assert!(factors.contains(&"release_match"), "{factors:?}");
+        assert!(factors.contains(&"downloads"), "{factors:?}");
+        assert!(factors.contains(&"looks_dubbed"), "{factors:?}");
+        assert!(!factors.contains(&"foreign_parts_only"), "{factors:?}");
+
+        // A plain, undistinguished sub earns none of them.
+        assert!(ranking_factors(&sub(2, "en", false, 0, ""), None).is_empty());
+    }
+
+    #[test]
+    fn hearing_impaired_is_parsed_and_named_as_a_factor() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "download_count": 1, "hearing_impaired": true,
+                "release": "Fight.Club.1999.1080p", "files": [{"file_id": 1}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert!(subs[0].hearing_impaired);
+        assert!(ranking_factors(&subs[0], None).contains(&"hearing_impaired"));
+    }
+
+    #[test]
+    fn download_error_reason_tag_distinguishes_sparse_from_suspect() {
+        assert_eq!(DownloadError::Gone("x".into()).reason_tag(), "gone");
+        assert_eq!(
+            DownloadError::Suspect("file 5 has too few cues for its span".into()).reason_tag(),
+            "sparse"
+        );
+        // A download that parsed to no cues at all (interstitial or empty upload) is `no_cues`, not
+        // the generic `suspect` this used to collapse into — the two read very differently on an
+        // incident.
+        assert_eq!(DownloadError::Suspect("subtitle link returned no cues".into()).reason_tag(), "no_cues");
+        // A non-2xx on the CDN's one-shot link is `expired_link`: almost always the capability URL
+        // expiring or being rate-limited, not a missing file.
+        assert_eq!(DownloadError::Suspect("subtitle link 404 Not Found".into()).reason_tag(), "expired_link");
+        assert_eq!(DownloadError::Unavailable("x".into()).reason_tag(), "unavailable");
+        // A message with no recognised shape still falls back to the generic tag rather than panicking
+        // or silently misclassifying.
+        assert_eq!(DownloadError::Suspect("something new and unanticipated".into()).reason_tag(), "suspect");
+        // `remembered_failure`'s reconstructed "(remembered: <tag>)" shape reads back as the same tag
+        // it was stored under, so a cache hit logs the same specific reason a live failure would.
+        for tag in ["sparse", "no_cues", "expired_link"] {
+            let remembered = DownloadError::Suspect(format!("file 5 would not download (remembered: {tag})"));
+            assert_eq!(remembered.reason_tag(), tag, "remembered {tag} did not round-trip");
+        }
+    }
+
+    /// `stats()` reads back exactly the numbers `download` embedded for a sparse refusal, and is
+    /// `None` for every shape that never had any to embed — a cue-less body, an expired link, a
+    /// remembered repeat (which never re-measures), and every non-`Suspect` variant.
+    #[test]
+    fn download_error_stats_round_trips_only_for_a_measured_sparse_refusal() {
+        let sparse = DownloadError::Suspect(
+            "file 5 has too few cues for its span cues=200 span_s=2400 cues_per_min=5.0 max_gap_s=180".into(),
+        );
+        let stats = sparse.stats().expect("a sparse refusal must carry its numbers");
+        assert_eq!((stats.count, stats.span_ms, stats.max_gap_ms), (200, 2_400_000, 180_000));
+        assert!((stats.per_minute - 5.0).abs() < 0.01);
+
+        assert!(DownloadError::Suspect("subtitle link returned no cues".into()).stats().is_none());
+        assert!(DownloadError::Suspect("subtitle link 404 Not Found".into()).stats().is_none());
+        assert!(
+            DownloadError::Suspect("file 5 would not download (remembered: sparse)".into()).stats().is_none(),
+            "a remembered repeat never re-measured the file, so it has no numbers to give back"
+        );
+        assert!(DownloadError::Gone("x".into()).stats().is_none());
+        assert!(DownloadError::Unavailable("x".into()).stats().is_none());
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-shot server: answers the API call with a link back to itself, then answers that link
+    /// with whatever the case under test wants the CDN to say.
+    async fn upstream(cdn_status: &'static str, cdn_body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = if req.starts_with("POST") {
+                    ("200 OK".to_string(), format!(r#"{{"link":"http://{addr}/cdn"}}"#))
+                } else {
+                    (cdn_status.to_string(), cdn_body.to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn download_from(status: &'static str, body: &'static str) -> Result<String, DownloadError> {
+        download_from_full(status, body, false, false, None).await
+    }
+
+    async fn download_from_allowing_sparse(
+        status: &'static str,
+        body: &'static str,
+        allow_sparse: bool,
+    ) -> Result<String, DownloadError> {
+        download_from_full(status, body, allow_sparse, false, None).await
+    }
+
+    async fn download_from_full(
+        status: &'static str,
+        body: &'static str,
+        allow_sparse: bool,
+        dub_flagged: bool,
+        fullest_sibling_cues: Option<usize>,
+    ) -> Result<String, DownloadError> {
+        let base = upstream(status, body).await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits }
+            .download(1, None, allow_sparse, dub_flagged, fullest_sibling_cues)
+            .await
+    }
+
+    /// A server that answers each connection with the next canned response, counting the requests.
+    async fn scripted(responses: Vec<String>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn throttled_cdn() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                count.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let response = match request.starts_with("POST") {
+                    true => reply(
+                        "200 OK",
+                        "content-type: application/json\r\n",
+                        &format!(r#"{{"link":"http://{addr}/cdn"}}"#),
+                    ),
+                    false => reply("429 Too Many Requests", "retry-after: 60\r\n", ""),
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_cdn_rate_limit_holds_other_files_without_marking_the_file_suspect() {
+        use std::sync::atomic::Ordering;
+
+        let (base, seen) = throttled_cdn().await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
+
+        let first = client.download(1, None, false, false, None).await.expect_err("the CDN 429 was accepted");
+        assert!(matches!(first, DownloadError::Unavailable(_)), "CDN throttle blamed the file: {first:?}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "expected one API call and one CDN call");
+
+        let second = client
+            .download(2, None, false, false, None)
+            .await
+            .expect_err("the CDN pause let another file out");
+        assert!(matches!(second, DownloadError::Unavailable(_)));
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "a paused CDN spent another /download credit");
+    }
+
+    #[tokio::test]
+    async fn a_pause_installed_after_admission_still_stops_dispatch() {
+        use std::sync::atomic::Ordering;
+
+        let (base, seen) =
+            scripted(vec![reply("200 OK", "content-type: application/json\r\n", r#"{"link":"unused"}"#)])
+                .await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
+        let permit = client.admit_download().await.unwrap();
+        limits.api.limited(client.api_limit_key(), Some(Duration::from_secs(60)));
+
+        let err = client
+            .download_admitted(1, None, false, false, None, &permit)
+            .await
+            .expect_err("a pause installed after admission still dispatched");
+        assert!(matches!(err, DownloadError::Unavailable(_)));
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "the paused request reached the API");
+    }
+
+    /// A rate limit is the KEY's. Remembered only per title, a 429 on one film left every other film
+    /// asking an API that had already refused the key — and a success is what lets it ask again.
+    #[tokio::test]
+    async fn a_rate_limit_on_one_title_holds_every_title_until_an_answer() {
+        use std::sync::atomic::Ordering;
+        let (base, seen) = scripted(vec![
+            reply("429 Too Many Requests", "retry-after: 1\r\n", "{}"),
+            reply("200 OK", "content-type: application/json\r\n", r#"{"data":[]}"#),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
+
+        assert!(client.search("tt0000001", None, None, "all", None).await.is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+        // Another title, same key: refused without a request, and downloads are held with it.
+        let err = client
+            .search("tt0000002", None, None, "all", None)
+            .await
+            .expect_err("the pause let a search out");
+        assert!(err.contains("rate limited"), "{err}");
+        assert!(matches!(client.download_paused(), Some(DownloadError::Unavailable(_))));
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a paused key still asked the API");
+        // Another key is not held.
+        let other = Client { api_key: "other", ..client };
+        assert!(other.download_paused().is_none(), "one key's rate limit held another's");
+
+        // Once the stated wait has passed the key asks again, and the answer clears it.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(client.search("tt0000002", None, None, "all", None).await.is_ok());
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        assert!(limits.api.remaining(client.api_limit_key()).is_none(), "a success left the key paused");
+    }
+
+    /// A 406 is the day's download quota. Every other file would get the same answer, so downloads
+    /// stop for the key until the reset the body names — and searching, which costs no quota, does not.
+    #[tokio::test]
+    async fn a_spent_download_quota_holds_downloads_until_its_reset() {
+        let (base, _) = scripted(vec![reply(
+            "406 Not Acceptable",
+            "content-type: application/json\r\n",
+            r#"{"remaining":0,"message":"quota","reset_time_utc":"2099-01-01T00:00:00.000Z"}"#,
+        )])
+        .await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client =
+            Client { http: &http, api_key: "k", token: Some("user"), api_base: &base, limits: &limits };
+
+        let err = client.download(1, None, false, false, None).await.expect_err("a 406 must fail");
+        assert!(matches!(err, DownloadError::Unavailable(_)), "the quota was blamed on the file: {err:?}");
+        assert!(
+            matches!(client.download_paused(), Some(DownloadError::Unavailable(_))),
+            "file 2 would still be asked for"
+        );
+        assert!(limits.api.remaining(client.api_limit_key()).is_none(), "a spent quota held searching too");
+        // Another user on the same key has a quota of their own.
+        assert!(Client { token: Some("someone-else"), ..client }.download_paused().is_none());
+
+        // The named reset is honoured, a missing or past one falls back to the end of the UTC day, and
+        // neither holds downloads for more than a day.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_643_500_000);
+        let named = serde_json::json!({"reset_time_utc": "2022-01-30T06:00:47.000Z"});
+        assert_eq!(quota_wait(Some(&named), now), Duration::from_secs(22_447));
+        let midnight = ratelimit::until_utc_midnight(now);
+        assert_eq!(quota_wait(None, now), midnight);
+        assert_eq!(
+            quota_wait(Some(&serde_json::json!({"reset_time_utc": "1999-01-01T00:00:00Z"})), now),
+            midnight
+        );
+        let far = serde_json::json!({"reset_time_utc": "2099-01-01T00:00:00Z"});
+        assert_eq!(quota_wait(Some(&far), now), MAX_QUOTA_PAUSE);
+    }
+
+    /// The error has to say whether the FILE or the SERVICE failed, because the pinned translation
+    /// source is forgotten on one and kept on the other — and keeping it through a quota exhaustion
+    /// is what stops the addon buying a replacement source, with a credit it does not have, for a
+    /// source that was never the problem.
+    #[tokio::test]
+    async fn a_download_error_says_whose_fault_it_is() {
+        // The CDN's verdicts are SUSPECT, never `Gone`. A 404 on a one-shot link means it expired,
+        // and a cue-less 200 is usually an interstitial — both clear on their own, and only `Gone`
+        // is allowed to drop the source pin shared by every install and language. A repeat promotes
+        // them; one does not.
+        let err = download_from("404 Not Found", "gone").await.expect_err("404 must fail");
+        assert!(matches!(err, DownloadError::Suspect(_)), "an expired link unpinned the source: {err:?}");
+
+        let err = download_from("200 OK", "<html>not a subtitle</html>").await.expect_err("must fail");
+        assert!(matches!(err, DownloadError::Suspect(_)), "an interstitial unpinned the source: {err:?}");
+
+        // A throttle or server outage is a SERVICE fact. It must not enter the suspect-file counter,
+        // where a later repeat would promote it to a seven-day `Gone` verdict.
+        for status in
+            ["408 Request Timeout", "425 Too Early", "429 Too Many Requests", "503 Service Unavailable"]
+        {
+            let err = download_from(status, "nope").await.expect_err("must fail");
+            assert!(matches!(err, DownloadError::Unavailable(_)), "{status} from the CDN: {err:?}");
+        }
+        // Other capability-link refusals remain suspect: they say this one link did not work, without
+        // the authoritative file verdict that only the API's 404/410 supplies.
+        for status in ["406 Not Acceptable", "403 Forbidden"] {
+            let err = download_from(status, "nope").await.expect_err("must fail");
+            assert!(matches!(err, DownloadError::Suspect(_)), "{status} from the CDN: {err:?}");
+        }
+
+        // The API's own verdict on the id is the one signal that names the FILE, and the only one
+        // trusted to drop a shared pin. Everything else it can say is about the credential.
+        assert!(matches!(
+            DownloadError::from_status(reqwest::StatusCode::NOT_FOUND, "opensubtitles download 404".into()),
+            DownloadError::Gone(_)
+        ));
+        assert!(matches!(
+            DownloadError::from_status(reqwest::StatusCode::GONE, "opensubtitles download 410".into()),
+            DownloadError::Gone(_)
+        ));
+        for code in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::NOT_ACCEPTABLE,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                matches!(DownloadError::from_status(code, "x".into()), DownloadError::Unavailable(_)),
+                "the API's {code} was blamed on the file"
+            );
+        }
+    }
+
+    /// The API call was status-checked and the CDN fetch that follows it was not, so an expired or
+    /// rate-limited link returned its error page AS the subtitle — stored under the file id for 60
+    /// days and served `immutable`. One blip, one track that silently shows nothing forever.
+    #[tokio::test]
+    async fn a_failed_link_fetch_is_not_a_subtitle() {
+        let err = download_from("403 Forbidden", "<html><body>Forbidden</body></html>")
+            .await
+            .expect_err("a 403 from the CDN must not become the subtitle");
+        let err = err.message();
+        assert!(err.contains("403"), "unexpected error: {err}");
+    }
+
+    /// And a 200 is not proof either — a CDN interstitial is a 200 often enough.
+    #[tokio::test]
+    async fn a_link_body_with_no_cues_is_not_a_subtitle() {
+        assert!(download_from("200 OK", "<html>just a page</html>").await.is_err());
+        assert!(download_from("200 OK", "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_real_subtitle_comes_back_intact() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
+        assert_eq!(download_from("200 OK", srt).await.unwrap(), srt);
+    }
+
+    /// `HH:MM:SS,mmm` for an SRT timecode, from milliseconds.
+    fn srt_ts(ms: u64) -> String {
+        let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
+        let (m, rem) = (rem / 60_000, rem % 60_000);
+        let (s, milli) = (rem / 1000, rem % 1000);
+        format!("{h:02}:{m:02}:{s:02},{milli:03}")
+    }
+
+    /// An SRT body with `count` half-second cues spaced `step_ms` apart, starting at 1s — enough to
+    /// drive `looks_incomplete` at a chosen density without hand-writing hundreds of cues.
+    fn spaced_srt(count: u64, step_ms: u64) -> String {
+        let mut out = String::new();
+        for i in 0..count {
+            let start = 1000 + i * step_ms;
+            out.push_str(&format!("{}\n{} --> {}\nline\n\n", i + 1, srt_ts(start), srt_ts(start + 500)));
+        }
+        out
+    }
+
+    /// The Fauda shape downloaded: a DUBBED-release English sub with real, correctly-timed cues —
+    /// `has_a_cue` and `has_a_cue`'s full cousin both pass it — but far too sparse for its own span
+    /// (200 cues over ~40 minutes, ≈5/minute) NEXT TO a full sibling (the shape `rank` normally
+    /// fetches first, demoting the dub release below it). `download` must refuse it so den-remux's
+    /// existing fall-back-to-the-next-candidate loop moves on, rather than serving it as complete.
+    #[tokio::test]
+    async fn a_sparse_but_cued_body_is_refused_next_to_a_full_sibling() {
+        // `download_from_full` takes `&'static str` (every other case here is a literal); leaking a
+        // test's own generated body is a fine way to get one without widening that for one case.
+        let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str()); // 200 cues, 12s apart ≈ 5/minute over ~40 minutes
+        let err = download_from_full("200 OK", srt, false, false, Some(500))
+            .await
+            .expect_err("a sparse dub sub next to a full sibling must not download clean");
+        // The density numbers that made the call travel with the refusal — `stats()` reads them back
+        // out — so the verdict is checkable from the journal without re-downloading the file.
+        let stats = err.stats().expect("a sparse-but-cued refusal must carry its density numbers");
+        assert_eq!(stats.count, 200);
+        let msg = err.message();
+        assert!(msg.contains("sparse"), "{msg}");
+    }
+
+    /// With no sibling at all, the same Fauda shape clears the much looser lone floor — the relative
+    /// check (above) and the `dub_flagged` flag (below) are what actually catch it in practice.
+    #[tokio::test]
+    async fn a_sparse_but_cued_body_alone_downloads_clean() {
+        let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str());
+        assert!(download_from("200 OK", srt).await.is_ok());
+    }
+
+    /// OpenSubtitles doesn't always flag a DUBBED release's English sub as `foreign_parts_only` (the
+    /// Fauda file this whole check was found from didn't) — but when the caller's own release-string
+    /// read (`looks_dubbed`) or the API's flag says so, that is decisive on its own, regardless of
+    /// density or of any sibling.
+    #[tokio::test]
+    async fn a_dub_flagged_body_is_refused_regardless_of_density() {
+        let srt: &'static str = Box::leak(spaced_srt(480, 5_000).into_boxed_str()); // dense: 12/minute
+        let err = download_from_full("200 OK", srt, false, true, None)
+            .await
+            .expect_err("a dub-flagged body must be refused even when dense");
+        let msg = err.message();
+        assert!(msg.contains("sparse"), "{msg}");
+    }
+
+    /// The owner's call: a sparse file is better than nothing when it is the only thing a language
+    /// has. `allow_sparse` is den-subtitles saying exactly that has been established — so the SAME
+    /// sparse body that the test above rejects is handed back here instead.
+    #[tokio::test]
+    async fn a_sparse_body_is_handed_back_when_the_caller_allows_it() {
+        let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str());
+        assert_eq!(download_from_allowing_sparse("200 OK", srt, true).await.unwrap(), srt);
+    }
+
+    /// `allow_sparse` rescues a real-but-incomplete track, never a non-subtitle. A CDN interstitial
+    /// or a genuinely empty upload stays refused even on the fallback pass — "sparse" never describes
+    /// either, so there is no file here for "better than nothing" to apply to.
+    #[tokio::test]
+    async fn allow_sparse_does_not_rescue_a_cue_less_body() {
+        assert!(download_from_allowing_sparse("200 OK", "<html>not a subtitle</html>", true).await.is_err());
+        assert!(download_from_allowing_sparse("200 OK", "", true).await.is_err());
+    }
+
+    /// A dense track of the same rough length downloads cleanly — the check is about density, not
+    /// about length or cue count alone.
+    #[tokio::test]
+    async fn a_dense_body_of_similar_length_downloads_clean() {
+        let srt: &'static str = Box::leak(spaced_srt(480, 5_000).into_boxed_str()); // 480 cues, 5s apart ≈ 12/minute over ~40 minutes
+        assert!(download_from("200 OK", srt).await.is_ok());
+    }
+}

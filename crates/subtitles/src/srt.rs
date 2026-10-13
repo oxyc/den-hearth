@@ -1,0 +1,799 @@
+//! SRT parse/serialize. The translation harness only ever touches `text` — indices and timestamps
+//! are preserved verbatim, so the model can neither renumber a cue nor corrupt a timecode (the
+//! classic "LLM ate the SRT" failure mode is structurally impossible when timing never leaves here).
+
+/// One subtitle cue. `start`/`end` are milliseconds from the start of the media.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cue {
+    pub index: u32,
+    pub start: u64,
+    pub end: u64,
+    /// The dialogue, `\n`-joined if the cue spans multiple display lines.
+    pub text: String,
+}
+
+/// Does this look like a subtitle at all? Answers the one-bit question without building the
+/// document: `parse` allocates a `Vec<&str>` over every line (~16 bytes per line, ~260 MB on a
+/// 12 MiB body of short lines) and the callers that ask this throw the cues away.
+pub fn has_a_cue(input: &str) -> bool {
+    // Mirrors `parse`'s rule for where a cue may start — a timing line, or an index line followed
+    // by one — but streams, stops at the first hit, and allocates nothing. It is deliberately the
+    // more eager of the two about block boundaries: this only ever answers "is this a subtitle at
+    // all, or an error page", so never rejecting a real one is what matters.
+    // Same BOM strip as `parse`: U+FEFF is not whitespace, so without this a BOM'd index line fails
+    // to parse as a number and the timing line after it is never even tested.
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let mut at_block_start = true;
+    let mut after_index = false;
+    for line in lines_like_parse(input) {
+        if line.trim().is_empty() {
+            at_block_start = true;
+            after_index = false;
+            continue;
+        }
+        if (at_block_start || after_index) && parse_timing(line).is_some() {
+            return true;
+        }
+        after_index = at_block_start && line.trim().parse::<u32>().is_ok();
+        at_block_start = false;
+    }
+    false
+}
+
+/// Lines as `parse` sees them after normalisation: "\r\n", "\n" and a bare "\r" are each ONE
+/// break. Splitting on the two characters independently yields a phantom empty string inside every
+/// "\r\n", which reads as a blank line — and a blank line means "a cue may start here", so almost
+/// every line of a CRLF document looked like a block start and `has_a_cue` accepted bodies that
+/// `parse` finds no cues in at all.
+fn lines_like_parse(input: &str) -> impl Iterator<Item = &str> {
+    input.split('\n').flat_map(|seg| seg.strip_suffix('\r').unwrap_or(seg).split('\r'))
+}
+
+/// Parse an SRT document. Tolerant of CRLF, a UTF-8 BOM, and blank runs; a malformed block is
+/// skipped rather than aborting the whole file (a single bad cue shouldn't lose the movie).
+pub fn parse(input: &str) -> Vec<Cue> {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let mut cues = Vec::new();
+    // Normalise CRLF first so a line break is one character everywhere below.
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    // An empty line always separates cues. A line holding only whitespace separates only when a cue
+    // header follows it.
+    //
+    // Real OpenSubtitles files carry separator lines with a space or a tab on them, and splitting on
+    // "\n\n" missed those: the next cue stayed inside the previous block, where the index and timing
+    // lines were already taken, so its timecode was joined onto the previous cue's dialogue — cue 2
+    // gone, its words shown at cue 1's timestamp, its timecode rendered as dialogue. But treating
+    // every blank-ish line as a separator is the same bug mirrored: a padded line INSIDE a cue would
+    // truncate it and drop the dialogue after it. Only the lookahead tells the two apart.
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut block: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !lines[i].trim().is_empty() {
+            block.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        // Take the whole blank run in one step. Deciding per line meant rescanning the rest of the
+        // run for every line in it — quadratic, and since this parser now gates every downloaded
+        // subtitle, a file of padded lines was minutes to hours of CPU on a runtime that has one
+        // thread for every connection.
+        let end = i + lines[i..].iter().take_while(|l| l.trim().is_empty()).count();
+        // A truly empty line always separates. A run of only whitespace separates when a cue
+        // header follows it; otherwise it is padding inside the dialogue and stays in the text.
+        if lines[i..end].iter().any(|l| l.is_empty()) || starts_a_cue(&lines[end..]) {
+            push_cue(&mut cues, &block);
+            block.clear();
+        } else {
+            block.extend_from_slice(&lines[i..end]);
+        }
+        i = end;
+    }
+    push_cue(&mut cues, &block);
+    cues
+}
+
+/// Does a cue begin here — an index followed by a timing line, or a bare timing line? Called with
+/// the run of blank lines already skipped, so it looks at two lines and returns.
+fn starts_a_cue(rest: &[&str]) -> bool {
+    let Some(first) = rest.first() else { return true }; // trailing padding ends the file
+    parse_timing(first).is_some()
+        || (first.trim().parse::<u32>().is_ok() && rest.get(1).is_some_and(|l| parse_timing(l).is_some()))
+}
+
+/// Turn one block's lines into a cue, skipping anything malformed — a single bad cue shouldn't
+/// lose the movie.
+fn push_cue(cues: &mut Vec<Cue>, block: &[&str]) {
+    let mut lines = block.iter().copied();
+    let Some(first) = lines.next() else { return };
+    // First line is the index; some files omit it and lead with the timecode — tolerate both.
+    let (index, timing_line) = match first.trim().parse::<u32>() {
+        Ok(n) => (n, lines.next().unwrap_or("")),
+        Err(_) => (cues.len() as u32 + 1, first),
+    };
+    let Some((start, end)) = parse_timing(timing_line) else { return };
+    let text = lines.collect::<Vec<_>>().join("\n");
+    cues.push(Cue { index, start, end, text });
+}
+
+/// Serialize cues back to a well-formed SRT (LF newlines, blank-line separated, trailing newline).
+pub fn serialize(cues: &[Cue]) -> String {
+    serialize_with(cues, ',', "")
+}
+
+/// The same document as WebVTT: a `WEBVTT` header, and `.` rather than `,` before the milliseconds.
+/// One implementation rather than two, because the part worth getting right — dropping a blank line
+/// inside a cue, which ends that cue for every reader downstream — is the same in both formats.
+pub fn serialize_vtt(cues: &[Cue]) -> String {
+    serialize_with(cues, '.', "WEBVTT\n\n")
+}
+
+fn serialize_with(cues: &[Cue], ms_sep: char, header: &str) -> String {
+    let mut out = String::from(header);
+    for (i, c) in cues.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&c.index.to_string());
+        out.push('\n');
+        out.push_str(&format_ts(c.start, ms_sep));
+        out.push_str(" --> ");
+        out.push_str(&format_ts(c.end, ms_sep));
+        out.push('\n');
+        // Blank lines are dropped, not written: one inside a cue's text ENDS that cue for every
+        // reader downstream, silently losing the rest of it. A translation model's output reaches
+        // here verbatim, so this is the only place that can guarantee a parseable document.
+        // Split the way `parse` will read it back: `str::lines` ignores a lone `\r`, but `parse`
+        // promotes every one to a line break, so a cue holding "a\r\rb" would come back truncated.
+        let mut first = true;
+        for line in c.text.split(['\n', '\r']).filter(|l| !l.trim().is_empty()) {
+            if !first {
+                out.push('\n');
+            }
+            match ms_sep {
+                '.' => out.push_str(&escape_vtt(line)),
+                _ => out.push_str(line),
+            }
+            first = false;
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Escape one cue line for WebVTT: `&` always, `<` only when it is not opening a tag.
+///
+/// WebVTT reads both as markup, so a line like "5 < 6 & rising" — ordinary, valid SRT — is malformed
+/// there and a strict parser mangles the cue. But `<i>`, `<b>`, `<u>` and `<font …>` are the dominant
+/// styling convention in real subtitle files AND are legal WebVTT markup, so escaping every `<`
+/// renders a literal `<i>Whispering</i>` on screen for a large share of tracks. That is a worse bug
+/// than the one being fixed, and it is what a blanket replace produces.
+fn escape_vtt(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    // `&` and `<` are ASCII, so every index here lands on a char boundary.
+    while let Some(i) = rest.find(['&', '<']) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if let Some(after) = tail.strip_prefix('&') {
+            out.push_str("&amp;");
+            rest = after;
+        } else if let Some(end) = tag_end(tail) {
+            // Tag-shaped and closed: hand it through as the markup it is — but an `&` inside it is
+            // still an `&`, and `<v Tom & Jerry>` is as malformed as a bare one in the dialogue.
+            out.push_str(&tail[..=end].replace('&', "&amp;"));
+            rest = &tail[end + 1..];
+        } else {
+            out.push_str("&lt;");
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte index of the `>` closing a WebVTT tag at the start of `s`, or `None` if this `<` is just a
+/// less-than sign. Covers `<i>`, `</i>`, `<c.loud>`, `<v Fred>`, `<lang en>` and the timestamp form
+/// `<00:00:01.000>`.
+///
+/// The search for `>` is bounded, and that bound is load-bearing twice over.
+///
+/// Cost: scanning the whole remaining line for each `<` is quadratic, and a cue is arbitrary
+/// downloaded text — a line of `<a<a<a…` took 794 ms at 320 KB and would take about twenty minutes
+/// at the 12 MiB body cap, on the one thread that serves every connection, replayed on every
+/// request because `to_vtt` caches nothing.
+///
+/// Correctness: unbounded, `5 <6 and 7> 8` found a distant `>` and passed `<6 and 7>` through raw —
+/// which is the malformed-VTT case this whole function exists to prevent. A real tag is short, and
+/// only the voice and language tags contain a space.
+fn tag_end(s: &str) -> Option<usize> {
+    /// Longer than `<00:00:01.000>` and any realistic `<v Name>`, short enough that scanning it per
+    /// `<` stays linear in the line.
+    const MAX_TAG: usize = 64;
+
+    // `<`, `>` and `/` are ASCII, so every byte index below is a char boundary.
+    if !s.starts_with('<') {
+        return None;
+    }
+    let end = s.bytes().take(MAX_TAG).position(|b| b == b'>')?;
+    let inner = s.get(1..end)?;
+    let name = inner.strip_prefix('/').unwrap_or(inner);
+    if !name.chars().next()?.is_ascii_alphanumeric() {
+        return None;
+    }
+    // A tag may carry attributes — `<font color="#00FF00">`, `<v Fred>`, `<lang en>`, `<v.loud Esme>`
+    // — and those all have an ALPHABETIC name before the first space or class dot. Prose does not:
+    // "5 <6 and 7> 8" has the name "6". Requiring the name to be alphabetic before allowing a space
+    // separates the two; listing the tags that may take attributes instead (`v`, `lang`) escaped
+    // every `<font …>` in the file, which is the same "renders as visible text" bug this function
+    // exists to avoid, on the single most common styling tag there is.
+    if name.contains(' ') {
+        let head = name.split([' ', '.']).next().unwrap_or("");
+        if head.is_empty() || !head.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+    }
+    Some(end)
+}
+
+/// `HH:MM:SS,mmm --> HH:MM:SS,mmm` → (start_ms, end_ms). Also accepts a `.` millisecond separator
+/// (VTT-style) since some sources mix them.
+fn parse_timing(line: &str) -> Option<(u64, u64)> {
+    let (a, b) = line.split_once("-->")?;
+    Some((parse_ts(a.trim())?, parse_ts(b.trim())?))
+}
+
+fn parse_ts(s: &str) -> Option<u64> {
+    // HH:MM:SS,mmm — split off millis on either separator first.
+    let (hms, ms) = s.split_once([',', '.'])?;
+    let mut parts = hms.split(':');
+    let h: u64 = parts.next()?.parse().ok()?;
+    let m: u64 = parts.next()?.parse().ok()?;
+    let sec: u64 = parts.next()?.parse().ok()?;
+    // Pad/truncate the millisecond field to exactly 3 digits before parsing (e.g. "5" → 500).
+    // char-based (not byte-slice): the ms field is arbitrary downloaded text, and a multibyte char
+    // straddling byte index 3 would panic a byte slice.
+    let ms3: String = ms.chars().take(3).collect();
+    let ms: u64 = format!("{ms3:0<3}").parse().ok()?;
+    // Saturating math: a malformed HH:MM:SS from hostile input mustn't overflow-panic in debug.
+    let total = h
+        .saturating_mul(60)
+        .saturating_add(m)
+        .saturating_mul(60)
+        .saturating_add(sec)
+        .saturating_mul(1000)
+        .saturating_add(ms);
+    Some(total)
+}
+
+fn format_ts(ms: u64, ms_sep: char) -> String {
+    let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
+    let (m, rem) = (rem / 60_000, rem % 60_000);
+    let (s, milli) = (rem / 1000, rem % 1000);
+    format!("{h:02}:{m:02}:{s:02}{ms_sep}{milli:03}")
+}
+
+/// Cues/minute floor for a file with no sibling to compare against (a lone candidate, or the first of
+/// its episode this process has seen). With nothing to measure it against, only flag a shape no real
+/// dialogue track — however slow-paced — could produce: Springfloden's three English files run
+/// 6.5–7.6/min and must clear this, so this is deliberately looser than the old absolute floor (8/min)
+/// that flagged them. A true partial/dub track (Fauda's ~5/min) still falls under it.
+const LONE_MIN_CUES_PER_MINUTE: f64 = 3.0;
+/// A single silence this long, with no sibling to compare against, is the same kind of tell — but
+/// loosened to match: a slow Nordic drama can go quiet for over a minute between lines; this only
+/// catches a gap no dialogue track leaves by accident.
+const LONE_MAX_GAP_MINUTES: f64 = 6.0;
+/// Below this fraction of the fullest sibling candidate's cue count (same episode, any language), a
+/// file is sparse by comparison: another real candidate proves the episode has more dialogue than
+/// this file captions. Fauda's DUBBED English track (~200 cues) against a full ~45-minute track
+/// (500+) is well under half; Springfloden's three files (276/320/321) are all within a few percent
+/// of each other and clear it easily.
+const SPARSE_RELATIVE_FLOOR: f64 = 0.5;
+/// Below this many sibling cues, "fullest seen" is too thin a sample to judge anything relative to —
+/// a handful of signs-only cues on a title with no fuller candidate yet shouldn't make a normal file
+/// look sparse by comparison.
+const MIN_FULLEST_FOR_RELATIVE_JUDGEMENT: usize = 20;
+
+/// The density measurements `looks_incomplete` judges a file by, surfaced so a caller can put them
+/// in the decision log — the same numbers that decided "sparse" are what makes that verdict
+/// checkable later from the journal, rather than trusted on the strength of a boolean alone.
+pub struct Stats {
+    pub count: usize,
+    pub span_ms: u64,
+    pub per_minute: f64,
+    pub max_gap_ms: u64,
+}
+
+/// `Stats` over a cue list's own span (first cue's start to last cue's end), or `None` when there are
+/// too few cues, or too little span, to measure anything.
+pub fn stats(cues: &[Cue]) -> Option<Stats> {
+    let (first, last) = (cues.first()?, cues.last()?);
+    let span_ms = last.end.saturating_sub(first.start);
+    if span_ms == 0 {
+        return Some(Stats { count: cues.len(), span_ms: 0, per_minute: 0.0, max_gap_ms: 0 });
+    }
+    let span_min = span_ms as f64 / 60_000.0;
+    let max_gap_ms = cues.windows(2).map(|w| w[1].start.saturating_sub(w[0].end)).max().unwrap_or(0);
+    Some(Stats { count: cues.len(), span_ms, per_minute: cues.len() as f64 / span_min, max_gap_ms })
+}
+
+/// Does this cue list look like a transcript of the whole thing, or a sparse one that only captions
+/// part of it? `has_a_cue`/`parse` finding cues at all is not enough: a subtitle made for a DUBBED
+/// release, or an unflagged foreign-parts-only track, has real, correctly-timed cues — just only over
+/// the scenes the dub or the main dialogue doesn't need translating, which OpenSubtitles' own
+/// metadata does not always say (the caller combines this with that flag; see `addon::judge_sparse`).
+///
+/// `fullest_sibling_cues` is the most cues any OTHER candidate for the same episode (any language)
+/// is known to have, when one has already been seen this density is judged RELATIVE to it
+/// (`SPARSE_RELATIVE_FLOOR`) rather than against an absolute floor — a slow-dialogue show's every
+/// candidate can legitimately run under the old fixed 8/minute bar (Springfloden: 6.5–7.6/min), but a
+/// track covering under half of what a real sibling proves is there is sparse regardless of genre.
+/// `None` (a lone candidate, or the first of its episode seen) falls back to a much looser absolute
+/// floor, because there is nothing yet to compare against.
+///
+/// Found from a real file: Fauda S01E01's English sub for a DUBBED release — 200 cues over 0:19–40:22
+/// (≈5/minute) with gaps up to 4 minutes, next to a full ~45-minute sibling. Judged against the cues'
+/// own span (first cue's start to last cue's end) rather than the episode's real runtime: a sub that
+/// genuinely starts late or ends before the credits is judged on what it actually covers, not
+/// penalised for runtime it was never going to have.
+pub fn looks_incomplete(cues: &[Cue], fullest_sibling_cues: Option<usize>) -> bool {
+    let Some(s) = stats(cues) else { return true };
+    if s.span_ms == 0 {
+        return true;
+    }
+    if let Some(fullest) = fullest_sibling_cues.filter(|&f| f >= MIN_FULLEST_FOR_RELATIVE_JUDGEMENT) {
+        return (s.count as f64) < (fullest as f64) * SPARSE_RELATIVE_FLOOR;
+    }
+    if s.per_minute < LONE_MIN_CUES_PER_MINUTE {
+        return true;
+    }
+    (s.max_gap_ms as f64 / 60_000.0) > LONE_MAX_GAP_MINUTES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WebVTT is the same document with a header and a different millisecond separator — and the
+    /// separator must land in the TIMECODE only. A blanket comma-to-dot replacement would rewrite
+    /// the dialogue, which is the obvious way to implement this and the reason it shares a
+    /// serializer with the SRT path instead.
+    #[test]
+    fn vtt_is_the_same_document_with_vtt_timecodes() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:04,000\nWait, no.\n");
+        let vtt = serialize_vtt(&cues);
+        assert!(vtt.starts_with("WEBVTT\n\n"), "a WebVTT file needs its header: {vtt:?}");
+        assert!(vtt.contains("00:00:01.000 --> 00:00:04.000"), "timecodes must use a dot: {vtt:?}");
+        assert!(vtt.contains("Wait, no."), "the dialogue's own comma was rewritten: {vtt:?}");
+
+        // And it is still the same cues: VTT timecodes parse back through the same reader, which
+        // already accepts either separator.
+        let round_tripped = parse(vtt.trim_start_matches("WEBVTT\n\n"));
+        assert_eq!(round_tripped, cues);
+
+        // `&` and `<` are markup in a VTT payload. Ordinary dialogue containing them is well-formed
+        // SRT and malformed VTT, which a strict parser drops rather than renders.
+        let awkward = parse("1\n00:00:01,000 --> 00:00:02,000\n5 < 6 & rising\n");
+        let vtt = serialize_vtt(&awkward);
+        assert!(vtt.contains("5 &lt; 6 &amp; rising"), "a VTT payload was not escaped: {vtt:?}");
+        // And SRT has no such rule, so it must be written through untouched.
+        assert!(serialize(&awkward).contains("5 < 6 & rising"), "SRT was escaped when it must not be");
+
+        // But `<i>` and friends are LEGAL WebVTT markup and are how most real subtitle files carry
+        // emphasis. Escaping those renders the tag on screen as text — a worse bug, on far more
+        // tracks, than the one the escaping is for.
+        let styled = parse("1\n00:00:01,000 --> 00:00:02,000\n<i>Whispering</i>\n");
+        let vtt = serialize_vtt(&styled);
+        assert!(vtt.contains("<i>Whispering</i>"), "italics were escaped into visible text: {vtt:?}");
+
+        // Both at once, on one line, each treated on its own merits.
+        let mixed = parse("1\n00:00:01,000 --> 00:00:02,000\n<b>Tom & Jerry</b> 5 < 6\n");
+        let vtt = serialize_vtt(&mixed);
+        assert!(vtt.contains("<b>Tom &amp; Jerry</b>"), "a tag or its ampersand was mishandled: {vtt:?}");
+        assert!(vtt.contains("5 &lt; 6"), "a bare less-than was left unescaped: {vtt:?}");
+
+        // A `<` that opens nothing is still escaped, even with a `>` later in the line.
+        let tricky = parse("1\n00:00:01,000 --> 00:00:02,000\na < b > c\n");
+        assert!(serialize_vtt(&tricky).contains("a &lt; b > c"), "a bare less-than was read as a tag");
+
+        // A distant `>` does not make a tag out of prose. Unbounded, this found the `>` after "7"
+        // and passed "<6 and 7>" through raw — the exact malformed payload the escaping is for.
+        let prose = parse("1\n00:00:01,000 --> 00:00:02,000\n5 <6 and 7> 8\n");
+        assert!(serialize_vtt(&prose).contains("5 &lt;6 and 7> 8"), "prose was read as a tag");
+        // Tags that carry attributes still pass. `<font …>` matters most: it is the single most
+        // common styling tag in real subtitle files, and an earlier version of this rule allowed a
+        // space only for `v ` and `lang ` — which escaped every one of them, showing the viewer a
+        // literal `<font color="#00FF00">` while the closing `</font>` passed through.
+        for styled in [
+            "<font color=\"#00FF00\">Hello</font>",
+            "<font face=\"Arial\" size=\"18\">Hi</font>",
+            "<v Fred>Hi</v>",
+            "<v.loud Esme>Hi</v>",
+            "<lang en>Hi</lang>",
+        ] {
+            let cues = parse(&format!("1\n00:00:01,000 --> 00:00:02,000\n{styled}\n"));
+            let vtt = serialize_vtt(&cues);
+            assert!(vtt.contains(styled), "legal markup was escaped into visible text: {vtt:?}");
+        }
+
+        // An `&` inside a tag is still an `&`.
+        let attr = parse("1\n00:00:01,000 --> 00:00:02,000\n<v Tom & Jerry>Hi</v>\n");
+        assert!(
+            serialize_vtt(&attr).contains("<v Tom &amp; Jerry>"),
+            "an ampersand inside a tag was left raw"
+        );
+    }
+
+    /// A cue is arbitrary downloaded text and `to_vtt` re-runs this per request, on the one runtime
+    /// thread, caching nothing. Scanning the rest of the line for a `>` at every `<` was quadratic:
+    /// 794 ms at 320 KB, and roughly twenty minutes at the body cap — one request stalling the
+    /// process. The bound is loose on purpose; it catches a return to quadratic, not milliseconds.
+    #[test]
+    fn escaping_a_hostile_line_stays_linear() {
+        // A RATIO, not a wall-clock bound. The quadratic version did 400 KB of this in about 1.2s in
+        // the test profile, so an absolute bound loose enough to be stable across machines was also
+        // loose enough to pass on the bug — which is what a first attempt at this test did.
+        // Doubling the input doubles linear work and quadruples quadratic work; 8x leaves room for
+        // noise while still failing on n².
+        let time_for = |repeats: usize| {
+            let cues = vec![Cue { index: 1, start: 0, end: 1000, text: "<a".repeat(repeats) }];
+            let started = std::time::Instant::now();
+            let out = serialize_vtt(&cues);
+            // And it really did escape them, rather than finding a shortcut that skips the work.
+            assert!(out.contains("&lt;a"), "the hostile line was not escaped at all");
+            started.elapsed()
+        };
+
+        // Fastest of three, not one. The suite runs these in parallel, so a single sample can be
+        // scheduled against the rest of it — and a ratio of two noisy samples is twice as noisy.
+        // The minimum is the run that got the least interference, which is the one worth comparing.
+        let best_of_three = |repeats: usize| (0..3).map(|_| time_for(repeats)).min().unwrap();
+
+        let small = best_of_three(100_000).max(std::time::Duration::from_micros(200));
+        let large = best_of_three(400_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(ratio < 8.0, "4x the input took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
+
+        // The other branch: every `<` DOES close, so each one is accepted as a tag and copied through
+        // its own allocation. Linear too, and untested by the case above, which only ever takes the
+        // reject path.
+        let tagged = |repeats: usize| {
+            let cues = vec![Cue { index: 1, start: 0, end: 1000, text: "<i>x</i>".repeat(repeats) }];
+            let started = std::time::Instant::now();
+            assert!(serialize_vtt(&cues).contains("<i>x</i>"), "tags were not passed through");
+            started.elapsed()
+        };
+        let best_tagged = |repeats: usize| (0..3).map(|_| tagged(repeats)).min().unwrap();
+        let small = best_tagged(50_000).max(std::time::Duration::from_micros(200));
+        let large = best_tagged(200_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(ratio < 8.0, "4x the tags took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
+    }
+
+    #[test]
+    fn round_trips_a_basic_cue() {
+        let src = "1\n00:00:01,000 --> 00:00:04,000\nHej, hur mår du?\n";
+        let cues = parse(src);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0], Cue { index: 1, start: 1000, end: 4000, text: "Hej, hur mår du?".into() });
+        assert_eq!(serialize(&cues), src);
+    }
+
+    /// The cheap gate must agree with the parser on what is and is not a subtitle — it stands in
+    /// for it on every downloaded body, so a false negative rejects a real subtitle outright.
+    #[test]
+    fn has_a_cue_agrees_with_the_parser() {
+        let cases = [
+            "1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+            // A BOM'd, LF-only, single-cue file: `parse` strips the BOM and the cheap gate did not,
+            // so it rejected a real subtitle outright. Every literal here was hand-picked, which is
+            // exactly why the BOM — the one case `parse` special-cases — was the one that got out.
+            "\u{feff}1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+            "\u{feff}00:00:01,000 --> 00:00:02,000\nno index\n",
+            "\u{feff}1\r\n00:00:01,000 --> 00:00:02,000\r\nhi\r\n",
+            "00:00:01,000 --> 00:00:02,000\nno index\n",
+            "\n\n1\n00:00:01,000 --> 00:00:02,000\nleading blanks\n",
+            "1\r\n00:00:01,000 --> 00:00:02,000\r\ncrlf\r\n",
+            "1\n00:00:01.000 --> 00:00:02.000\ndot millis\n",
+            "<html><body>Forbidden</body></html>",
+            "",
+            "just some prose with no timings in it at all",
+            "1\n2\n3\n",
+        ];
+        for input in cases {
+            assert_eq!(
+                has_a_cue(input),
+                !parse(input).is_empty(),
+                "the cheap gate and the parser disagree on {input:?}"
+            );
+        }
+    }
+
+    /// The cheap gate stands in for the parser on every downloaded body, so it must agree with it
+    /// in BOTH directions: never rejecting a real subtitle, and never passing something the parser
+    /// finds no cues in — that body would be cached for sixty days and render as nothing.
+    ///
+    /// A deterministic differential over the shapes that actually differ: separators, a BOM, stray
+    /// prose, and timing-shaped fragments. Splitting on the two line characters independently put a
+    /// phantom empty line inside every CRLF, which read as "a cue may start here".
+    #[test]
+    fn has_a_cue_agrees_with_the_parser_across_separators() {
+        let pieces = ["1", "00:00:01,000 --> 00:00:02,000", "hi", "x", "", "\u{feff}1", "2.", "00:00:0"];
+        let seps = ["\n", "\r\n", "\r", "\n\n", "\r\n\r\n", " \n"];
+        // A small xorshift keeps this deterministic and dependency-free.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let mut doc = String::new();
+            for _ in 0..rand(8) + 1 {
+                doc.push_str(pieces[rand(pieces.len())]);
+                doc.push_str(seps[rand(seps.len())]);
+            }
+            assert_eq!(has_a_cue(&doc), !parse(&doc).is_empty(), "gate and parser disagree on {doc:?}");
+        }
+    }
+
+    /// The exact minimal case the disagreement reduced to.
+    #[test]
+    fn a_crlf_after_prose_does_not_invent_a_cue() {
+        let doc = "x\r\n00:00:01,000 --> 00:00:02,000";
+        assert!(parse(doc).is_empty(), "the parser finds no cue here");
+        assert!(!has_a_cue(doc), "the gate accepted a body with no cues in it");
+    }
+
+    /// A cue whose text carries a blank line — which a translation model can return, since its
+    /// output reaches serialize verbatim — must not end the cue early. It used to: everything after
+    /// the blank line was lost, and the truncated document was cached for 60 days.
+    #[test]
+    fn a_blank_line_inside_a_cue_does_not_truncate_the_document() {
+        let cues = vec![
+            Cue { index: 1, start: 1000, end: 2000, text: "Hej.\n\nHur mår du?".into() },
+            Cue { index: 2, start: 3000, end: 4000, text: "Bra.".into() },
+        ];
+        let round_tripped = parse(&serialize(&cues));
+        assert_eq!(round_tripped.len(), 2, "a cue was lost");
+        assert_eq!(round_tripped[0].text, "Hej.\nHur mår du?", "dialogue after the blank line went missing");
+        assert_eq!(round_tripped[1].text, "Bra.");
+    }
+
+    /// `str::lines` ignores a lone `\r` but `parse` promotes every one to a line break, so
+    /// splitting on `\n` alone let "a\r\rb" through as one physical line that read back as a cue
+    /// broken in half. A model returning a bare CR is legal JSON.
+    #[test]
+    fn a_lone_carriage_return_does_not_truncate_a_cue() {
+        for text in ["Hej.\r\rHur mår du?", "Hej.\n\rHur mår du?", "Hej.\r\n\rHur mår du?"] {
+            let cues = vec![
+                Cue { index: 1, start: 1000, end: 2000, text: text.into() },
+                Cue { index: 2, start: 3000, end: 4000, text: "Bra.".into() },
+            ];
+            let round_tripped = parse(&serialize(&cues));
+            assert_eq!(round_tripped.len(), 2, "a cue was lost for {text:?}");
+            assert!(
+                round_tripped[0].text.contains("Hur mår du?"),
+                "dialogue after the CR went missing for {text:?}: {:?}",
+                round_tripped[0].text
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_millisecond_field() {
+        // A malformed timecode whose millisecond field carries a multibyte char at byte 3 must not
+        // panic a byte slice; the cue is simply skipped (unparseable ms).
+        let src = "1\n00:00:01,ab€ --> 00:00:02,000\nhi\n";
+        assert!(parse(src).is_empty());
+    }
+
+    #[test]
+    fn keeps_multiline_text_and_skips_garbage() {
+        let src = "1\n00:00:01,000 --> 00:00:02,000\nline one\nline two\n\nGARBAGE\n\n2\n00:00:03,000 --> 00:00:04,000\nnext\n";
+        let cues = parse(src);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "line one\nline two");
+        assert_eq!(cues[1].index, 2);
+    }
+
+    /// Evenly spaced cues at a given density (cues/minute) over `minutes`, starting one second in —
+    /// mirrors how `looks_incomplete` measures the Fauda file: by its own span, not the real runtime.
+    fn evenly_spaced(per_minute: f64, minutes: f64) -> Vec<Cue> {
+        let count = (per_minute * minutes).round() as u64;
+        let span_ms = (minutes * 60_000.0) as u64;
+        let step = span_ms / count.max(1);
+        (0..count)
+            .map(|i| Cue {
+                index: i as u32 + 1,
+                start: 1000 + i * step,
+                end: 1000 + i * step + 500,
+                text: "x".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_cues_or_a_zero_span_looks_incomplete() {
+        assert!(looks_incomplete(&[], None), "no cues at all");
+        let one = vec![Cue { index: 1, start: 5000, end: 5000, text: "x".into() }];
+        assert!(looks_incomplete(&one, None), "a single zero-length cue has no span to judge");
+    }
+
+    /// The numbers behind `looks_incomplete`'s verdict, for the decision log — a reader must be able
+    /// to check "sparse" against the same density `looks_incomplete` itself computed.
+    #[test]
+    fn stats_reports_the_numbers_looks_incomplete_judges() {
+        assert!(stats(&[]).is_none(), "no cues, nothing to report");
+        let cues = evenly_spaced(5.0, 40.0);
+        let s = stats(&cues).expect("a real cue list has stats");
+        assert_eq!(s.count, cues.len());
+        assert!((s.per_minute - 5.0).abs() < 0.5, "per_minute was {}", s.per_minute);
+    }
+
+    /// The real file this check was written for: Fauda S01E01's English sub for a DUBBED release —
+    /// 200 cues over roughly 0:19–40:22 (≈5/minute) — judged next to a full ~45-minute sibling (500+
+    /// cues), which is the shape that actually occurs: `rank` already demotes a dub/foreign-parts
+    /// release below a full track of the same language, so the full one is normally fetched (and
+    /// recorded) first. See `addon::judge_sparse` for the independent dub/foreign-parts-flag check
+    /// that also catches this file even with no sibling yet.
+    #[test]
+    fn the_fauda_dubbed_release_shape_is_flagged_next_to_a_full_sibling() {
+        let cues = evenly_spaced(5.0, 40.0);
+        assert!(
+            looks_incomplete(&cues, Some(500)),
+            "{} cues next to a 500-cue sibling should read as sparse by comparison",
+            cues.len()
+        );
+    }
+
+    /// With NO sibling yet, the Fauda shape (5/min) still clears the new, much looser lone floor
+    /// (3/min) — the relative check above, or the dub/foreign-parts flag, is what actually catches it
+    /// in practice; density alone, with nothing to compare against, is deliberately permissive.
+    #[test]
+    fn the_fauda_dubbed_release_shape_alone_clears_the_lone_floor() {
+        let cues = evenly_spaced(5.0, 40.0);
+        assert!(!looks_incomplete(&cues, None), "{} cues alone should not be flagged by density", cues.len());
+    }
+
+    /// A real, complete track — dense, no long silences — must not be flagged, with or without a
+    /// (necessarily smaller) sibling to compare against.
+    #[test]
+    fn a_dense_full_track_is_not_flagged() {
+        let cues = evenly_spaced(12.0, 45.0);
+        assert!(!looks_incomplete(&cues, None), "{} cues over 45 minutes is a full track", cues.len());
+        assert!(!looks_incomplete(&cues, Some(100)), "a full track still beats a smaller sibling");
+    }
+
+    /// A lone candidate with one scene-long silence past the new, looser gap floor is still flagged —
+    /// a 7-minute silence is not a slow Nordic drama's ordinary pacing.
+    #[test]
+    fn a_single_long_gap_is_flagged_even_at_adequate_density_when_lone() {
+        let mut cues = evenly_spaced(9.0, 20.0);
+        let last = cues.last().unwrap().end;
+        cues.push(Cue {
+            index: 999,
+            start: last + 7 * 60_000,
+            end: last + 7 * 60_000 + 500,
+            text: "x".into(),
+        });
+        assert!(looks_incomplete(&cues, None), "a 7-minute silence mid-track should be flagged");
+    }
+
+    /// Springfloden's own shape: three English candidates (276/320/321 cues, 6.5–7.6/min, longest gap
+    /// 145s) must all clear BOTH the lone floor and the relative check against each other — a slow
+    /// Nordic drama, not foreign-parts files.
+    #[test]
+    fn the_springfloden_candidates_are_not_flagged_lone_or_against_each_other() {
+        for cues in [evenly_spaced(6.5, 42.5), evenly_spaced(7.6, 42.1), evenly_spaced(7.6, 42.2)] {
+            assert!(!looks_incomplete(&cues, None), "{} cues alone should not be flagged", cues.len());
+            assert!(
+                !looks_incomplete(&cues, Some(321)),
+                "{} cues next to the fullest (321) should not be flagged",
+                cues.len()
+            );
+        }
+    }
+
+    /// A sub that starts late or ends well before the credits is judged on what it covers, not
+    /// penalised for runtime outside its own span.
+    #[test]
+    fn a_sub_that_starts_late_is_judged_on_its_own_span_only() {
+        let cues = evenly_spaced(12.0, 30.0);
+        assert!(
+            !looks_incomplete(&cues, None),
+            "a short, dense sub covering only part of the runtime is fine"
+        );
+    }
+}
+
+#[cfg(test)]
+mod separator_tests {
+    use super::*;
+    /// This parser gates every downloaded subtitle body (up to the 2 MiB subtitle-body ceiling of third-party CDN
+    /// content), it has no await in it, and the runtime has one thread — so its cost is the whole
+    /// server's cost. Deciding the separator question per line rescanned the rest of the blank run
+    /// each time: 40k padded lines took 1.6s, 160k took 27s, and a megabyte never finished.
+    ///
+    /// The bound is loose on purpose — it is here to catch a return to quadratic, not to police
+    /// milliseconds. Linear does this in single-digit ms; quadratic needs minutes.
+    #[test]
+    fn a_long_run_of_padded_lines_stays_linear() {
+        let mut input = String::from("1\n00:00:01,000 --> 00:00:02,000\nhi\n");
+        for _ in 0..200_000 {
+            input.push_str(" \n");
+        }
+        input.push_str("not-a-cue-header\n");
+        let started = std::time::Instant::now();
+        let cues = parse(&input);
+        let took = started.elapsed();
+        assert_eq!(cues.len(), 1);
+        assert!(took < std::time::Duration::from_secs(10), "parse took {took:?} — quadratic again?");
+    }
+
+    /// A separator line carrying a space or a tab is still a separator. Splitting on the literal
+    /// "\n\n" missed those and swallowed the following cue whole — so this asserts the cue count,
+    /// the recovered cue's OWN timing, and that no timecode leaked into anyone's dialogue. The
+    /// count alone would pass on a parser that kept two cues but glued the text to the wrong one.
+    #[test]
+    fn a_whitespace_only_line_separates_cues() {
+        for sep in ["   ", "\t", " \t ", ""] {
+            let input = format!(
+                "1\n00:00:01,000 --> 00:00:02,000\nfirst\n{sep}\n2\n00:00:05,000 --> 00:00:06,000\nsecond\n"
+            );
+            let cues = parse(&input);
+            assert_eq!(cues.len(), 2, "separator {sep:?} did not separate");
+            assert_eq!(cues[0].text, "first", "separator {sep:?}");
+            assert_eq!(cues[1].text, "second", "separator {sep:?}");
+            // The second cue keeps its own timing rather than inheriting the first's.
+            assert_eq!((cues[1].start, cues[1].end), (5000, 6000), "separator {sep:?}");
+            for c in &cues {
+                assert!(!c.text.contains("-->"), "a timecode became dialogue: {:?}", c.text);
+            }
+        }
+    }
+
+    /// The same file with CRLF line endings, since normalisation runs before the split.
+    #[test]
+    fn a_whitespace_only_line_separates_cues_with_crlf() {
+        let input = "1\r\n00:00:01,000 --> 00:00:02,000\r\nfirst\r\n \r\n2\r\n00:00:05,000 --> 00:00:06,000\r\nsecond\r\n";
+        let cues = parse(input);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[1].start, 5000);
+    }
+
+    /// The converse of the rule above, and the case the first version of this fix regressed: a
+    /// padded line INSIDE a cue is dialogue, not a separator. Treating it as one truncated the cue
+    /// and dropped everything after it — cue A rendered blank, its second line gone.
+    #[test]
+    fn a_padded_line_inside_a_cue_keeps_the_dialogue_after_it() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:04,000\n \n- Hello there.\n\n2\n00:00:05,000 --> 00:00:06,000\nsecond\n");
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, " \n- Hello there.", "the dialogue after the padded line was dropped");
+        assert_eq!(cues[1].text, "second");
+
+        let cues = parse("1\n00:00:01,000 --> 00:00:04,000\nHello.\n \nGoodbye.\n\n2\n00:00:05,000 --> 00:00:06,000\nsecond\n");
+        assert_eq!(cues[0].text, "Hello.\n \nGoodbye.");
+        assert_eq!(cues.len(), 2);
+    }
+
+    /// An EMPTY line always separates, whatever follows — that is the format, and it is how a
+    /// malformed block gets skipped rather than folded into its neighbour's dialogue.
+    #[test]
+    fn an_empty_line_separates_even_before_garbage() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:02,000\nline one\n\nGARBAGE\n\n2\n00:00:03,000 --> 00:00:04,000\nnext\n");
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "line one", "garbage was folded into the cue text");
+    }
+
+    /// Runs of blank lines are not empty cues, and a file that ends without a trailing newline
+    /// still yields its last cue — the final block is flushed after the loop, not by a separator.
+    #[test]
+    fn blank_runs_and_a_missing_trailing_newline() {
+        let cues =
+            parse("1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n \n\n2\n00:00:05,000 --> 00:00:06,000\nlast");
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[1].text, "last");
+    }
+}
