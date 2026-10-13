@@ -1,0 +1,574 @@
+//! DIRECT URLS: hand a browser the googlevideo URL itself, instead of downloading the trailer and
+//! proxying it back.
+//!
+//! `/play` exists because the Apple TV cannot do this. It downloads, muxes a faststart MP4, bakes the
+//! `clap` crop and serves the bytes — minutes of yt-dlp and ffmpeg, a 4 GB cache volume, and the
+//! trailer crossing this box twice. For a muted picture running behind a billboard that is a great
+//! deal of machinery, and all of it is spent because AVPlayer needs one file with sound in it.
+//!
+//! A browser does not. So: resolve with yt-dlp (`--print`, no download — the `--simulate` class of
+//! work, which is why it takes a probe permit rather than a download one) and answer with the URLs.
+//! The page streams them from Google directly, at full height, with no wait and no bytes through here.
+//!
+//! **The URLs work away from this server.** They carry `ip=<this box>` inside the signed `sparams`
+//! set, which reads like an IP binding and is why `/play` proxies — but Google does not enforce it:
+//! a URL resolved here plays from an unrelated address. (Verified against both `videoplayback` and
+//! `manifest.googlevideo.com`.) They do expire, in about six hours, which is what `expires` and the
+//! response's `max-age` are for.
+//!
+//! **Two streams, usually.** YouTube still lists the muxed itag 18, but no longer serves it — every
+//! current answer is adaptive, so `video` is video-only and `audio` is a separate track. A muted
+//! surface can ignore `audio` entirely, and a `<video>` element cannot combine the two at all.
+//!
+//! **Which is what `hls` is for.** YouTube also publishes an HLS master playlist carrying video,
+//! audio and subtitles as renditions, adaptive across every height — one URL, and the only way a
+//! browser gets the trailer's SOUND. WebKit plays it natively from a bare `<video>`, which covers
+//! every browser on iOS. Elsewhere it needs MSE, and googlevideo sends no `Access-Control-Allow-Origin`,
+//! so hls.js cannot fetch the segments: Chrome and Firefox take the progressive `video` instead, and
+//! anything there that wants sound stays on `/play`. AetherEngine takes one source per session with
+//! no external-audio API, so the Apple TV keeps `/play` throughout.
+//!
+//! **No crop.** The `clap` box is baked into the cached MP4 by the download path, so a trailer with
+//! baked-in letterbox keeps its bars here. `/crop` cannot help — it reads the downloaded file.
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use hyper::{Response, StatusCode};
+use serde_json::json;
+use tokio::process::Command;
+
+use futures_util::FutureExt;
+
+use crate::config::Config;
+use crate::httputil::{self, Body};
+use crate::state::{AppState, BoxFuture, SharedResolve};
+use crate::ytdlp::{classify, PlayError};
+
+/// yt-dlp `--print` is a metadata round-trip, not a download; well under the probe's own backstop.
+const RESOLVE_TIMEOUT_SECS: u64 = 30;
+
+/// Stop handing out a URL this long before it expires, so a page that starts playing on the last
+/// answer still has time to finish loading it.
+pub(crate) const EXPIRY_MARGIN_MS: u64 = 5 * 60 * 1000;
+
+/// What to cache when the URL carries no expiry we can read. Short: an unreadable expiry means the
+/// shape changed, and serving a dead URL for an hour is worse than resolving again in five minutes.
+const UNKNOWN_EXPIRY_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Bound on the resolve cache. Same reasoning as `PLAY_FAIL_MAX`: every entry is an optimisation,
+/// each expires on its own, and losing one costs a single yt-dlp run.
+pub const DIRECT_CACHE_MAX: usize = 512;
+
+/// A resolved set of direct URLs, and when they stop working.
+///
+/// Serializable so the answers survive a redeploy (`load_direct_cache` / `save_direct_cache`). Re-resolving
+/// one costs a yt-dlp run — 1.2–3.6 s measured — and a restart otherwise throws away every one of them, so
+/// the first open of every title after a deploy pays it again.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Direct {
+    /// The video stream — video-only whenever YouTube answers adaptively, which is now always.
+    pub video: String,
+    /// The separate audio track, absent only if a muxed format did come back.
+    pub audio: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// YouTube's own HLS master playlist: one URL carrying video, audio and subtitles as separate
+    /// renditions, adaptive across every height. WebKit plays it natively from a bare `<video>` —
+    /// which is every browser on iOS — and it is the only way a browser gets the trailer's SOUND,
+    /// since the progressive pair above cannot be combined by a `<video>` element.
+    pub hls: Option<String>,
+    /// Epoch ms after which the URLs stop working, as far as we could read it.
+    pub expires: u64,
+}
+
+/// One cached answer: a resolve that worked, or the reason it did not, and when to ask again.
+pub type CachedDirect = (Result<Direct, PlayError>, u64);
+
+/// Read `expire=<unix seconds>` out of a googlevideo URL. It appears as a query parameter on
+/// `videoplayback` and as a `/expire/<n>/` path segment on `manifest.googlevideo.com`, so both
+/// shapes are accepted. Returns epoch MILLISECONDS, to match every other clock here.
+pub fn parse_expiry_ms(url: &str) -> Option<u64> {
+    let secs = url
+        .split(['?', '&'])
+        .skip(1)
+        .find_map(|p| p.strip_prefix("expire="))
+        .or_else(|| {
+            let at = url.find("/expire/")?;
+            url[at + "/expire/".len()..].split('/').next()
+        })
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?;
+    secs.parse::<u64>().ok()?.checked_mul(1000)
+}
+
+/// The soonest expiry across every URL in the answer — an answer is only good while ALL of its
+/// streams are, since a page playing video with a dead audio track is not playing the trailer.
+fn earliest_expiry(urls: &[&str], now: u64) -> u64 {
+    urls.iter().filter_map(|u| parse_expiry_ms(u)).min().unwrap_or(now + UNKNOWN_EXPIRY_TTL_MS)
+}
+
+/// Parse yt-dlp's two `--print` lines: `"<width> <height>"`, then one URL per selected format.
+/// yt-dlp writes `NA` for a field it does not know, which is not a failure — an answer with no
+/// dimensions is still a playable URL.
+pub fn parse_resolve(stdout: &str, now: u64) -> Option<Direct> {
+    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let dims = lines.next()?;
+    let (mut urls, mut hls): (Vec<&str>, Option<String>) = (Vec::new(), None);
+    for line in lines {
+        if line.starts_with("https://") {
+            urls.push(line);
+        } else if hls.is_none() {
+            hls = first_url_in(line).map(str::to_string);
+        }
+    }
+    let (video, audio) = match urls.as_slice() {
+        // One URL is a muxed format — rare now, but it is still what the ladder's last rung asks for.
+        [only] => (only.to_string(), None),
+        // yt-dlp prints the selected formats in the order the selector named them: video, then audio.
+        [video, audio, ..] => (video.to_string(), Some(audio.to_string())),
+        [] => return None,
+    };
+    let mut dim = dims.split_whitespace().map(|v| v.parse::<u32>().ok());
+    // The HLS master expires on its own clock, and an answer is only good while everything in it is.
+    let mut dated = urls.clone();
+    if let Some(master) = hls.as_deref() {
+        dated.push(master);
+    }
+    Some(Direct {
+        expires: earliest_expiry(&dated, now),
+        video,
+        audio,
+        hls,
+        width: dim.next().flatten(),
+        height: dim.next().flatten(),
+    })
+}
+
+/// The first `https://…` held in a line that is not itself a URL.
+///
+/// `--print "%(formats.:.manifest_url)s"` answers with a Python-style list, most of whose entries are
+/// `None` — only the HLS formats carry one, and every one of them names the same master playlist, so
+/// the first is the answer. Terminated on the quote or separator that closes the entry.
+fn first_url_in(line: &str) -> Option<&str> {
+    let rest = &line[line.find("https://")?..];
+    Some(&rest[..rest.find(['\'', '"', ',', ']', ' ']).unwrap_or(rest.len())])
+}
+
+/// The resident worker's answer as a `Direct` — by the same rules the printed one goes through, so
+/// one place decides what counts as an answer and when it stops being good.
+fn from_worker(answer: crate::worker::Answer, now: u64) -> Option<Direct> {
+    let urls: Vec<&str> = answer.urls.iter().map(String::as_str).collect();
+    let (video, audio) = match urls.as_slice() {
+        [only] => (only.to_string(), None),
+        [video, audio, ..] => (video.to_string(), Some(audio.to_string())),
+        [] => return None,
+    };
+    let mut dated = urls;
+    if let Some(master) = answer.hls.as_deref() {
+        dated.push(master);
+    }
+    let expires = earliest_expiry(&dated, now);
+    Some(Direct { expires, video, audio, hls: answer.hls, width: answer.width, height: answer.height })
+}
+
+/// Ask yt-dlp for the URLs, without downloading anything.
+///
+/// The format string is `cfg.ytdlp_format` — the very same ladder `/play` extracts with — or that
+/// ladder from a lower rung (`height_cap`). Either way it pins avc1 + mp4a under `MAX_HEIGHT`, which
+/// is what a browser's own hardware decoder wants for the same reasons AVPlayer does, and it means
+/// this endpoint cannot start answering with a VP9/AV1 stream that only some browsers can play.
+pub async fn resolve(cfg: &Config, vid: &str, format: &str, now: u64) -> Result<Direct, PlayError> {
+    let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
+    let mut cmd = Command::new(&cfg.ytdlp);
+    cmd.args([
+        "-q",
+        "--no-warnings",
+        "--no-playlist",
+        "--socket-timeout",
+        "15",
+        "--cache-dir",
+        &cache, // the same nsig/player-JS work a probe or a download already paid for
+        "-f",
+        format,
+        "--print",
+        "%(width)s %(height)s",
+        "--print",
+        "urls",
+        // The progressive selection above carries no manifest of its own, so this is what makes one
+        // run answer both transports instead of two. Every HLS format names the same master.
+        "--print",
+        "%(formats.:.manifest_url)s",
+        &format!("https://www.youtube.com/watch?v={vid}"),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped()) // captured, never swallowed: `classify` reads it to say WHY
+    .kill_on_drop(true);
+    if let Some(ea) = &cfg.ytdlp_extractor_args {
+        cmd.args(["--extractor-args", ea]);
+    }
+    let out = match tokio::time::timeout(Duration::from_secs(RESOLVE_TIMEOUT_SECS), cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return Err(PlayError {
+                status: 502,
+                reason: "extraction_failed".into(),
+                message: "Could not fetch this trailer.".into(),
+                detail: format!("spawn yt-dlp: {e}"),
+            })
+        }
+        Err(_) => {
+            return Err(PlayError {
+                status: 504,
+                reason: "timeout".into(),
+                message: "This trailer took too long to resolve.".into(),
+                detail: format!("yt-dlp --print exceeded {RESOLVE_TIMEOUT_SECS}s"),
+            })
+        }
+    };
+    if !out.status.success() {
+        return Err(classify(out.status.code(), &String::from_utf8_lossy(&out.stderr)));
+    }
+    // Exit 0 with nothing we can use is not an extraction failure — the extractor worked and we
+    // could not read it — so it does not wear a reason that sends the operator to bump yt-dlp.
+    parse_resolve(&String::from_utf8_lossy(&out.stdout), now).ok_or_else(|| PlayError {
+        status: 502,
+        reason: "no_direct_url".into(),
+        message: "Could not fetch this trailer.".into(),
+        detail: format!("yt-dlp exited 0 with no usable URL: {}", crate::ytdlp::stderr_tail(&out.stdout)),
+    })
+}
+
+/// Does googlevideo refuse the last byte of this URL's file?
+///
+/// Measured on the box on 2026-10-11 (yt-dlp 2026.08.19, `visionos`, no PO token): 3 of 13 extractions
+/// answered with URLs that serve only the start of the file. On one, every range up to byte 14.50 MB
+/// served and every range from 14.60 MB on was a 403 — about 60 s of media at that file's average
+/// bitrate — and the same ranges were still refused ten minutes later, while a fresh extraction of
+/// the same video served to the end (2 of 2 videos re-extracted). Both streams of a capped extraction
+/// were capped (2 of 2 checked), so the video is enough to ask about. Every capped extraction's URLs also carried `52227522` in `fexp` and no
+/// uncapped one did; what that flag means is not known, so this asks googlevideo instead of reading it.
+///
+/// Anything but a 403 — a URL with no `clen`, a network error — counts as not capped: this only ever
+/// spends one more extraction, it never refuses an answer.
+pub(crate) async fn refuses_its_end(http: &reqwest::Client, url: &str) -> bool {
+    let Some(last) = crate::progressive::media_param(url, "clen")
+        .and_then(|c| c.parse::<u64>().ok())
+        .and_then(|c| c.checked_sub(1))
+    else {
+        return false;
+    };
+    let asked = http
+        .get(url)
+        .header(hyper::header::RANGE.as_str(), format!("bytes={last}-{last}"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    matches!(asked, Ok(res) if res.status() == reqwest::StatusCode::FORBIDDEN)
+}
+
+/// One extraction: the resident worker first, and the binary whenever it cannot answer — which is
+/// every way it can fail, including not being configured at all.
+async fn extract(st: &AppState, vid: &str, format: &str) -> Result<Direct, PlayError> {
+    match st.worker.resolve(&st.cfg, vid, format).await {
+        Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
+            status: 502,
+            reason: "no_direct_url".into(),
+            message: "Could not fetch this trailer.".into(),
+            detail: "the resident yt-dlp answered with no usable URL".into(),
+        }),
+        // Its own words about this video, classified exactly as the binary's stderr is.
+        Some(Err(said)) => Err(classify(None, &said)),
+        None => resolve(&st.cfg, vid, format, (st.clock)()).await,
+    }
+}
+
+/// The rung a request's `?height=` caps the answer at, or `None` for the full `MAX_HEIGHT` ladder.
+///
+/// A muted preview behind text has no use for 1080p, and Safari will not say it can play through
+/// until it has buffered ahead, which takes longer the more bytes each second carries. Rounded down
+/// to a step of the ladder (and up to its lowest) so one video resolves at most once per step, not
+/// once per number a caller can type — the height is not part of the signature.
+pub(crate) fn height_cap(cfg: &Config, asked: Option<&str>) -> Option<u32> {
+    let asked: u32 = asked?.parse().ok()?;
+    let max: u32 = cfg.max_height.parse().ok()?;
+    let steps: Vec<u32> = crate::config::LADDER_STEPS.into_iter().filter(|s| *s < max).collect();
+    if asked >= max {
+        return None;
+    }
+    steps.iter().copied().find(|s| *s <= asked).or(steps.last().copied())
+}
+
+/// Where an answer is kept: the id alone at the full ladder, the id and its rung below it.
+pub(crate) fn key(vid: &str, cap: Option<u32>) -> String {
+    match cap {
+        Some(h) => format!("{vid}@{h}"),
+        None => vid.to_string(),
+    }
+}
+
+/// The still-standing cached answer under `key`, if it has not expired.
+fn cached(state: &AppState, key: &str, now: u64) -> Option<Result<Direct, PlayError>> {
+    peek_key(state, key, now)
+}
+
+/// One decision-log line for a trailer request's chosen transport: which one was served, or why
+/// not, and how long it took. `vid` is an identity field (`LOG_IDENTITY`, on by default); the rest
+/// of the line — event, outcome, reason, duration — is written either way.
+pub(crate) fn transport_line(
+    cfg: &Config,
+    transport: &str,
+    outcome: &str,
+    reason: &str,
+    dur_ms: u128,
+    vid: &str,
+) -> String {
+    let mut line =
+        format!("event=transport transport={transport} outcome={outcome} reason={reason} upstream=youtube dur_ms={dur_ms}");
+    if cfg.log_identity {
+        line.push_str(&format!(" vid={vid}"));
+    }
+    line
+}
+
+/// One decision-log line for `/direct`'s resolve cache: a hit costs nothing further, a miss ran
+/// yt-dlp (or the resident worker) to fill it. `vid` and the resolved answer's height/audio are
+/// identity fields (`LOG_IDENTITY`); the rest of the line is written either way. The actual
+/// itag/vcodec/acodec choice is logged by `/play`'s download path (`ytdlp::cache_line`) — this
+/// endpoint never downloads, so there is no format to report beyond what the URLs carry.
+pub(crate) fn resolve_cache_line(
+    cfg: &Config,
+    outcome: &str,
+    reason: &str,
+    dur_ms: u128,
+    vid: &str,
+    resolved: Option<&Direct>,
+) -> String {
+    let mut line =
+        format!("event=ytdlp_resolve outcome={outcome} reason={reason} upstream=youtube dur_ms={dur_ms}");
+    if cfg.log_identity {
+        line.push_str(&format!(" vid={vid}"));
+        if let Some(d) = resolved {
+            line.push_str(&format!(
+                " height={} has_audio={}",
+                d.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
+                d.audio.is_some()
+            ));
+        }
+    }
+    line
+}
+
+/// The answer standing for `vid` at `cap`, if there is one, without resolving anything.
+pub(crate) fn peek(state: &AppState, vid: &str, cap: Option<u32>) -> Option<Result<Direct, PlayError>> {
+    peek_key(state, &key(vid, cap), (state.clock)())
+}
+
+fn peek_key(state: &AppState, key: &str, now: u64) -> Option<Result<Direct, PlayError>> {
+    let map = state.direct_cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(key).filter(|(_, exp)| *exp > now).map(|(r, _)| r.clone())
+}
+
+/// Remember an answer until `exp`. Bounded exactly like `play_fails`, and for the same reason.
+fn remember(state: &AppState, key: &str, entry: CachedDirect, now: u64) {
+    let mut map = state.direct_cache.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= DIRECT_CACHE_MAX {
+        map.retain(|_, (_, exp)| *exp > now);
+        if map.len() >= DIRECT_CACHE_MAX {
+            map.clear();
+        }
+    }
+    map.insert(key.to_string(), entry);
+}
+
+/// How long this answer may stand: until its URLs are close to expiring, and never past the moment
+/// they stop working. A failure keeps `/play`'s reason-aware cooldown, which already knows that
+/// "removed" is a fact and "timed out" is a mood.
+fn ttl_ms(answer: &Result<Direct, PlayError>, now: u64) -> u64 {
+    match answer {
+        Ok(d) => d.expires.saturating_sub(now).saturating_sub(EXPIRY_MARGIN_MS),
+        Err(e) => crate::play::fail_ttl_ms(&e.reason),
+    }
+}
+
+/// This id's answer at `cap` (`height_cap`), from memory or from yt-dlp. `None` timing means it
+/// came from the cache.
+///
+/// Shared by the request path and by the warm-up `/meta` fires, so a speculative resolve and a real
+/// one cannot drift apart — and so the warm-up genuinely fills the cache the request then reads.
+pub(crate) async fn answer(
+    state: &Arc<AppState>,
+    vid: &str,
+    cap: Option<u32>,
+) -> (Result<Direct, PlayError>, Option<std::time::Duration>) {
+    let key = key(vid, cap);
+    if let Some(answer) = cached(state, &key, (state.clock)()) {
+        eprintln!("{}", resolve_cache_line(&state.cfg, "served", "cache_hit", 0, vid, answer.as_ref().ok()));
+        return (answer, None);
+    }
+    let started = std::time::Instant::now();
+    // Join the resolve already running for this id, or start the one the others will join.
+    //
+    // A semaphore cannot do this. The probe budget is six, so `/meta`'s warm-up and the `/direct`
+    // that follows it a few milliseconds later each took a permit of their own, each missed the
+    // cache, and each spent a yt-dlp run — about two seconds of Python and YouTube — on the very
+    // same video. The warm-up bought nothing at all, which is the opposite of what it is for.
+    let shared: SharedResolve = {
+        let mut map = state.direct_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = map.get(&key) {
+            running.clone()
+        } else {
+            let st = state.clone();
+            let v = vid.to_string();
+            let k = key.clone();
+            let format = cap.map(crate::config::format_ladder).unwrap_or_else(|| st.cfg.ytdlp_format.clone());
+            let fut: BoxFuture<Result<Direct, PlayError>> = Box::pin(async move {
+                // While YouTube is throttling this box nothing is asked — the same gate a download
+                // meets, since a resolve is an extraction too.
+                let answer = if st.youtube.remaining_ms((st.clock)()).is_some() {
+                    // Logged here rather than falling through to the generic error branch below:
+                    // this attempt never ran yt-dlp at all, so there is no resolve duration to report.
+                    eprintln!("{}", resolve_cache_line(&st.cfg, "refused", "throttled", 0, &v, None));
+                    Err(PlayError::throttled())
+                } else {
+                    // The permit is taken INSIDE the shared future, so waiters queue on the resolve
+                    // rather than on the budget: one permit is spent per video, not per caller.
+                    let _permit = st.probe_sem.acquire().await;
+                    let started = std::time::Instant::now();
+                    let mut answer = extract(&st, &v, &format).await;
+                    // A capped extraction stays capped for its URLs' whole six hours, and a fresh one
+                    // usually is not (`refuses_its_end`), so it is worth one more — once, so a video
+                    // that is capped every time still plays its first minute rather than nothing.
+                    if let Ok(d) = &answer {
+                        if refuses_its_end(&st.http, &d.video).await {
+                            let again = extract(&st, &v, &format).await;
+                            let still = match &again {
+                                Ok(d) => refuses_its_end(&st.http, &d.video).await.to_string(),
+                                Err(e) => e.reason.clone(),
+                            };
+                            eprintln!("[{v}] googlevideo refused the end of the resolved file; resolved again (still capped: {still})");
+                            if again.is_ok() {
+                                answer = again;
+                            }
+                        }
+                    }
+                    st.resolves.record(started.elapsed());
+                    // Once per resolve that actually ran, however many requests join it — the cache
+                    // fill itself, not a line per joiner.
+                    let dur_ms = started.elapsed().as_millis();
+                    eprintln!(
+                        "{}",
+                        match &answer {
+                            Ok(d) => resolve_cache_line(&st.cfg, "served", "cache_miss", dur_ms, &v, Some(d)),
+                            Err(e) => resolve_cache_line(&st.cfg, "refused", &e.reason, dur_ms, &v, None),
+                        }
+                    );
+                    answer
+                };
+                let now = (st.clock)();
+                match &answer {
+                    Ok(_) => st.youtube.clear(),
+                    // A trip while already paused is a no-op, so the gated answer above costs nothing.
+                    Err(e) if e.reason == "throttled" => {
+                        st.youtube.trip(now, None, "YouTube is throttling extractions");
+                    }
+                    // Once per resolve that actually ran, at most once a minute per reason — the
+                    // shape the download path logs with, and for the same reason: in an outage
+                    // every one of them fails alike.
+                    Err(e) => {
+                        crate::log_limited(&format!("direct {}", e.reason), || format!("[{v}] {}", e.detail))
+                    }
+                }
+                // A throttle says nothing about this video; the pause answers for every id, and a
+                // cached copy would outlive it.
+                if !matches!(&answer, Err(e) if e.reason == "throttled") {
+                    remember(&st, &k, (answer.clone(), now + ttl_ms(&answer, now)), now);
+                }
+                st.direct_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&k);
+                answer
+            });
+            let shared = fut.shared();
+            map.insert(key, shared.clone());
+            // Driven by a task of its own, so a client that navigates away mid-resolve cannot leave
+            // the entry standing with a future nobody will poll — which would wedge the id until
+            // restart. Same reason the download path detaches its driver.
+            let driver = shared.clone();
+            tokio::spawn(async move {
+                let _ = driver.await;
+            });
+            shared
+        }
+    };
+    (shared.await, Some(started.elapsed()))
+}
+
+/// Resolve ahead of the request that will want it, so `/direct` costs a hash lookup instead of a
+/// yt-dlp run.
+///
+/// `/meta` already prewarms the DOWNLOAD, which is what made `/play` feel instant — and is exactly
+/// why the direct path felt slower for a title that had been browsed: it traded a warm file for a
+/// cold resolve. This puts the resolve on the same footing. Fire-and-forget, and it takes the same
+/// probe permit, so a browse cannot spend more of the budget than a probe would.
+///
+/// `progressive`, when set, also builds `/progressive`'s index once the resolve is in — with the sound
+/// track when it is `true` — which is a round of range requests to Google rather than a yt-dlp run.
+pub fn warm(state: Arc<AppState>, vid: String, cap: Option<u32>, progressive: Option<bool>) {
+    if !crate::is_valid_vid(&vid) {
+        return;
+    }
+    // Nothing to do if the answer is already standing and no index is wanted — checked before spawning,
+    // so a browse over titles that are all cached costs no tasks at all.
+    if progressive.is_none() && cached(&state, &key(&vid, cap), (state.clock)()).is_some() {
+        return;
+    }
+    tokio::spawn(async move {
+        let (answer, _) = answer(&state, &vid, cap).await;
+        if let (Ok(direct), Some(audio)) = (answer, progressive) {
+            crate::progressive::warm(&state, &vid, cap, &direct, audio).await;
+        }
+    });
+}
+
+pub async fn handle_direct(state: Arc<AppState>, vid: String, cap: Option<u32>) -> Response<Body> {
+    let (answer, spent) = answer(&state, &vid, cap).await;
+    let now = (state.clock)();
+    let dur_ms = spent.map(|d| d.as_millis()).unwrap_or(0);
+    eprintln!(
+        "{}",
+        match &answer {
+            Ok(_) => transport_line(&state.cfg, "direct", "served", "ok", dur_ms, &vid),
+            Err(e) => transport_line(&state.cfg, "direct", "refused", &e.reason, dur_ms, &vid),
+        }
+    );
+    let timing = match spent {
+        Some(d) => httputil::timing("resolve", d),
+        None => "cache;desc=hit".to_string(),
+    };
+    httputil::timed(respond(&state, &vid, &answer, now), &timing)
+}
+
+/// The JSON body, cacheable for exactly as long as the URLs in it are good for.
+fn respond(state: &AppState, vid: &str, answer: &Result<Direct, PlayError>, now: u64) -> Response<Body> {
+    let d = match answer {
+        Ok(d) => d,
+        Err(e) => return crate::play::play_error(state, vid, e),
+    };
+    let body = json!({
+        "id": vid,
+        "video": d.video,
+        "audio": d.audio,
+        "hls": d.hls,
+        "width": d.width,
+        "height": d.height,
+        "expires": d.expires / 1000,
+    });
+    // Never past the URLs' own life. A client holding this after that point has a 403 from Google
+    // and no way to know why, so the answer must go stale before the thing it describes does.
+    let max_age = ttl_ms(answer, now) / 1000;
+    httputil::json(
+        StatusCode::OK,
+        &body,
+        &[("cache-control", &format!("private, max-age={max_age}") as &str)],
+    )
+}

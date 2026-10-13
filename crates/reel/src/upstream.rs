@@ -1,0 +1,522 @@
+//! ADDON discovery: imdb id → ordered YouTube trailer candidates, via TMDB (primary) and KinoCheck
+//! (fallback). Behind a trait so tests can swap in a fake with no network.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use serde_json::Value;
+
+use crate::backoff::Backoff;
+use crate::config::Config;
+
+/// Max upstream JSON body we'll buffer.
+///
+/// 256 KB, down from 4 MB. Asking for `include_video_language={lang},en,null` made these responses
+/// 10–30× larger — a title can now come back with 57 videos instead of two — so "these payloads are
+/// a few KB" stopped being the whole story, and the cap is the only thing standing between a runaway
+/// or hostile body and memory. It is not one buffer either: nothing gates concurrent resolves, so the
+/// real ceiling is this times however many `/meta` misses are in flight, and each buffer becomes a
+/// `serde_json::Value` tree several times its own size.
+///
+/// 256 KB still admits roughly a thousand videos for one title, which is orders of magnitude past
+/// anything TMDB actually returns.
+const MAX_UPSTREAM_BODY: usize = 256 * 1024;
+
+/// How long a host is left alone after a 429 or 5xx that did not say how long itself, doubling per
+/// consecutive refusal. The cap also bounds what a `Retry-After` may ask for, so a misconfigured or
+/// hostile upstream cannot switch discovery off for a day.
+const PAUSE_BASE_MS: u64 = 30 * 1000;
+pub(crate) const PAUSE_CAP_MS: u64 = 60 * 60 * 1000;
+
+/// A source could not be asked: transport error, a wrong key's 401, a 429, a 5xx, a 200 whose body
+/// never arrived, or the host pause one of those started. Distinct from a source that answered with
+/// nothing, which is a real result.
+/// The distinction has to travel with the call — a shared counter compared across one cannot say
+/// which lookup faulted, so an unrelated title's outage was read as this one's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoAnswer;
+
+pub type Answered<T> = Result<T, NoAnswer>;
+
+/// The two upstream lookups the resolver needs, plus the title lookup behind the search fallback.
+#[async_trait]
+pub trait Upstream: Send + Sync {
+    /// `tmdb_key` / `kinocheck_key` are the per-request BYOK credentials (from the URL config, or the
+    /// env fallback during migration) — resolved by the caller so the upstream holds no key of its own.
+    /// An empty `tmdb_key` is `Ok(vec![])`: TMDB was not consulted, which is not a failure.
+    async fn tmdb_candidates(
+        &self,
+        tmdb_key: &str,
+        imdb: &str,
+        ty: &str,
+        lang: &str,
+    ) -> Answered<Vec<String>>;
+    async fn kinocheck_youtube_id(
+        &self,
+        kinocheck_key: Option<&str>,
+        imdb: &str,
+        ty: &str,
+        lang: &str,
+    ) -> Answered<Option<String>>;
+    /// imdb → the title (+ year, e.g. "Backrooms 2025") for a YouTube-search fallback query, or None on
+    /// miss. Used only when TMDB/KinoCheck carry no trailer for the title.
+    async fn tmdb_title(&self, tmdb_key: &str, imdb: &str, ty: &str) -> Answered<Option<String>>;
+    /// Consecutive hard upstream faults, for /health (ADDON-02). Non-HTTP upstreams report 0.
+    fn recent_failures(&self) -> u32 {
+        0
+    }
+}
+
+/// Which language band a TMDB /videos entry falls in: the language asked for, English, or other.
+///
+/// An untagged video (`iso_639_1` absent or empty) lands in `other` rather than being guessed at. We
+/// ask for `null` in `include_video_language` so those are not lost, but an untagged video is not
+/// evidence of anything, so it sorts behind the two we can actually identify.
+fn lang_band(v: &Value, preferred: &str) -> u8 {
+    match v["iso_639_1"].as_str() {
+        Some(l) if l.eq_ignore_ascii_case(preferred) => 0,
+        Some(l) if l.eq_ignore_ascii_case("en") => 1,
+        _ => 2,
+    }
+}
+
+/// Rank a TMDB /videos entry: official trailer first, then trailer, teaser, anything else.
+fn rank(v: &Value) -> u8 {
+    let ty = v["type"].as_str().unwrap_or("");
+    let official = v["official"].as_bool().unwrap_or(false);
+    match (ty, official) {
+        ("Trailer", true) => 0,
+        ("Trailer", _) => 1,
+        ("Teaser", _) => 2,
+        _ => 3,
+    }
+}
+
+/// Rank + dedupe a TMDB /videos result into an ordered list of YouTube ids. Pure — unit-tested.
+///
+/// Ordered by language band first, then by kind (official trailer, trailer, teaser, other). The
+/// bands are: the FILM'S OWN language, then English, then anything else.
+///
+/// `original` is the film's `original_language`, not the viewer's. That is the whole point: a trailer
+/// tagged with the viewer's language is a dub or a local-market cut, and the thing worth watching is
+/// the film as it was made — with subtitles if the client wants them, which is the client's business.
+/// English second because it is both the most common original language and the most likely to exist
+/// at all; when the film IS English the two bands coincide and this is simply kind order.
+pub fn pick_trailer_candidates(results: &[Value], preferred: &str) -> Vec<String> {
+    let mut yt: Vec<&Value> = results
+        .iter()
+        // An id from upstream is untrusted: it ends up as a cache filename and a yt-dlp -o path,
+        // so `../../tmp/evil` would write outside the cache dir. The inbound imdb id is already
+        // checked for the same reason; this is the other direction.
+        .filter(|v| v["site"] == "YouTube" && v["key"].as_str().is_some_and(crate::is_valid_vid))
+        .collect();
+    // stable → preserves TMDB order within a rank, like JS's sort
+    yt.sort_by_key(|v| (lang_band(v, preferred), rank(v)));
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for v in yt {
+        if let Some(k) = v["key"].as_str() {
+            if seen.insert(k.to_string()) {
+                out.push(k.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub struct HttpUpstream {
+    cfg: Arc<Config>,
+    http: reqwest::Client,
+    /// Consecutive hard upstream faults (transport / 401 / 403 / 429 / 5xx) — surfaced as `degraded`
+    /// on /health (ADDON-02). A 404 "not found" is a miss, not a fault, so it doesn't count.
+    fails: AtomicU32,
+    /// One pause per host. A 429 or 5xx is about the host, not the title, so the per-title failure
+    /// cooldown still sent every other title straight back to a host that had just refused.
+    tmdb_pause: Backoff,
+    kinocheck_pause: Backoff,
+}
+
+impl HttpUpstream {
+    pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
+        HttpUpstream {
+            cfg,
+            http,
+            fails: AtomicU32::new(0),
+            tmdb_pause: Backoff::new("tmdb", PAUSE_BASE_MS, PAUSE_CAP_MS),
+            kinocheck_pause: Backoff::new("kinocheck", PAUSE_BASE_MS, PAUSE_CAP_MS),
+        }
+    }
+
+    /// The pause for the host a URL belongs to.
+    fn pause(&self, url: &str) -> &Backoff {
+        if self.counts_toward_health(url) {
+            &self.tmdb_pause
+        } else {
+            &self.kinocheck_pause
+        }
+    }
+
+    /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
+    /// trailers are broken, and counting it let `/health` say "TMDB/KinoCheck have been failing"
+    /// while TMDB was answering every request.
+    fn counts_toward_health(&self, url: &str) -> bool {
+        url.starts_with(&self.cfg.tmdb_base)
+    }
+
+    /// Which upstream a URL is, for naming a logged failure's condition.
+    fn source(&self, url: &str) -> &'static str {
+        if self.counts_toward_health(url) {
+            "tmdb"
+        } else {
+            "kinocheck"
+        }
+    }
+
+    /// `Ok(Some(v))` parsed; `Ok(None)` the upstream said "not there" (404); `Err(NoAnswer)` we did
+    /// not get an answer at all.
+    async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Answered<Option<Value>> {
+        if self.pause(url).remaining_ms(crate::state::default_clock()).is_some() {
+            // Not asked: the host told us to back off, and asking anyway is what keeps a throttle
+            // from lifting. Still no answer — and counted for /health like the 429 it stands in
+            // for, or a throttled TMDB would read as healthy just because we stopped asking.
+            if self.counts_toward_health(url) {
+                self.fails.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(NoAnswer);
+        }
+        let mut req = self.http.get(url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
+                // with the path only. redact() strips the api_key from OUR url, but reqwest's own
+                // Display re-appends the whole thing ("… for url (…?api_key=…)"), so redacting one
+                // side and interpolating the error beside it published the BYOK key on every
+                // outage. without_url() drops reqwest's copy; keep both, or neither works. Once a
+                // minute per upstream: an outage fails every lookup the same way.
+                crate::log_limited(&format!("{} transport", self.source(url)), || {
+                    transport_fault_line(url, e)
+                });
+                if self.counts_toward_health(url) {
+                    self.fails.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(NoAnswer);
+            }
+        };
+        let status = res.status();
+        let now = crate::state::default_clock();
+        if status == 429 || status.is_server_error() {
+            let hint = retry_after_ms(res.headers(), now);
+            self.pause(url).trip(now, hint, &format!("answered {}", status.as_u16()));
+        } else {
+            // Any other status is the host answering, which ends a pause — a 404 or a bad key's 401
+            // included, since those are about the title or the install, not the host's capacity.
+            self.pause(url).clear();
+            if let Some(ms) = rate_limit_spent_ms(res.headers(), now) {
+                self.pause(url).trip(now, Some(ms), "rate limit spent");
+            }
+        }
+        if !status.is_success() {
+            // A 404 is a real "this title is not there": a miss, not a fault. KinoCheck answers it
+            // for every title it has no trailer for, so it is neither counted nor logged.
+            if status == 404 {
+                return Ok(None);
+            }
+            // Surface the faults that mean "misconfigured / throttled / upstream down", so a broken
+            // TMDB_KEY isn't a silent empty result — once a minute per upstream and status.
+            crate::log_limited(&format!("{} {}", self.source(url), status.as_u16()), || {
+                format!("upstream {} -> {status}", redact(url))
+            });
+            // 401/403 is THIS install's key, not the upstream — and /health is process-wide while
+            // keys are per-install, so counting them let one bad key report "TMDB has been failing"
+            // for everyone, and a healthy install's traffic cleared the counter so a persistently
+            // broken one never surfaced. The CALLER still hears about it: a wrong key means this
+            // request got no answer, which is a different question from whether TMDB is up.
+            if (status == 429 || status.is_server_error()) && self.counts_toward_health(url) {
+                self.fails.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(NoAnswer);
+        }
+        // Cap the body (defense-in-depth beyond the 15s timeout): these JSON payloads are small, so a
+        // multi-MB response is either broken or hostile — stop reading rather than buffer it all.
+        let mut stream = res.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                // A body that stalls or truncates after a 200 — the shape an overloaded upstream
+                // takes. Everything below returns the same empty result as "no trailer", so a
+                // status line alone must not count as an answer: it used to return here silently,
+                // having ALREADY cleared the health signal, and the caller then pinned "no trailer"
+                // for an hour for every install.
+                Err(e) => return self.no_answer(url, &body_fault_why(e)),
+            };
+            if buf.len() + chunk.len() > MAX_UPSTREAM_BODY {
+                return self.no_answer(url, &format!("body over {MAX_UPSTREAM_BODY} bytes"));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let Ok(v) = serde_json::from_slice(&buf) else {
+            return self.no_answer(url, "body was not JSON");
+        };
+        if self.counts_toward_health(url) {
+            self.fails.store(0, Ordering::Relaxed); // a parsed TMDB response clears the signal
+        }
+        Ok(Some(v))
+    }
+
+    /// Log and return: we did not get an answer, whatever the status line said. A fault that lands
+    /// after the status line is the same outage as one that lands before it — reqwest's timeout
+    /// spans the body read, so which side of the line a wedged upstream falls on is arbitrary.
+    fn no_answer(&self, url: &str, why: &str) -> Answered<Option<Value>> {
+        crate::log_limited(&format!("{} body", self.source(url)), || {
+            format!("upstream {}: {why}", redact(url))
+        });
+        if self.counts_toward_health(url) {
+            self.fails.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(NoAnswer)
+    }
+}
+
+/// The log line for a transport fault, built here so it can be tested for what it must NOT contain.
+///
+/// Both halves have to be redacted. `redact()` strips the api_key from our own URL, but reqwest's
+/// Display re-appends the entire thing ("… for url (…?api_key=…)") whenever the error carries one,
+/// so interpolating the error beside a redacted URL published the BYOK key on every transport fault
+/// — throughout precisely the outage that generates the most log lines.
+/// An error plus its source chain. Display alone is a bare category ("error sending request",
+/// "error decoding response body") that renders connection-refused, DNS failure, TLS failure and
+/// timeout identically — the cause is only in the chain. Debug carries it too, but re-includes the
+/// url and with it the api_key, so walk source(): those are hyper/rustls/std errors, which never
+/// carry a url.
+fn cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        out.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    out
+}
+
+/// Why a body read failed, with its cause. Same reason as `transport_fault_line`: "error decoding
+/// response body" is identical for a truncation and for a timeout, and the difference — one is the
+/// upstream dying mid-response, the other is it wedging — is the whole diagnostic.
+pub(crate) fn body_fault_why(e: reqwest::Error) -> String {
+    // Body errors carry no url today (reqwest sets one only on the send path), so this is belt and
+    // braces — but the function is pub(crate), and a future caller handing it a send-path error
+    // would leak the api_key immediately. Costs nothing to not depend on that.
+    format!("body read failed ({})", cause_chain(&e.without_url()))
+}
+
+pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {
+    // without_url() is what keeps the api_key out: reqwest's Display re-appends the whole url, and
+    // it is the only error in the chain that carries one.
+    let e = e.without_url();
+    format!("upstream request failed: {} ({})", redact(url), cause_chain(&e))
+}
+
+/// Drop the query string (which carries `api_key=…`) so a logged URL never leaks the key.
+fn redact(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
+/// `Retry-After` as a delay in ms — delta-seconds or an HTTP-date — capped at `PAUSE_CAP_MS`. `None`
+/// when absent, unreadable or already past, and the caller falls back to its own exponential window:
+/// "retry now" on a 429 is not advice worth taking.
+pub(crate) fn retry_after_ms(headers: &reqwest::header::HeaderMap, now: u64) -> Option<u64> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let ms = match v.parse::<u64>() {
+        Ok(secs) => secs.saturating_mul(1000),
+        Err(_) => http_date_ms(v)?.checked_sub(now)?,
+    };
+    (ms > 0).then_some(ms.min(PAUSE_CAP_MS))
+}
+
+/// Epoch ms for an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the HTTP-date form servers send.
+/// Rewritten as RFC 3339 so the one date parser in the tree does the validating.
+pub(crate) fn http_date_ms(s: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let f: Vec<&str> = s.split_whitespace().collect();
+    let [_weekday, day, month, year, time, "GMT"] = f.as_slice() else { return None };
+    let month = MONTHS.iter().position(|m| m == month)? + 1;
+    if day.len() != 2 {
+        return None;
+    }
+    crate::config::parse_rfc3339_ms(&format!("{year}-{month:02}-{day}T{time}Z"))
+}
+
+/// How long until the rate-limit window resets, when a response says none of it is left:
+/// `X-RateLimit-Remaining: 0` with `X-RateLimit-Reset`, or the IETF draft `RateLimit` field
+/// (`remaining=0, reset=N` in early drafts, `r=0;t=N` in later ones). A reset above a billion is a
+/// unix timestamp and anything smaller a delay in seconds — both conventions are in use, and no
+/// window is thirty years long. Capped like `Retry-After`.
+pub(crate) fn rate_limit_spent_ms(headers: &reqwest::header::HeaderMap, now: u64) -> Option<u64> {
+    fn field<'a>(h: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+        h.get(name).and_then(|v| v.to_str().ok()).map(str::trim)
+    }
+    let mut remaining = field(headers, "x-ratelimit-remaining");
+    let mut reset = field(headers, "x-ratelimit-reset");
+    if let Some(draft) = field(headers, "ratelimit") {
+        for (k, v) in draft.split([',', ';']).filter_map(|p| p.split_once('=')) {
+            match k.trim() {
+                "remaining" | "r" => remaining = Some(v.trim()),
+                "reset" | "t" => reset = Some(v.trim()),
+                _ => {}
+            }
+        }
+    }
+    if remaining? != "0" {
+        return None;
+    }
+    let n: u64 = reset?.parse().ok()?;
+    let ms =
+        if n > 1_000_000_000 { n.saturating_mul(1000).checked_sub(now)? } else { n.saturating_mul(1000) };
+    (ms > 0).then_some(ms.min(PAUSE_CAP_MS))
+}
+
+#[async_trait]
+impl Upstream for HttpUpstream {
+    /// `tmdb:<id>` goes straight to /videos; an imdb id resolves through /find first. Ordered YouTube
+    /// trailer candidates, `[]` on miss.
+    async fn tmdb_candidates(&self, tmdb_key: &str, id: &str, ty: &str, lang: &str) -> Answered<Vec<String>> {
+        if tmdb_key.is_empty() {
+            return Ok(Vec::new()); // not consulted, which is not a failure
+        }
+        let key = tmdb_key;
+        let tmdb_type = if ty == "series" { "tv" } else { "movie" };
+        // A tmdb id is the one TMDB wants, so it reaches the videos below with no lookup at all. An imdb
+        // id costs a /find first — exactly the round trip a client already holding a tmdb id need not pay.
+        let hit_id = match id.strip_prefix("tmdb:") {
+            Some(n) => n.to_string(),
+            None => {
+                let find_url =
+                    format!("{}/find/{id}?external_source=imdb_id&api_key={key}", self.cfg.tmdb_base);
+                let Some(found) = self.get_json(&find_url, &[]).await? else {
+                    return Ok(Vec::new());
+                };
+                let results =
+                    if tmdb_type == "movie" { &found["movie_results"] } else { &found["tv_results"] };
+                let Some(hit) = results.get(0).and_then(|h| h["id"].as_i64()) else {
+                    return Ok(Vec::new());
+                };
+                hit.to_string()
+            }
+        };
+        // `include_video_language` is what makes this work at all.
+        //
+        // Without it, `/videos` returns only videos TAGGED with `language=` — and with no `language=`
+        // at all TMDB defaults to en-US, which is the same thing. Measured against the live API:
+        // Amélie returns 14 videos, all English, and NOT its two French trailers.
+        //
+        // `null` is what keeps an UNTAGGED video, which is how a great many original trailers arrive.
+        //
+        // The language asked for is the caller's preference, English unless it says otherwise, and it
+        // is deliberately a preference rather than the film's own language: reading `original_language`
+        // meant a /find on every lookup, which is the round trip a tmdb id exists to avoid. A film's own
+        // trailer is usually untagged and still arrives through `null`; what is lost is one tagged
+        // French video for Amélie, against a lookup saved on every title.
+        //
+        // A caller that DOES ask (`?lang=es`) gets Spanish first, then English, then the untagged —
+        // worth knowing that a video tagged `es` is often a dub rather than the film as made, which is
+        // why nothing asks for it by default.
+        let videos_url = format!(
+            "{}/{tmdb_type}/{hit_id}/videos?api_key={key}&language=en&include_video_language={lang},en,null",
+            self.cfg.tmdb_base
+        );
+        let Some(data) = self.get_json(&videos_url, &[]).await? else {
+            return Ok(Vec::new());
+        };
+        let empty = Vec::new();
+        let results = data["results"].as_array().unwrap_or(&empty);
+        Ok(pick_trailer_candidates(results, lang))
+    }
+
+    /// An imdb or tmdb id → "Title Year", for the YouTube-search fallback query. None on miss.
+    async fn tmdb_title(&self, tmdb_key: &str, id: &str, ty: &str) -> Answered<Option<String>> {
+        if tmdb_key.is_empty() {
+            return Ok(None); // not consulted, which is not a failure
+        }
+        let tmdb_type = if ty == "series" { "tv" } else { "movie" };
+        // A tmdb id names the title's own record, which carries the name and date outright; an imdb id
+        // has to be looked up before anything can be read off it.
+        let (url, named_outright) = match id.strip_prefix("tmdb:") {
+            Some(n) => (format!("{}/{tmdb_type}/{n}?api_key={tmdb_key}", self.cfg.tmdb_base), true),
+            None => (
+                format!("{}/find/{id}?external_source=imdb_id&api_key={tmdb_key}", self.cfg.tmdb_base),
+                false,
+            ),
+        };
+        let Some(found) = self.get_json(&url, &[]).await? else {
+            return Ok(None);
+        };
+        let hit = if named_outright {
+            Some(&found)
+        } else if tmdb_type == "movie" {
+            found["movie_results"].get(0)
+        } else {
+            found["tv_results"].get(0)
+        };
+        let Some(hit) = hit else { return Ok(None) };
+        // Movies carry `title` + `release_date`; TV carries `name` + `first_air_date`.
+        let Some(title) = hit["title"].as_str().or_else(|| hit["name"].as_str()) else {
+            return Ok(None);
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(None);
+        }
+        let year = hit["release_date"]
+            .as_str()
+            .or_else(|| hit["first_air_date"].as_str())
+            .and_then(|d| d.get(0..4))
+            .filter(|y| y.len() == 4);
+        Ok(Some(match year {
+            Some(y) => format!("{title} {y}"),
+            None => title.to_string(),
+        }))
+    }
+
+    /// KinoCheck discovery fallback: an imdb OR tmdb id → the official trailer's YouTube id (or None).
+    /// It takes either, so a tmdb id needs no resolving here — and it answers without a key, which is
+    /// what a caller with no TMDB key of its own is left with.
+    async fn kinocheck_youtube_id(
+        &self,
+        kinocheck_key: Option<&str>,
+        id: &str,
+        ty: &str,
+        lang: &str,
+    ) -> Answered<Option<String>> {
+        let endpoint = if ty == "series" { "shows" } else { "movies" };
+        let language = if lang.starts_with("de") { "de" } else { "en" };
+        let param = match id.strip_prefix("tmdb:") {
+            Some(n) => format!("tmdb_id={n}"),
+            None => format!("imdb_id={id}"),
+        };
+        let url =
+            format!("{}/{endpoint}?{param}&categories=Trailer&language={language}", self.cfg.kinocheck_base);
+        let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];
+        if let Some(k) = kinocheck_key {
+            headers.push(("X-Api-Key", k));
+            headers.push(("X-Api-Host", "api.kinocheck.com"));
+        }
+        let Some(data) = self.get_json(&url, &headers).await? else {
+            return Ok(None);
+        };
+        Ok(data["trailer"]["youtube_video_id"]
+            .as_str()
+            .filter(|id| crate::is_valid_vid(id))
+            .map(|s| s.to_string()))
+    }
+
+    fn recent_failures(&self) -> u32 {
+        self.fails.load(Ordering::Relaxed)
+    }
+}

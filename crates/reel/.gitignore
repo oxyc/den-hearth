@@ -1,0 +1,4 @@
+/target
+cache/
+*.mp4
+.env

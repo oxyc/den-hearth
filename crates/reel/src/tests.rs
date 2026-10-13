@@ -1,0 +1,6704 @@
+//! Ports meta.test.js: the pure functions, the resolve/cache logic (with a fake upstream + a
+//! stubbed prober, so no network and no yt-dlp), and the HTTP /meta + /play serve contract.
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+
+use crate::config::Config;
+use crate::state::{default_clock, AppState, PrewarmFn, ProbeFn};
+use crate::upstream::NoAnswer;
+use crate::upstream::{pick_trailer_candidates, Upstream};
+use crate::ytdlp::classify;
+
+// --- fakes / builders -------------------------------------------------------
+
+struct FakeInner {
+    tmdb: Mutex<Vec<String>>,
+    kc: Mutex<Option<String>>,
+    title: Mutex<Option<String>>,
+    calls: AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+    fail_kc: std::sync::atomic::AtomicBool,
+    fail_title: std::sync::atomic::AtomicBool,
+    /// Holds a lookup inside `tmdb_candidates` until the test releases it, so a second resolve can
+    /// run to completion in between. The live-entry branch is only reachable that way.
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+}
+
+#[derive(Clone)]
+struct FakeUpstream(Arc<FakeInner>);
+
+impl FakeUpstream {
+    fn new(tmdb: &[&str], kc: Option<&str>) -> FakeUpstream {
+        FakeUpstream(Arc::new(FakeInner {
+            tmdb: Mutex::new(tmdb.iter().map(|s| s.to_string()).collect()),
+            kc: Mutex::new(kc.map(|s| s.to_string())),
+            title: Mutex::new(None),
+            calls: AtomicUsize::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_kc: std::sync::atomic::AtomicBool::new(false),
+            fail_title: std::sync::atomic::AtomicBool::new(false),
+            gate: Mutex::new(None),
+        }))
+    }
+    fn set_tmdb(&self, tmdb: &[&str]) {
+        *self.0.tmdb.lock().unwrap() = tmdb.iter().map(|s| s.to_string()).collect();
+    }
+    fn set_kc(&self, kc: Option<&str>) {
+        *self.0.kc.lock().unwrap() = kc.map(|s| s.to_string());
+    }
+    fn set_title(&self, title: &str) {
+        *self.0.title.lock().unwrap() = Some(title.to_string());
+    }
+    fn calls(&self) -> usize {
+        self.0.calls.load(Ordering::SeqCst)
+    }
+    /// Make the next lookup look like a transport error / 401 / 429 / 5xx: an empty result that is
+    /// NOT an answer. The fault must land DURING the call, which is the only thing that
+    /// distinguishes it from a title that genuinely has no trailer.
+    fn fail_next(&self) {
+        self.0.fail.store(true, Ordering::SeqCst);
+    }
+    /// Make the next lookup block inside `tmdb_candidates` until the returned semaphore is given a
+    /// permit. Lets a test interleave two resolves on the one runtime thread.
+    fn gate_next(&self) -> Arc<tokio::sync::Semaphore> {
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.0.gate.lock().unwrap() = Some(sem.clone());
+        sem
+    }
+    /// The title lookup could not be made. It gates the search fallback, so its failure means no
+    /// search ran and the empty result is not an answer.
+    fn fail_title(&self) {
+        self.0.fail_title.store(true, Ordering::SeqCst);
+    }
+    /// A hard fault on the FALLBACK source, as the real upstream records it.
+    fn fail_fallback(&self) {
+        self.0.fail_kc.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Upstream for FakeUpstream {
+    async fn tmdb_candidates(
+        &self,
+        _tmdb_key: &str,
+        _imdb: &str,
+        _ty: &str,
+        _lang: &str,
+    ) -> crate::upstream::Answered<Vec<String>> {
+        self.0.calls.fetch_add(1, Ordering::SeqCst);
+        // Claim this call's outcome BEFORE parking, or the resolve that runs while we are parked
+        // consumes the flag that was armed for us.
+        let failed = self.0.fail.swap(false, Ordering::SeqCst);
+        let gate = self.0.gate.lock().unwrap().take();
+        if let Some(sem) = gate {
+            let _ = sem.acquire().await;
+        }
+        if failed {
+            return Err(crate::upstream::NoAnswer);
+        }
+        Ok(self.0.tmdb.lock().unwrap().clone())
+    }
+    async fn kinocheck_youtube_id(
+        &self,
+        _kinocheck_key: Option<&str>,
+        _imdb: &str,
+        _ty: &str,
+        _lang: &str,
+    ) -> crate::upstream::Answered<Option<String>> {
+        if self.0.fail_kc.load(Ordering::SeqCst) {
+            return Err(crate::upstream::NoAnswer);
+        }
+        Ok(self.0.kc.lock().unwrap().clone())
+    }
+    async fn tmdb_title(
+        &self,
+        _tmdb_key: &str,
+        _imdb: &str,
+        _ty: &str,
+    ) -> crate::upstream::Answered<Option<String>> {
+        if self.0.fail_title.load(Ordering::SeqCst) {
+            return Err(crate::upstream::NoAnswer);
+        }
+        Ok(self.0.title.lock().unwrap().clone())
+    }
+}
+
+/// A clock the test drives, so a TTL can be asserted by advancing time rather than sleeping.
+#[derive(Clone, Default)]
+struct TestClock(Arc<AtomicU64>);
+impl TestClock {
+    fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms, Ordering::SeqCst);
+    }
+    fn as_fn(&self) -> crate::state::ClockFn {
+        let c = self.0.clone();
+        Box::new(move || c.load(Ordering::SeqCst))
+    }
+}
+
+/// `kill(pid, 0)`: ESRCH means gone, anything else means it exists (EPERM included — not ours, but
+/// alive, so still not ours to delete).
+fn pid_is_alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    // last_os_error rather than errno directly: the symbol differs per platform (__error on macOS,
+    // __errno_location on Linux) and this has to build on both.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+static TMP_CNT: AtomicUsize = AtomicUsize::new(0);
+pub(crate) fn temp_dir() -> PathBuf {
+    // Sweep what DEAD runs left. Nothing removes its own directory — a test that fails mid-way
+    // should leave its files to look at — but a suite run creates ~100 and they had accumulated
+    // into tens of thousands.
+    //
+    // Liveness matters: "not my pid" also matches a second test binary running right now, and
+    // deleting its directories takes its fake yt-dlp/ffmpeg scripts out from under it. That
+    // reproduced every time two runs overlapped, and failed the other run's tests with errors
+    // pointing at the code rather than at this.
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        let me = std::process::id();
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let Some(rest) = name.strip_prefix("den-reel-test-") else { continue };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid != me && !pid_is_alive(pid) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+    let n = TMP_CNT.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!("den-reel-test-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn test_cfg(cache_dir: PathBuf) -> Config {
+    Config {
+        port: 8092,
+        ytdlp_cache: cache_dir.join("yt-dlp"),
+        resolve_cache: cache_dir.join("state").join("resolve.json"),
+        direct_cache: cache_dir.join("state").join("direct.json"),
+        crop_cache: cache_dir.join("state").join("crop.json"),
+        index_cache: cache_dir.join("state").join("index.json"),
+        cache_dir,
+        ytdlp: "yt-dlp".into(),
+        ffmpeg: "ffmpeg".into(),
+        mp4box: "MP4Box".into(),
+        bake_clap: true,
+        max_height: "1080".into(),
+        cache_max_bytes: 8 * 1024 * 1024 * 1024,
+        cache_ttl: std::time::Duration::from_secs(365 * 24 * 60 * 60), // effectively off for the size-cap tests
+        tmdb_key: Some("test-key".into()),
+        kinocheck_key: None,
+        config_key: String::new(),
+        config_keys_prev: String::new(),
+        revocation: Default::default(),
+        play_secret: None,
+        play_secrets_prev: Vec::new(),
+        play_signing_grace: None,
+        metrics_token: None,
+        direct_media_concurrency: 16,
+        direct_media_idle: std::time::Duration::from_secs(30),
+        direct_media_lifetime: std::time::Duration::from_secs(15 * 60),
+        log_requests: false,
+        log_identity: true,
+        public_base_url: None,
+        ytdlp_format: "fmt".into(),
+        ytdlp_extractor_args: Some("youtube:player_client=visionos".into()),
+        // Never the resident one in a test: it would want an interpreter and the pinned zipapp.
+        ytdlp_worker: None,
+        python: "python3".into(),
+        tmdb_base: "http://unused".into(),
+        kinocheck_base: "http://unused".into(),
+        cache_ok_until: std::sync::atomic::AtomicU64::new(0),
+        cache_epoch: std::sync::atomic::AtomicU64::new(0),
+    }
+}
+
+fn always_playable() -> ProbeFn {
+    Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }))
+}
+fn noop_prewarm() -> PrewarmFn {
+    Box::new(|_state, _id| {})
+}
+
+/// The search fallback never fires in most tests (mock `tmdb_title` is None); a no-op keeps them hermetic.
+fn noop_searcher() -> crate::state::SearchFn {
+    Box::new(|_q| Box::pin(async { Some(Vec::<String>::new()) }))
+}
+
+fn build_state(
+    cache_dir: PathBuf,
+    upstream: Box<dyn Upstream>,
+    prober: ProbeFn,
+    prewarm: PrewarmFn,
+) -> Arc<AppState> {
+    build_state_cfg(test_cfg(cache_dir), upstream, prober, prewarm)
+}
+
+/// Like `build_state` but with an explicit `Config` — lets a test enable the sealed-config keyring
+/// (via `config_key`) exactly the way production does.
+fn build_state_cfg(
+    cfg: Config,
+    upstream: Box<dyn Upstream>,
+    prober: ProbeFn,
+    prewarm: PrewarmFn,
+) -> Arc<AppState> {
+    build_state_full(cfg, upstream, prober, prewarm, noop_searcher())
+}
+
+/// Full builder with an injectable searcher (only the search-fallback test needs a non-noop one).
+fn build_state_full(
+    cfg: Config,
+    upstream: Box<dyn Upstream>,
+    prober: ProbeFn,
+    prewarm: PrewarmFn,
+    searcher: crate::state::SearchFn,
+) -> Arc<AppState> {
+    let config_keyring = crate::seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
+    let media_gate = std::sync::Arc::new(crate::media_gate::MediaGate::new(
+        cfg.direct_media_concurrency,
+        cfg.direct_media_idle,
+        cfg.direct_media_lifetime,
+    ));
+    Arc::new(AppState {
+        cfg: Arc::new(cfg),
+        config_keyring,
+        yt_cache: Mutex::new(HashMap::new()),
+        ids: Mutex::new(HashMap::new()),
+        in_flight: Mutex::new(HashMap::new()),
+        dl_gen: std::sync::atomic::AtomicU64::new(0),
+        crop_cache: Mutex::new(HashMap::new()),
+        crop_unknown: Mutex::new(HashMap::new()),
+        crop_inflight: Mutex::new(Default::default()),
+        play_fails: Mutex::new(HashMap::new()),
+        direct_cache: Mutex::new(HashMap::new()),
+        direct_inflight: Mutex::new(HashMap::new()),
+        progressive: Mutex::new(HashMap::new()),
+        worker: Default::default(),
+        upstream,
+        // Never used by a test: nothing here reaches the HLS proxy, and a client builds no
+        // connection until something asks it for one.
+        http: reqwest::Client::new(),
+        prober,
+        searcher,
+        prewarm,
+        // Never the real one: /meta would spawn yt-dlp behind every test that browses a title.
+        direct_warm: Box::new(|_state, _id, _cap, _index| {}),
+        clock: Box::new(default_clock),
+        download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
+        prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
+        probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
+        index_build_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::progressive::INDEX_BUILD_CONCURRENCY,
+        )),
+        media_gate,
+        cache_trailer_bytes: std::sync::atomic::AtomicU64::new(0),
+        cache_trailer_count: std::sync::atomic::AtomicU64::new(0),
+        cache_scratch_bytes: std::sync::atomic::AtomicU64::new(0),
+        cache_measured_at: std::sync::atomic::AtomicU64::new(0),
+        index_video: Default::default(),
+        index_audio: Default::default(),
+        index_failures: std::sync::atomic::AtomicU64::new(0),
+        index_build_refused: std::sync::atomic::AtomicU64::new(0),
+        index_hits: std::sync::atomic::AtomicU64::new(0),
+        index_waits: std::sync::atomic::AtomicU64::new(0),
+        resolves: Default::default(),
+        extract_fails: std::sync::atomic::AtomicU32::new(0),
+        local_fails: std::sync::atomic::AtomicU32::new(0),
+        youtube: crate::state::youtube_backoff(),
+        health_logged: Mutex::new(None),
+    })
+}
+
+fn build_state_clock(
+    cache_dir: PathBuf,
+    upstream: Box<dyn Upstream>,
+    clock: crate::state::ClockFn,
+) -> Arc<AppState> {
+    let state = build_state(cache_dir, upstream, always_playable(), noop_prewarm());
+    let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
+    state.clock = clock;
+    Arc::new(state)
+}
+
+/// Both at once: a real `Config` (so a test can point `ytdlp` at a fake) and a driven clock (so a
+/// TTL can be asserted by advancing time rather than sleeping).
+fn build_state_cfg_clock(
+    cfg: Config,
+    upstream: Box<dyn Upstream>,
+    clock: crate::state::ClockFn,
+) -> Arc<AppState> {
+    let state = build_state_cfg(cfg, upstream, always_playable(), noop_prewarm());
+    let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
+    state.clock = clock;
+    Arc::new(state)
+}
+
+/// How many times the fake yt-dlp was actually run (it appends a line per invocation).
+fn spawn_count(p: &std::path::Path) -> usize {
+    std::fs::read_to_string(p).map(|s| s.lines().count()).unwrap_or(0)
+}
+
+/// Start the real router on an ephemeral port; returns the base URL.
+async fn spawn_server(state: Arc<AppState>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req| {
+                    let state = state.clone();
+                    async move { Ok::<_, Infallible>(crate::handle_request(state, req).await) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+// --- pure functions ---------------------------------------------------------
+
+#[test]
+fn pick_candidates_orders_and_dedupes() {
+    let results = vec![
+        json!({ "site": "YouTube", "type": "Teaser", "key": "teaser00000" }),
+        json!({ "site": "Vimeo", "type": "Trailer", "key": "ignored0000" }),
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "key": "official111" }),
+        json!({ "site": "YouTube", "type": "Trailer", "key": "plain222222" }),
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "key": "official111" }),
+    ];
+    assert_eq!(pick_trailer_candidates(&results, "en"), vec!["official111", "plain222222", "teaser00000"]);
+}
+
+/// The ordering prefers the FILM'S language, then English, then anything else — never the viewer's.
+///
+/// A video tagged with the viewer's language is a dub or a local-market cut; the thing worth watching
+/// is the film as it was made, subtitled by the client if it wants. An earlier version of this ranked
+/// the viewer's language first, which handed a Finnish viewer a Finnish-dubbed trailer for an English
+/// film in preference to the original.
+#[test]
+fn pick_candidates_prefers_the_films_own_language_then_english() {
+    // The Finnish entry is deliberately the OFFICIAL trailer: language has to outrank kind, or a
+    // locally-marketed cut wins on being marked official.
+    let results = vec![
+        json!({ "site": "YouTube", "type": "Teaser", "iso_639_1": "en", "key": "engTeaser01" }),
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "iso_639_1": "fr", "key": "frenchOff01" }),
+        json!({ "site": "YouTube", "type": "Trailer", "iso_639_1": "en", "key": "engTrailer1" }),
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "iso_639_1": "fi", "key": "finnishDub1" }),
+        json!({ "site": "YouTube", "type": "Trailer", "key": "untagged001" }),
+    ];
+
+    // A French film: its own official trailer leads, then English by kind, then the rest. The
+    // Finnish cut is behind both English videos despite being the other "official" one.
+    assert_eq!(
+        pick_trailer_candidates(&results, "fr"),
+        vec!["frenchOff01", "engTrailer1", "engTeaser01", "finnishDub1", "untagged001"]
+    );
+    // An English film: English leads by kind, and the French and Finnish officials both fall behind
+    // an English video that is not marked official at all.
+    assert_eq!(
+        pick_trailer_candidates(&results, "en"),
+        vec!["engTrailer1", "engTeaser01", "frenchOff01", "finnishDub1", "untagged001"]
+    );
+    // A film whose own language has no video here falls back to English — and behaves exactly like
+    // an English film, because nothing occupies the first band. Nothing is dropped: a dub is still a
+    // playable last resort if everything ahead of it fails.
+    assert_eq!(
+        pick_trailer_candidates(&results, "ja"),
+        pick_trailer_candidates(&results, "en"),
+        "falling back to English should order identically to an English film"
+    );
+}
+
+#[test]
+fn build_meta_produces_same_host_play_url() {
+    let out = crate::addon::build_meta(
+        "movie",
+        "tt0111161",
+        "https://trailers.example.com/",
+        &["abc123DEF01".to_string()],
+        None,
+        crate::sign::Binding::Install { iid: Some(IID), ep: 2 },
+    );
+    assert_eq!(
+        out["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/abc123DEF01.mp4",
+        "without a secret nothing is signed, so there is nothing to bind"
+    );
+}
+
+/// The tag for `vid` as this release signs it, bound to `binding`.
+fn bound_tag(vid: &str, binding: crate::sign::Binding) -> String {
+    crate::sign::tag("s3cret", &crate::sign::message(vid, binding))
+}
+
+/// With a secret configured the play URL carries the tag /play and /crop will demand, bound to the
+/// install that asked — and without one it is byte-for-byte the URL it has always been, because
+/// every install in the field is holding unsigned URLs with a week of `max-age` on them.
+#[test]
+fn a_signed_install_hands_out_signed_play_urls() {
+    use crate::sign::Binding;
+    let url = |binding| {
+        let meta = crate::addon::build_meta(
+            "movie",
+            "tt0111161",
+            "https://trailers.example.com",
+            &["abc123DEF01".to_string()],
+            Some("s3cret"),
+            binding,
+        );
+        meta["meta"]["links"][0]["trailers"].as_str().unwrap().to_string()
+    };
+    let base = "https://trailers.example.com/play/abc123DEF01.mp4";
+    let installed = Binding::Install { iid: Some(IID), ep: 2 };
+    assert_eq!(url(installed), format!("{base}?s={}&i={IID}&e=2", bound_tag("abc123DEF01", installed)));
+    let no_iid = Binding::Install { iid: None, ep: 0 };
+    assert_eq!(url(no_iid), format!("{base}?s={}&e=0", bound_tag("abc123DEF01", no_iid)));
+    assert_eq!(
+        url(Binding::Unbound),
+        format!("{base}?s={}", bound_tag("abc123DEF01", Binding::Unbound)),
+        "the config-less /meta has no install to name"
+    );
+}
+
+/// The only thing standing in front of /play and /crop was "is this eleven characters", and both
+/// spend a download permit, a yt-dlp process and cache space on whatever they are handed. An
+/// instance reachable beyond the LAN was a YouTube extraction service for anyone who found it.
+#[tokio::test]
+async fn a_signed_install_refuses_unsigned_play_and_crop() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "an unsigned /play was served");
+
+    let r =
+        client.get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "a wrong tag was accepted");
+
+    let tag = bound_tag("cachedVid07", crate::sign::Binding::Unbound);
+    let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "the URL /meta hands out must actually play");
+
+    // /crop is a second door to the same download, so it is gated too — by the same tag, since the
+    // signature covers the id rather than the path. But it DEGRADES rather than refusing: nothing
+    // this server emits is a signed crop URL (the tag rides on the play URL and the client has to
+    // carry it across), so a 403 here would turn a client that does not into de-letterboxing that
+    // silently vanishes. The answer is the same "just play it" every other failing path returns —
+    // and it reaches none of the download the gate exists to protect.
+    let r = client.get(format!("{base}/crop/cachedVid07.json")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "an unsigned /crop should degrade, not break de-letterboxing");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["letterboxed"], false, "an unsigned caller gets the play-it-whole answer");
+    assert!(body.get("content").is_none(), "an unsigned caller must not get a detected rect");
+
+    let r = client.get(format!("{base}/crop/cachedVid07.json?s={tag}")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "the play URL's tag must open /crop for the same id");
+}
+
+/// Turning signing on over an install whose clients hold a week of unsigned `/meta` answers: until
+/// the deadline a request with NO tag is still served, and so is one signed over the id alone by a
+/// release before install binding; a WRONG tag never is, and after it the gate is exactly the one
+/// above.
+#[tokio::test]
+async fn a_signing_grace_serves_untagged_and_pre_binding_urls_until_its_deadline() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.play_signing_grace = Some(crate::config::PlayGrace { until_ms: 60_000, until: "deadline".into() });
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let installed = crate::sign::Binding::Install { iid: Some(IID), ep: 0 };
+    let bound = format!("s={}&i={IID}&e=0", bound_tag("cachedVid07", installed));
+    let pre_binding = crate::sign::tag("s3cret", "cachedVid07");
+    let status = |q: String| {
+        let client = client.clone();
+        let url = format!("{base}/play/cachedVid07.mp4{q}");
+        async move { client.get(url).send().await.unwrap().status() }
+    };
+
+    assert_eq!(
+        status(String::new()).await,
+        200,
+        "a URL cached before signing was turned on 403'd inside the grace"
+    );
+    assert_eq!(
+        status("?s=deadbeefdeadbeefdeadbeef".into()).await,
+        403,
+        "the grace is for a missing tag, not a wrong one"
+    );
+    assert_eq!(status(format!("?{bound}")).await, 200, "signed URLs must play during the grace too");
+    assert_eq!(
+        status(format!("?s={pre_binding}")).await,
+        200,
+        "a URL the previous release signed 403'd inside the grace"
+    );
+    assert_eq!(
+        status(format!("?s={pre_binding}&i={IID}&e=0")).await,
+        403,
+        "a pre-binding tag does not cover an install, so it must not arrive with one"
+    );
+
+    clock.advance(60_000);
+    assert_eq!(status(String::new()).await, 403, "the grace outlived its deadline");
+    assert_eq!(status(format!("?s={pre_binding}")).await, 403, "a pre-binding tag outlived the grace");
+    for q in [String::new(), format!("?s={pre_binding}")] {
+        let body: Value = client
+            .get(format!("{base}/crop/cachedVid07.json{q}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["letterboxed"], false, "a refused /crop after the deadline degrades as before");
+        assert!(body.get("content").is_none());
+    }
+    assert_eq!(status(format!("?{bound}")).await, 200, "signed URLs outlive the grace");
+}
+
+/// A second install id, using both url-safe characters.
+const OTHER_IID: &str = "_-_-_-_-_-_-_-_-_-_-_w";
+
+/// A signed install over `dir` (which holds `cachedVid07`), refusing the installs in `revoked`, links
+/// stamped below `epoch`, and — with `require_iid` — links without an install id.
+fn signed_state(dir: PathBuf, revoked: &str, epoch: &str, require_iid: bool) -> Arc<AppState> {
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.revocation =
+        crate::userconfig::Revocation::from_env(revoked, Some(epoch)).requiring_install_id(require_iid);
+    build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["cachedVid07"], None)),
+        always_playable(),
+        noop_prewarm(),
+    )
+}
+
+/// The play link `/meta` hands the install whose config is `json`, as a path and query.
+async fn minted_link(base: &str, json: &str) -> String {
+    let body: Value = reqwest::get(format!("{base}/{}/meta/movie/tt0111161.json", plain_segment(json)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let link = body["meta"]["links"][0]["trailers"].as_str().expect("a link").to_string();
+    link.strip_prefix(base).expect("a link on this host").to_string()
+}
+
+/// Revoking an install used to leave every trailer link it had been handed playing until
+/// PLAY_SECRET was rotated. The link is bound to the install now, so the revocation reaches it —
+/// with the same 403 a bad tag gets, and without touching any other install's links.
+#[tokio::test]
+async fn a_revoked_install_s_trailer_links_stop_playing() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mine = format!(r#"{{"tmdbKey":"k","iid":"{IID}","ep":0}}"#);
+    let theirs = format!(r#"{{"tmdbKey":"k","iid":"{OTHER_IID}","ep":0}}"#);
+
+    // Handed out while the install was admitted...
+    let before = spawn_server(signed_state(dir.clone(), "", "0", false)).await;
+    let link = minted_link(&before, &mine).await;
+    assert!(link.ends_with(&format!("&i={IID}&e=0")), "the link does not name its install: {link}");
+    assert_eq!(reqwest::get(format!("{before}{link}")).await.unwrap().status(), 200);
+    let other_link = minted_link(&before, &theirs).await;
+
+    // ...and replayed once it was revoked.
+    let after = spawn_server(signed_state(dir, IID, "0", false)).await;
+    let refused = reqwest::get(format!("{after}{link}")).await.unwrap();
+    assert_eq!(refused.status(), 403, "a revoked install's trailer link still played");
+    let bad_tag =
+        reqwest::get(format!("{after}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).await.unwrap();
+    assert_eq!(
+        refused.json::<Value>().await.unwrap(),
+        bad_tag.json::<Value>().await.unwrap(),
+        "a revoked link must be answered exactly like a bad tag"
+    );
+    let crop = link.replace("/play/cachedVid07.mp4", "/crop/cachedVid07.json");
+    let body: Value = reqwest::get(format!("{after}{crop}")).await.unwrap().json().await.unwrap();
+    assert!(body.get("content").is_none(), "a revoked link's /crop must degrade like an unsigned one");
+    assert_eq!(
+        reqwest::get(format!("{after}{other_link}")).await.unwrap().status(),
+        200,
+        "revoking one install must leave another's links alone"
+    );
+}
+
+#[tokio::test]
+async fn a_trailer_link_stamped_below_config_epoch_is_refused() {
+    use crate::sign::Binding;
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let link = |iid: Option<&str>, ep: u64| {
+        let binding = Binding::Install { iid, ep };
+        format!("/play/cachedVid07.mp4?s={}{}", bound_tag("cachedVid07", binding), binding.query())
+    };
+    let base = spawn_server(signed_state(dir.clone(), "", "2", false)).await;
+    for (iid, ep, want) in [(Some(IID), 1, 403u16), (Some(IID), 2, 200), (Some(IID), 3, 200), (None, 2, 200)]
+    {
+        let r = reqwest::get(format!("{base}{}", link(iid, ep))).await.unwrap();
+        assert_eq!(r.status(), want, "iid={iid:?} ep={ep}");
+    }
+    // A link minted from a config without an install id is refused once ids are required, like the
+    // config itself.
+    let base = spawn_server(signed_state(dir, "", "0", true)).await;
+    assert_eq!(reqwest::get(format!("{base}{}", link(None, 0))).await.unwrap().status(), 403);
+    assert_eq!(reqwest::get(format!("{base}{}", link(Some(IID), 0))).await.unwrap().status(), 200);
+}
+
+/// The install a link names is signed, so it cannot be swapped for one that is still admitted, and
+/// stripping it does not fall back to the grace window's pre-binding acceptance.
+#[tokio::test]
+async fn a_tampered_install_id_or_epoch_is_refused() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.play_signing_grace = Some(crate::config::PlayGrace { until_ms: 60_000, until: "deadline".into() });
+    let state =
+        build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), TestClock::default().as_fn());
+    let base = spawn_server(state).await;
+    let s = bound_tag("cachedVid07", crate::sign::Binding::Install { iid: Some(IID), ep: 1 });
+
+    let status = |q: String| {
+        let url = format!("{base}/play/cachedVid07.mp4?{q}");
+        async move { reqwest::get(url).await.unwrap().status().as_u16() }
+    };
+    assert_eq!(status(format!("s={s}&i={IID}&e=1")).await, 200, "the untampered link");
+    for tampered in [
+        format!("s={s}&i={OTHER_IID}&e=1"),
+        format!("s={s}&i={IID}&e=5"),
+        format!("s={s}&i={IID}&e=0"),
+        format!("s={s}&i={IID}&e=x"),
+        format!("s={s}&e=1"),
+        format!("s={s}&i={IID}"),
+        format!("s={s}"),
+    ] {
+        assert_eq!(status(tampered.clone()).await, 403, "{tampered}");
+    }
+}
+
+/// `PLAY_SIGNING_GRACE_UNTIL` is RFC 3339 with an offset, read to the millisecond.
+#[test]
+fn a_grace_timestamp_parses_to_epoch_ms() {
+    use crate::config::parse_rfc3339_ms as p;
+    assert_eq!(p("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(p("2026-09-17T10:00:00Z"), Some(1_789_639_200_000));
+    assert_eq!(p("2026-09-17T12:00:00+02:00"), Some(1_789_639_200_000), "an offset east of UTC");
+    assert_eq!(p("2026-09-17T05:30:00-04:30"), Some(1_789_639_200_000), "an offset west of UTC");
+    assert_eq!(p("2026-09-17t10:00:00z"), Some(1_789_639_200_000), "RFC 3339 allows a lowercase t and z");
+    assert_eq!(p("2024-02-29T23:59:59.5Z"), Some(1_709_251_199_500), "a leap day, and a fraction");
+}
+
+/// A mistyped deadline must enforce signing now, not open a gate that never closes.
+#[test]
+fn a_bad_grace_timestamp_fails_closed() {
+    use crate::config::play_grace;
+    for bad in [
+        "next tuesday",
+        "1789639200",
+        "2026-09-17",
+        "2026-09-17T10:00:00",
+        "2026-02-29T00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "2026-09-17T24:00:00Z",
+        "2026-09-17T10:00:00.Z",
+        "2026-09-17T10:00:00+2:00",
+        "1969-12-31T23:59:59Z",
+    ] {
+        assert!(play_grace(true, Some(bad)).is_none(), "{bad:?} opened a grace window");
+    }
+    let good = play_grace(true, Some(" 2026-09-17T10:00:00Z ")).expect("a valid deadline");
+    assert_eq!((good.until_ms, good.until.as_str()), (1_789_639_200_000, "2026-09-17T10:00:00Z"));
+}
+
+/// With no secret nothing is refused, so a grace has nothing to relax and is not read at all.
+#[test]
+fn a_grace_without_a_secret_is_ignored() {
+    assert!(crate::config::play_grace(false, Some("2099-01-01T00:00:00Z")).is_none());
+    assert!(crate::config::play_grace(false, Some("garbage")).is_none(), "nor warned about");
+}
+
+/// The startup line is where an operator checks what the gate is doing right now.
+#[test]
+fn the_startup_line_says_whether_signing_is_in_grace() {
+    use crate::play_signing_state as state;
+    let mut cfg = test_cfg(temp_dir());
+    assert_eq!(state(&cfg, 0), "off");
+    cfg.play_signing_grace = crate::config::play_grace(true, Some("2026-09-17T10:00:00Z"));
+    assert_eq!(state(&cfg, 0), "off", "a grace without a secret is not signing");
+    cfg.play_secret = Some("s3cret".into());
+    assert_eq!(state(&cfg, 1_789_639_199_999), "grace(until=2026-09-17T10:00:00Z)");
+    assert_eq!(state(&cfg, 1_789_639_200_000), "on", "a grace that has passed is plain signing");
+    cfg.play_signing_grace = None;
+    assert_eq!(state(&cfg, 0), "on");
+}
+
+/// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
+async fn start_serve(
+    grace: std::time::Duration,
+    header_timeout: std::time::Duration,
+) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let stop = async move {
+        let _ = rx.await;
+    };
+    (addr, tx, tokio::spawn(crate::serve_until(listener, state, stop, grace, header_timeout)))
+}
+
+/// A client that opens a socket and dribbles half a request head is dropped once the head is overdue,
+/// rather than holding a connection (and, at a stop, the drain) for as long as it likes.
+#[tokio::test]
+async fn a_request_head_that_never_finishes_is_dropped() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (addr, _stop, _server) =
+        start_serve(std::time::Duration::from_secs(5), std::time::Duration::from_millis(200)).await;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), sock.read_to_end(&mut rest))
+        .await
+        .expect("a half-sent request head held its connection open")
+        .ok();
+}
+
+#[tokio::test]
+async fn an_idle_server_stops_at_once() {
+    let (_, stop, server) = start_serve(std::time::Duration::from_secs(5), crate::HEADER_READ_TIMEOUT).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("an idle server waited out the grace instead of stopping")
+        .unwrap();
+}
+
+/// A graceful shutdown waits for every connection, so without a deadline a client that sends half a
+/// request head and goes quiet would hold the stop open for as long as it liked.
+#[tokio::test]
+async fn a_half_sent_request_cannot_hold_the_stop_open() {
+    use tokio::io::AsyncWriteExt;
+    let (addr, stop, server) =
+        start_serve(std::time::Duration::from_millis(300), crate::HEADER_READ_TIMEOUT).await;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the server accept it first
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .expect("the drain is unbounded")
+        .unwrap();
+}
+
+/// ...and with no secret configured, nothing changes: every install in the field is holding unsigned
+/// play URLs that /meta told it to cache for a week.
+#[tokio::test]
+async fn an_unsigned_install_is_completely_unchanged() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid08", 100);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let r = reqwest::get(format!("{base}/play/cachedVid08.mp4")).await.unwrap();
+    assert_eq!(r.status(), 200, "signing is opt-in and this install did not opt in");
+}
+
+/// /health answers one question in one word. Everything behind that verdict — how full the volume
+/// is, how many downloads are in flight, how much of the resolve cache is standing — was visible
+/// only by reading logs. The figures come from the eviction pass, which already walks the directory,
+/// because an ops endpoint that stats a few thousand files per request makes a busy box busier.
+#[tokio::test]
+async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
+    let dir = temp_dir();
+    seed_cache(&dir, "statsVid001", 4096);
+    let mut cfg = test_cfg(dir);
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state.clone()).await;
+
+    let r = scrape_metrics(&base, Some("scrape-me")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "text/plain; version=0.0.4; charset=utf-8");
+    let body = r.text().await.unwrap();
+    let has = |body: &str, line: &str| body.lines().any(|l| l == line);
+    assert!(has(&body, &format!("reel_build_info{{version=\"{}\"}} 1", crate::release_version())));
+    // Nothing has measured the volume yet — and /metrics must not be the thing that does, even
+    // though there is a trailer sitting right there.
+    assert!(has(&body, "reel_cache_measured_at_seconds 0"), "/metrics walked the cache directory itself");
+    assert!(has(&body, "reel_cache_trailers 0"), "/metrics walked the cache directory itself");
+
+    // The eviction pass measures; /metrics reports what it found.
+    let u = crate::play::evict_if_needed(&state.cfg).expect("the cache dir is readable");
+    state.record_cache_usage(u);
+
+    let body = scrape_metrics(&base, Some("scrape-me")).await.text().await.unwrap();
+    assert!(has(&body, "reel_cache_trailers 1"));
+    assert!(has(&body, "reel_cache_trailer_bytes 4096"));
+    assert!(!has(&body, "reel_cache_measured_at_seconds 0"), "the measurement was not timestamped");
+    assert!(
+        has(&body, &format!("reel_cache_free_bytes {}", state.cfg.cache_max_bytes - 4096)),
+        "free space must account for what trailers already hold"
+    );
+    assert!(has(&body, &format!("reel_downloads_max {}", crate::DOWNLOAD_CONCURRENCY)));
+    assert!(has(&body, "reel_direct_media_active 0"));
+    assert!(has(&body, "reel_direct_media_high_water 0"));
+    assert!(has(&body, "reel_direct_media_max 16"));
+    assert!(has(&body, "reel_direct_media_refused_total 0"));
+    assert!(has(&body, "reel_direct_media_timeouts_total{kind=\"idle\"} 0"));
+    assert!(has(&body, "reel_direct_media_timeouts_total{kind=\"lifetime\"} 0"));
+    assert!(has(&body, "reel_direct_media_cancellations_total 0"));
+    assert!(has(&body, "reel_index_build_active 0"));
+    assert!(has(&body, "reel_index_build_refused_total 0"));
+    assert!(has(&body, "reel_consecutive_failures{kind=\"extract\"} 0"));
+
+    // What the web's trailers cost, as they are recorded.
+    state.index_audio.record(std::time::Duration::from_millis(2874));
+    state.index_audio.record(std::time::Duration::from_millis(1126));
+    state.index_hits.fetch_add(3, Ordering::Relaxed);
+    state.resolves.record(std::time::Duration::from_millis(1559));
+    let body = scrape_metrics(&base, Some("scrape-me")).await.text().await.unwrap();
+    assert!(has(&body, "# TYPE reel_index_builds_total counter"));
+    assert!(has(&body, "reel_index_builds_total{streams=\"video+audio\"} 2"));
+    assert!(has(&body, "reel_index_builds_total{streams=\"video\"} 0"));
+    assert!(has(&body, "reel_index_build_milliseconds_total{streams=\"video+audio\"} 4000"));
+    assert!(has(&body, "reel_index_requests_total{index=\"built\"} 3"));
+    assert!(has(&body, "# TYPE reel_index_ranges_retried_total counter"));
+    assert!(has(&body, "reel_resolve_milliseconds_total 1559"));
+    assert!(has(&body, "reel_last_milliseconds{of=\"index_video+audio\"} 1126"), "the last, not the largest");
+}
+
+/// The fleet reads the token one way: `Bearer ` required, the rest trimmed. A bare token is a refusal,
+/// answered like any unknown path.
+#[tokio::test]
+async fn metrics_wants_the_bearer_prefix_and_trims_the_token() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let with = |auth: &'static str| {
+        reqwest::Client::new().get(format!("{base}/metrics")).header("authorization", auth).send()
+    };
+    assert_eq!(with("scrape-me").await.unwrap().status(), 404, "a bare token was accepted");
+    assert_eq!(with("Bearer  scrape-me").await.unwrap().status(), 200, "the token was not trimmed");
+}
+
+/// Every route is a read, so anything but GET/HEAD/OPTIONS is refused before routing — a POST to
+/// /play must not start a download.
+#[tokio::test]
+async fn an_unsafe_method_is_405_before_any_route_runs() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid09", 100);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    for path in ["/play/cachedVid09.mp4", "/health", "/nope"] {
+        let r = reqwest::Client::new().post(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 405, "{path}");
+        assert_eq!(r.headers()["cache-control"], "no-store", "{path}");
+        assert_eq!(r.headers()["allow"], "GET, HEAD, OPTIONS", "{path}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "method_not_allowed", "{path}");
+    }
+}
+
+async fn scrape_metrics(base: &str, token: Option<&str>) -> reqwest::Response {
+    let mut req = reqwest::Client::new().get(format!("{base}/metrics"));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    req.send().await.unwrap()
+}
+
+/// With no METRICS_TOKEN the endpoint does not exist — whatever the caller sends.
+#[tokio::test]
+async fn metrics_is_off_without_a_token() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    assert_eq!(scrape_metrics(&base, None).await.status(), 404);
+    assert_eq!(scrape_metrics(&base, Some("anything")).await.status(), 404);
+}
+
+/// A wrong token is refused exactly as an unknown path is, so a refusal says nothing about whether a
+/// token is configured.
+#[tokio::test]
+async fn metrics_refuses_a_wrong_token_like_a_missing_route() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let wrong = scrape_metrics(&base, Some("scrape-me-not")).await;
+    assert_eq!(wrong.status(), 404);
+    let missing = reqwest::get(format!("{base}/no-such-route")).await.unwrap();
+    assert_eq!(missing.status(), 404);
+    assert_eq!(wrong.text().await.unwrap(), missing.text().await.unwrap());
+    assert_eq!(scrape_metrics(&base, None).await.status(), 404);
+}
+
+/// An unknown path and a refused /metrics answer the same JSON 404 every Den addon gives.
+#[tokio::test]
+async fn a_missing_route_is_the_shared_json_404() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    for r in [reqwest::get(format!("{base}/no-such-route")).await.unwrap(), scrape_metrics(&base, None).await]
+    {
+        assert_eq!(r.status(), 404);
+        assert_eq!(r.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(r.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(r.text().await.unwrap(), r#"{"error":"not_found"}"#);
+    }
+}
+
+/// A preflight is answered on any path, before routing — including one that would otherwise 404.
+#[tokio::test]
+async fn options_is_a_cors_preflight_on_any_path() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    for path in ["/play/cachedVid09.mp4", "/no-such-route"] {
+        let r = client.request(reqwest::Method::OPTIONS, format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 204, "{path}");
+        let h = r.headers();
+        assert_eq!(h.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(h.get("access-control-allow-methods").unwrap(), "GET, HEAD, OPTIONS");
+        assert_eq!(h.get("access-control-allow-headers").unwrap(), "*");
+        assert_eq!(h.get("access-control-max-age").unwrap(), "86400");
+    }
+}
+
+/// CORS is on every response, not just the JSON ones: the video, a plain-text error, the page, and
+/// a 304.
+#[tokio::test]
+async fn every_response_allows_any_origin() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid10", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let acao = |r: &reqwest::Response| r.headers().get("access-control-allow-origin").cloned();
+
+    let play = client.get(format!("{base}/play/cachedVid10.mp4")).send().await.unwrap();
+    assert_eq!(play.status(), 200);
+    assert_eq!(acao(&play).unwrap(), "*");
+    let bad_id = client.get(format!("{base}/play?v=nope")).send().await.unwrap();
+    assert_eq!(bad_id.status(), 400);
+    assert_eq!(acao(&bad_id).unwrap(), "*");
+    let page = client.get(format!("{base}/configure")).send().await.unwrap();
+    assert_eq!(acao(&page).unwrap(), "*");
+    let etag = page.headers().get("etag").unwrap().clone();
+    let revalidated =
+        client.get(format!("{base}/configure")).header("if-none-match", etag).send().await.unwrap();
+    assert_eq!(revalidated.status(), 304);
+    assert_eq!(acao(&revalidated).unwrap(), "*");
+}
+
+/// The request log never shows a config segment: it carries a BYOK key, sealed or not. Our own
+/// routes pass through untouched.
+#[test]
+fn the_request_log_redacts_the_config_segment() {
+    let r = |p: &str| crate::redact_path(p).into_owned();
+    assert_eq!(r("/eyJ0bWRiIjoieCJ9/manifest.json"), "/<config>/manifest.json");
+    assert_eq!(r("/sealed.AbC-_9/meta/movie/tt0111161.json"), "/<config>/meta/movie/tt0111161.json");
+    assert_eq!(r("/sealed.AbC-_9/configure"), "/<config>/configure");
+    assert_eq!(r("/sealed.AbC-_9"), "/<config>");
+    assert_eq!(r("/m/s/eyJpIjoiY2FwIn0"), "/m/s/<cap>");
+    assert_eq!(r("/_internal/validate/m/s/eyJpIjoiY2FwIn0"), "/_internal/validate/m/s/<cap>");
+    for own in ["/", "/health", "/manifest.json", "/meta/movie/tt0111161.json", "/play/abc123DEF01.mp4"] {
+        assert_eq!(r(own), own);
+    }
+}
+
+/// The caller's X-Request-Id ends the line, so it can be matched to the app's own log; a hostile
+/// value is cut down to the safe alphabet and 32 characters, and no header means no `rid`.
+#[test]
+fn the_request_log_carries_the_callers_request_id() {
+    let line = |rid: Option<&str>| {
+        let mut b = hyper::Request::builder().method("GET").uri("/sealed.AbC-_9/manifest.json?s=secret");
+        if let Some(rid) = rid {
+            b = b.header("x-request-id", rid);
+        }
+        let (parts, _) = b.body(()).unwrap().into_parts();
+        crate::request_line(&parts, hyper::StatusCode::OK, std::time::Duration::from_millis(12))
+    };
+    assert_eq!(line(Some("a1B2-c_3")), "GET /<config>/manifest.json 200 12ms rid=a1B2-c_3");
+    assert_eq!(line(None), "GET /<config>/manifest.json 200 12ms");
+    assert_eq!(line(Some("\"; DROP fake=200")), "GET /<config>/manifest.json 200 12ms rid=DROPfake200");
+    assert_eq!(
+        line(Some(&"x".repeat(40))),
+        format!("GET /<config>/manifest.json 200 12ms rid={}", "x".repeat(32))
+    );
+    assert_eq!(line(Some("!!!")), "GET /<config>/manifest.json 200 12ms", "nothing left is no rid");
+}
+
+/// A /sources line says what was asked, so a detail page opening and a press can be told apart, and says nothing a
+/// caller wrote or the signature carried.
+#[test]
+fn the_request_log_says_what_a_sources_ask_was_for() {
+    let line = |uri: &str| {
+        let (parts, _) = hyper::Request::builder().uri(uri).body(()).unwrap().into_parts();
+        crate::request_line(&parts, hyper::StatusCode::OK, std::time::Duration::from_millis(0))
+    };
+    assert_eq!(
+        line("/sources/dQw4w9WgXcQ.json?surface=audible&player=native&intent=warm&s=secrettag&i=install&e=3"),
+        "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=audible player=native intent=warm"
+    );
+    assert_eq!(
+        line("/sources/dQw4w9WgXcQ.json?player=hls.js&surface=silent"),
+        "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=silent player=hls.js"
+    );
+    assert_eq!(
+        line("/sources/dQw4w9WgXcQ.json?surface=x%0Afake%3D1&intent=cold"),
+        "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=? player=?",
+        "an unknown value is not written"
+    );
+    assert_eq!(
+        line("/prepare/movie/tt0111161.json?surface=audible&player=hls.js&intent=warm"),
+        "GET /prepare/movie/tt0111161.json 200 0ms prepare surface=audible player=hls.js intent=warm"
+    );
+    assert_eq!(
+        line("/sealed/prepare/movie/tt0111161.json?surface=audible&player=native&intent=play"),
+        "GET /<config>/prepare/movie/tt0111161.json 200 0ms prepare surface=audible player=native"
+    );
+    assert_eq!(line("/play/dQw4w9WgXcQ.mp4?surface=silent"), "GET /play/dQw4w9WgXcQ.mp4 200 0ms");
+}
+
+/// Off when unset, empty or exactly "0"; on for anything else — the rule every Den addon shares.
+#[test]
+fn log_requests_is_off_only_when_unset_empty_or_zero() {
+    use crate::config::log_requests_on as on;
+    assert!(!on(None));
+    assert!(!on(Some("")));
+    assert!(!on(Some("0")));
+    for v in ["1", "true", "yes", " 0", "00"] {
+        assert!(on(Some(v)), "{v:?} should turn the request log on");
+    }
+}
+
+/// On by default — the opposite default from `LOG_REQUESTS` — and off only for one of the usual
+/// false-y tokens, case-insensitively.
+#[test]
+fn log_identity_is_on_by_default_and_off_only_for_a_falsey_token() {
+    use crate::config::log_identity_on as on;
+    assert!(on(None));
+    assert!(on(Some("")));
+    assert!(on(Some("1")));
+    assert!(on(Some("anything")));
+    for v in ["0", "false", "off", "no", "FALSE", " Off "] {
+        assert!(!on(Some(v)), "{v:?} should turn identity logging off");
+    }
+}
+
+/// yt-dlp's `%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s` print line, parsed for the decision
+/// log — and never fatal to the download it describes when it doesn't parse.
+#[test]
+fn ytdlp_format_info_is_parsed_from_the_print_line() {
+    use crate::ytdlp::parse_format;
+    let f = parse_format("303+140|1080|avc1.640028|mp4a.40.2").expect("a well-formed line");
+    assert_eq!(f.format_id, "303+140");
+    assert_eq!(f.height, Some(1080));
+    assert_eq!(f.vcodec, "avc1.640028");
+    assert_eq!(f.acodec, "mp4a.40.2");
+
+    let muxed = parse_format("18|360|avc1.42001E|mp4a.40.2").expect("itag 18");
+    assert_eq!(muxed.height, Some(360));
+
+    assert!(parse_format("").is_none(), "an empty line has no format to report");
+    assert!(parse_format("|||").is_none(), "an empty format_id has no format to report");
+    assert!(parse_format("not enough fields").is_none());
+}
+
+/// `has_audio` reads yt-dlp's own `"none"` for a video-only format — the common case now that
+/// YouTube answers adaptively — rather than guessing from the ladder.
+#[test]
+fn format_has_audio_reads_acodec_none_as_silent() {
+    use crate::ytdlp::parse_format;
+    assert!(!parse_format("303|1080|avc1.640028|none").unwrap().has_audio());
+    assert!(parse_format("18|360|avc1.42001E|mp4a.40.2").unwrap().has_audio());
+}
+
+/// The decision-log line for a yt-dlp download or cache fill: identity fields (the video id and the
+/// chosen format) appear only with `LOG_IDENTITY` on; everything else is written either way.
+#[test]
+fn ytdlp_cache_line_gates_identity_fields_on_log_identity() {
+    use crate::ytdlp::{cache_line, parse_format};
+    let mut cfg = test_cfg(temp_dir());
+    let format = parse_format("303+140|1080|avc1.640028|mp4a.40.2").unwrap();
+
+    cfg.log_identity = true;
+    let on = cache_line(&cfg, "ytdlp_download", "served", "cache_miss", 1234, "dQw4w9WgXcQ", Some(&format));
+    assert_eq!(
+        on,
+        "event=ytdlp_download outcome=served reason=cache_miss upstream=youtube dur_ms=1234 \
+         vid=dQw4w9WgXcQ format_id=303+140 height=1080 vcodec=avc1.640028 acodec=mp4a.40.2 has_audio=true"
+    );
+
+    cfg.log_identity = false;
+    let off = cache_line(&cfg, "ytdlp_download", "served", "cache_miss", 1234, "dQw4w9WgXcQ", Some(&format));
+    assert_eq!(off, "event=ytdlp_download outcome=served reason=cache_miss upstream=youtube dur_ms=1234");
+    assert!(!off.contains("dQw4w9WgXcQ"), "the video id must not survive LOG_IDENTITY=0");
+    assert!(!off.contains("avc1"), "the chosen format must not survive LOG_IDENTITY=0 either");
+
+    // A cache hit carries no format — nothing was decided — but the video id is still identity.
+    let hit = cache_line(&cfg, "ytdlp_download", "served", "cache_hit", 0, "dQw4w9WgXcQ", None);
+    assert_eq!(hit, "event=ytdlp_download outcome=served reason=cache_hit upstream=youtube dur_ms=0");
+}
+
+/// `/direct`'s resolve-cache decision line, same gating: the video id and the resolved
+/// height/has-audio are identity, the hit/miss verdict and the duration are not.
+#[test]
+fn direct_resolve_cache_line_gates_identity_fields_on_log_identity() {
+    use crate::direct::{resolve_cache_line, Direct};
+    let mut cfg = test_cfg(temp_dir());
+    let resolved = Direct {
+        video: "https://r1.googlevideo.com/v".into(),
+        audio: Some("https://r1.googlevideo.com/a".into()),
+        width: Some(1920),
+        height: Some(1080),
+        hls: None,
+        expires: 0,
+    };
+
+    cfg.log_identity = true;
+    let on = resolve_cache_line(&cfg, "served", "cache_miss", 820, "dQw4w9WgXcQ", Some(&resolved));
+    assert_eq!(
+        on,
+        "event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=820 \
+         vid=dQw4w9WgXcQ height=1080 has_audio=true"
+    );
+
+    cfg.log_identity = false;
+    let off = resolve_cache_line(&cfg, "served", "cache_miss", 820, "dQw4w9WgXcQ", Some(&resolved));
+    assert_eq!(off, "event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=820");
+}
+
+/// The transport decision line (`/direct`, `/hls`): same gating, and a fallback carries its reason
+/// either way, since "hls_drm" is a decision outcome, not a title.
+#[test]
+fn transport_line_gates_only_the_video_id_on_log_identity() {
+    use crate::direct::transport_line;
+    let mut cfg = test_cfg(temp_dir());
+
+    cfg.log_identity = true;
+    let on = transport_line(&cfg, "hls", "fallback", "hls_drm", 42, "dQw4w9WgXcQ");
+    assert_eq!(
+        on,
+        "event=transport transport=hls outcome=fallback reason=hls_drm upstream=youtube dur_ms=42 \
+         vid=dQw4w9WgXcQ"
+    );
+
+    cfg.log_identity = false;
+    let off = transport_line(&cfg, "hls", "fallback", "hls_drm", 42, "dQw4w9WgXcQ");
+    assert_eq!(
+        off,
+        "event=transport transport=hls outcome=fallback reason=hls_drm upstream=youtube dur_ms=42"
+    );
+    assert!(off.contains("reason=hls_drm"), "the fallback reason is not an identity field");
+}
+
+/// /health's verdict is logged when it changes — into degraded with its reason, and back to ok —
+/// not once per failure behind it.
+#[test]
+fn health_is_logged_on_the_way_into_degraded_and_back_out() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    assert_eq!(state.note_health(), None, "an ok instance has nothing to say");
+
+    state.extract_fails.store(crate::HEALTH_FAIL_THRESHOLD, Ordering::Relaxed);
+    let line = state.note_health().expect("the flip to degraded was not logged");
+    assert!(line.contains("extractor_unavailable"), "{line}");
+    state.extract_fails.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(state.note_health(), None, "a further failure is not a change");
+
+    state.extract_fails.store(0, Ordering::Relaxed);
+    assert_eq!(state.note_health().as_deref(), Some("health: ok"));
+    assert_eq!(state.note_health(), None, "staying ok is not a change");
+}
+
+fn server_timing(r: &reqwest::Response) -> String {
+    r.headers().get("server-timing").expect("no Server-Timing").to_str().unwrap().to_string()
+}
+
+/// /meta names what the resolve did — the upstream calls on a miss, the cache on a hit — and the
+/// header always ends with `total`.
+#[tokio::test]
+async fn meta_says_where_its_time_went() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["goodTrailer"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let base = spawn_server(state).await;
+
+    let miss = server_timing(&reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap());
+    assert!(miss.starts_with("tmdb;dur="), "{miss}");
+    assert!(miss.contains(", kinocheck;dur=") && miss.contains(", total;dur="), "{miss}");
+    let hit = server_timing(&reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap());
+    assert!(hit.starts_with("cache;desc=hit, total;dur="), "{hit}");
+}
+
+/// A trailer already on the volume is a cache hit, and `total` is the time to headers.
+#[tokio::test]
+async fn a_cached_play_says_it_was_a_cache_hit() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid11", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::get(format!("{base}/play/cachedVid11.mp4")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let t = server_timing(&r);
+    assert!(t.starts_with("cache;desc=hit, total;dur="), "{t}");
+}
+
+/// The last known trailers served while the lookup fails say so, and so does the cache hit on
+/// them that follows. A fresh answer carries no such header.
+#[tokio::test]
+async fn a_stand_in_meta_answer_says_it_is_degraded() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+    let base = spawn_server(state).await;
+    let degraded =
+        |r: &reqwest::Response| r.headers().get("x-den-degraded").map(|v| v.to_str().unwrap().to_string());
+
+    let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(degraded(&fresh), None, "a fresh answer was marked degraded");
+
+    clock.advance(crate::YT_TTL_MS + 1);
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let stood_in = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(degraded(&stood_in).as_deref(), Some("stale_answer"));
+    let hit = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(degraded(&hit).as_deref(), Some("stale_answer"));
+}
+
+#[test]
+fn classify_maps_geoblock_to_451() {
+    let e = classify(
+        Some(1),
+        "ERROR: [youtube] X: The uploader has not made this video available in your country",
+    );
+    assert_eq!(e.status, 451);
+    assert_eq!(e.reason, "geo_blocked");
+}
+
+#[test]
+fn classify_defaults_to_502() {
+    assert_eq!(classify(Some(1), "some other failure").status, 502);
+}
+
+// --- /health (ADDON-02) ------------------------------------------------------
+
+#[test]
+fn health_reports_degraded_and_ok_states() {
+    // No TMDB key AND no sealed-config keyring → trailers can't work → degraded.
+    assert_eq!(
+        crate::health_body(false, 0, 0, 0, None),
+        json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
+    );
+    // A missing key wins even if upstreams / the extractor are also failing.
+    assert_eq!(crate::health_body(false, 99, 99, 0, None)["reason"], "tmdb_key_missing");
+
+    // Key present but upstreams have been failing (>= threshold) → degraded (wins over the extractor).
+    assert_eq!(
+        crate::health_body(true, 3, 99, 0, None),
+        json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
+    );
+    assert_eq!(crate::health_body(true, 4, 0, 0, None)["reason"], "upstream_unavailable");
+
+    // Upstreams fine but yt-dlp can't extract anything (>= threshold) → degraded (the silent-outage gap).
+    assert_eq!(crate::health_body(true, 0, 3, 0, None)["reason"], json!("extractor_unavailable"));
+    assert_eq!(crate::health_body(true, 0, 2, 0, None), json!({"status": "ok"})); // below threshold → ok
+
+    // Key present, everything below the threshold → ok.
+    assert_eq!(crate::health_body(true, 0, 0, 0, None), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 2, 2, 0, None), json!({"status": "ok"}));
+
+    // A YouTube throttle outranks the extractor counter — "bump yt-dlp" is the wrong advice for it —
+    // and says when it lifts.
+    let throttled = crate::health_body(true, 0, 3, 0, Some(90_500));
+    assert_eq!(throttled["reason"], "youtube_throttled");
+    assert_eq!(throttled["retry_after_s"], 91);
+}
+
+// --- resolve logic ----------------------------------------------------------
+
+#[tokio::test]
+async fn resolve_returns_first_playable_and_caches() {
+    let fake = FakeUpstream::new(&["firstGood11"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+            .await
+            .ids
+            .first()
+            .map(String::as_str),
+        Some("firstGood11")
+    );
+    let after = fake.calls();
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+            .await
+            .ids
+            .first()
+            .map(String::as_str),
+        Some("firstGood11")
+    );
+    assert_eq!(fake.calls(), after, "second lookup is a cache hit (no new upstream calls)");
+}
+
+#[tokio::test]
+async fn resolve_returns_alternates_after_the_primary_for_fallback() {
+    // Best-playable pick first, then the other candidates as unprobed fallbacks (#5 — the client tries
+    // the next one on a playback failure). No extra probing beyond first_playable.
+    let fake = FakeUpstream::new(&["playable1", "playable2"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["playable1".to_string(), "playable2".to_string()]);
+}
+
+#[tokio::test]
+async fn resolve_returns_candidates_in_rank_order_without_probing() {
+    // No resolve-time probe: the TMDB/KinoCheck candidates come back in rank order, unvalidated. A dead /
+    // geo-blocked / portrait pick is the client's problem (it advances to the next), and playability is
+    // validated lazily on /play — so /meta never spawns yt-dlp.
+    let fake = FakeUpstream::new(&["blockedUS01", "worldwide22"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["blockedUS01".to_string(), "worldwide22".to_string()]);
+}
+
+#[tokio::test]
+async fn resolve_empty_only_when_no_candidates_at_all() {
+    // Empty ONLY when TMDB/KinoCheck carry no trailer (and search finds nothing) — never because a
+    // candidate looked unplayable (that check moved to /play).
+    let fake = FakeUpstream::new(&["someCandidate"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["someCandidate".to_string()]);
+}
+
+#[tokio::test]
+async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
+    // TMDB + KinoCheck carry no trailer, but the title is known → search YouTube and return the results
+    // (in search order; no probe — the client picks the first that plays + is landscape).
+    let fake = FakeUpstream::new(&[], None);
+    fake.set_title("Backrooms 2025");
+    let searcher: crate::state::SearchFn =
+        Box::new(|_q| Box::pin(async { Some(vec!["searchOne".into(), "searchTwo".into()]) }));
+    let state =
+        build_state_full(test_cfg(temp_dir()), Box::new(fake), always_playable(), noop_prewarm(), searcher);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["searchOne".to_string(), "searchTwo".to_string()]);
+}
+
+#[tokio::test]
+async fn resolve_no_search_when_title_unknown() {
+    // No candidates AND no title → the search fallback can't build a query → empty, no panic.
+    let fake = FakeUpstream::new(&[], None); // title left None
+    let prober: ProbeFn =
+        Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }));
+    let searcher: crate::state::SearchFn =
+        Box::new(|_q| Box::pin(async { Some(vec!["shouldNotBeUsed".into()]) }));
+    let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await.ids,
+        Vec::<String>::new()
+    );
+}
+
+// (Landscape preference moved off the server: den-reel returns candidates in rank order and the CLIENT
+// advances past a portrait/dead pick — so the old `resolve_prefers_landscape` / `falls_back_to_portrait`
+// probe tests are gone. `parse_landscape` is still exercised below since the prober helper retains it.)
+
+#[test]
+fn parse_landscape_reads_dims_and_defaults_safely() {
+    use crate::ytdlp::parse_landscape;
+    assert!(parse_landscape("1920 1080"), "wide → landscape");
+    assert!(parse_landscape("1080 1080"), "square counts as landscape (not a sliver)");
+    assert!(!parse_landscape("1080 1920"), "tall → portrait");
+    assert!(parse_landscape("NA NA"), "unknown dims default to landscape (don't skip)");
+    assert!(parse_landscape(""), "empty output defaults to landscape");
+}
+
+// --- HTTP contract ----------------------------------------------------------
+
+#[tokio::test]
+async fn get_manifest_returns_addon_manifest() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let body: Value = reqwest::get(format!("{base}/manifest.json")).await.unwrap().json().await.unwrap();
+    assert_eq!(body["id"], "com.den.reel");
+    assert_eq!(body["resources"][0], "meta");
+    assert!(body.get("denInstallId").is_none(), "the config-less manifest names no install");
+    assert_eq!(body["denAttribution"][0]["link"], "KinoCheck");
+}
+
+/// A configured install's manifest names its install id — the value to put in REVOKED_INSTALLS —
+/// and is otherwise the same manifest.
+#[tokio::test]
+async fn a_configured_manifest_carries_its_install_id() {
+    let base = spawn_server(revoking_state("", "0")).await;
+    let get = |path: String| async move { reqwest::get(path).await.unwrap().json::<Value>().await.unwrap() };
+    let bare = get(format!("{base}/manifest.json")).await;
+
+    let with = get(format!(
+        "{base}/{}/manifest.json",
+        plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}"}}"#))
+    ))
+    .await;
+    assert_eq!(with["denInstallId"], IID);
+    let mut rest = with.clone();
+    rest.as_object_mut().unwrap().remove("denInstallId");
+    assert_eq!(rest, bare, "the rest of the manifest changed");
+
+    let without = get(format!("{base}/{}/manifest.json", plain_segment(r#"{"tmdbKey":"k"}"#))).await;
+    assert!(without.get("denInstallId").is_none(), "a config without an install id names none: {without}");
+    assert_eq!(without, bare);
+}
+
+#[tokio::test]
+async fn get_meta_rejects_non_imdb_with_no_upstream_call() {
+    let fake = FakeUpstream::new(&["should-not-be-used"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let body: Value =
+        reqwest::get(format!("{base}/meta/movie/not-an-id.json")).await.unwrap().json().await.unwrap();
+    assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 0);
+    assert_eq!(fake.calls(), 0, "no upstream call for a non-imdb id");
+}
+
+#[tokio::test]
+async fn get_meta_resolves_imdb_to_play_url_on_request_host() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let body: Value = reqwest::Client::new()
+        .get(format!("{base}/meta/movie/tt0111161.json"))
+        .header("x-forwarded-host", "trailers.example.com")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
+}
+
+#[tokio::test]
+async fn get_meta_caches_success_not_empty() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let base = spawn_server(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    let ok = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
+    assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("s-maxage=86400"));
+
+    state.yt_cache.lock().unwrap().clear();
+    fake.set_tmdb(&[]); // no trailer → empty links → no-store (client re-checks, doesn't cache a miss)
+    let empty = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
+    assert_eq!(empty.headers().get("cache-control").unwrap(), "no-store");
+    assert!(empty.headers().get("cache-tag").is_none(), "only what a shared cache keeps is tagged");
+    let body: Value = empty.json().await.unwrap();
+    assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn prewarm_default_but_not_when_opted_out() {
+    let warmed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let rec = warmed.clone();
+    let prewarm: PrewarmFn = Box::new(move |_state, id| rec.lock().unwrap().push(id));
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), prewarm);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    client.get(format!("{base}/meta/movie/tt0111161.json?prewarm=0")).send().await.unwrap();
+    assert!(warmed.lock().unwrap().is_empty(), "prewarm should be skipped");
+
+    client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
+    assert_eq!(*warmed.lock().unwrap(), vec!["vidKey12345".to_string()], "default should prewarm");
+}
+
+// --- sealed config-in-URL (den-scout/docs/SEALED-CONFIG.md) -----------------
+
+// The fixed vector key + a PyNaCl-sealed {tmdbKey,kinocheckKey} segment (same key the seal/userconfig
+// unit tests use), driven through the real router so the config-scoped routes are proven end-to-end.
+const VEC_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+const VEC_PUB: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8=";
+const SEALED_SEG: &str = "Abo-qmntVxuOmeVa0Q5pPWju0VrZDS4aRoAP-0JHNtk7nmMcduhttWlvldwvUdXPafUGUegc4ul5J3gFVo8nEGOd8htc7he_3BihPsWtiuA5_2Du-FL5NpaNzfvqhDAHM_LAjw";
+
+/// Build a state with the sealed-config keyring enabled and NO env TMDB key — so a resolved trailer
+/// can only come from the per-install (sealed) config path.
+fn sealed_state(fake: FakeUpstream) -> Arc<AppState> {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_key = None; // prove the URL config supplies the key, not the env
+    cfg.config_key = VEC_PRIV.into();
+    build_state_cfg(cfg, Box::new(fake), always_playable(), noop_prewarm())
+}
+
+#[tokio::test]
+async fn config_key_serves_pubkey_when_keyring_set() {
+    let base = spawn_server(sealed_state(FakeUpstream::new(&[], None))).await;
+    let r = reqwest::get(format!("{base}/config-key")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["key"], VEC_PUB);
+}
+
+#[tokio::test]
+async fn config_key_404s_when_sealing_disabled() {
+    // Default test state has no CONFIG_KEY → sealing disabled.
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    assert_eq!(reqwest::get(format!("{base}/config-key")).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn sealed_config_url_resolves_manifest_and_meta() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let base = spawn_server(sealed_state(fake)).await;
+    let client = reqwest::Client::new();
+
+    // The pasted install URL.
+    let manifest = client.get(format!("{base}/{SEALED_SEG}/manifest.json")).send().await.unwrap();
+    assert_eq!(manifest.status(), 200);
+    // The path carries the sealed key: no shared cache may keep either answer.
+    let cc = |r: &reqwest::Response| r.headers()["cache-control"].to_str().unwrap().to_string();
+    assert!(cc(&manifest).starts_with("private,"), "{}", cc(&manifest));
+
+    // Stremio then derives /<config>/meta/... — resolves the trailer using the sealed BYOK TMDB key.
+    let meta = client
+        .get(format!("{base}/{SEALED_SEG}/meta/movie/tt0111161.json"))
+        .header("x-forwarded-host", "trailers.example.com")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .unwrap();
+    assert!(cc(&meta).starts_with("private,"), "{}", cc(&meta));
+    let body: Value = meta.json().await.unwrap();
+    assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
+}
+
+#[tokio::test]
+async fn a_bad_config_segment_fails_closed() {
+    let base = spawn_server(sealed_state(FakeUpstream::new(&["x"], None))).await;
+    let client = reqwest::Client::new();
+    // Garbage where a config belongs → 400, never a silent env-key fallback under a config-shaped URL.
+    let bad = client.get(format!("{base}/not-a-valid-config/manifest.json")).send().await.unwrap();
+    assert_eq!(bad.status(), 400);
+    let body: Value = bad.json().await.unwrap();
+    assert_eq!(body["error"], "bad_config");
+}
+
+// Issue #8 R3: an install id as /configure mints it (bytes 0..16).
+const IID: &str = "AAECAwQFBgcICQoLDA0ODw";
+
+fn plain_segment(json: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+/// A state refusing the installs in `revoked` and every link stamped below `epoch`.
+fn revoking_state(revoked: &str, epoch: &str) -> Arc<AppState> {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.revocation = crate::userconfig::Revocation::from_env(revoked, Some(epoch));
+    build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["vidKey12345"], None)),
+        always_playable(),
+        noop_prewarm(),
+    )
+}
+
+/// Both config-scoped routes refuse a revoked install, with exactly the answer an undecodable segment
+/// gets. `/play` and `/crop` carry no config — a play URL names a video, not an install — so there is
+/// nothing on them for a revocation to reach.
+#[tokio::test]
+async fn a_revoked_install_is_refused_on_every_config_route() {
+    let seg = plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}"}}"#));
+    let base = spawn_server(revoking_state(IID, "0")).await;
+    for route in ["manifest.json", "meta/movie/tt0111161.json", "meta/series/tt0944947.json"] {
+        let revoked = reqwest::get(format!("{base}/{seg}/{route}")).await.unwrap();
+        let garbage = reqwest::get(format!("{base}/not-a-valid-config/{route}")).await.unwrap();
+        assert_eq!(revoked.status(), 400, "{route}");
+        assert_eq!(garbage.status(), 400, "{route}");
+        let body: Value = revoked.json().await.unwrap();
+        assert_eq!(body, json!({"error": "bad_config"}), "{route}");
+        assert_eq!(body, garbage.json::<Value>().await.unwrap(), "{route}");
+    }
+    // The same install, not revoked, is served.
+    let base = spawn_server(revoking_state("", "0")).await;
+    assert_eq!(reqwest::get(format!("{base}/{seg}/manifest.json")).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn an_install_stamped_below_config_epoch_is_refused() {
+    let base = spawn_server(revoking_state("", "2")).await;
+    for (json, want) in [
+        (r#"{"tmdbKey":"k","ep":1}"#, 400u16),
+        (r#"{"tmdbKey":"k"}"#, 400), // no epoch reads as 0
+        (r#"{"tmdbKey":"k","ep":2}"#, 200),
+        (r#"{"tmdbKey":"k","ep":3}"#, 200),
+    ] {
+        let r = reqwest::get(format!("{base}/{}/manifest.json", plain_segment(json))).await.unwrap();
+        assert_eq!(r.status(), want, "{json}");
+    }
+}
+
+/// Links built before install ids existed carry neither field, and keep working until an epoch is
+/// raised.
+#[tokio::test]
+async fn a_config_without_an_install_id_works_at_epoch_zero() {
+    let base = spawn_server(revoking_state(IID, "0")).await;
+    let r =
+        reqwest::get(format!("{base}/{}/manifest.json", plain_segment(r#"{"tmdbKey":"k"}"#))).await.unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// /configure stamps the epoch into every link, sealed or not, so both answers carry it.
+#[tokio::test]
+async fn config_key_carries_the_config_epoch() {
+    for (key, want) in [(VEC_PRIV, 200u16), ("", 404)] {
+        let mut cfg = test_cfg(temp_dir());
+        cfg.config_key = key.into();
+        cfg.revocation = crate::userconfig::Revocation::from_env("", Some("4"));
+        let state =
+            build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+        let r = reqwest::get(format!("{}/config-key", spawn_server(state).await)).await.unwrap();
+        assert_eq!(r.status(), want);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["epoch"], 4, "{body}");
+    }
+}
+
+/// Every link the page builds names its install and the epoch it was minted in, and both are inside
+/// what gets sealed.
+#[tokio::test]
+async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let page =
+        reqwest::get(format!("{}/configure", spawn_server(state).await)).await.unwrap().text().await.unwrap();
+    assert!(page.contains("crypto.getRandomValues(bytes)"), "the install id is not minted from the CSPRNG");
+    assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
+    assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
+    assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
+    assert!(page.contains(r#"<code id="iid"></code>"#), "the page has nowhere to show the install id");
+    assert!(page.contains("iidEl.textContent = install.iid"), "the built link's install id is not shown");
+    assert!(page.contains("REVOKED_INSTALLS</code> to revoke just this link"), "the id is not explained");
+}
+
+#[tokio::test]
+async fn a_plaintext_config_is_refused_while_sealing_is_on() {
+    // Every install /configure issues is sealed once a key is set, and /config-key is public: a plaintext
+    // segment is one anyone could have minted.
+    use base64::Engine;
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let base = spawn_server(sealed_state(fake)).await;
+    let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"tmdbKey":"plain"}"#);
+    let resp = reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"error": "bad_config"}));
+}
+
+// --- /play serve contract (seed a cached file so fetch_trailer never spawns yt-dlp) ---
+
+fn seed_cache(dir: &std::path::Path, vid: &str, size: usize) -> usize {
+    std::fs::write(dir.join(format!("{vid}.mp4")), vec![7u8; size]).unwrap();
+    size
+}
+
+#[tokio::test]
+async fn play_cached_no_range_is_200_with_length_and_ranges() {
+    let dir = temp_dir();
+    let size = seed_cache(&dir, "cachedVid01", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::get(format!("{base}/play/cachedVid01.mp4")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers().get("content-length").unwrap(), &size.to_string());
+    assert_eq!(r.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(r.headers().get("content-type").unwrap(), "video/mp4");
+}
+
+#[tokio::test]
+async fn play_with_range_is_206() {
+    let dir = temp_dir();
+    let size = seed_cache(&dir, "cachedVid02", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::Client::new()
+        .get(format!("{base}/play/cachedVid02.mp4"))
+        .header("range", "bytes=0-99")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.headers().get("content-range").unwrap(), &format!("bytes 0-99/{size}"));
+    assert_eq!(r.headers().get("content-length").unwrap(), "100");
+    assert_eq!(r.headers().get("accept-ranges").unwrap(), "bytes");
+}
+
+/// A plain GET revalidating a cached trailer gets a 304, not the whole file again — but a Range
+/// request carrying the same validator still gets its bytes, or a player seek would read nothing.
+#[tokio::test]
+async fn play_revalidation_is_304_but_a_range_still_gets_its_bytes() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid03", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/play/cachedVid03.mp4");
+    let etag = client.get(&url).send().await.unwrap().headers().get("etag").unwrap().clone();
+
+    let again = client.get(&url).header("if-none-match", etag.clone()).send().await.unwrap();
+    assert_eq!(again.status(), 304);
+    assert_eq!(again.headers().get("etag").unwrap(), &etag);
+    assert!(again.headers().get("cache-control").unwrap().to_str().unwrap().contains("immutable"));
+    assert!(again.bytes().await.unwrap().is_empty());
+
+    let ranged =
+        client.get(&url).header("if-none-match", etag).header("range", "bytes=0-99").send().await.unwrap();
+    assert_eq!(ranged.status(), 206);
+    assert_eq!(ranged.bytes().await.unwrap().len(), 100);
+}
+
+/// Eviction and a fresh download put different bytes at the same path, often at the same size. The
+/// validators must tell the two files apart, and a Range resumed against the old one must get the new
+/// file whole rather than a splice of both.
+#[tokio::test]
+async fn a_trailer_fetched_again_is_a_new_file_even_at_the_same_size() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid04", 4096);
+    let state =
+        build_state(dir.clone(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/play/cachedVid04.mp4");
+
+    let first = client.get(&url).send().await.unwrap();
+    assert_eq!(first.headers()["cache-control"], "private, max-age=604800, immutable");
+    let (old_etag, old_date) = (first.headers()["etag"].clone(), first.headers()["last-modified"].clone());
+
+    // Against the file it was read from, a resume gets its range, by tag or by date.
+    for validator in [&old_etag, &old_date] {
+        let resumed = client
+            .get(&url)
+            .header("range", "bytes=100-")
+            .header("if-range", validator)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), 206, "{validator:?}");
+    }
+    // A weak tag never holds a range.
+    let weak = format!("W/{}", old_etag.to_str().unwrap());
+    let r = client.get(&url).header("range", "bytes=100-").header("if-range", weak).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Evicted and downloaded again: same path and size, other bytes, a later write.
+    let fp = dir.join("cachedVid04.mp4");
+    std::fs::write(&fp, vec![9u8; 4096]).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::open(&fp).unwrap().set_times(std::fs::FileTimes::new().set_modified(later)).unwrap();
+
+    let second = client.get(&url).send().await.unwrap();
+    assert_ne!(second.headers()["etag"], old_etag, "the new file kept the old file's tag");
+    assert_ne!(second.headers()["last-modified"], old_date, "the new file kept the old file's date");
+    for validator in [&old_etag, &old_date] {
+        let resumed = client
+            .get(&url)
+            .header("range", "bytes=100-")
+            .header("if-range", validator)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), 200, "a resume against the old file got a range of the new one");
+        assert_eq!(resumed.bytes().await.unwrap().len(), 4096);
+    }
+
+    // A revalidation by date alone collapses to a 304 that keeps both validators.
+    let date = second.headers()["last-modified"].clone();
+    let again = client.get(&url).header("if-modified-since", date.clone()).send().await.unwrap();
+    assert_eq!(again.status(), 304);
+    assert_eq!(again.headers()["last-modified"], date);
+    assert_eq!(again.headers()["etag"], second.headers()["etag"]);
+    // ...and a stale tag beside it still means the body: If-None-Match wins.
+    let stale = client
+        .get(&url)
+        .header("if-none-match", old_etag)
+        .header("if-modified-since", date)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 200);
+}
+
+// --- cropdetect parsing ---
+
+#[test]
+fn typical_crop_takes_the_modal_box_not_the_union() {
+    // With reset=1 cropdetect prints one box per keyframe. Most keyframes are a clean 1920x816
+    // letterbox; two "logo card" frames read taller. The UNION (old behaviour) would keep the taller
+    // box and leave the bar in; the median keeps the letterbox → the transient logo is cropped away.
+    let stderr = "\
+[cropdetect] crop=1920:816:0:132\n\
+[cropdetect] crop=1920:816:0:132\n\
+[cropdetect] crop=1920:1060:0:20\n\
+[cropdetect] crop=1920:816:0:132\n\
+[cropdetect] crop=1920:1060:0:20\n\
+[cropdetect] crop=1920:816:0:132\n";
+    let boxes = crate::crop::parse_all_crops(stderr);
+    assert_eq!(boxes.len(), 6);
+    assert_eq!(
+        crate::crop::typical_crop(&boxes),
+        Some(crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 })
+    );
+}
+
+#[test]
+fn refine_snaps_transient_logo_and_guards_dark_frames() {
+    use crate::crop::{refine_report, report_from, RawCrop};
+    let src = Some((1920, 1080));
+
+    // Already-clean 2.35 letterbox (816): snapping to 2.35 lands on 817 — within the keep-px slop, so
+    // the measured box is left untouched (no 1px jitter).
+    let clean = refine_report(report_from("x", src, RawCrop { w: 1920, h: 816, x: 0, y: 132 }));
+    assert_eq!(clean.content.as_ref().map(|c| (c.w, c.h, c.x, c.y)), Some((1920, 816, 0, 132)));
+    assert!(clean.letterboxed);
+
+    // A logo-inflated box (840, ~2.29:1) is within tolerance of 2.35 and >keep-px off → snapped to a
+    // clean, centred scope crop (1920x817), cropping the logo strip out of the bar.
+    let inflated = refine_report(report_from("x", src, RawCrop { w: 1920, h: 840, x: 0, y: 120 }));
+    assert_eq!(inflated.content.as_ref().map(|c| (c.w, c.h, c.x, c.y)), Some((1920, 817, 0, 131)));
+
+    // A pathological dark-frame box (500px, ~3.84:1 — no standard match, below the 60% floor) is
+    // treated as unsure → not cropped (play the full frame) rather than shave real content.
+    let dark = refine_report(report_from("x", src, RawCrop { w: 1920, h: 500, x: 0, y: 290 }));
+    assert!(!dark.letterboxed);
+    assert_eq!(dark.content.as_ref().map(|c| c.h), Some(1080));
+
+    // A mild non-standard letterbox (738px, ~2.6:1 — no snap, but above the floor) is kept as measured.
+    let mild = refine_report(report_from("x", src, RawCrop { w: 1920, h: 738, x: 0, y: 171 }));
+    assert_eq!(mild.content.as_ref().map(|c| c.h), Some(738));
+    assert!(mild.letterboxed);
+}
+
+#[test]
+fn full_frame_guard_spares_mixed_framing_trailers() {
+    use crate::crop::{uses_full_frame, RawCrop};
+    let src = Some((640u32, 360u32));
+    let lb = RawCrop { w: 640, h: 272, x: 0, y: 44 }; // 2.35 letterbox
+    let full = RawCrop { w: 640, h: 360, x: 0, y: 0 }; // full frame
+
+    // Monsters-vs-Aliens shape: dominant 2.35 letterbox + a few genuine full-frame shots → guard fires,
+    // so the caller keeps the full frame instead of slicing those shots (the v0.3.0 regression).
+    let mut mixed = vec![lb; 60];
+    mixed.extend([full; 3]);
+    mixed.extend([RawCrop { w: 578, h: 272, x: 0, y: 44 }; 2]);
+    assert!(uses_full_frame(&mixed, src), "3 full-frame shots among a letterbox → don't crop");
+
+    // A cleanly letterboxed trailer (no full-frame keyframes) is not spared → it still gets cropped.
+    assert!(!uses_full_frame(&vec![lb; 60], src));
+
+    // A single stray full-frame flash on an otherwise-clean letterbox is below the floor → still crops.
+    let mut flash = vec![lb; 60];
+    flash.push(full);
+    assert!(!uses_full_frame(&flash, src), "one flash shouldn't suppress the crop");
+}
+
+#[test]
+fn refine_plays_full_frame_for_portrait_and_pillarbox() {
+    use crate::crop::{refine_report, report_from, RawCrop};
+
+    // Portrait source (landscape clip padded into a 720x1280 frame): the huge top/bottom padding is NOT
+    // a cinematic letterbox — cropping it to a thin strip is what broke the billboard. Must play full.
+    let portrait =
+        refine_report(report_from("x", Some((720, 1280)), RawCrop { w: 640, h: 404, x: 40, y: 438 }));
+    assert!(!portrait.letterboxed, "a portrait source must not be letterbox-cropped");
+    assert_eq!(portrait.content.as_ref().map(|c| (c.w, c.h)), Some((720, 1280)));
+
+    // Pillarbox (side bars, not top/bottom) → not our job → full frame.
+    let pillar =
+        refine_report(report_from("x", Some((1920, 1080)), RawCrop { w: 1200, h: 1080, x: 360, y: 0 }));
+    assert!(!pillar.letterboxed);
+    assert_eq!(pillar.content.as_ref().map(|c| c.w), Some(1920));
+
+    // Kept letterboxes are always emitted centred + full-width, so the baked clap is symmetric/valid.
+    let kept = refine_report(report_from("x", Some((1920, 1080)), RawCrop { w: 1918, h: 804, x: 1, y: 138 }));
+    assert_eq!(kept.content.as_ref().map(|c| (c.x, c.w)), Some((0, 1920)), "normalised to full width");
+    assert_eq!(kept.content.as_ref().map(|c| c.y), Some((1080 - 804) / 2), "centred vertically");
+}
+
+#[test]
+fn parse_source_dims_reads_the_video_stream_line() {
+    let stderr = "  Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 24 fps";
+    assert_eq!(crate::crop::parse_source_dims(stderr), Some((1920, 1080)));
+}
+
+#[test]
+fn report_flags_letterbox_but_not_pixel_noise() {
+    // 1080 → 816 content = 264px bars (~24%) → letterboxed, ~2.35 aspect.
+    let boxed = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
+    );
+    assert!(boxed.letterboxed);
+    assert_eq!(boxed.aspect, Some(2.35));
+    // 1080 → 1072 content = 8px (<2%) → treated as noise, not letterboxed.
+    let noise = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 1072, x: 0, y: 4 },
+    );
+    assert!(!noise.letterboxed);
+}
+
+// Exercises the real detect()+bake_clap() path against ffmpeg + MP4Box. Kept out of CI (which has
+// neither). Run locally with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn clap_pipeline_bakes_box_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("clapvid0001.mp4");
+    // 1920x1080 with a 1920x816 testsrc content region and 132px black bars top/bottom.
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=1920x816:rate=24:d=2",
+            "-vf",
+            "pad=1920:1080:0:132:color=black",
+            "-c:v",
+            "libx264",
+            "-g",
+            "6",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&fp)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "ffmpeg failed to build the letterbox fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "clapvid0001", &fp).await.expect("detect returned a rect");
+    assert!(report.letterboxed, "132px bars should read as letterboxed");
+    assert_eq!(report.content.as_ref().unwrap().h, 816);
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Baked,
+        "MP4Box should write the clap box"
+    );
+
+    // ffprobe reads the clap back as frame cropping — 132px top & bottom.
+    let out = std::process::Command::new("ffprobe")
+        .args(["-hide_banner", "-v", "error", "-show_streams"])
+        .arg(&fp)
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
+}
+
+// Proves the modal detection crops a TRANSIENT logo card out of the bar — not just a clean letterbox.
+// A union over all frames would keep the bar; the median shouldn't. Needs ffmpeg + MP4Box; run locally
+// with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn clap_pipeline_crops_transient_logo_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("logovid0001.mp4");
+    // 4s of a 1920x816 letterbox padded to 1080, with a bright "logo" box drawn in the TOP black bar
+    // for the last second only (a minority of keyframes).
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-f", "lavfi", "-i", "testsrc=size=1920x816:rate=24:d=4",
+            "-vf",
+            "pad=1920:1080:0:132:color=black,drawbox=x=40:y=20:w=420:h=90:color=white:t=fill:enable='between(t,3,4)'",
+            "-c:v", "libx264", "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ])
+        .arg(&fp)
+        .status().unwrap().success();
+    assert!(ok, "ffmpeg failed to build the transient-logo fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "logovid0001", &fp).await.expect("detect returned a rect");
+    assert!(report.letterboxed, "the dominant frame is a 132px letterbox");
+    // The logo appears in a minority of keyframes, so the typical box is still the 816 letterbox and
+    // the logo is cropped away — a union would have reported a taller box here and kept the bar.
+    assert_eq!(report.content.as_ref().unwrap().h, 816, "a transient logo must not hold the bar open");
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Baked,
+        "MP4Box should write the clap box"
+    );
+
+    let out = std::process::Command::new("ffprobe")
+        .args(["-hide_banner", "-v", "error", "-show_streams"])
+        .arg(&fp)
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
+}
+
+// A mixed-framing trailer (mostly letterboxed + genuine full-frame shots) must NOT be cropped — the
+// full-frame guard keeps the whole frame rather than slicing those shots. Reproduces the real
+// Monsters-vs-Aliens regression. Needs ffmpeg; run locally with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn detect_does_not_crop_mixed_framing_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("mixedvid0001.mp4");
+    // 6s of a full-frame testsrc with 131px black bars painted top+bottom (a 2.35 letterbox) — EXCEPT
+    // the last ~1.2s, which is left full-frame (genuine full-frame shots).
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=24:d=6",
+            "-vf",
+            "drawbox=x=0:y=0:w=1920:h=131:color=black:t=fill:enable='lt(t,4.8)',drawbox=x=0:y=949:w=1920:h=131:color=black:t=fill:enable='lt(t,4.8)'",
+            "-c:v", "libx264", "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ])
+        .arg(&fp)
+        .status().unwrap().success();
+    assert!(ok, "ffmpeg failed to build the mixed-framing fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "mixedvid0001", &fp).await.expect("detect returned a report");
+    // The dominant framing is the 2.35 letterbox, but real full-frame shots are present → play full.
+    assert!(!report.letterboxed, "a trailer with genuine full-frame shots must not be cropped");
+    assert_eq!(report.content.as_ref().unwrap().h, 1080, "full frame kept, not sliced to the letterbox");
+    // And nothing is baked, so an AVPlayer sees the full frame.
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "no clap baked for a full-frame report"
+    );
+}
+
+// A PORTRAIT trailer (landscape clip padded into a tall frame) must NOT be letterbox-cropped — that
+// baked a clap that broke the billboard. detect() should report full-frame and bake nothing. Needs
+// ffmpeg + MP4Box; run locally with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn detect_does_not_crop_portrait_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("portrait0001.mp4");
+    // A 720x404 landscape testsrc padded into a 720x1280 portrait frame (huge top/bottom padding).
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=720x404:rate=24:d=3",
+            "-vf",
+            "pad=720:1280:0:438:color=black",
+            "-c:v",
+            "libx264",
+            "-g",
+            "6",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(&fp)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "ffmpeg failed to build the portrait fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "portrait0001", &fp).await.expect("detect returned a report");
+    assert!(!report.letterboxed, "a portrait source must not be letterbox-cropped");
+    assert_eq!(report.content.as_ref().unwrap().h, 1280, "full portrait frame kept, not a thin strip");
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "no clap baked for a portrait trailer"
+    );
+}
+
+#[tokio::test]
+async fn cache_available_reflects_dir_usability() {
+    let dir = temp_dir();
+    let cfg_ok = test_cfg(dir.clone());
+    assert!(crate::play::cache_available(&cfg_ok).await, "a normal temp dir is usable");
+
+    // Point cache_dir under a regular file so create_dir_all fails (ENOTDIR) → unavailable.
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let mut cfg_bad = test_cfg(dir);
+    cfg_bad.cache_dir = file.join("cache");
+    cfg_bad.ytdlp_cache = cfg_bad.cache_dir.join("yt-dlp");
+    assert!(!crate::play::cache_available(&cfg_bad).await, "cache under a file is unusable");
+
+    // A positive answer is memoised for a few seconds — `tokio::fs` is spawn_blocking underneath, so
+    // asking per request cost two dispatches to the blocking pool ahead of every cache hit. A
+    // FAILURE is never memoised, or a volume coming back would have to wait out a TTL first.
+    assert!(!crate::play::cache_available(&cfg_bad).await, "a failure was remembered as an answer");
+    assert!(crate::play::cache_available(&cfg_ok).await, "a working volume must still be usable");
+}
+
+#[tokio::test]
+async fn error_responses_are_no_store_json() {
+    use http_body_util::BodyExt;
+    let e = crate::httputil::error(hyper::StatusCode::SERVICE_UNAVAILABLE, "cache_unavailable", "x");
+    assert_eq!(e.headers().get("cache-control").unwrap(), "no-store");
+    assert_eq!(e.headers().get("content-type").unwrap(), "application/json");
+    let body: serde_json::Value =
+        serde_json::from_slice(&e.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body, json!({"error": "cache_unavailable", "detail": "x"}));
+    // The 404 too.
+    let t = crate::httputil::not_found();
+    assert_eq!(t.headers().get("cache-control").unwrap(), "no-store");
+}
+
+/// A malformed id was a plain-text 400; it is the same JSON shape as every other refusal now.
+#[tokio::test]
+async fn a_bad_video_id_is_a_json_400() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::get(format!("{base}/play?v=short")).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"], "bad_video_id");
+}
+
+#[test]
+fn clap_params_are_center_relative() {
+    // Symmetric 2.35 letterbox → offsets 0 (content centre == frame centre).
+    let centered = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
+    );
+    assert_eq!(crate::crop::clap_params(&centered), Some((1920, 816, 0, 0)));
+
+    // Logo kept in the bottom bar → content off-centre downward → positive vertOff (num over 2).
+    let off = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 922, x: 0, y: 132 },
+    );
+    assert_eq!(crate::crop::clap_params(&off), Some((1920, 922, 0, 106))); // 106/2 = 53px
+
+    // Not letterboxed → nothing to bake.
+    let full = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 1080, x: 0, y: 0 },
+    );
+    assert_eq!(crate::crop::clap_params(&full), None);
+}
+
+#[test]
+fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("aaaaaaaaaa1.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join(".bbbbbb.123.0.partial.mp4"), vec![0u8; 100]).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    // Scratch counts toward the cap but is not evictable, so leave a budget above it — a cap at or
+    // below the scratch means evicting trailers cannot help, which is the case below.
+    cfg.cache_max_bytes = 150;
+    crate::play::evict_if_needed(&cfg);
+    assert!(!dir.join("aaaaaaaaaa1.mp4").exists(), "completed file should be evicted");
+    assert!(
+        dir.join(".bbbbbb.123.0.partial.mp4").exists(),
+        "in-progress .partial temp must be skipped by eviction"
+    );
+}
+
+/// `valid_lang` accepts either case by design, but everything downstream is case-sensitive: the
+/// resolve cache keys on the raw string, and KinoCheck's language pick is a `starts_with("de")`.
+/// So "DE" got its own cache entry AND silently fell back to English trailers.
+#[tokio::test]
+async fn an_uppercase_language_is_the_same_language() {
+    let fake = FakeUpstream::new(&["dQw4w9WgXcQ"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let headers = hyper::header::HeaderMap::new();
+
+    let _ = crate::addon::handle_meta(&state, &headers, None, "movie", "tt0111161", "lang=de").await;
+    let after_lower = fake.calls();
+    let _ = crate::addon::handle_meta(&state, &headers, None, "movie", "tt0111161", "lang=DE").await;
+    assert_eq!(
+        fake.calls(),
+        after_lower,
+        "\"DE\" resolved separately from \"de\" instead of hitting the same cache entry"
+    );
+}
+
+/// Repeat /meta for ONE title is the common burst — a re-rendered detail screen, a retry, two
+/// installs on the same film. Those all de-dupe onto a single download, so spending a permit each
+/// let three of them exhaust the cap and lock every other title out until that download finished.
+#[tokio::test]
+async fn duplicates_of_one_title_do_not_spend_the_prewarm_cap() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let slow = dir.join("slow-ytdlp");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = slow.to_string_lossy().into_owned();
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        crate::state::default_prewarm(),
+    );
+
+    // The same title, over and over.
+    for _ in 0..10 {
+        (state.prewarm)(state.clone(), "sameVid0001".to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // A different title must still be able to start.
+    (state.prewarm)(state.clone(), "otherVid002".to_string());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let running: Vec<String> = state.in_flight.lock().unwrap().keys().cloned().collect();
+    assert!(
+        running.iter().any(|k| k == "otherVid002"),
+        "duplicates of one title locked the cap; in flight: {running:?}"
+    );
+}
+
+/// PREWARM_MAX was a check-then-act count of `in_flight`, but that map is only written after
+/// `fetch_trailer`'s first await — so a browse burst all read the same stale count and all spawned,
+/// queueing speculative downloads ahead of the /play the viewer is actually waiting for.
+#[tokio::test]
+async fn a_browse_burst_cannot_outrun_the_prewarm_cap() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    // A yt-dlp that just blocks, so a started prewarm stays started and the count is observable.
+    let slow = dir.join("slow-ytdlp");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = slow.to_string_lossy().into_owned();
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        crate::state::default_prewarm(),
+    );
+
+    // Fire far more than the cap in one go, exactly as a shelf of /meta calls would.
+    for i in 0..20 {
+        (state.prewarm)(state.clone(), format!("vid{i:0>8}"));
+    }
+    // Let every spawned task get past its first await, which is where it registers itself.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let started = state.in_flight.lock().unwrap().len();
+    assert!(
+        started <= crate::PREWARM_MAX,
+        "{started} prewarms running against a cap of {}",
+        crate::PREWARM_MAX
+    );
+}
+
+/// An `unknown` crop means ffmpeg failed or the file was not there — a transient condition its own
+/// doc says "a later call retries". It was served with the same year-long `immutable` as a real
+/// rect, so one hiccup cost that trailer its de-letterboxing until the client cleared its cache.
+#[tokio::test]
+async fn an_unknown_crop_is_not_cached_by_the_client() {
+    let dir = temp_dir();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = "/nonexistent/yt-dlp".into(); // nothing cached, and the download cannot start
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+
+    let cc_of = |r: hyper::Response<crate::httputil::Body>| {
+        r.headers().get("cache-control").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+    };
+
+    let resp = crate::crop::handle_crop(state.clone(), "dQw4w9WgXcQ".into()).await;
+    assert_eq!(resp.status(), hyper::StatusCode::OK, "an unknown crop still answers 200");
+    let cc = cc_of(resp);
+    assert!(!cc.contains("immutable"), "an unknown crop was cached as if it were a real rect: {cc}");
+
+    // A detected rect still caches, for a week and with a validator — but not `immutable`: it
+    // describes the cached MP4, and after eviction the same id is a new download.
+    let known = crate::crop::refine_report(crate::crop::report_from(
+        "dQw4w9WgXcQ",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
+    ));
+    let resp = crate::crop::json(&known);
+    assert!(resp.headers().contains_key("etag"), "a detected rect lost its validator");
+    assert_eq!(cc_of(resp), "public, max-age=604800", "a detected rect's caching changed");
+}
+
+/// The format ladder degrades in quality order, but the lower rungs were a fixed 720/480 — so a
+/// cap below 720 was matched by a rung LOOSER than itself, and MAX_HEIGHT=480 could fetch and cache
+/// a 720p file whenever the ≤480 avc1 rendition was missing.
+#[test]
+fn the_format_ladder_never_exceeds_the_configured_cap() {
+    let heights_in = |fmt: &str| -> Vec<u32> {
+        fmt.split("height<=").skip(1).filter_map(|t| t.split(']').next()?.parse::<u32>().ok()).collect()
+    };
+    for (cap, expect_rungs) in [
+        ("1080", vec![1080, 1080, 720, 720, 480, 480]),
+        ("720", vec![720, 720, 480, 480]),
+        ("480", vec![480, 480]),
+        ("360", vec![360, 360]),
+    ] {
+        std::env::set_var("MAX_HEIGHT", cap);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("MAX_HEIGHT");
+        let cap_n: u32 = cap.parse().unwrap();
+        let got = heights_in(&cfg.ytdlp_format);
+        assert!(got.iter().all(|h| *h <= cap_n), "cap {cap}: ladder reaches above it: {got:?}");
+        assert_eq!(got, expect_rungs, "cap {cap}");
+    }
+    // A MAX_HEIGHT the ladder cannot use must cost the setting, not the service. yt-dlp rejects a
+    // malformed filter while BUILDING the selector, so `height<=abc` in the first rung killed the
+    // whole chain — terminal fallback included — and every trailer 502'd until the env was fixed.
+    // "0" and "12" parse but are the opposite failure: no rung can match, so selection falls
+    // through to the uncapped terminal fallback and the cap becomes no cap at all.
+    for bad in ["abc", "-5", "1e3", "1080p", "", "  ", "0", "12"] {
+        std::env::set_var("MAX_HEIGHT", bad);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("MAX_HEIGHT");
+        assert_eq!(cfg.max_height, "1080", "MAX_HEIGHT={bad:?} was not normalised");
+        // Every `height<=` in the selector must be followed by a number. If one isn't, yt-dlp
+        // rejects the whole chain while building it.
+        let total = cfg.ytdlp_format.matches("height<=").count();
+        assert_eq!(
+            heights_in(&cfg.ytdlp_format).len(),
+            total,
+            "MAX_HEIGHT={bad:?} put a non-numeric filter in the selector: {}",
+            cfg.ytdlp_format
+        );
+    }
+
+    // The terminal fallback must still pin the hardware-decode codecs.
+    std::env::set_var("MAX_HEIGHT", "1080");
+    let cfg = crate::config::Config::from_env();
+    std::env::remove_var("MAX_HEIGHT");
+    assert!(cfg.ytdlp_format.ends_with("18/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]"), "{}", cfg.ytdlp_format);
+}
+
+/// The search fallback is the third source of YouTube ids, after TMDB and KinoCheck, and they all
+/// become filenames. It was the one left ungated when the other two were fixed.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_ids_are_gated_like_every_other_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let fake = dir.join("fake-ytdlp");
+    // yt-dlp prints one id per line; these are what a hostile or broken source could emit.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '../../../../tmp/evil\\n/etc/passwd\\nhas/slash\\nsh\\ndQw4w9WgXcQ\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    assert_eq!(
+        crate::ytdlp::search(&cfg, "anything", 5).await,
+        Some(vec!["dQw4w9WgXcQ".to_string()]),
+        "an id that is not a YouTube id must not reach a filename"
+    );
+}
+
+/// `/health`'s upstream counter is process-wide, but TMDB keys are per-install. A 401 means THIS
+/// install's key is wrong — counting it let one bad key report "TMDB has been failing" for
+/// everyone, and let a healthy install's traffic clear a broken one's failures so they never
+/// surfaced. Only faults that are actually about the upstream count.
+#[tokio::test]
+async fn a_bad_install_key_does_not_mark_the_upstream_down() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn server(status: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = "{}";
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    let fails_after = |status: &'static str| async move {
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = server(status).await;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        let _ = up.tmdb_candidates("bad-key", "tt0111161", "movie", "en").await;
+        crate::upstream::Upstream::recent_failures(&up)
+    };
+
+    // KinoCheck is a fallback; its outage does not mean trailers are broken.
+    {
+        let mut cfg = test_cfg(temp_dir());
+        cfg.kinocheck_base = server("503 Service Unavailable").await;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        let _ = up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
+        assert_eq!(
+            crate::upstream::Upstream::recent_failures(&up),
+            0,
+            "a KinoCheck outage reported TMDB as down"
+        );
+    }
+
+    assert_eq!(fails_after("401 Unauthorized").await, 0, "one install's bad key marked TMDB down");
+    assert_eq!(fails_after("403 Forbidden").await, 0, "one install's bad key marked TMDB down");
+    assert!(fails_after("503 Service Unavailable").await > 0, "a real upstream fault must count");
+    assert!(fails_after("429 Too Many Requests").await > 0, "throttling must count");
+}
+
+/// The scheme in the play URL comes from a client-supplied header. Reflected unchecked it produced
+/// `javascript://host/...` — the same spoofing the Host filter beside it was written to stop.
+#[tokio::test]
+async fn a_forwarded_proto_is_a_scheme_or_it_is_http() {
+    use hyper::header::{HeaderMap, HeaderValue};
+    let base = |proto: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", HeaderValue::from_str(proto).unwrap());
+        h.insert("host", HeaderValue::from_static("reel.local:8092"));
+        crate::addon::self_base(None, &h, 8092)
+    };
+    assert_eq!(base("https"), "https://reel.local:8092");
+    assert_eq!(base("http"), "http://reel.local:8092");
+    // A proxy that title-cases the header still means https; downgrading it to http would hand
+    // every play URL back as plaintext on a TLS-fronted install.
+    assert_eq!(base("HTTPS"), "https://reel.local:8092");
+    assert_eq!(base("Https"), "https://reel.local:8092");
+    for hostile in ["javascript", "https://attacker.evil", "file", ""] {
+        assert_eq!(base(hostile), "http://reel.local:8092", "accepted scheme {hostile:?}");
+    }
+}
+
+/// yt-dlp forks ffmpeg to do the merge, so killing the direct child left the grandchild running —
+/// and it kept writing to the temp path we had just deleted. The download runs in its own process
+/// group so the whole tree can be reaped; this pins that the group kill reaches a grandchild.
+#[cfg(unix)]
+#[tokio::test]
+async fn killing_the_group_reaches_a_grandchild() {
+    use std::os::unix::process::CommandExt;
+    let dir = temp_dir();
+    let marker = dir.join("grandchild-alive");
+    // A parent that forks a long-lived child, exactly like yt-dlp spawning ffmpeg.
+    let script = dir.join("parent.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nsh -c 'sleep 30; : > {}' &\nsleep 30\n", marker.display()))
+        .unwrap();
+    std::fs::set_permissions(
+        &script,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+
+    let mut cmd = std::process::Command::new(&script);
+    cmd.process_group(0);
+    let mut child = cmd.spawn().unwrap();
+    let pgid = child.id();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    crate::ytdlp::kill_group(Some(pgid));
+    let _ = child.wait();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Still alive? Then it is holding CPU and will finish writing to a path nobody supervises.
+    let alive = std::process::Command::new("pgrep")
+        .args(["-g", &pgid.to_string()])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    assert!(!alive, "a grandchild outlived the group kill");
+}
+
+/// Ids from TMDB/KinoCheck become a cache filename and a yt-dlp `-o` path, and `/meta` prewarms on
+/// them with no client involvement — so a traversal in upstream data wrote outside the cache dir.
+/// The inbound imdb id was already checked for exactly this reason; this is the other direction.
+#[test]
+fn a_traversing_id_from_upstream_is_not_a_candidate() {
+    use serde_json::json;
+    let results = vec![
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "../../../../tmp/evil"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "/etc/cron.d/evil"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "has/slash"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "sh"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "dQw4w9WgXcQ"}),
+    ];
+    assert_eq!(
+        crate::upstream::pick_trailer_candidates(&results, "en"),
+        vec!["dQw4w9WgXcQ".to_string()],
+        "an id that is not a YouTube id must not reach a filename"
+    );
+}
+
+/// The imdb id becomes an upstream request path AND part of a resolve cache key that is written to
+/// disk at shutdown. Unbounded, a caller could park a 60-digit id in that key and push the file past
+/// the size the loader will read — which does not fail loudly, it just discards the whole parked
+/// cache on every boot from then on, because each shutdown rewrites the same oversized file. /meta
+/// has no gate in front of it.
+#[tokio::test]
+async fn an_imdb_id_is_bounded_before_it_reaches_a_cache_key() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let base = spawn_server(state.clone()).await;
+
+    let huge = format!("tt{}", "1".repeat(60));
+    let body: serde_json::Value =
+        reqwest::get(format!("{base}/meta/movie/{huge}.json")).await.unwrap().json().await.unwrap();
+
+    assert!(
+        body["meta"]["links"].as_array().is_some_and(|a| a.is_empty()),
+        "an unbounded id was resolved rather than rejected"
+    );
+    assert_eq!(fake.calls(), 0, "an unbounded id reached the upstream");
+    assert!(
+        state.yt_cache.lock().unwrap().is_empty(),
+        "an unbounded id reached the resolve cache, and from there the file parked at shutdown"
+    );
+
+    // A real one, and a plausibly longer future one, still work.
+    for ok in ["tt0111161", "tt10000000"] {
+        let body: serde_json::Value =
+            reqwest::get(format!("{base}/meta/movie/{ok}.json")).await.unwrap().json().await.unwrap();
+        assert!(
+            body["meta"]["links"].as_array().is_some_and(|a| !a.is_empty()),
+            "{ok} was rejected, but it is a real shape"
+        );
+    }
+}
+
+/// A YouTube video id is a base64url-encoded 64-bit value: exactly 11 characters, and it has been
+/// for the life of the service. This gate is the only check standing in front of /play and /crop,
+/// both of which spend a download permit and a yt-dlp process on whatever they are handed, and it is
+/// also what the cache sweep uses to tell a published trailer from abandoned scratch.
+#[test]
+fn a_video_id_is_exactly_eleven_characters() {
+    assert!(crate::is_valid_vid("dSdWpY2Bxsc"), "a real id must still pass");
+    assert!(crate::is_valid_vid("_-Aa09Zz123"), "the full base64url alphabet is legal");
+    for bad in [
+        "",
+        "short",
+        "dSdWpY2Bxs",   // 10
+        "dSdWpY2Bxscc", // 12
+        "dSdWpY2Bxs/",  // right length, path separator
+        "dSdWpY2Bxs.",  // right length, extension games
+        "../../etc",
+    ] {
+        assert!(!crate::is_valid_vid(bad), "{bad:?} was accepted as a YouTube id");
+    }
+}
+
+/// And the sink refuses it too, so a future caller cannot reintroduce the same hole.
+#[tokio::test]
+async fn fetch_trailer_refuses_an_id_that_is_not_a_youtube_id() {
+    let dir = temp_dir();
+    let state = build_state(
+        dir.clone(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let err = crate::play::fetch_trailer(state, "../../../../tmp/evil".into())
+        .await
+        .expect_err("a traversing id must be refused");
+    assert_eq!(err.status, 400);
+    let escaped = dir.join("../../../../tmp/evil.mp4");
+    assert!(!escaped.exists(), "a file was written outside the cache dir");
+}
+
+#[test]
+fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir();
+    // Dot-prefixed so eviction skips them — which is why nothing counted them toward the cap and
+    // nothing ever removed them. A crash or redeploy mid-download left one on disk forever.
+    // The names yt-dlp actually leaves behind mid-download, not just the finished temp name:
+    // `<tmp>.part` while fetching, and a per-format `.f<id>.<ext>.part` for each stream it merges.
+    let abandoned = [
+        ".aaaaaa.1.0.partial.mp4",
+        ".aaaaaa.1.0.partial.mp4.part",
+        ".aaaaaa.1.0.partial.f137.mp4.part",
+        ".aaaaaa.1.0.partial.f140.m4a.part",
+        // MP4Box's own working copy, from `-tmp <cache_dir>`: no dot, no extension. A SIGKILL mid
+        // bake leaves it, and it matched neither cleanup filter.
+        "_libgpac_64884_0x133704950_4587_352815186",
+    ];
+    for name in abandoned {
+        std::fs::write(dir.join(name), vec![0u8; 100]).unwrap();
+    }
+    std::fs::write(dir.join(".bbbbbb.2.0.partial.mp4.part"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("cccccc.mp4"), vec![0u8; 100]).unwrap();
+    // Older than any download can still be running: the download timeout is 240s.
+    let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    for name in abandoned {
+        let f = std::fs::File::open(dir.join(name)).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old).set_accessed(old)).unwrap();
+    }
+
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+    for name in abandoned {
+        assert!(!dir.join(name).exists(), "{name} was left on disk");
+    }
+    assert!(
+        dir.join(".bbbbbb.2.0.partial.mp4.part").exists(),
+        "a live download was deleted under its writer"
+    );
+    assert!(dir.join("cccccc.mp4").exists(), "the sweep touched a finished trailer");
+
+    // yt-dlp keeps its player-JS cache in a subdirectory here; the sweep must not touch it.
+    let ytdlp_cache = dir.join("yt-dlp");
+    std::fs::create_dir_all(&ytdlp_cache).unwrap();
+    std::fs::write(ytdlp_cache.join("player.json"), b"{}").unwrap();
+    let old_dir = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    let f = std::fs::File::open(&ytdlp_cache).unwrap();
+    let _ = f.set_times(std::fs::FileTimes::new().set_modified(old_dir).set_accessed(old_dir));
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+    assert!(ytdlp_cache.join("player.json").exists(), "the sweep removed yt-dlp's own cache");
+}
+
+#[test]
+fn eviction_ttl_drops_stale_but_keeps_fresh() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir();
+    // Real `<vid>.mp4` names: anything else on the volume is scratch, which the TTL pass leaves to
+    // sweep_partials rather than deleting under a live download.
+    std::fs::write(dir.join("freshVid001.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("staleVid001.mp4"), vec![0u8; 100]).unwrap();
+    // Age the stale one's last-access to 20 days ago (past a 14-day TTL); the other stays at "now".
+    let old = SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
+    let f = std::fs::File::open(dir.join("staleVid001.mp4")).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(old)).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.cache_ttl = Duration::from_secs(14 * 24 * 60 * 60); // 14-day TTL
+    cfg.cache_max_bytes = u64::MAX; // isolate the TTL: the size cap must not interfere
+    crate::play::evict_if_needed(&cfg);
+    assert!(!dir.join("staleVid001.mp4").exists(), "trailer past the last-access TTL should be evicted");
+    assert!(dir.join("freshVid001.mp4").exists(), "recently-served trailer must be kept");
+}
+
+/// Serving a warm file must reach the bytes without consulting the extractor at all, and must stamp
+/// atime on the way — that stamp is the only thing making an in-use trailer sort as recently used,
+/// and `evict_if_needed` removes oldest-atime first after every download.
+///
+/// Both halves are now done by the single blocking call that opens the file, which also makes the
+/// stamp deterministic: it completes before the response is built, where the old fire-and-forget
+/// touch could still be in flight while eviction was already reading the directory.
+#[tokio::test]
+async fn a_warm_serve_stamps_atime_and_never_reaches_yt_dlp() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir();
+    seed_cache(&dir, "warmVid0001", 100);
+
+    // Age the stamp well past anything a test could take, so a bump is unmistakable.
+    let old = SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
+    let f = std::fs::File::open(dir.join("warmVid0001.mp4")).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(old)).unwrap();
+    drop(f);
+
+    let mut cfg = test_cfg(dir.clone());
+    // If the warm path tries to download, this fails loudly rather than quietly succeeding.
+    cfg.ytdlp = "/nonexistent/yt-dlp".into();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let resp = crate::play::handle_play(state, &hyper::HeaderMap::new(), "warmVid0001".into()).await;
+    assert_eq!(resp.status(), 200, "a cached trailer was not served from cache");
+
+    let atime = std::fs::metadata(dir.join("warmVid0001.mp4")).unwrap().accessed().unwrap();
+    assert!(
+        atime.elapsed().unwrap() < Duration::from_secs(60),
+        "the serve did not stamp atime, so eviction cannot tell this file is in use"
+    );
+}
+
+#[tokio::test]
+async fn play_unsatisfiable_range_is_416() {
+    let dir = temp_dir();
+    let size = seed_cache(&dir, "cachedVid03", 100);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::Client::new()
+        .get(format!("{base}/play/cachedVid03.mp4"))
+        .header("range", format!("bytes={}-", size + 10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 416);
+}
+
+/// A failed lookup and a title with no trailer both arrive as an empty Vec, and the negative cache
+/// pinned either for an hour under a key that excludes the credential — so one install's 401, or one
+/// TMDB blip, blanked that title for every install while /health stayed green. A failure now gets a
+/// short cooldown instead: long enough not to stampede a sick upstream, short enough that a recovery
+/// shows up in about a minute rather than an hour.
+#[tokio::test]
+async fn a_failed_lookup_cools_down_instead_of_caching_no_trailer() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_next();
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    // Within the cooldown the failure is not re-asked — that is what bounds the stampede.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS / 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    assert_eq!(fake.calls(), after, "a failed lookup is not rate-limited at all");
+
+    // Past it — and long before a real negative would have expired — the recovery is visible.
+    fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_FAIL_TTL_MS);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a failed lookup was cached as 'this title has no trailer'"
+    );
+}
+
+/// A KinoCheck fault must NOT move the fault counter: it is a fallback, and treating its outage as
+/// "we got no answer" made every resolve refuse to cache — turning one dead fallback into unbounded
+/// repeat lookups, which then fed the very 429s that kept it dead.
+///
+/// Exercised against the real HttpUpstream, because the thing under test is which URLs count, and a
+/// fake upstream cannot get that wrong. Both bases point at a closed port, so each call is a
+/// transport error with no server needed.
+#[tokio::test]
+async fn only_the_primary_source_moves_the_fault_counter() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = "http://127.0.0.1:1/tmdb".to_string();
+    cfg.kinocheck_base = "http://127.0.0.1:1/kinocheck".to_string();
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    // Both report NoAnswer for themselves — the caller decides which one matters, per request.
+    assert_eq!(up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await, Err(NoAnswer));
+    // ...and neither marks the UPSTREAM down, which is a separate question from this call's outcome.
+    assert_eq!(up.recent_failures(), 1, "only the primary source speaks for /health");
+}
+
+/// A keyless lookup asks a narrower question — only KinoCheck runs — so its answer lives under its
+/// own cache key. Sharing it let a config-less /meta blank titles for installs that DO have a key.
+#[tokio::test]
+async fn a_keyless_answer_does_not_blank_the_title_for_keyed_installs() {
+    let fake = FakeUpstream::new(&[], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    fake.set_tmdb(&["realTrailer"]);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a keyless lookup was cached as the keyed answer"
+    );
+}
+
+/// The same asymmetry on the OTHER credential. An install with no KinoCheck key can ask a narrower
+/// question too — KinoCheck answers keyless requests until it rate-limits or rejects one — and its
+/// thinner candidate list was published under the shared key, where an install that DOES have a key
+/// then read it for a full YT_TTL_MS. It costs an alternate rather than a primary, which is exactly
+/// why it went unnoticed: the trailer still plays, there is just nothing to fall back to.
+#[tokio::test]
+async fn a_kinocheck_keyless_answer_does_not_blank_the_alternate_for_keyed_installs() {
+    let fake = FakeUpstream::new(&["primaryVid1"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["primaryVid1"], "no KinoCheck key, so no fallback candidate");
+
+    // Now the source that install could not ask has something to say.
+    fake.set_kc(Some("kcAltVid111"));
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", Some("kc-key"), "tt0111161", "movie", "en")
+            .await
+            .ids;
+    assert_eq!(
+        ids,
+        vec!["primaryVid1", "kcAltVid111"],
+        "a KinoCheck-keyless answer was cached as the keyed one, losing the fallback trailer"
+    );
+}
+
+/// ...and the keyless answer is still cached in its own right, at the FULL negative TTL. Treating a
+/// missing key as a transient failure meant re-asking KinoCheck every 60s, forever, per title.
+#[tokio::test]
+async fn a_keyless_answer_is_cached_for_a_full_negative_ttl() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    assert_eq!(fake.calls(), after, "a missing key was priced as a transient blip and re-asked");
+}
+
+/// A genuine "no trailer" must still be negative-cached for the FULL hour, or every browse re-hits
+/// TMDB. Nothing pinned this arm: the failure tests all advance the clock past the 60s cooldown, so
+/// collapsing every negative onto the cooldown — a 60x load increase — passed the whole suite.
+#[tokio::test]
+async fn a_real_empty_answer_is_cached_for_the_full_negative_ttl() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    let after = fake.calls();
+
+    // Well past the failure cooldown — a real answer must not be re-asked on that schedule.
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    assert_eq!(fake.calls(), after, "a real 'no trailer' was re-asked at the failure cooldown");
+
+    // ...and it does expire eventually, so a geo-block or a late-added trailer is picked up.
+    fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_NEG_TTL_MS);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids.first().map(String::as_str), Some("realTrailer"), "the negative cache never expired");
+}
+
+/// A cache cap smaller than one trailer parses cleanly and inverts the setting: eviction runs right
+/// after the rename and sees the file it just published, so every /play downloads, deletes its own
+/// output, retries once, and 500s — forever, on every request.
+#[test]
+fn a_cache_cap_too_small_to_hold_a_trailer_falls_back() {
+    for bad in ["0", "4", "1048576"] {
+        std::env::set_var("CACHE_MAX_BYTES", bad);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("CACHE_MAX_BYTES");
+        assert_eq!(
+            cfg.cache_max_bytes,
+            4 * 1024 * 1024 * 1024,
+            "CACHE_MAX_BYTES={bad} was accepted; eviction would delete each trailer as it is written"
+        );
+    }
+    // A real, usable cap must still be honoured.
+    std::env::set_var("CACHE_MAX_BYTES", "536870912");
+    let cfg = crate::config::Config::from_env();
+    std::env::remove_var("CACHE_MAX_BYTES");
+    assert_eq!(cfg.cache_max_bytes, 536_870_912, "a usable cap was overridden");
+}
+
+/// CLAP is the documented escape hatch for a mis-cropped trailer. Recognising only "0" meant the
+/// three other obvious spellings silently left baking enabled.
+#[test]
+fn the_clap_escape_hatch_answers_to_more_than_one_spelling() {
+    for off in ["0", "false", "off", "no", "FALSE", " off ", ""] {
+        std::env::set_var("CLAP", off);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("CLAP");
+        assert!(!cfg.bake_clap, "CLAP={off:?} left clap baking enabled");
+    }
+    for on in ["1", "true", "yes"] {
+        std::env::set_var("CLAP", on);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("CLAP");
+        assert!(cfg.bake_clap, "CLAP={on:?} disabled clap baking");
+    }
+}
+
+/// A failed download used to unlink only the final temp, leaving yt-dlp's sibling scratch on disk.
+/// Those are dot-prefixed, so the size cap neither counts nor evicts them — real usage exceeded the
+/// cap by every failed download until the hourly sweep's 30-minute grace expired.
+#[tokio::test]
+async fn a_failed_download_leaves_none_of_its_scratch_behind() {
+    let dir = temp_dir();
+    let cfg = test_cfg(dir.clone());
+    let tmp = dir.join(".vidvidvid11.42.0.partial.mp4");
+    for name in [
+        ".vidvidvid11.42.0.partial.mp4",
+        ".vidvidvid11.42.0.partial.mp4.part",
+        // yt-dlp puts `.f<id>` on EITHER side of the extension: inserted when the stream's ext
+        // matches the output's (video, always mp4 under this ladder), appended when it differs
+        // (audio, m4a). Matching the full filename caught only the small audio one and left the
+        // multi-hundred-MB video partial — which is the whole leak.
+        ".vidvidvid11.42.0.partial.f137.mp4",
+        ".vidvidvid11.42.0.partial.f137.mp4.part",
+        ".vidvidvid11.42.0.partial.f137.mp4.part-Frag3",
+        ".vidvidvid11.42.0.partial.mp4.f140.m4a.part",
+    ] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    // Another download's scratch, and a published trailer: neither is ours to remove.
+    std::fs::write(dir.join(".vidvidvid11.99.0.partial.mp4.part"), b"x").unwrap();
+    std::fs::write(dir.join("cccccccccc1.mp4"), b"x").unwrap();
+
+    crate::play::remove_temp_set(&cfg, &tmp).await;
+
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".vidvidvid11.42.0."))
+        .collect();
+    assert!(left.is_empty(), "the failed download left scratch the size cap cannot see: {left:?}");
+    assert!(dir.join(".vidvidvid11.99.0.partial.mp4.part").exists(), "another download's temp was removed");
+    assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was removed");
+}
+
+/// /meta embeds play URLs built from the forwarded host and scheme, or from `Host` when nothing is
+/// forwarded, and goes out `public`. Without naming those inputs, a shared cache may hand one
+/// requester's body — pointing at an authority they chose — to everyone else. A body that embeds no
+/// host names none of them, or it splits every cache for nothing.
+#[tokio::test]
+async fn only_a_body_built_from_the_host_varies_on_it() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let meta = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    let vary = meta.headers().get("vary").map(|v| v.to_str().unwrap().to_ascii_lowercase());
+    let vary = vary.unwrap_or_default();
+    for name in ["x-forwarded-host", "x-forwarded-proto", "host"] {
+        assert!(vary.split(',').any(|v| v.trim() == name), "/meta did not vary on {name}: {vary:?}");
+    }
+
+    let manifest = reqwest::get(format!("{base}/manifest.json")).await.unwrap();
+    assert!(manifest.headers().get("etag").is_some(), "the manifest lost its validator");
+    assert!(manifest.headers().get("vary").is_none(), "the manifest names no host but varied on one");
+}
+
+/// A broken yt-dlp made the search fallback return the same empty list as "YouTube has nothing",
+/// and that got negative-cached for an hour — the same two-failures-one-value bug as the other two
+/// sources, on the one path that only runs for titles TMDB has no video for.
+#[tokio::test]
+async fn a_failed_search_is_not_cached_as_no_trailer() {
+    let fake = FakeUpstream::new(&[], None);
+    fake.set_title("Backrooms 2025");
+    let broken: crate::state::SearchFn = Box::new(|_q| Box::pin(async { None }));
+    let clock = TestClock::default();
+    let mut state = build_state_full(
+        test_cfg(temp_dir()),
+        Box::new(fake.clone()),
+        always_playable(),
+        noop_prewarm(),
+        broken,
+    );
+    {
+        let st = Arc::get_mut(&mut state).expect("sole owner");
+        st.clock = clock.as_fn();
+    }
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a broken search was cached as 'this title has no trailer'"
+    );
+}
+
+/// Serve one fixed HTTP response on an ephemeral port, then close. `body` may be shorter than the
+/// declared `content_length`, which is how a truncated response is simulated.
+async fn serve_once(status_line: &str, content_length: usize, body: &'static str) -> String {
+    serve_once_bytes(status_line, content_length, body.as_bytes().to_vec()).await
+}
+
+/// Send headers, then hold the socket open without sending the body — so a client timeout is what
+/// ends the request. `serve_once` closes immediately, which is a connection reset, not a stall.
+async fn serve_once_stalling(content_length: usize) -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n"
+    );
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(b"{\"re").await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Serve one fixed response and hand back the request line, so a test can assert WHICH url was asked
+/// for — the only way to pin that an id reached an upstream under the parameter it belongs in.
+async fn serve_once_capturing(body: &'static str) -> (String, tokio::sync::oneshot::Receiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            let _ = tx.send(line);
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+async fn serve_once_bytes(status_line: &str, content_length: usize, body: Vec<u8>) -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let head = format!(
+        "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n"
+    );
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A 200 whose body then fails — truncated, oversized, or not JSON — returns the same empty result
+/// as "this title has no trailer". Counting only the status line meant an overloaded TMDB (which
+/// accepts, replies 200, then stalls) got that empty answer pinned for an hour for every install,
+/// with /health still green because the status line had already cleared the signal.
+#[tokio::test]
+async fn a_200_that_fails_after_the_status_line_is_not_an_answer() {
+    for (label, len, body) in [("truncated", 500usize, "{\"re"), ("not JSON", 5usize, "hello")] {
+        let base = serve_once("HTTP/1.1 200 OK", len, body).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+        assert_eq!(
+            up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "a {label} body counted as a real 'no trailer' answer"
+        );
+    }
+}
+
+/// The BYOK TMDB key is a bearer secret the app keeps in the Keychain and never logs. redact()
+/// strips it from our own URL, but reqwest's Display re-appends the whole thing ("… for url
+/// (…?api_key=…)"), so interpolating the error beside a redacted URL published the key on every
+/// transport fault — i.e. throughout exactly the outage that produces the most log lines.
+#[tokio::test]
+async fn a_transport_fault_does_not_log_the_api_key() {
+    let url = "http://127.0.0.1:1/tmdb/3/find/tt0111161?external_source=imdb_id&api_key=SUPERSECRETKEY";
+    let err = reqwest::Client::new().get(url).send().await.expect_err("a closed port must fail");
+
+    let logged = crate::upstream::transport_fault_line(url, err);
+    assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
+    assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
+    // It still has to say which upstream failed AND why, or the redaction has eaten the diagnostic:
+    // Display alone renders connection-refused, DNS failure and TLS failure byte-identically.
+    assert!(logged.contains("/3/find/tt0111161"), "the log line lost the path: {logged}");
+    // Pin the property, not an errno string: the line must distinguish failure shapes. Asserting
+    // "connection refused" couples the test to an OS message and to where reqwest nests the cause.
+    let timed_out = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1))
+        .build()
+        .unwrap()
+        .get("http://10.255.255.1/tmdb?api_key=SUPERSECRETKEY")
+        .send()
+        .await
+        .expect_err("an unroutable address must fail");
+    let other = crate::upstream::transport_fault_line(url, timed_out);
+    assert!(!other.contains("SUPERSECRETKEY"), "the api_key reached a log line: {other}");
+    assert_ne!(
+        logged.split(" (").nth(1),
+        other.split(" (").nth(1),
+        "two different transport failures log an identical cause: {logged}"
+    );
+}
+
+/// A fault that lands AFTER the status line is the same outage as one that lands before it —
+/// reqwest's timeout spans the body read, so which side a wedged upstream falls on is arbitrary.
+/// Bumping only the caching counter left /health reporting ok while every resolve came back empty.
+#[tokio::test]
+async fn a_200_that_fails_late_also_degrades_health() {
+    let base = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = base;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    assert_eq!(up.recent_failures(), 0);
+    assert_eq!(up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await, Err(NoAnswer));
+    assert!(up.recent_failures() > 0, "/health stayed green through an outage that empties every resolve");
+}
+
+/// A body over the cap is the third late-failure shape. The body must stay VALID JSON past the cap:
+/// an invalid one falls into the not-JSON arm, which bumps the same counter, so the test passed
+/// with the cap removed entirely — pinning nothing, while claiming to pin the one guard against
+/// buffering a runaway upstream.
+#[tokio::test]
+async fn an_oversize_body_is_not_an_answer() {
+    let mut body = Vec::with_capacity(6 * 1024 * 1024);
+    body.push(b'[');
+    while body.len() < 6 * 1024 * 1024 {
+        body.extend_from_slice(b"0,");
+    }
+    body.extend_from_slice(b"0]");
+    let len = body.len();
+    let base = serve_once_bytes("HTTP/1.1 200 OK", len, body).await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = base;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    assert_eq!(
+        up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
+        Err(NoAnswer),
+        "an oversize body was buffered and accepted as an answer"
+    );
+}
+
+/// A tmdb id spends ONE upstream call where an imdb id spends two, which is the whole point of taking
+/// it. `serve_once` answers exactly one request, so the single body proves which call was made: given a
+/// /videos-shaped answer, the tmdb id reads a trailer out of it, while the imdb id spends that one
+/// answer on /find — where a videos body carries no `movie_results` — and comes back with nothing.
+#[tokio::test]
+async fn a_tmdb_id_reaches_the_videos_without_a_find() {
+    const VIDEOS: &str = "{\"results\":[{\"site\":\"YouTube\",\"key\":\"dQw4w9WgXcQ\",\
+        \"type\":\"Trailer\",\"official\":true,\"iso_639_1\":\"en\"}]}";
+    let upstream = || async {
+        let base = serve_once("HTTP/1.1 200 OK", VIDEOS.len(), VIDEOS).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new())
+    };
+
+    assert_eq!(
+        upstream().await.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await,
+        Ok(vec!["dQw4w9WgXcQ".to_string()]),
+        "a tmdb id should have asked for the videos outright"
+    );
+    assert_eq!(
+        upstream().await.tmdb_candidates("test-key", "tt0816692", "movie", "en").await,
+        Ok(Vec::new()),
+        "an imdb id still spends its first call resolving the id"
+    );
+}
+
+/// KinoCheck takes either id, which is what keeps it reachable for a caller holding only a tmdb id —
+/// and it is the one source that answers with no key at all, so that path has to stay open.
+#[tokio::test]
+async fn kinocheck_is_asked_by_whichever_id_it_was_given() {
+    const KC: &str = "{\"trailer\":{\"youtube_video_id\":\"dQw4w9WgXcQ\"}}";
+    for (id, expected) in [("tmdb:157336", "tmdb_id=157336"), ("tt0816692", "imdb_id=tt0816692")] {
+        let (base, asked) = serve_once_capturing(KC).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.kinocheck_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+        assert_eq!(
+            up.kinocheck_youtube_id(None, id, "movie", "en").await,
+            Ok(Some("dQw4w9WgXcQ".to_string())),
+            "{id}"
+        );
+        let line = asked.await.expect("the upstream was never asked");
+        assert!(line.contains(expected), "{id} was asked for as {line}, not {expected}");
+    }
+}
+
+/// An id that is neither form never reaches an upstream url. The route still answers 200 with no links,
+/// as it does for any title it has no trailer for — a crafted id is not an error to report back.
+#[tokio::test]
+async fn a_malformed_tmdb_id_is_refused() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    for id in ["tmdb:abc", "tmdb:", "tmdb:1234567890", "nonsense"] {
+        let r = client.get(format!("{base}/meta/movie/{id}.json")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{id}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["meta"]["links"].as_array().map(Vec::len), Some(0), "{id} was not refused");
+    }
+    let ok = client.get(format!("{base}/meta/movie/tmdb:157336.json")).send().await.unwrap();
+    let body: serde_json::Value = ok.json().await.unwrap();
+    assert!(
+        !body["meta"]["links"].as_array().unwrap().is_empty(),
+        "a well-formed tmdb id was refused along with the bad ones"
+    );
+}
+
+/// A client that holds both ids can say so, and then the two forms are one title here rather than two:
+/// whichever it asks with next reads what the other already resolved.
+#[tokio::test]
+async fn a_stated_id_pair_shares_one_resolve_entry() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let cache = Arc::clone(&state);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let stated =
+        client.get(format!("{base}/meta/movie/tmdb:157336.json?imdb=tt0816692")).send().await.unwrap();
+    assert_eq!(stated.status(), 200);
+    let by_imdb = client.get(format!("{base}/meta/movie/tt0816692.json")).send().await.unwrap();
+    assert_eq!(by_imdb.status(), 200);
+
+    let entries = cache.yt_cache.lock().unwrap().len();
+    assert_eq!(entries, 1, "the same title resolved once per id form instead of once");
+}
+
+/// With no TMDB key, KinoCheck is the only source consulted — so its outage is a total failure to
+/// get an answer, not the ignorable fallback blip it is for a keyed install.
+#[tokio::test]
+async fn a_keyless_lookup_treats_a_fallback_outage_as_no_answer() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.kinocheck_base = "http://127.0.0.1:1/kinocheck".to_string();
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    assert_eq!(
+        up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await,
+        Err(NoAnswer),
+        "a keyless install's only source failed and nothing recorded it"
+    );
+    // ...and it still must not move the TMDB-facing signal.
+    assert_eq!(up.recent_failures(), 0, "a fallback outage degraded /health");
+}
+
+/// A keyless install consults ONLY KinoCheck, so its outage there is a total failure to get an
+/// answer — it must take the short cooldown, not pin "no trailer" for an hour on the one path where
+/// no other signal (health, the TMDB fault counter, the log line) can see it.
+#[tokio::test]
+async fn a_keyless_lookup_does_not_pin_a_fallback_outage_for_an_hour() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_fallback();
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    // Past the cooldown but far short of a real negative: the outage must be re-asked.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    assert!(
+        fake.calls() > after,
+        "a keyless install pinned its only source's outage as 'no trailer' for a full hour"
+    );
+}
+
+/// ...while for a KEYED install a KinoCheck outage stays ignorable: TMDB answered, so the negative
+/// is real and must keep its full TTL rather than being re-asked every minute.
+#[tokio::test]
+async fn a_keyed_lookup_still_ignores_a_fallback_outage() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_fallback();
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    assert_eq!(fake.calls(), after, "a fallback outage shortened a real answer's TTL");
+}
+
+/// Every way a source can fail to answer must move its counter — the bad-status path and the
+/// post-200 body paths as well as the transport one. Only the transport writer was pinned, and the
+/// two unpinned ones are exactly what fires when KinoCheck 5xx's or truncates: the decisive signal
+/// for a keyless install, where it is the only source consulted.
+#[tokio::test]
+async fn every_no_answer_shape_moves_its_counter() {
+    // (status line, content-length, body, is_tmdb)
+    let cases: [(&str, usize, &'static str); 3] = [
+        ("HTTP/1.1 503 Service Unavailable", 2, "{}"), // bad status
+        ("HTTP/1.1 200 OK", 500, "{\"re"),             // truncated body
+        ("HTTP/1.1 200 OK", 5, "hello"),               // not JSON
+    ];
+    for (status_line, len, body) in cases {
+        // The fallback source...
+        let base = serve_once(status_line, len, body).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.kinocheck_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        assert_eq!(
+            up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "{status_line:?} on the fallback source read as an answer; a keyless install would cache it"
+        );
+
+        // ...and the primary.
+        let base = serve_once(status_line, len, body).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        assert_eq!(
+            up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "{status_line:?} on TMDB read as an answer"
+        );
+    }
+}
+
+/// A wrong key means THIS request got no answer, so it must count — otherwise the empty result is
+/// cached as a real "no trailer" for an hour, under a key that excludes the credential, and one
+/// install's typo blanks the title for every install. That is the bug the counter exists for, and
+/// it is easy to "tidy away" by mirroring the health counter, which excludes 401/403 for a
+/// different and correct reason.
+#[tokio::test]
+async fn a_wrong_key_counts_as_no_answer_even_though_health_ignores_it() {
+    for status_line in ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 403 Forbidden"] {
+        let base = serve_once(status_line, 2, "{}").await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+        assert_eq!(
+            up.tmdb_candidates("wrong-key", "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "{status_line:?} was read as a real 'no trailer'"
+        );
+        assert_eq!(up.recent_failures(), 0, "{status_line:?} marked the upstream itself down");
+    }
+}
+
+/// The resolve cache key is credential-free and shared by every install, so an install whose key is
+/// wrong must not replace a working install's trailer list with an empty one — that is a cache HIT
+/// for the whole window, so the title shows no trailer and no upstream call happens to correct it.
+#[tokio::test]
+async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A healthy install caches a real answer, which then expires.
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids.first().map(String::as_str), Some("goodTrailer"));
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // An install with a wrong key resolves the same title and gets nothing.
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let broken =
+        crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(
+        broken.first().map(String::as_str),
+        Some("goodTrailer"),
+        "a failed lookup discarded the answer we already had"
+    );
+
+    // The healthy install must still see its trailer, and the failure must not be serving as a hit.
+    fake.set_tmdb(&["goodTrailer"]);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("goodTrailer"),
+        "one install's bad key blanked the trailer for every install"
+    );
+}
+
+/// "error decoding response body" is what reqwest Displays for a truncation and for a timeout
+/// alike — one is the upstream dying mid-response, the other is it wedging, and that difference is
+/// the whole diagnostic during the outage this arm exists for. The stalling server has to actually
+/// stall: closing the socket is a reset, which is the truncation case wearing a timeout's name.
+#[tokio::test]
+async fn a_body_fault_says_which_kind_it_was() {
+    let base = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
+    let truncated = reqwest::Client::new()
+        .get(format!("{base}/x?api_key=SUPERSECRETKEY"))
+        .send()
+        .await
+        .expect("headers arrive")
+        .bytes()
+        .await
+        .expect_err("a truncated body must fail");
+
+    let slow = serve_once_stalling(500).await;
+    let stalled = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .unwrap()
+        .get(format!("{slow}/x?api_key=SUPERSECRETKEY"))
+        .send()
+        .await
+        .expect("headers arrive")
+        .bytes()
+        .await
+        .expect_err("a stalled body must time out");
+
+    let a = crate::upstream::body_fault_why(truncated);
+    let b = crate::upstream::body_fault_why(stalled);
+    assert!(!a.contains("SUPERSECRETKEY") && !b.contains("SUPERSECRETKEY"), "{a} / {b}");
+    assert!(b.to_lowercase().contains("time"), "a stalled body did not report a timeout: {b}");
+    assert_ne!(a, b, "a truncated body and a stalled one log the same line: {a}");
+}
+
+/// One title's outage must not touch another's. The old signal was a process-wide counter sampled
+/// across the join, so a fault raised while resolving ANY title read as this title's lookup having
+/// failed — and Den resolves a whole row at once, so overlapping resolves are the steady state.
+#[tokio::test]
+async fn one_titles_outage_does_not_touch_another_title() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_next();
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    // A different title, resolved successfully right after, must be cached at the FULL TTL.
+    fake.set_tmdb(&["goodTrailer"]);
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
+        vec!["goodTrailer".to_string()]
+    );
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 3);
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
+        vec!["goodTrailer".to_string()]
+    );
+    assert_eq!(fake.calls(), after, "another title's outage downgraded this title's entry");
+}
+
+/// Serving the last-known-good must still rate-limit the outage. Returning early skipped the
+/// insert, so every browse during a fault paid a full upstream round.
+#[tokio::test]
+async fn serving_a_stale_answer_still_rate_limits_the_outage() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // A persistent outage, browsed repeatedly.
+    fake.set_tmdb(&[]);
+    let mut calls = Vec::new();
+    for _ in 0..5 {
+        fake.fail_next();
+        let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
+        assert_eq!(ids, vec!["goodTrailer".to_string()], "the last known answer was dropped");
+        calls.push(fake.calls());
+        clock.advance(crate::YT_FAIL_TTL_MS / 4);
+    }
+    assert!(calls[4] - calls[0] <= 1, "each browse during the outage paid a full upstream round: {calls:?}");
+}
+
+/// Serving the last known answer must expire. Re-serving rewrites the entry's expiry, so without an
+/// independent "when was this confirmed" clock a trailer that was REMOVED upstream is handed out
+/// for as long as anything in the process keeps faulting — and /meta ships it with a 7-day max-age.
+#[tokio::test]
+async fn a_stale_answer_stops_being_served_eventually() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // The trailer is gone upstream, and the lookups keep failing. Browse repeatedly, well past the
+    // grace, so each failure gets the chance to refresh the entry it is serving.
+    fake.set_tmdb(&[]);
+    let mut last = vec!["goodTrailer".to_string()];
+    for _ in 0..40 {
+        fake.fail_next();
+        last = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
+        clock.advance(crate::STALE_GRACE_MS / 10);
+    }
+    assert!(
+        last.is_empty(),
+        "a removed trailer was still being served after {} days of failures",
+        (crate::YT_TTL_MS + 4 * crate::STALE_GRACE_MS) / (24 * 60 * 60 * 1000)
+    );
+}
+
+/// ...but it is still served for a good while: an outage must not blank the catalogue immediately.
+#[tokio::test]
+async fn a_stale_answer_survives_a_long_outage() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["goodTrailer".to_string()], "an outage blanked the title immediately");
+}
+
+/// A slow failing resolve must not downgrade a fast good one's full-TTL entry to the cooldown.
+///
+/// This needs the two resolves genuinely interleaved. Seeding the cache and calling again does not
+/// work — a live entry short-circuits at the top of the function, so the branch is never reached
+/// and the test passes with the code deleted. The failing resolve is held inside its upstream call
+/// while the good one runs to completion and inserts.
+#[tokio::test]
+async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A: starts first, will fail, and parks inside tmdb_candidates.
+    let gate = fake.gate_next();
+    fake.fail_next();
+    let s_a = state.clone();
+    let a = tokio::spawn(async move {
+        crate::addon::resolve_youtube_ids(&s_a, "k", None, "tt0111161", "movie", "en").await.ids
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(fake.calls(), 1, "A did not reach the upstream");
+
+    // B: runs to completion while A is parked, inserting a live 24h entry.
+    fake.set_tmdb(&["goodTrailer"]);
+    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["goodTrailer".to_string()]);
+
+    // A resumes and finds B's live entry.
+    gate.add_permits(1);
+    assert_eq!(a.await.unwrap(), vec!["goodTrailer".to_string()], "A published its own empty result");
+
+    // B's entry must still be live well past the failure cooldown.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 3);
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
+        vec!["goodTrailer".to_string()]
+    );
+    assert_eq!(fake.calls(), after, "a failing resolve downgraded a live 24h entry to the cooldown");
+}
+
+/// A redeploy made the next browse re-ask TMDB for every title on screen. Parking the map fixes
+/// that, but the two kinds of entry have to be validated by DIFFERENT clocks, and getting it
+/// backwards is worse than not persisting at all.
+#[test]
+fn a_parked_resolve_cache_keeps_answers_and_drops_cooldowns() {
+    let dir = temp_dir();
+    let cfg = test_cfg(dir);
+    let now = 1_000_000_000_000u64;
+    let mut map: HashMap<String, crate::state::YtEntry> = HashMap::new();
+
+    // A good answer whose `exp` was rewritten to a retry cooldown by a failing lookup that
+    // substituted it. The ids are still confirmed, so it must come back — and come back with the
+    // expiry a confirmed answer earns, not the cooldown.
+    map.insert(
+        "tt1:en".into(),
+        crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now - 1, confirmed: now - 1000 },
+    );
+    // A confirmed answer that is simply too old to trust.
+    map.insert(
+        "tt2:en".into(),
+        crate::state::YtEntry {
+            ids: vec!["staleTrailr".into()],
+            exp: now + 999,
+            confirmed: now - crate::YT_TTL_MS - 1,
+        },
+    );
+    // A 60-second failure cooldown that has already passed. `confirmed` is set to now on EVERY
+    // write, empties included, so validating this one by `confirmed` would promote it into a
+    // 24-hour "this title has no trailer" — the exact inversion YT_FAIL_TTL_MS < YT_NEG_TTL_MS
+    // exists to prevent.
+    map.insert("tt3:en".into(), crate::state::YtEntry { ids: vec![], exp: now - 1, confirmed: now - 1 });
+    // A live "this title really has no trailer", which is worth keeping.
+    map.insert("tt4:en".into(), crate::state::YtEntry { ids: vec![], exp: now + 60_000, confirmed: now - 1 });
+    // A `confirmed` that did not come from our clock. Everything downstream ADDS to this value
+    // without checking — the /meta staleness test, and the substitution path on top of that — which
+    // was only ever safe because it could not come from anywhere but a clock reading. Both kinds of
+    // entry, because the empty ones are read by that same staleness test.
+    map.insert(
+        "tt5:en".into(),
+        crate::state::YtEntry { ids: vec!["overflowVid".into()], exp: now + 999, confirmed: u64::MAX - 10 },
+    );
+    map.insert(
+        "tt6:en".into(),
+        crate::state::YtEntry { ids: vec![], exp: now + 60_000, confirmed: u64::MAX - 10 },
+    );
+
+    std::fs::create_dir_all(cfg.resolve_cache.parent().unwrap()).unwrap();
+    std::fs::write(&cfg.resolve_cache, serde_json::to_vec(&map).unwrap()).unwrap();
+    let back = crate::state::load_resolve_cache(&cfg, now);
+
+    assert_eq!(
+        back.get("tt1:en").map(|e| e.ids.clone()),
+        Some(vec!["goodTrailer".to_string()]),
+        "a confirmed answer was dropped because a failing lookup had left a cooldown on it"
+    );
+    assert_eq!(
+        back["tt1:en"].exp,
+        back["tt1:en"].confirmed + crate::YT_TTL_MS,
+        "the restored answer kept the cooldown instead of the expiry it had earned"
+    );
+    assert!(!back.contains_key("tt2:en"), "an answer past its confirmation window came back");
+    assert!(!back.contains_key("tt3:en"), "a 60-second cooldown came back as a day of 'no trailer'");
+    assert!(back.contains_key("tt4:en"), "a live negative answer was dropped, so every browse re-asks");
+    assert!(!back.contains_key("tt5:en"), "a populated entry confirmed in the future was restored");
+    assert!(!back.contains_key("tt6:en"), "an empty entry confirmed in the future was restored");
+}
+
+/// ...and the round trip actually works, through the paths production uses.
+#[test]
+fn the_resolve_cache_survives_a_restart() {
+    let dir = temp_dir();
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let now = (state.clock)();
+    state.yt_cache.lock().unwrap().insert(
+        "tt0111161:en".into(),
+        crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now + 1000, confirmed: now },
+    );
+
+    // Already dead when we shut down: bytes to write, bytes to read back, and an entry to parse and
+    // immediately discard. It should not reach the file at all.
+    state.yt_cache.lock().unwrap().insert(
+        "tt0000001:en".into(),
+        crate::state::YtEntry { ids: vec![], exp: now.saturating_sub(1), confirmed: now.saturating_sub(1) },
+    );
+
+    crate::state::save_resolve_cache(&state);
+    let raw = std::fs::read_to_string(&state.cfg.resolve_cache).unwrap();
+    assert!(!raw.contains("tt0000001:en"), "an already-expired entry was parked to disk");
+
+    let back = crate::state::load_resolve_cache(&state.cfg, now);
+    assert_eq!(
+        back.get("tt0111161:en").map(|e| e.ids.clone()),
+        Some(vec!["goodTrailer".to_string()]),
+        "the parked cache did not come back"
+    );
+}
+
+/// The saver has to ask "is this still live?" the same way the loader does, and `exp` alone is not
+/// that question for a populated entry. The stale-substitution path rewrites `exp` to a 60-second
+/// retry cooldown while leaving good ids and their original `confirmed` in place — so a save
+/// filtered on `exp` dropped exactly the entries the loader goes out of its way to rescue. A TMDB
+/// blip followed by a redeploy a minute later wiped the answers the blip had been leaning on, which
+/// is this file's whole purpose, failing during an outage.
+///
+/// The other two persistence tests cannot see this seam: one writes its JSON straight to disk and
+/// never calls the saver, the other saves an entry whose `exp` is fresh.
+#[test]
+fn a_stand_in_answer_survives_being_parked() {
+    let dir = temp_dir();
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let now = (state.clock)();
+
+    // Exactly what addon.rs writes when a failing lookup serves the last known answer: good ids, an
+    // old `confirmed`, and an `exp` that is only the failure cooldown — already elapsed.
+    state.yt_cache.lock().unwrap().insert(
+        "tt0111161:en".into(),
+        crate::state::YtEntry {
+            ids: vec!["goodTrailer".into()],
+            exp: now.saturating_sub(1),
+            confirmed: now.saturating_sub(60_000),
+        },
+    );
+
+    crate::state::save_resolve_cache(&state);
+    let back = crate::state::load_resolve_cache(&state.cfg, now);
+
+    assert_eq!(
+        back.get("tt0111161:en").map(|e| e.ids.clone()),
+        Some(vec!["goodTrailer".to_string()]),
+        "a stand-in answer was dropped at save, so a redeploy after an outage re-asks TMDB for everything"
+    );
+}
+
+/// The parked file lives in a SUBDIRECTORY of the cache, and that is not cosmetic: the sweep deletes
+/// every top-level file that is not `<vid>.mp4` as abandoned scratch.
+#[test]
+fn the_parked_resolve_cache_is_not_swept_away() {
+    let dir = temp_dir();
+    let state =
+        build_state(dir.clone(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let now = (state.clock)();
+    state.yt_cache.lock().unwrap().insert(
+        "tt0111161:en".into(),
+        crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now + 1000, confirmed: now },
+    );
+    crate::state::save_resolve_cache(&state);
+    // The other two parked beside it. None of this is a trailer, and none of it may be evicted with them:
+    // the sweep walks files at the top of the cache dir and steps over subdirectories, which is the whole
+    // reason `state/` is where these live.
+    state.direct_cache.lock().unwrap().insert(
+        "dQw4w9WgXcQ".into(),
+        (
+            Ok(crate::direct::Direct {
+                video: "https://rr7.googlevideo.com/videoplayback?itag=136".into(),
+                audio: None,
+                width: None,
+                height: None,
+                hls: None,
+                expires: now + 3_600_000,
+            }),
+            now + 3_600_000,
+        ),
+    );
+    crate::state::save_direct_cache(&state);
+    crate::crop::cache_report(
+        &state,
+        "dQw4w9WgXcQ",
+        crate::crop::report_from(
+            "dQw4w9WgXcQ",
+            Some((1920, 1080)),
+            crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+        ),
+    );
+    crate::state::save_crop_cache(&state);
+    crate::state::save_index_cache(&state);
+    let parked_files =
+        [&state.cfg.resolve_cache, &state.cfg.direct_cache, &state.cfg.crop_cache, &state.cfg.index_cache];
+    for parked in parked_files {
+        assert!(parked.exists(), "nothing was written to {}, so this proves nothing", parked.display());
+    }
+
+    crate::play::sweep_partials(&state.cfg);
+    crate::play::evict_if_needed(&state.cfg);
+
+    for parked in parked_files {
+        assert!(parked.exists(), "the sweep reaped {}, which it is meant to step over", parked.display());
+    }
+}
+
+/// The size sweep drops entries by expiry. Keying it off any other field wipes the whole cache on
+/// every insert past the bound — which no test noticed.
+#[tokio::test]
+async fn the_cache_sweep_drops_only_expired_entries() {
+    let fake = FakeUpstream::new(&["keepMe00001"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A live answer, then enough expired junk to trip the sweep on the next insert.
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+    {
+        let mut cache = state.yt_cache.lock().unwrap();
+        for i in 0..crate::YT_CACHE_MAX {
+            cache.insert(
+                format!("tt{i:08}:en"),
+                crate::state::YtEntry { ids: vec!["x".into()], exp: 0, confirmed: 0 },
+            );
+        }
+    }
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0000001", "movie", "en").await.ids;
+
+    let cache = state.yt_cache.lock().unwrap();
+    assert!(cache.len() < crate::YT_CACHE_MAX, "the sweep did not run: {}", cache.len());
+    // `:nokc` because the resolve above passes no KinoCheck key — the key names which sources the
+    // request could ask. This test is about the sweep; the suffix is just what the key looks like.
+    assert_eq!(
+        cache.get("tt0111161:en:nokc").map(|e| e.ids.clone()),
+        Some(vec!["keepMe00001".to_string()]),
+        "the sweep dropped a live entry"
+    );
+}
+
+/// The title lookup gates the search fallback: if IT could not be made, no search ran, so the empty
+/// result is "we could not ask", not "this title has no trailer". Treating it as an answer pinned
+/// the title empty for a full hour on the path that exists for titles TMDB has no video for.
+#[tokio::test]
+async fn a_failed_title_lookup_is_not_an_answer() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_title();
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
+
+    // Past the failure cooldown but well short of a negative TTL: it must be re-asked.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
+    assert!(fake.calls() > after, "a failed title lookup was cached as 'this title has no trailer'");
+}
+
+/// A stand-in answer must not be pinned in every client for a week. The server stops trusting it
+/// after a day, so a 7-day max-age outlives the server's own bound by six.
+#[tokio::test]
+async fn a_stale_answer_is_not_cached_in_the_client_for_a_week() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A fresh answer is cacheable for the full week.
+    let fresh = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert!(!fresh.stale, "a fresh answer was marked stale");
+
+    // ...and the same answer, once it is only standing in for a failed lookup, is not.
+    clock.advance(crate::YT_TTL_MS + 1);
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let stood_in = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert_eq!(stood_in.ids, vec!["goodTrailer".to_string()]);
+    assert!(stood_in.stale, "a stand-in answer was offered as a fresh one");
+
+    // A cache HIT on that stand-in must stay marked too — the client sees the same body either way.
+    let hit = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert_eq!(hit.ids, vec!["goodTrailer".to_string()]);
+    assert!(hit.stale, "a cache hit on a stand-in was offered as a fresh answer");
+}
+
+/// YT_CACHE_MAX must be a cap, not a threshold. Sweeping only expired entries means that once that
+/// many are live the map grows anyway, and every later insert pays a full scan under the mutex.
+#[tokio::test]
+async fn the_resolve_cache_is_actually_bounded() {
+    let fake = FakeUpstream::new(&["keepMe00001"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // Fill past the bound with entries that are all LIVE, so the expiry sweep frees nothing.
+    {
+        let mut cache = state.yt_cache.lock().unwrap();
+        let far = crate::YT_TTL_MS * 10;
+        for i in 0..crate::YT_CACHE_MAX + 50 {
+            cache.insert(
+                format!("tt{i:08}:en"),
+                crate::state::YtEntry { ids: vec!["x".into()], exp: far + i as u64, confirmed: 0 },
+            );
+        }
+    }
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt7777777", "movie", "en").await;
+
+    let len = state.yt_cache.lock().unwrap().len();
+    assert!(len < crate::YT_CACHE_MAX, "the map grew past its bound with all entries live: {len}");
+}
+
+/// ...and the response actually says so. The flag only matters if it reaches the header — /meta lets a
+/// client keep a trailer link for a week, which for a stand-in outlives the server's own 48h bound.
+#[tokio::test]
+async fn meta_shortens_max_age_for_a_stand_in_answer() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+    let base = spawn_server(state.clone()).await;
+
+    let cc = |r: &reqwest::Response| r.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
+
+    let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert!(cc(&fresh).contains("s-maxage=86400"), "a fresh answer lost its long cache: {}", cc(&fresh));
+
+    // Age it out and make the next lookup fail, so the answer becomes a stand-in.
+    clock.advance(crate::YT_TTL_MS + 1);
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let stale = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    let header = cc(&stale);
+    assert!(!header.contains("604800"), "a stand-in answer was pinned in the client for a week: {header}");
+    assert!(header.contains("max-age"), "a stand-in answer lost caching entirely: {header}");
+}
+
+/// A redeploy (SIGTERM from `podman auto-update`) must not strand the partials it was writing.
+/// They carry this process's pid, so after exit nothing can tell them from another instance's live
+/// work — sweep_partials has to wait out its 30-minute grace, and until then they sit on the volume.
+#[test]
+fn shutdown_reclaims_this_processes_partials() {
+    let dir = temp_dir();
+    let pid = std::process::id();
+    let mine = [
+        format!(".vidvidvid11.{pid}.0.partial.mp4"),
+        format!(".vidvidvid11.{pid}.0.partial.mp4.part"),
+        format!(".othervid001.{pid}.3.partial.f137.mp4.part"),
+    ];
+    for n in &mine {
+        std::fs::write(dir.join(n), b"x").unwrap();
+    }
+    // Another instance's live work, and a published trailer: neither is ours to remove.
+    let other = format!(".vidvidvid11.{}.0.partial.mp4.part", pid + 1);
+    std::fs::write(dir.join(&other), b"x").unwrap();
+    std::fs::write(dir.join("cccccccccc1.mp4"), b"x").unwrap();
+
+    crate::play::sweep_own_temps(&test_cfg(dir.clone()));
+
+    for n in &mine {
+        assert!(!dir.join(n).exists(), "{n} survived shutdown and is unreclaimable until the sweep");
+    }
+    assert!(dir.join(&other).exists(), "another instance's live download was deleted");
+    assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was deleted");
+}
+
+/// body_fault_why is pub(crate) and drops the url as belt-and-braces: body errors carry none today,
+/// but a future caller handing it a SEND-path error — which does carry one, with the api_key in the
+/// query string — would leak immediately. Feed it exactly that.
+#[tokio::test]
+async fn body_fault_why_redacts_even_a_send_path_error() {
+    let url = "http://127.0.0.1:1/tmdb/3/find/tt0111161?external_source=imdb_id&api_key=SUPERSECRETKEY";
+    let send_err = reqwest::Client::new().get(url).send().await.expect_err("a closed port must fail");
+    assert!(
+        send_err.url().is_some(),
+        "this test is pointless unless the error carries the url it must not print"
+    );
+
+    let logged = crate::upstream::body_fault_why(send_err);
+    assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
+    assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
+}
+
+// --- /direct: the googlevideo URLs themselves --------------------------------
+
+/// Read a handler's JSON body. Named for this section so it cannot collide with a helper elsewhere.
+async fn direct_body(resp: hyper::Response<crate::httputil::Body>) -> Value {
+    use http_body_util::BodyExt;
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn prepare_returns_a_signed_primary_ladder_with_its_exact_resolution_base() {
+    let dir = temp_dir();
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    let mut state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<bool>)>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).unwrap().direct_warm =
+        Box::new(move |_state, _id, cap, index| seen.lock().unwrap().push((cap, index)));
+    let install = crate::userconfig::UserConfig {
+        tmdb_key: "byok".into(),
+        kinocheck_key: None,
+        iid: Some("AAAAAAAAAAAAAAAAAAAAAA".into()),
+        ep: 7,
+    };
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", "reel.example".parse().unwrap());
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &headers,
+        Some(&install),
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = direct_body(response).await;
+    assert_eq!(body["primary"]["id"], "dQw4w9WgXcQ");
+    let base = body["primary"]["sourcesBase"].as_str().unwrap();
+    assert!(base.starts_with("http://reel.example/sources/dQw4w9WgXcQ.json?s="), "{base}");
+    assert!(base.ends_with("&i=AAAAAAAAAAAAAAAAAAAAAA&e=7"), "{base}");
+
+    let relative = body["sources"][0]["url"].as_str().unwrap();
+    let media_url = relative.strip_prefix("../m/n/").expect("relative to the supplied /sources base");
+    let (blob, query) = media_url.split_once('?').unwrap();
+    let signature = crate::httputil::query_param(query, "s").unwrap();
+    let media = crate::sources::unseal(Some("s3cret"), &[], blob, Some(&signature)).unwrap();
+    assert_eq!(media.i.as_deref(), Some("AAAAAAAAAAAAAAAAAAAAAA"));
+    assert_eq!(media.e, Some(7));
+    assert_eq!(
+        warmed.lock().unwrap().as_slice(),
+        &[(Some(720), None)],
+        "warm prepare starts the direct resolve but no progressive index"
+    );
+}
+
+/// Prepare embeds the very same v2 SourcePlan `/sources` serves. Candidate links keep discovery
+/// labels, but every playback transport is replaced by a complete, signed planUrl.
+#[tokio::test]
+async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-prepare-v2",
+        "printf '1280 720\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\n'",
+    );
+    let mut cfg = test_cfg(dir);
+    cfg.ytdlp = yt;
+    cfg.play_secret = Some("s3cret".into());
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ", "alternate01"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let install = crate::userconfig::UserConfig {
+        tmdb_key: "byok".into(),
+        kinocheck_key: None,
+        iid: Some("AAAAAAAAAAAAAAAAAAAAAA".into()),
+        ep: 7,
+    };
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", "reel.example".parse().unwrap());
+    let query = "v=2&surface=silent&player=hls.js&intent=play&height=540&playable=%7B%22h264%22%3A51%7D";
+    let response =
+        crate::prepare::handle_prepare(&state, &headers, Some(&install), "movie", "tt0111161", query).await;
+    assert_eq!(response.status(), 200);
+    let body = direct_body(response).await;
+    assert_eq!(body["v"], 2);
+    assert!(body.get("sources").is_none() && body.get("crop").is_none() && body.get("expires").is_none());
+    assert_eq!(body["primary"]["id"], "dQw4w9WgXcQ");
+
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert_eq!(links.len(), 2);
+    for link in links {
+        assert_eq!(link["name"], "Trailer");
+        assert_eq!(link["category"], "Trailer");
+        assert_eq!(link["provider"], "Den Reel");
+        assert!(link.get("trailers").is_none());
+        assert!(link.get("sources").is_none());
+        let plan_url = link["planUrl"].as_str().unwrap();
+        assert!(plan_url.contains("?s="), "the signed source base was lost: {plan_url}");
+        assert!(plan_url.contains("&i=AAAAAAAAAAAAAAAAAAAAAA&e=7&v=2"), "{plan_url}");
+        assert!(
+            plan_url.ends_with(
+                "&surface=silent&player=hls.js&intent=play&height=540&playable=%7B%22h264%22%3A51%7D"
+            ),
+            "{plan_url}"
+        );
+    }
+    assert_eq!(body["primary"]["planUrl"], links[0]["planUrl"]);
+
+    let plan_url = body["primary"]["planUrl"].as_str().unwrap();
+    let plan_query = plan_url.split_once('?').unwrap().1;
+    let source_response =
+        crate::sources::handle_sources(state.clone(), &headers, "dQw4w9WgXcQ".into(), plan_query).await;
+    assert_eq!(source_response.status(), 200);
+    assert_eq!(direct_body(source_response).await, body["primaryPlan"]);
+
+    let empty =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let empty = direct_body(
+        crate::prepare::handle_prepare(
+            &empty,
+            &hyper::HeaderMap::new(),
+            None,
+            "movie",
+            "tt0111161",
+            "v=2&surface=audible&player=native&intent=play",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(empty["v"], 2);
+    assert!(empty["primary"].is_null() && empty["primaryPlan"].is_null());
+    assert!(empty.get("sources").is_none(), "an invalid primary emitted fallback capabilities");
+}
+
+#[tokio::test]
+async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() {
+    let dir = temp_dir();
+    let mut state = build_state(
+        dir,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<bool>)>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).unwrap().direct_warm =
+        Box::new(move |_state, _id, cap, index| seen.lock().unwrap().push((cap, index)));
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=hls.js&intent=play",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["sources"][0]["kind"], "hls");
+    assert_eq!(warmed.lock().unwrap().as_slice(), &[(Some(720), Some(true))]);
+
+    let empty =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let response = crate::prepare::handle_prepare(
+        &empty,
+        &hyper::HeaderMap::new(),
+        None,
+        "series",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = direct_body(response).await;
+    assert!(body["primary"].is_null());
+    assert_eq!(body["sources"], json!([]));
+}
+
+#[tokio::test]
+async fn prepare_is_routed_for_legacy_and_configured_installs() {
+    use base64::Engine as _;
+
+    let mut cfg = test_cfg(temp_dir());
+    cfg.play_secret = Some("s3cret".into());
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let query = "surface=audible&player=native&intent=warm";
+    let request = hyper::Request::builder()
+        .uri(format!("/prepare/movie/tt0111161.json?{query}"))
+        .header("host", "reel.example")
+        .body(())
+        .unwrap();
+    let legacy = direct_body(crate::handle_request(state.clone(), request).await).await;
+    assert_eq!(legacy["primary"]["id"], "dQw4w9WgXcQ");
+
+    let segment = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(r#"{"tmdbKey":"byok","iid":"AAAAAAAAAAAAAAAAAAAAAA","ep":9}"#);
+    let request = hyper::Request::builder()
+        .uri(format!("/{segment}/prepare/movie/tt0111161.json?{query}"))
+        .header("host", "reel.example")
+        .body(())
+        .unwrap();
+    let configured = direct_body(crate::handle_request(state, request).await).await;
+    let source_base = configured["primary"]["sourcesBase"].as_str().unwrap();
+    assert!(source_base.ends_with("&i=AAAAAAAAAAAAAAAAAAAAAA&e=9"), "{source_base}");
+}
+
+#[tokio::test]
+async fn prepare_rejects_the_ask_before_discovery() {
+    let fake = FakeUpstream::new(&["dQw4w9WgXcQ"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    for query in [
+        "surface=wrong&player=native&intent=warm",
+        "surface=audible&player=wrong&intent=warm",
+        "surface=audible&player=native&intent=wrong",
+        "v=7&surface=audible&player=native&intent=warm",
+    ] {
+        let response = crate::prepare::handle_prepare(
+            &state,
+            &hyper::HeaderMap::new(),
+            None,
+            "movie",
+            "tt0111161",
+            query,
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+    }
+    assert_eq!(fake.calls(), 0, "an invalid source ask still spent upstream discovery");
+}
+
+#[tokio::test]
+async fn a_resolved_silent_native_warm_neither_builds_nor_advertises_an_unready_index() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let now = (state.clock)();
+    state.direct_cache.lock().unwrap().insert(
+        crate::direct::key("dQw4w9WgXcQ", Some(720)),
+        (
+            Ok(crate::direct::Direct {
+                video: "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000".into(),
+                audio: None,
+                width: Some(1280),
+                height: Some(720),
+                hls: None,
+                expires: now + 3_600_000,
+            }),
+            now + 3_600_000,
+        ),
+    );
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=silent&player=native&intent=warm",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["prepared"]["intent"], "warm");
+    assert_eq!(body["prepared"]["playReady"], true);
+    assert_eq!(body["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(body["sources"][0]["kind"], "hls", "an unindexed progressive URL was advertised first");
+    assert!(state.progressive.lock().unwrap().is_empty(), "warm built a progressive index");
+    assert!(state.crop_inflight.lock().unwrap().is_empty(), "warm started crop measurement");
+}
+
+#[tokio::test]
+async fn prepare_keeps_alternates_when_the_primary_source_prep_fails() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["deadPrimary", "liveSecond1"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let now = (state.clock)();
+    state.direct_cache.lock().unwrap().insert(
+        crate::direct::key("deadPrimary", None),
+        (
+            Err(crate::ytdlp::PlayError {
+                status: 503,
+                reason: "throttled".into(),
+                message: "try later".into(),
+                detail: "test".into(),
+            }),
+            now + 60_000,
+        ),
+    );
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=play",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-den-degraded"], "primary_unavailable");
+    let retry_after = response.headers()["retry-after"].to_str().unwrap().to_owned();
+    let timing = response.headers()["server-timing"].to_str().unwrap();
+    assert!(timing.contains("tmdb;dur="), "discovery timing was dropped: {timing}");
+    assert!(timing.contains("cache;desc=hit"), "source failure timing was dropped: {timing}");
+    let body = direct_body(response).await;
+    assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 2, "the alternate disappeared");
+    assert!(body["prepared"].is_null());
+    assert_eq!(
+        body["degraded"],
+        json!({ "reason": "primary_unavailable", "status": 503, "retryAfter": retry_after })
+    );
+    assert_eq!(body["sources"], json!([]));
+
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "v=2&surface=audible&player=native&intent=play",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["v"], 2);
+    assert!(body["primaryPlan"].is_null());
+    assert!(body.get("sources").is_none(), "a failed primary emitted fallback capabilities");
+}
+
+#[tokio::test]
+async fn prepare_caps_demoted_answers_and_does_not_warm_an_all_dead_list() {
+    let fake = FakeUpstream::new(&["deadFirst01", "liveSecond1"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let gone = crate::ytdlp::PlayError {
+        status: 404,
+        reason: "unavailable".into(),
+        message: "gone".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "deadFirst01", &gone);
+    let now = (state.clock)();
+    state.direct_cache.lock().unwrap().insert(
+        crate::direct::key("liveSecond1", None),
+        (
+            Ok(crate::direct::Direct {
+                video: "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000".into(),
+                audio: None,
+                width: Some(1280),
+                height: Some(720),
+                hls: None,
+                expires: now + 86_400_000,
+            }),
+            now + 86_400_000,
+        ),
+    );
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], "private, max-age=3600");
+
+    let mut all_dead = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["deadOnly001"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut all_dead).unwrap().direct_warm =
+        Box::new(move |_state, id, _cap, _index| seen.lock().unwrap().push(id));
+    crate::play::record_failure(&all_dead, "deadOnly001", &gone);
+    let response = crate::prepare::handle_prepare(
+        &all_dead,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(warmed.lock().unwrap().is_empty(), "an all-dead list started a direct resolve");
+}
+
+/// A fake yt-dlp standing in for `--print "%(width)s %(height)s" --print urls`, counting its runs.
+fn fake_resolver(dir: &std::path::Path, name: &str, prints: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = dir.join(format!("{name}-runs"));
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!/bin/sh\necho x >> {}\n{prints}\n", runs.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script.to_string_lossy().into_owned(), runs)
+}
+
+pub(crate) fn direct_state(dir: &std::path::Path, ytdlp: String) -> Arc<AppState> {
+    let mut cfg = test_cfg(dir.to_path_buf());
+    cfg.ytdlp = ytdlp;
+    build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm())
+}
+
+/// The expiry is signed into the URL and is the only thing that says how long an answer is good for.
+/// It appears as a query parameter on `videoplayback` and as a path segment on the manifest host.
+#[test]
+fn an_expiry_is_read_from_either_url_shape() {
+    let q = "https://rr7.googlevideo.com/videoplayback?itag=140&expire=1789357731&ei=x";
+    let p =
+        "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1789357725/ei/x/file/index.m3u8";
+    assert_eq!(crate::direct::parse_expiry_ms(q), Some(1_789_357_731_000));
+    assert_eq!(crate::direct::parse_expiry_ms(p), Some(1_789_357_725_000));
+    // No expiry at all, and one that is not a number, both mean "we cannot tell" — never a wrong answer.
+    assert_eq!(crate::direct::parse_expiry_ms("https://rr7.googlevideo.com/videoplayback?itag=140"), None);
+    assert_eq!(crate::direct::parse_expiry_ms("https://rr7.googlevideo.com/v?expire=soon"), None);
+}
+
+/// An adaptive answer is two streams, and it stops being usable when the FIRST of them dies — a page
+/// playing video against a dead audio track is not playing the trailer.
+#[test]
+fn a_resolve_reads_both_streams_and_expires_with_the_soonest() {
+    let out = "1920 1080\n\
+               https://rr7.googlevideo.com/videoplayback?itag=137&expire=2000\n\
+               https://rr7.googlevideo.com/videoplayback?itag=140&expire=1500\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("two streams");
+    assert!(d.video.contains("itag=137"), "the video stream is the first one printed");
+    assert!(d.audio.as_deref().is_some_and(|a| a.contains("itag=140")));
+    assert_eq!((d.width, d.height), (Some(1920), Some(1080)));
+    assert_eq!(d.expires, 1_500_000, "the answer outlived its audio track");
+}
+
+/// yt-dlp writes `NA` for a field it does not know. That is not a failure: a URL with no dimensions
+/// still plays, and dropping the answer over it would lose a trailer for a cosmetic reason.
+#[test]
+fn a_muxed_resolve_names_no_audio_and_unknown_dimensions_are_not_a_failure() {
+    let out = "NA NA\nhttps://rr7.googlevideo.com/videoplayback?itag=18&expire=2000\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("one stream");
+    assert!(d.audio.is_none(), "a muxed format carries its own audio");
+    assert_eq!((d.width, d.height), (None, None));
+}
+
+/// One run carries both transports: the progressive pair, and the HLS master that is the only way a
+/// browser gets sound. yt-dlp prints the manifests as a Python-style list, mostly `None`.
+#[test]
+fn a_resolve_also_carries_the_hls_master() {
+    let out = "1920 1080\n\
+               [None, 'https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/index.m3u8', None]\n\
+               https://rr7.googlevideo.com/videoplayback?itag=137&expire=2000\n\
+               https://rr7.googlevideo.com/videoplayback?itag=140&expire=2000\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("two streams and a master");
+    assert_eq!(
+        d.hls.as_deref(),
+        Some("https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/index.m3u8")
+    );
+    assert!(d.video.contains("itag=137"), "the master must not be mistaken for the video stream");
+    // The master expires first here, and an answer is only good while everything in it still works.
+    assert_eq!(d.expires, 1_900_000);
+}
+
+/// A video YouTube publishes no HLS rendition for is still a usable answer for the muted path.
+#[test]
+fn a_resolve_without_a_master_is_still_an_answer() {
+    let out = "1920 1080\n[None, None]\nhttps://rr7.googlevideo.com/videoplayback?itag=18&expire=2000\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("one stream");
+    assert!(d.hls.is_none());
+    assert_eq!(d.expires, 2_000_000);
+}
+
+/// Exit 0 with nothing we can use is still nothing we can use.
+#[test]
+fn a_resolve_with_no_url_is_not_an_answer() {
+    assert!(crate::direct::parse_resolve("1920 1080\n", 0).is_none());
+    assert!(crate::direct::parse_resolve("", 0).is_none());
+}
+
+#[tokio::test]
+async fn direct_answers_the_urls_and_resolves_each_id_once() {
+    let dir = temp_dir();
+    // Expiring in 2096, so the answer is good and the cache TTL is comfortably positive.
+    let (yt, runs) = fake_resolver(
+        &dir,
+        "yt-printing",
+        "printf '1920 1080\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\\n'",
+    );
+    let state = direct_state(&dir, yt);
+
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(resp.status(), 200);
+    let body = direct_body(resp).await;
+    assert_eq!(body["video"], "https://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000");
+    assert_eq!(body["audio"], "https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000");
+    assert_eq!(body["height"], 1080);
+    assert_eq!(body["expires"], 4_000_000_000u64);
+    assert_eq!(spawn_count(&runs), 1);
+
+    // The URLs are good for hours. Re-resolving would spend a yt-dlp run to print the same thing.
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(spawn_count(&runs), 1, "the same id was resolved twice inside its own expiry");
+}
+
+/// googlevideo on 127.0.0.1: a 403 for any path containing `capped`, as a capped extraction's URL
+/// answers for a range past its first minute, and one byte of 206 otherwise.
+async fn serve_capped_or_whole() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+                let answer: &[u8] = if line.contains("capped") {
+                    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 99-99/100\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx"
+                };
+                let _ = sock.write_all(answer).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    base
+}
+
+/// A resident worker (run by `sh`, standing in for the interpreter) answering its first `capped`
+/// extractions with a URL `serve_capped_or_whole` refuses the end of, and a whole one after. Counts
+/// its extractions. The worker, because the binary's printed answer only takes `https://` lines.
+fn capped_worker_state(dir: &std::path::Path, base: &str, capped: usize) -> (Arc<AppState>, PathBuf) {
+    let runs = dir.join("worker-runs");
+    let script = dir.join("worker.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "while read -r line; do\necho x >> {runs}\n\
+             if [ $(wc -l < {runs}) -le {capped} ]; then kind=capped; else kind=whole; fi\n\
+             echo \"{{\\\"ok\\\": true, \\\"width\\\": 1920, \\\"height\\\": 1080, \\\"urls\\\": \
+             [\\\"{base}/$kind?itag=137&clen=100&expire=4000000000\\\"], \\\"hls\\\": null}}\"\ndone\n",
+            runs = runs.display()
+        ),
+    )
+    .unwrap();
+    let mut cfg = test_cfg(dir.to_path_buf());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = Some(script.to_string_lossy().into_owned());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    (state, runs)
+}
+
+/// About one extraction in four answered with URLs googlevideo refuses past ~60 s of media, for the URLs'
+/// whole life, while the next extraction of the same video served to the end (measured 2026-10-11). Such
+/// an answer must not be the one cached and handed out for six hours: it is resolved once more.
+#[tokio::test]
+async fn a_resolve_whose_end_is_refused_is_resolved_once_more() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (state, runs) = capped_worker_state(&dir, &base, 1);
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    let video = answer.expect("the second extraction answered").video;
+    assert!(video.contains("/whole?"), "the capped URL was kept: {video}");
+    assert_eq!(spawn_count(&runs), 2);
+
+    // The standing answer is the whole one, so nothing is extracted again.
+    let (again, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(again.unwrap().video.contains("/whole?"));
+    assert_eq!(spawn_count(&runs), 2);
+}
+
+/// Capped every time is still a trailer's first minute, so the second answer is served — and there is
+/// no third extraction.
+#[tokio::test]
+async fn a_resolve_capped_twice_is_served_after_one_retry() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (state, runs) = capped_worker_state(&dir, &base, 5);
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.is_ok(), "a capped answer is still an answer: {answer:?}");
+    assert_eq!(spawn_count(&runs), 2, "retried more than once, or not at all");
+}
+
+/// `?height=` lands on a step of the ladder, so a caller cannot make one video resolve once per
+/// number, and it never reaches past `MAX_HEIGHT`.
+#[test]
+fn a_height_cap_lands_on_a_step_of_the_ladder() {
+    let cfg = test_cfg(temp_dir());
+    let cap = |asked: &str| crate::direct::height_cap(&cfg, Some(asked));
+    assert_eq!(cap("720"), Some(720));
+    assert_eq!(cap("900"), Some(720), "rounded down, never up past what was asked");
+    assert_eq!(cap("600"), Some(480));
+    assert_eq!(cap("240"), Some(480), "below the lowest step is the lowest step");
+    assert_eq!(cap("1080"), None, "the full ladder is the uncapped answer");
+    assert_eq!(cap("2160"), None, "MAX_HEIGHT still caps");
+    assert_eq!(cap("720p"), None);
+    assert_eq!(crate::direct::height_cap(&cfg, None), None);
+}
+
+/// A preview asking for 720p gets the ladder from 720 down, and an answer of its own: the 1080p one
+/// standing in the cache must not be handed to it, nor it to the next request at full height.
+#[tokio::test]
+async fn a_capped_direct_resolves_its_own_ladder_once() {
+    let dir = temp_dir();
+    let args = dir.join("args");
+    let (yt, runs) = fake_resolver(
+        &dir,
+        "yt-capped",
+        &format!(
+            "printf '%s\\n' \"$*\" >> {}\nprintf '1280 720\\nhttps://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\\n'",
+            args.display()
+        ),
+    );
+    let state = direct_state(&dir, yt);
+
+    let full = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(full.status(), 200);
+    let capped = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), Some(720)).await;
+    assert_eq!(capped.status(), 200);
+    assert_eq!(spawn_count(&runs), 2, "the capped ask was answered from the full-height resolve");
+
+    let asked = std::fs::read_to_string(&args).unwrap();
+    let mut lines = asked.lines();
+    // The test config's own ladder is `fmt`: the full-height ask uses it unchanged.
+    assert!(lines.next().unwrap().contains("-f fmt "));
+    let second = lines.next().unwrap();
+    assert!(!second.contains("height<=1080"), "a 720p cap still reached 1080p: {second}");
+    assert!(second.contains("height<=720") && second.contains("height<=480"), "{second}");
+
+    let again = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), Some(720)).await;
+    assert_eq!(again.status(), 200);
+    assert_eq!(spawn_count(&runs), 2, "the capped answer was resolved twice inside its own expiry");
+}
+
+/// The resident worker's protocol, held still. A success carries the streams flattened alongside
+/// `ok`; a failure carries yt-dlp's own words, which are classified exactly as its stderr would be;
+/// and a line that is not a reply at all says the far end has stopped being a worker.
+#[test]
+fn the_resident_workers_replies_are_read_as_answers_or_reasons() {
+    let good =
+        r#"{"ok":true,"width":1920,"height":1080,"urls":["https://a","https://b"],"hls":"https://m.m3u8"}"#;
+    let answer = crate::worker::read_reply(good).expect("a readable line").expect("an answer");
+    assert_eq!((answer.width, answer.height), (Some(1920), Some(1080)));
+    assert_eq!(answer.urls, vec!["https://a", "https://b"]);
+    assert_eq!(answer.hls.as_deref(), Some("https://m.m3u8"));
+
+    let bad = r#"{"ok":false,"error":"ERROR: [youtube] Video unavailable"}"#;
+    let said = crate::worker::read_reply(bad).expect("a readable line").expect_err("a reason");
+    assert_eq!(crate::ytdlp::classify(None, &said).reason, "unavailable");
+
+    assert!(crate::worker::read_reply("Traceback (most recent call last):").is_err());
+}
+
+/// A browser that plays YouTube's own URL never reads the downloaded file, so asking for it spends
+/// a yt-dlp and an ffmpeg against the resolve it is actually waiting on. One that falls back to
+/// `/play` — no native HLS, so nothing else carries sound — still needs both.
+#[test]
+fn prewarm_asks_for_what_the_client_will_actually_use() {
+    assert_eq!(crate::addon::prewarm_choice(None), (true, true, false), "the TV needs the file");
+    assert_eq!(crate::addon::prewarm_choice(Some("1")), (true, true, false));
+    assert_eq!(crate::addon::prewarm_choice(Some("direct")), (false, true, false));
+    assert_eq!(crate::addon::prewarm_choice(Some("progressive")), (false, true, true), "and the index");
+    assert_eq!(crate::addon::prewarm_choice(Some("0")), (false, false, false), "browse-time prefetch");
+}
+
+/// `/meta`'s warm-up and the `/direct` chasing it a moment later have to be ONE yt-dlp run between
+/// them. The probe budget cannot arrange that — six permits mean neither ever waits for the other,
+/// so both missed the cache and both resolved the same video, and the warm-up bought nothing.
+#[tokio::test]
+async fn concurrent_asks_for_one_id_share_a_single_resolve() {
+    let dir = temp_dir();
+    // Slow enough that the second ask certainly arrives while the first is still running.
+    let (yt, runs) = fake_resolver(
+        &dir,
+        "yt-slow-printing",
+        "sleep 1\nprintf '1920 1080\\nhttps://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000\\n'",
+    );
+    let state = direct_state(&dir, yt);
+
+    let (first, second) = tokio::join!(
+        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None),
+        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None),
+    );
+
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200, "the waiter must get the answer, not an error of its own");
+    assert_eq!(spawn_count(&runs), 1, "one video, resolved twice at once");
+}
+
+/// A page names its surface and player and gets the forms to try in order, as URLs this server minted,
+/// never the same one twice — and `/meta` says where to ask, under the play URL's own tag.
+#[tokio::test]
+async fn sources_list_the_forms_a_surface_should_try_in_order() {
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-sources",
+        "printf '1280 720\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\\n'",
+    );
+    let state = direct_state(&dir, yt);
+    // A letterbox already measured, so no answer here sets off a measurement of its own.
+    let measured = crate::crop::report_from(
+        "dQw4w9WgXcQ",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+    );
+    crate::crop::cache_report(&state, "dQw4w9WgXcQ", measured);
+    let ask = |query: &'static str| {
+        let state = state.clone();
+        async move {
+            crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await
+        }
+    };
+
+    let resp = ask("surface=silent&player=hls.js").await;
+    let vary: Vec<String> =
+        resp.headers().get_all("vary").iter().map(|v| v.to_str().unwrap().to_ascii_lowercase()).collect();
+    assert_eq!(
+        vary,
+        [crate::client::HEADER.to_ascii_lowercase()],
+        "the answer names no host, so varies on none"
+    );
+    let body = direct_body(resp).await;
+    assert_eq!(
+        body["crop"],
+        serde_json::json!({ "letterboxed": true, "aspect": 2.4, "rect": [0.0, 0.1296, 1.0, 0.7407] }),
+        "the letterbox as fractions of the frame, whatever height is played"
+    );
+    let list = body["sources"].as_array().unwrap();
+    assert_eq!(
+        list[0]["url"], "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000",
+        "a Media Source player previews Google's own file"
+    );
+    assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(false)));
+    assert_eq!(
+        (list[0]["width"].as_u64(), list[0]["height"].as_u64()),
+        (Some(1280), Some(720)),
+        "the frame the resolve picked, so a page can tell a portrait trailer without loading it"
+    );
+    assert!(list[2]["width"].is_null(), "a master names a ladder of frames, not one");
+    assert!(
+        list[1]["url"].as_str().unwrap().starts_with("../m/s/"),
+        "carried by this server, and named relative to /sources/<id>.json: {}",
+        list[1]["url"]
+    );
+    assert_eq!(list[2]["kind"], "hls");
+
+    let resp = ask("surface=audible&player=native").await;
+    assert_eq!(
+        resp.headers()["server-timing"],
+        "resolve;desc=background",
+        "an audible surface is answered before its resolve, not after"
+    );
+    let body = direct_body(resp).await;
+    let list = body["sources"].as_array().unwrap();
+    assert_eq!(list[0]["kind"], "hls", "Safari's own HLS player started soonest with sound");
+    assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(true)));
+    let urls: std::collections::HashSet<&str> = list.iter().map(|s| s["url"].as_str().unwrap()).collect();
+    assert_eq!(urls.len(), list.len(), "no URL twice");
+    let blob =
+        list[0]["url"].as_str().unwrap().split("/m/n/").nth(1).expect("a native master is filed under n");
+    let media = crate::sources::unseal(None, &[], blob, None).expect("a URL this server minted");
+    assert!(media.n && media.f == "h", "the native master keeps Google's segment URIs: {media:?}");
+
+    assert_eq!(ask("player=native").await.status(), 400, "a surface is required");
+    assert_eq!(ask("surface=silent").await.status(), 400, "and so is a player");
+
+    let meta = crate::addon::build_meta(
+        "movie",
+        "tt0111161",
+        "https://t.example",
+        &["dQw4w9WgXcQ".into()],
+        None,
+        crate::sign::Binding::Unbound,
+    );
+    assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
+}
+
+/// v2 is a logical plan: delivery is an explicit tagged union, Reel capabilities are opaque, and
+/// the slow downloaded file is a normal final fallback rather than a client-derived URL.
+#[tokio::test]
+async fn sources_v2_is_explicit_and_ends_with_a_download_capability() {
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-sources-v2",
+        "printf '1280 720\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\n'",
+    );
+    let state = direct_state(&dir, yt);
+    let response = crate::sources::handle_sources(
+        state.clone(),
+        &hyper::HeaderMap::new(),
+        "dQw4w9WgXcQ".into(),
+        "v=2&surface=silent&player=hls.js",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = direct_body(response).await;
+    assert_eq!(body["v"], 2);
+    assert_eq!(
+        body.as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+        ["crop", "expires", "sources", "v"].into_iter().collect()
+    );
+
+    let sources = body["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 4, "external, progressive, HLS, then downloaded fallback");
+    for source in sources {
+        assert_eq!(
+            source.as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            ["audio", "delivery", "height", "kind", "width"].into_iter().collect()
+        );
+    }
+    assert_eq!(
+        sources[0]["delivery"],
+        json!({
+            "type": "external",
+            "url": "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000",
+        })
+    );
+    assert!(sources[0].get("url").is_none(), "delivery must not be inferred from a legacy source URL");
+    for source in &sources[1..] {
+        assert_eq!(source["delivery"]["type"], "reel");
+        assert!(source.get("url").is_none());
+        assert!(source["delivery"]["capability"].as_str().unwrap().starts_with("m/"));
+    }
+
+    let last = sources.last().unwrap();
+    assert_eq!((last["kind"].as_str(), last["audio"].as_bool()), (Some("mp4"), Some(true)));
+    let capability = last["delivery"]["capability"].as_str().unwrap();
+    let rest = capability.strip_prefix("m/s/").unwrap();
+    let (blob, tag) = rest.split_once('?').unwrap_or((rest, ""));
+    let signature = crate::httputil::query_param(tag, "s");
+    let media = crate::sources::unseal(None, &[], blob, signature.as_deref()).unwrap();
+    assert_eq!(media.f, "d");
+    assert!(media.a && media.h.is_none() && !media.n && media.p.is_none());
+
+    let legacy = crate::sources::handle_sources(
+        state.clone(),
+        &hyper::HeaderMap::new(),
+        "dQw4w9WgXcQ".into(),
+        "v=1&surface=silent&player=hls.js",
+    )
+    .await;
+    let legacy = direct_body(legacy).await;
+    assert_eq!(legacy["id"], "dQw4w9WgXcQ");
+    assert_eq!(legacy["sources"].as_array().unwrap().len(), 3);
+    assert!(legacy["sources"][0].get("url").is_some());
+    assert!(legacy["sources"][0].get("delivery").is_none());
+
+    let invalid = crate::sources::handle_sources(
+        state,
+        &hyper::HeaderMap::new(),
+        "dQw4w9WgXcQ".into(),
+        "v=7&surface=silent&player=hls.js",
+    )
+    .await;
+    assert_eq!(invalid.status(), 400, "unknown contract versions must not silently become v1");
+}
+
+/// A built index survives a redeploy, so the first open after one does not pay to build it again.
+///
+/// Proved across two states sharing a cache directory rather than within one, because a park that never
+/// reached disk would pass the easier version. Silent if it breaks: every index would simply be rebuilt on
+/// the first request after each restart — 45 range requests to Google apiece — with nothing to show for it.
+#[tokio::test]
+async fn a_built_index_survives_a_redeploy() {
+    let dir = temp_dir();
+    let before = direct_state(&dir, "yt-dlp-never-run".into());
+    let video = crate::progressive::tests::fragmented(&[&[7, 3], &[7, 3]], 0);
+    let audio = crate::progressive::tests::fragmented(&[&[2, 2]], 1);
+    let (base, asked) = crate::progressive::tests::serve_ranges(vec![video, audio], 0, "").await;
+    let direct = crate::direct::Direct {
+        video: format!("{base}/0"),
+        audio: Some(format!("{base}/1")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+    crate::progressive::prepare(&before, "dQw4w9WgXcQ", Some(720), &direct, true).await.expect("an index");
+    crate::state::save_index_cache(&before);
+    let built = asked.swap(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(built > 0, "nothing was indexed, so this proves nothing");
+
+    // A second process, same volume.
+    let after = direct_state(&dir, "yt-dlp-never-run".into());
+    assert!(!crate::progressive::ready(&after, "dQw4w9WgXcQ", Some(720), &direct, true), "started warm");
+    let parked = crate::state::load_index_cache(&after.cfg);
+    let kept = crate::progressive::restore(&after, parked, (after.clock)());
+
+    assert_eq!(kept, 1, "the parked index did not come back");
+    assert!(crate::progressive::ready(&after, "dQw4w9WgXcQ", Some(720), &direct, true), "back but unusable");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "restoring it went back to Google, which is the cost it exists to avoid"
+    );
+}
+
+/// A measured letterbox survives a redeploy, and a report that left its optional fields out still reads back.
+///
+/// Silent if it breaks: nothing errors when a park writes nothing or a load rejects its own output. Every
+/// trailer would simply be cropdetected again after each restart — a second and up to 2.6 MB of Google's
+/// bandwidth apiece — with no sign of it anywhere.
+#[tokio::test]
+async fn a_measured_letterbox_survives_a_redeploy() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let measured = crate::crop::report_from(
+        "dQw4w9WgXcQ",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+    );
+    crate::crop::cache_report(&state, "dQw4w9WgXcQ", measured);
+
+    crate::state::save_crop_cache(&state);
+    let back = crate::state::load_crop_cache(&state.cfg);
+
+    let report = back.get("dQw4w9WgXcQ").expect("the letterbox that was measured");
+    assert!(report.letterboxed, "a trailer with bars came back without them");
+    assert_eq!(report.content.as_ref().map(|r| (r.x, r.y, r.w, r.h)), Some((0, 140, 1920, 800)));
+    assert_eq!(report.source.as_ref().map(|d| (d.w, d.h)), Some((1920, 1080)));
+
+    // The fields that are skipped when empty must be optional coming back in, or this writes a file it
+    // cannot read: every restart would then discard the lot and quietly re-measure everything.
+    std::fs::write(&state.cfg.crop_cache, r#"{"x":{"id":"x","letterboxed":false}}"#).unwrap();
+    let sparse = crate::state::load_crop_cache(&state.cfg);
+    assert!(sparse.contains_key("x"), "a report with no rect was thrown away: {sparse:?}");
+}
+
+/// A built index is known to be built, and asked about without building one.
+///
+/// An audible surface's whole ordering decision rests on this answer, and the failure it guards against is
+/// silent: were `ready` to disagree with `prepare` about the key, it would simply always say no, the trailer
+/// file would never lead, nothing would error, and the only symptom would be that the hero stayed slow.
+#[tokio::test]
+async fn a_built_index_is_known_to_be_ready_without_building_one() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let video = crate::progressive::tests::fragmented(&[&[7, 3], &[7, 3]], 0);
+    let audio = crate::progressive::tests::fragmented(&[&[2, 2]], 1);
+    let (base, asked) = crate::progressive::tests::serve_ranges(vec![video, audio], 0, "").await;
+    let direct = crate::direct::Direct {
+        video: format!("{base}/0"),
+        audio: Some(format!("{base}/1")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+    let ready = |cap, audio| crate::progressive::ready(&state, "dQw4w9WgXcQ", cap, &direct, audio);
+
+    assert!(!ready(Some(720), true), "nothing is built yet");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 0, "asking cost Google nothing");
+
+    crate::progressive::prepare(&state, "dQw4w9WgXcQ", Some(720), &direct, true).await.expect("an index");
+    assert!(ready(Some(720), true), "built, so ready");
+
+    // Each of these is a different index, and saying otherwise would offer a file that is not there.
+    assert!(!ready(Some(720), false), "without sound is a different index");
+    assert!(!ready(Some(480), true), "another rung is a different index");
+}
+
+/// The first caller deliberately leaves an index build self-driven, so cancelling it must not free
+/// admission for an arbitrary number of new detached builds. New keys are refused before a task or
+/// upstream connection is created; when the one admitted build ends, its permit comes back.
+#[tokio::test]
+async fn cancelled_index_waiters_cannot_leave_unbounded_detached_builders() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let counted = accepted.clone();
+    let held = release.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let held = held.clone();
+            tokio::spawn(async move {
+                let mut request = [0; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = held.acquire().await;
+            });
+        }
+    });
+
+    let mut state = direct_state(&temp_dir(), "yt-dlp-never-run".into());
+    Arc::get_mut(&mut state).unwrap().index_build_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let direct = crate::direct::Direct {
+        video: format!("{base}/video"),
+        audio: None,
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: u64::MAX,
+    };
+
+    let first_state = state.clone();
+    let first_direct = direct.clone();
+    let first = tokio::spawn(async move {
+        crate::progressive::prepare(&first_state, "firstBuild01", Some(720), &first_direct, false).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while accepted.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted build never opened its first range");
+    first.abort();
+    let _ = first.await;
+    assert_eq!(state.index_build_sem.available_permits(), 0, "caller cancellation released build admission");
+
+    for n in 0..128 {
+        let error =
+            crate::progressive::prepare(&state, &format!("churnBuild{n:03}"), Some(720), &direct, false)
+                .await
+                .expect_err("a detached build was admitted past the strict cap");
+        assert!(error.retry && error.why.contains("busy"));
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1, "refused churn still opened upstream connections");
+    assert_eq!(state.progressive.lock().unwrap().len(), 1, "refused churn left shared futures behind");
+    assert_eq!(state.index_build_refused.load(Ordering::Relaxed), 128);
+
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.index_build_sem.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the self-driven build did not return its permit after upstream ended");
+    server.abort();
+}
+
+/// Opening an audible detail after a muted surface has warmed the same video must fetch only the audio
+/// index. This is the common upgrade path: refetching all 40 video fragments made it 57 requests instead of
+/// 16, even though their parsed boxes were already resident. The composed file must remain byte-for-byte the
+/// same layout as a fresh two-source build, not merely save requests.
+#[tokio::test]
+async fn an_audible_index_reuses_the_video_index_already_in_memory() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let video_fragments: Vec<Vec<u32>> = (0..40).map(|_| vec![7, 3, 3, 3]).collect();
+    let audio_fragments: Vec<Vec<u32>> = (0..15).map(|_| vec![2, 2, 2]).collect();
+    let video = crate::progressive::tests::fragmented(
+        &video_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        0,
+    );
+    let audio = crate::progressive::tests::fragmented(
+        &audio_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        1,
+    );
+    let expected = crate::progressive::tests::layout_of(&[&video, &audio]).expect("a reference layout");
+    let (base, asked) = crate::progressive::tests::serve_ranges(vec![video, audio], 0, "").await;
+    let direct = crate::direct::Direct {
+        video: format!("{base}/0"),
+        audio: Some(format!("{base}/1")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+
+    crate::progressive::prepare(&state, "dQw4w9WgXcQ", Some(720), &direct, false)
+        .await
+        .expect("a video index");
+    assert_eq!(
+        asked.swap(0, std::sync::atomic::Ordering::Relaxed),
+        1 + 40,
+        "the video head and each video fragment"
+    );
+
+    crate::progressive::prepare(&state, "dQw4w9WgXcQ", Some(720), &direct, true)
+        .await
+        .expect("an audible index");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::Relaxed),
+        1 + 15,
+        "only the audio head and audio fragments"
+    );
+
+    let key = format!("{}+audio", crate::direct::key("dQw4w9WgXcQ", Some(720)));
+    let shared = state.progressive.lock().unwrap().get(&key).expect("the audible entry").2.clone();
+    let actual = shared.await.expect("the audible layout");
+    assert_eq!(actual.head, expected.head, "the rebuilt MP4 header");
+    assert_eq!(actual.pieces, expected.pieces, "the interleaved source ranges");
+    assert_eq!(actual.total, expected.total, "the served file length");
+    assert_eq!(actual.etag, expected.etag, "the file identity");
+    assert_eq!(actual.keyframes, expected.keyframes, "the crop-detection index");
+    assert_eq!(actual.avcc, expected.avcc, "the video decoder configuration");
+}
+
+/// The resolved URLs survive a redeploy, and only the ones still worth having.
+///
+/// Worth a test of its own because the failure is silent: a park that wrote nothing, or a load that filtered
+/// everything, would leave no error anywhere — just the first open of every title after every deploy paying
+/// for yt-dlp again, which is the cost this exists to remove.
+#[tokio::test]
+async fn resolved_urls_survive_a_redeploy_unless_they_have_expired() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let url = |itag: &str| format!("https://rr7.googlevideo.com/videoplayback?itag={itag}");
+    let resolved = |expires| crate::direct::Direct {
+        video: url("136"),
+        audio: Some(url("140")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires,
+    };
+    let now = (state.clock)();
+    {
+        let mut cache = state.direct_cache.lock().unwrap();
+        cache.insert("live".into(), (Ok(resolved(now + 3_600_000)), now + 3_600_000));
+        cache.insert("expired".into(), (Ok(resolved(now - 1)), now - 1));
+    }
+
+    crate::state::save_direct_cache(&state);
+    let back = crate::state::load_direct_cache(&state.cfg, now);
+
+    assert_eq!(back.len(), 1, "only what is still worth having came back: {back:?}");
+    let (answer, exp) = back.get("live").expect("the live entry");
+    assert_eq!(exp, &(now + 3_600_000));
+    let restored = answer.as_ref().expect("an answer, not a refusal");
+    assert_eq!(restored.video, url("136"), "the URL a player would have had to wait on yt-dlp for");
+    assert_eq!(restored.audio.as_deref(), Some(url("140").as_str()));
+    assert_eq!((restored.width, restored.height), (Some(1280), Some(720)));
+}
+
+/// A press builds the index the open after it will need, at the rung the billboard already resolved, so that
+/// open waits for nothing. It is the same index the open itself would ask for — the two cannot drift apart.
+#[tokio::test]
+async fn a_press_builds_the_index_the_open_after_it_will_need() {
+    let dir = temp_dir();
+    let mut state = direct_state(&dir, "yt-dlp-never-run".into());
+    crate::crop::cache_report(
+        &state,
+        "dQw4w9WgXcQ",
+        crate::crop::report_from(
+            "dQw4w9WgXcQ",
+            Some((1920, 1080)),
+            crate::crop::RawCrop { w: 1920, h: 1080, x: 0, y: 0 },
+        ),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<bool>)>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).expect("not yet shared").direct_warm =
+        Box::new(move |_state, _id, cap, index| seen.lock().unwrap().push((cap, index)));
+    let ask = |query: &'static str| {
+        let state = state.clone();
+        async move {
+            crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await
+        }
+    };
+    let taken = || warmed.lock().unwrap().drain(..).collect::<Vec<_>>();
+
+    assert_eq!(ask("surface=audible&player=native&intent=warm").await.status(), 200);
+    assert_eq!(
+        taken(),
+        [(Some(720), Some(true))],
+        "a press builds the index the open after it will need, at the rung the billboard already resolved"
+    );
+    assert_eq!(ask("surface=audible&player=native").await.status(), 200);
+    assert_eq!(taken(), [(Some(720), Some(true))], "and that open asks for the very same one");
+}
+
+/// Answering an audible surface ahead of its resolve must not hand out a list for a video already known to be
+/// gone: that is refused at once, as a silent surface's wait would have refused it.
+#[tokio::test]
+async fn an_audible_answer_still_refuses_a_video_known_to_be_gone() {
+    let dir = temp_dir();
+    let (yt, runs) = fake_resolver(&dir, "yt-gone-sources", "echo 'ERROR: Video unavailable' >&2\nexit 1");
+    let state = direct_state(&dir, yt);
+    let removed = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(removed.status(), 404);
+
+    let query = "surface=audible&player=native";
+    let resp =
+        crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await;
+    assert_eq!(resp.status(), 404, "the verdict already standing, not a list of URLs that cannot play");
+    assert_eq!(spawn_count(&runs), 1, "and without resolving it again");
+}
+
+/// A media URL opens only as it was minted, for the install it was minted for, and until it expires.
+#[tokio::test]
+async fn a_media_url_opens_only_as_minted_and_until_it_expires() {
+    let dir = temp_dir();
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let signer = crate::sign::Signer::new("s3cret");
+    // A form no handler plays, so a URL that passes every check answers 404 without fetching anything.
+    let media = |x: u64| crate::sources::Media {
+        v: "dQw4w9WgXcQ".into(),
+        f: "none".into(),
+        h: None,
+        a: false,
+        n: false,
+        p: None,
+        i: None,
+        e: None,
+        x,
+    };
+    let open = |path: String| {
+        let state = state.clone();
+        async move {
+            let (filed, rest) = path.strip_prefix("m/").unwrap().split_once('/').unwrap();
+            let (blob, query) = rest.split_once('?').unwrap();
+            crate::sources::handle_media(state, &hyper::HeaderMap::new(), filed, blob, query).await.status()
+        }
+    };
+    // Carried by this server, so filed under `s`; the same URL under `n` would be metered as a playlist.
+    let carried = crate::sources::seal(Some(&signer), &media(4_000_000_000));
+    assert!(carried.starts_with("m/s/"), "{carried}");
+    assert_eq!(open(carried.replacen("m/s/", "m/n/", 1)).await, 404, "filed under the wrong segment");
+
+    assert_eq!(
+        open(crate::sources::seal(Some(&signer), &media(4_000_000_000))).await,
+        404,
+        "passes every check"
+    );
+    assert_eq!(open(crate::sources::seal(Some(&signer), &media(1))).await, 410, "expired");
+    let forged = crate::sources::seal(Some(&crate::sign::Signer::new("other")), &media(4_000_000_000));
+    assert_eq!(open(forged).await, 403, "another secret's tag");
+}
+
+/// The direct listener asks this before it redirects a client away from den-edge. Validation is
+/// only the signed bearer capability: no member credential and, critically, no resolve/media fetch.
+#[test]
+fn direct_media_validation_is_signed_expiring_and_revocable() {
+    let make = |state: &AppState, media: crate::sources::Media, signer: Option<&crate::sign::Signer>| {
+        let sealed = crate::sources::seal(signer, &media);
+        let (_, rest) = sealed.split_once("m/s/").expect("a carried media path");
+        let (blob, query) = rest.split_once('?').unwrap_or((rest, ""));
+        crate::sources::validate_direct_capability(state, blob, query)
+    };
+    let progressive = |x| crate::sources::Media {
+        v: "dQw4w9WgXcQ".into(),
+        f: "p".into(),
+        h: Some(720),
+        a: false,
+        n: false,
+        p: None,
+        i: None,
+        e: None,
+        x,
+    };
+    let signer = crate::sign::Signer::new("s3cret");
+    let state = signed_state(temp_dir(), "", "0", false);
+    let good = make(&state, progressive(4_000_000_000), Some(&signer));
+    assert_eq!(good.status(), 204);
+    assert_eq!(good.headers()["x-den-media-form"], "progressive");
+    assert_eq!(good.headers()["x-den-media-expires"], "4000000000");
+
+    let hls = crate::sources::Media {
+        f: "h".into(),
+        h: None,
+        p: Some("report".into()),
+        ..progressive(4_000_000_000)
+    };
+    let good = make(&state, hls, Some(&signer));
+    assert_eq!(good.status(), 204);
+    assert_eq!(good.headers()["x-den-media-form"], "hls-proxy");
+
+    let downloaded = crate::sources::Media {
+        f: "d".into(),
+        h: None,
+        a: true,
+        n: false,
+        p: None,
+        ..progressive(4_000_000_000)
+    };
+    let good = make(&state, downloaded, Some(&signer));
+    assert_eq!(good.status(), 204);
+    assert_eq!(good.headers()["x-den-media-form"], "download");
+    for malformed in [
+        crate::sources::Media { f: "d".into(), a: false, ..progressive(4_000_000_000) },
+        crate::sources::Media { f: "d".into(), a: true, h: Some(720), ..progressive(4_000_000_000) },
+        crate::sources::Media { f: "d".into(), a: true, n: true, ..progressive(4_000_000_000) },
+        crate::sources::Media {
+            f: "d".into(),
+            a: true,
+            p: Some("report".into()),
+            ..progressive(4_000_000_000)
+        },
+    ] {
+        assert_eq!(make(&state, malformed, Some(&signer)).status(), 403);
+    }
+    assert_eq!(make(&state, progressive(1), Some(&signer)).status(), 410, "expired");
+    assert_eq!(make(&state, progressive(4_000_000_000), None).status(), 403, "unsigned");
+    let forged = crate::sign::Signer::new("not-the-secret");
+    assert_eq!(make(&state, progressive(4_000_000_000), Some(&forged)).status(), 403, "invalid tag");
+
+    let revoked = signed_state(temp_dir(), IID, "0", false);
+    let bound = crate::sources::Media { i: Some(IID.into()), e: Some(0), ..progressive(4_000_000_000) };
+    assert_eq!(make(&revoked, bound, Some(&signer)).status(), 403, "revoked install");
+    let old_epoch = signed_state(temp_dir(), "", "1", false);
+    let bound = crate::sources::Media { i: Some(IID.into()), e: Some(0), ..progressive(4_000_000_000) };
+    assert_eq!(make(&old_epoch, bound, Some(&signer)).status(), 403, "old install epoch");
+
+    let unsigned =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    assert_eq!(
+        make(&unsigned, progressive(4_000_000_000), None).status(),
+        503,
+        "the direct-validation feature stays off without PLAY_SECRET"
+    );
+}
+
+/// Proxied HLS segments share the same direct-media permits as progressive bodies. Refusal happens
+/// after host + MAC validation but before opening Google, so overload is cheap and deterministic.
+#[tokio::test]
+async fn a_direct_hls_segment_is_refused_at_the_global_media_cap() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.play_secret = Some("s3cret".into());
+    cfg.direct_media_concurrency = 1;
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let held = state.media_gate.try_enter().unwrap();
+    let url = "https://r1.googlevideo.com/videoplayback";
+    let tag = crate::sign::tag("s3cret", &crate::hls::message(url));
+    let query = format!("u=https%3A%2F%2Fr1.googlevideo.com%2Fvideoplayback&s={tag}");
+    let response = crate::hls::handle_segment(state.clone(), &query, &hyper::HeaderMap::new(), true).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(state.media_gate.refused(), 1);
+    drop(held);
+    assert_eq!(state.media_gate.active(), 0);
+}
+
+/// The download path learned this lesson the expensive way: without a remembered verdict, every
+/// request for a video YouTube has removed spends another yt-dlp run rediscovering it.
+#[tokio::test]
+async fn a_removed_video_is_classified_and_not_re_resolved() {
+    let dir = temp_dir();
+    let (yt, runs) = fake_resolver(&dir, "yt-gone", "echo 'ERROR: Video unavailable' >&2\nexit 1");
+    let state = direct_state(&dir, yt);
+
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(resp.status(), 404, "a removed video is a 404, as it is on /play");
+    assert_eq!(direct_body(resp).await["error"], "unavailable");
+
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(resp.status(), 404);
+    assert_eq!(spawn_count(&runs), 1, "a known-dead id was re-resolved");
+}
+
+/// A resolve is a yt-dlp run, so the gate that protects the download has to cover this too —
+/// refusing, not degrading, because unlike a crop hint there is no useful constant to answer with.
+#[tokio::test]
+async fn direct_refuses_an_unsigned_link_when_play_is_signed() {
+    let dir = temp_dir();
+    let (yt, runs) = fake_resolver(&dir, "yt-unused", "printf '1920 1080\\nhttps://x/v\\n'");
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt;
+    cfg.play_secret = Some("s3cret".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let req = hyper::Request::builder().uri("/direct/dQw4w9WgXcQ.json").body(()).unwrap();
+    let resp = crate::handle_request(state, req).await;
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(direct_body(resp).await["error"], "bad_signature");
+    assert_eq!(spawn_count(&runs), 0, "a refused caller still got a yt-dlp run");
+}
+
+/// ...and the check has to sit BEFORE the fetch. `record_unknown` only proves the file existed when
+/// detection ran, and eviction is ordinary on a full volume — so with the check after the fetch, a
+/// /crop inside the ten-minute window could take a download permit and pull a whole trailer down to
+/// return a constant that does not depend on it.
+#[tokio::test]
+async fn an_unreadable_crop_does_not_re_download_the_trailer() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let downloads = dir.join("dl-count");
+    let yt = dir.join("yt-counting");
+    std::fs::write(&yt, format!("#!/bin/sh\necho x >> {}\nexit 1\n", downloads.display())).unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ff = dir.join("failing-ffmpeg");
+    std::fs::write(&ff, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&ff, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.ffmpeg = ff.to_string_lossy().into_owned();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    seed_cache(&dir, "unreadable2", 100);
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable2".into()).await;
+    assert_eq!(spawn_count(&downloads), 0, "the file was cached; nothing should have downloaded");
+
+    // Eviction takes the file while the "unreadable" verdict is still standing.
+    std::fs::remove_file(dir.join("unreadable2.mp4")).unwrap();
+    let resp = crate::crop::handle_crop(state.clone(), "unreadable2".into()).await;
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        spawn_count(&downloads),
+        0,
+        "/crop spent a download permit and a yt-dlp run to return a constant"
+    );
+}
+
+/// The probe permit bounded how many cropdetect passes run at once. It did nothing about the same
+/// unreadable trailer paying for a whole-file ffmpeg pass on every single call — which is the most
+/// expensive thing this service does per request, and only the SUCCESSFUL side was ever cached.
+#[tokio::test]
+async fn an_unreadable_crop_is_not_re_detected_on_every_call() {
+    let dir = temp_dir();
+    let runs = dir.join("ffmpeg-runs");
+    let fake = dir.join("failing-ffmpeg");
+    std::fs::write(&fake, format!("#!/bin/sh\necho x >> {}\nexit 1\n", runs.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ffmpeg = fake.to_string_lossy().into_owned();
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+    seed_cache(&dir, "unreadable1", 100);
+
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable1".into()).await;
+    // However many spawns one detection costs internally — this test is about repetition, not that.
+    let first = spawn_count(&runs);
+    assert!(first > 0, "the fake ffmpeg never ran, so this test proves nothing");
+
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable1".into()).await;
+    assert_eq!(spawn_count(&runs), first, "an unreadable trailer re-ran the whole-file ffmpeg pass");
+
+    // Short-lived on purpose: the other way to land here is a cropdetect that timed out under load.
+    clock.advance(crate::CROP_UNKNOWN_TTL_MS + 1);
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable1".into()).await;
+    assert!(spawn_count(&runs) > first, "the unknown never expired");
+}
+
+/// /crop's ffmpeg pass takes a probe permit. It was the only subprocess spawn without one, and it
+/// is a whole-file decode with no negative cache behind it, so an undetectable trailer re-runs it on
+/// every request at any concurrency.
+#[tokio::test]
+async fn crop_detection_is_bounded_by_the_probe_budget() {
+    let dir = temp_dir();
+    // A fake ffmpeg that sleeps, so overlapping /crop calls are observable.
+    let fake = dir.join("slow-ffmpeg");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ffmpeg = fake.to_string_lossy().into_owned();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // More concurrent /crop calls than the probe budget allows.
+    let over = crate::PROBE_CONCURRENCY + 4;
+    for i in 0..over {
+        let id = format!("cropvid{i:04}");
+        seed_cache(&dir, &id, 100);
+        let st = state.clone();
+        tokio::spawn(async move { crate::crop::handle_crop(st, id).await });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let running = std::process::Command::new("pgrep")
+        .args(["-f", &fake.to_string_lossy()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0);
+    let _ = std::process::Command::new("pkill").args(["-f", &fake.to_string_lossy()]).status();
+
+    assert!(running > 0, "the fake ffmpeg never ran, so this test proves nothing");
+    assert!(
+        running <= crate::PROBE_CONCURRENCY,
+        "{running} concurrent ffmpeg passes for {over} requests, over a budget of {}",
+        crate::PROBE_CONCURRENCY
+    );
+}
+
+/// Scratch counts toward the cap, so when it fills the cap on its own the eviction loop could never
+/// satisfy the target — and deleted every trailer, on every call, including the one the download
+/// that triggered it had just published. That is the death spiral the cap's floor exists to prevent,
+/// arrived at from the other side.
+#[test]
+fn scratch_filling_the_cap_does_not_wipe_the_cache() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("aaaaaaaaaa1.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("bbbbbbbbbb2.mp4"), vec![0u8; 100]).unwrap();
+    // An in-flight download bigger than the whole cap.
+    std::fs::write(dir.join(".ccccccccc11.123.0.partial.mp4.part"), vec![0u8; 500]).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.cache_max_bytes = 400;
+    crate::play::evict_if_needed(&cfg);
+
+    assert!(dir.join("aaaaaaaaaa1.mp4").exists(), "a trailer was evicted to make room for scratch");
+    assert!(dir.join("bbbbbbbbbb2.mp4").exists(), "the cache was wiped by unevictable scratch");
+}
+
+/// The process-group registry has real kill power, so a pgid left in it after the process died
+/// would make shutdown SIGKILL whatever the OS reused that number for. A no-op'd `unregister_group`
+/// is invisible to every other test, and that is exactly the dangerous mutation.
+///
+/// Asserted per-id rather than on the registry's size: it is process-wide, so a concurrent test's
+/// subprocesses are in it too, and `kill_live_groups()` here would kill them.
+#[test]
+fn a_finished_download_leaves_nothing_in_the_kill_registry() {
+    // In range, but far above any real pid — pid_max is orders of magnitude below this.
+    let unused_pgid = i32::MAX as u32 - 1;
+    assert!(!crate::ytdlp::is_group_live(unused_pgid));
+
+    crate::ytdlp::register_group(Some(unused_pgid));
+    assert!(crate::ytdlp::is_group_live(unused_pgid), "a live download was not registered");
+
+    crate::ytdlp::unregister_group(Some(unused_pgid));
+    assert!(
+        !crate::ytdlp::is_group_live(unused_pgid),
+        "a finished download stayed in the registry; shutdown would signal a reused pgid"
+    );
+
+    // pgid 0 is "the caller's own group" — registering it would make shutdown kill den-reel itself.
+    crate::ytdlp::register_group(Some(0));
+    assert!(!crate::ytdlp::is_group_live(0), "pgid 0 was registered; shutdown would kill our own group");
+
+    // A pgid above i32::MAX negates into a POSITIVE pid: `-(u32::MAX - 7) as i32` is 8. It must
+    // never reach the registry, because kill_group would then SIGKILL whatever pid 8 is.
+    crate::ytdlp::register_group(Some(u32::MAX - 7));
+    assert!(
+        !crate::ytdlp::is_group_live(u32::MAX - 7),
+        "a pgid that negates into a plain pid was registered"
+    );
+}
+
+/// A cancelled subprocess must leave nothing registered. The await in `output_in_group` is a
+/// cancellation point, and the routine way to reach it is a client hanging up mid-/crop — which the
+/// server treats as normal. Cleaning up only after the await left the pgid registered forever
+/// (nothing else prunes it), so shutdown SIGKILLed groups that had been dead for hours, and pid
+/// reuse makes that somebody else's group.
+#[tokio::test]
+async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
+    let dir = temp_dir();
+    let slow = dir.join("slow-cmd");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pgid = {
+        let mut cmd = tokio::process::Command::new(&slow);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            // Every production caller sets this; without it the drop path under test is not theirs,
+            // and tokio leaves the child unreaped as a zombie for the life of the test binary.
+            .kill_on_drop(true);
+        let fut = crate::ytdlp::output_in_group(&mut cmd);
+        tokio::pin!(fut);
+
+        tokio::select! {
+            _ = &mut fut => panic!("the fake exited immediately; this test proves nothing"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        // The child is ours and still running; its pid is its pgid (process_group(0)).
+        let out = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(slow.to_string_lossy().as_ref())
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .expect("the fake is running")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(crate::ytdlp::is_group_live(pid), "a running subprocess was not registered");
+        pid
+        // `fut` is dropped here — the cancellation the client hangup causes.
+    };
+
+    assert!(
+        !crate::ytdlp::is_group_live(pgid),
+        "a cancelled subprocess stayed in the registry; shutdown would signal a reused pgid"
+    );
+}
+
+/// yt-dlp's stderr pipe is inherited by everything it forks, so draining to EOF waits on the
+/// longest-lived descendant rather than on yt-dlp. A download that had already finished — complete
+/// file on disk, exit 0 — blocked for as long as that descendant lived, holding a download slot,
+/// and past the timeout became a 504 whose cleanup deleted the file it had just downloaded.
+#[tokio::test]
+async fn a_lingering_descendant_does_not_pin_a_finished_download() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-leaves-a-child");
+    // Fork a grandchild that holds the inherited stderr open, then exit 0 having written the file.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+         (sleep 30) &\nhead -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let out = dir.join("out.mp4");
+
+    let started = std::time::Instant::now();
+    let r = crate::ytdlp::download_to(&cfg, "abcdefghij1", &out).await;
+    let took = started.elapsed();
+
+    assert!(r.is_ok(), "the download failed: {r:?}");
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "a finished download was pinned by a lingering descendant for {took:?}"
+    );
+}
+
+/// yt-dlp's `--print` implies `--simulate` unless `--no-simulate` is also given. The download gained
+/// a `--print` for the decision log and from then on every fresh download exited 0 having written
+/// nothing — measured on the box with yt-dlp 2026.08.19: 2428ms, exit 0, empty directory, and the
+/// same command plus `--no-simulate` wrote the full 32798907-byte file. This fake behaves the way
+/// yt-dlp did there.
+#[tokio::test]
+async fn the_download_print_does_not_turn_it_into_a_simulation() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-print-simulates");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nout=\"\"; prev=\"\"; print=0; nosim=0\n\
+         for a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; [ \"$a\" = --print ] && print=1; \
+         [ \"$a\" = --no-simulate ] && nosim=1; prev=\"$a\"; done\n\
+         [ $print = 1 ] && echo '137+140|1080|avc1.640028|mp4a.40.2'\n\
+         [ $print = 1 ] && [ $nosim = 0 ] && exit 0\n\
+         head -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let format = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("out.mp4"))
+        .await
+        .expect("the download only simulated and wrote no file");
+    assert_eq!(format.format_id, "137+140", "the decision-log format was lost");
+}
+
+/// yt-dlp's stderr decides how a failure is classified, which drives /play's status, the /health
+/// extraction signal and autoPickRank. read_to_string discards the WHOLE buffer on one non-UTF-8
+/// byte, so a single accented character in an upstream message blanked the log and turned a
+/// geo-block into a generic extraction failure.
+#[tokio::test]
+async fn a_non_utf8_byte_does_not_discard_the_whole_error() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-latin1");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf 'ERROR: [youtube] Caf\\351: The uploader has not made this video available in your country.\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("the fake exits 1");
+
+    assert_eq!(err.status, 451, "a geo-block was misclassified: {err:?}");
+}
+
+/// A fake yt-dlp that fails the way a capped extraction does — `HTTP Error 403` part-way — for its
+/// first `capped` runs, then writes the file. Counts its runs.
+fn fake_capped_download(dir: &std::path::Path, capped: usize) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = dir.join("download-runs");
+    let fake = dir.join("ytdlp-capped");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho x >> {runs}\n\
+             if [ $(wc -l < {runs}) -le {capped} ]; then\n\
+             echo 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2\nexit 1\nfi\n\
+             out=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+             head -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+            runs = runs.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (fake.to_string_lossy().into_owned(), runs)
+}
+
+/// 2 of 8 hand-run downloads on 2026-10-11 died part-way on a googlevideo 403, and the extraction behind
+/// such a 403 stays refused while the next one usually serves. Each yt-dlp run extracts afresh, so one
+/// more run is the retry.
+#[tokio::test]
+async fn a_download_refused_part_way_is_run_once_more() {
+    let dir = temp_dir();
+    let (fake, runs) = fake_capped_download(&dir, 1);
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake;
+    crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect("the second run wrote the file");
+    assert_eq!(spawn_count(&runs), 2);
+}
+
+#[tokio::test]
+async fn a_download_refused_twice_fails_without_a_third_run() {
+    let dir = temp_dir();
+    let (fake, runs) = fake_capped_download(&dir, 5);
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake;
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("capped every time");
+    assert_eq!(err.reason, "extraction_failed");
+    assert_eq!(spawn_count(&runs), 2);
+}
+
+/// An ERROR line written after yt-dlp exits — by something holding the inherited pipe — must still
+/// be captured. Killing the group the instant the child exited threw it away, and with it the
+/// difference between "this video is geo-blocked" and "our extractor is broken".
+#[tokio::test]
+async fn an_error_written_after_exit_is_still_captured() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-late-error");
+    // A child that outlives the parent briefly and writes the diagnostic on the inherited stderr.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n(sleep 0.3; echo 'ERROR: [youtube] Video unavailable. This video is private' >&2) &\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("the fake exits 1");
+
+    assert_ne!(
+        err.reason, "extraction_failed",
+        "a late ERROR line was lost, so a private video read as a broken extractor: {err:?}"
+    );
+}
+
+/// MP4Box rewrites the trailer IN PLACE, on the same inode, so a bake that was killed part-way
+/// leaves a half-rewritten file — which then gets renamed into the cache and served immutable for a
+/// year, never re-fetched. Whether the bake ran at all is therefore the load-bearing distinction,
+/// and it was being thrown away with a bool: "disabled" and "killed mid-rewrite" were both `false`.
+#[tokio::test]
+async fn a_refusal_that_never_wrote_is_not_damage() {
+    let dir = temp_dir();
+    let fp = dir.join("bakevid0001.mp4");
+    std::fs::write(&fp, vec![0u8; 2048]).unwrap();
+    let report = crate::crop::report_from(
+        "bakevid0001",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+    );
+
+    use std::os::unix::fs::PermissionsExt;
+    // Refused without touching the file — what a real MP4Box does for a bad flag, a missing track,
+    // a read-only target or an unparseable MP4. The trailer is fine.
+    let refusing = dir.join("mp4box-refuses");
+    std::fs::write(&refusing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.mp4box = refusing.to_string_lossy().into_owned();
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "a refusal that never wrote cost us the trailer"
+    );
+
+    // Failed PART WAY through the rewrite — ENOSPC, EIO. This one really did damage it.
+    let mangling = dir.join("mp4box-mangles");
+    std::fs::write(
+        &mangling,
+        // POSIX: `for` leaves $f holding the LAST argument, which is MP4Box's target. `${@: -1}` is a
+        // bashism — under dash, which is /bin/sh on Linux CI, it is a Bad Substitution, so the fake
+        // exited without writing and the branch this test exists for was never reached there.
+        "#!/bin/sh\nfor f in \"$@\"; do :; done\nhead -c 64 /dev/zero >> \"$f\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mangling, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.mp4box = mangling.to_string_lossy().into_owned();
+    let before = std::fs::metadata(&fp).unwrap().len();
+    let verdict = crate::crop::bake_clap(&cfg, &fp, &report).await;
+    // Check the FAKE did its job before trusting the verdict. A fake that silently no-ops makes
+    // this test pass for the wrong reason — which is exactly what a bashism did under dash, leaving
+    // the branch below unexercised everywhere except one developer's machine.
+    assert_ne!(
+        std::fs::metadata(&fp).unwrap().len(),
+        before,
+        "the fake MP4Box never wrote to the file, so this proves nothing about a damaged bake"
+    );
+    assert_eq!(
+        verdict,
+        crate::crop::Bake::Damaged,
+        "a bake that wrote and then failed left a half-rewritten file"
+    );
+
+    // A binary that cannot start never touched the file, so the download is still publishable.
+    let mut cfg = test_cfg(dir.clone());
+    cfg.mp4box = dir.join("no-such-mp4box").to_string_lossy().into_owned();
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "a missing MP4Box must not condemn a perfectly good download"
+    );
+
+    // ...and so does baking being switched off.
+    let mut cfg = test_cfg(dir.clone());
+    cfg.bake_clap = false;
+    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Skipped);
+}
+
+/// yt-dlp exiting 0 with no file is a LOCAL failure — a grace kill, a full disk, a bad output path
+/// — never the extractor's verdict. Routing it through classify() produced a bare
+/// `extraction_failed`, and three of those flip /health to `extractor_unavailable`, telling the
+/// operator to bump yt-dlp for something yt-dlp did not do.
+#[tokio::test]
+async fn exit_zero_with_no_file_is_not_blamed_on_the_extractor() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-writes-nothing");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("no output file is a failure");
+
+    assert_ne!(
+        err.reason, "extraction_failed",
+        "a local failure was charged to the extractor's health signal: {err:?}"
+    );
+}
+
+/// A total outage has to show up somewhere. Local failures — no output file, a bake killed
+/// mid-rewrite — are not the extractor's fault, so they must not say "bump yt-dlp"; but they used
+/// to move nothing at all, and an instance failing every single download reported `ok`.
+#[test]
+fn downloads_failing_locally_degrade_health_under_their_own_reason() {
+    let t = crate::HEALTH_FAIL_THRESHOLD;
+    let ok = crate::health_body(true, 0, 0, 0, None);
+    assert_eq!(ok["status"], "ok");
+
+    let local = crate::health_body(true, 0, 0, t, None);
+    assert_eq!(local["status"], "degraded", "every download failing still reported ok");
+    assert_eq!(local["reason"], "downloads_failing");
+    let detail = local["detail"].as_str().unwrap_or_default();
+    assert!(!detail.contains("yt-dlp can't extract"), "local failures blamed the extractor: {detail}");
+
+    // An extractor outage still wins: it is the more specific diagnosis.
+    let both = crate::health_body(true, 0, t, t, None);
+    assert_eq!(both["reason"], "extractor_unavailable");
+}
+
+/// An exit code does not say whether the file was written. MP4Box validates its arguments and its
+/// input before opening the target, so every refusal mode — unknown flag, no such track, read-only
+/// target, unparseable MP4 — leaves it byte-identical; treating those as damage deleted perfectly
+/// good trailers. Only a run that actually touched the file and did not finish is unpublishable.
+#[test]
+fn only_a_bake_that_actually_wrote_condemns_the_file() {
+    use crate::crop::{bake_outcome, Bake, BakeRun};
+    assert_eq!(bake_outcome(BakeRun::Ok), Bake::Baked);
+    assert_eq!(bake_outcome(BakeRun::NeverStarted), Bake::Skipped);
+    assert_eq!(
+        bake_outcome(BakeRun::Refused { touched: false }),
+        Bake::Skipped,
+        "MP4Box refusing left the file byte-identical; losing the trailer over that is the worse bug"
+    );
+    assert_eq!(
+        bake_outcome(BakeRun::Refused { touched: true }),
+        Bake::Damaged,
+        "it exited non-zero AFTER writing — that file is half-rewritten"
+    );
+    assert_eq!(
+        bake_outcome(BakeRun::Killed),
+        Bake::Damaged,
+        "a bake killed mid-rewrite was treated as if it had never touched the file"
+    );
+}
+
+/// The gate itself: a bake that may have half-rewritten the file must not be renamed into the cache.
+/// Once published it is served for as long as it stays cached and never re-fetched, because any cached file
+/// with len > 0 counts as a hit — so a single interrupted bake is permanent.
+#[tokio::test]
+async fn a_damaged_bake_is_not_renamed_into_the_cache() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let sh = |p: &std::path::Path, body: &str| {
+        std::fs::write(p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // yt-dlp: write the output and exit 0.
+    let yt = dir.join("yt");
+    sh(&yt, "out=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 4096 /dev/zero > \"$out\"");
+    // ffmpeg: report a letterboxed rect so a clap is worth baking.
+    let ff = dir.join("ff");
+    sh(&ff, "echo '  Stream #0:0: Video: h264, yuv420p, 1920x1080 [SAR 1:1]' >&2\ni=0; while [ $i -lt 12 ]; do echo 'crop=1920:800:0:140' >&2; i=$((i+1)); done");
+    // MP4Box: ran, and failed — so the trailer may be mid-rewrite.
+    let mp = dir.join("mp");
+    let ran = dir.join("mp-ran");
+    // Quoted: an unquoted path word-splits under a TMPDIR containing a space, the marker is never
+    // written, and the test fails for a reason that has nothing to do with the code.
+    sh(&mp, &format!("for f in \"$@\"; do :; done; head -c 64 /dev/zero >> \"$f\" && : > \"{}\"; echo boom >&2; exit 1", ran.display()));
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.ffmpeg = ff.to_string_lossy().into_owned();
+    cfg.mp4box = mp.to_string_lossy().into_owned();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let err = crate::play::fetch_trailer(state.clone(), "bakevid0002".into())
+        .await
+        .expect_err("a possibly-corrupt trailer must not be published");
+    // The fake MP4Box has to have actually written, or this asserts the wrong failure.
+    assert!(
+        dir.join("mp-ran").exists(),
+        "the fake MP4Box never ran or never wrote; this proves nothing about a damaged bake"
+    );
+    assert_eq!(err.reason, "incomplete_download", "{err:?}");
+    // Name the failure, or this passes just as well when yt-dlp wrote nothing and the bake never ran.
+    assert!(
+        err.detail.contains("bake"),
+        "this asserts a blocked bake, but the failure was something else: {err:?}"
+    );
+    assert!(!dir.join("bakevid0002.mp4").exists(), "a half-rewritten trailer was published to the cache");
+    // ...and it has to be visible. An instance failing every download this way reported `ok`.
+    assert!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "a local download failure moved no health signal at all"
+    );
+    assert_eq!(
+        state.extract_fails.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a local failure was charged to the extractor"
+    );
+}
+
+/// The headline local failure — yt-dlp exits 0 and no file appears (a full or read-only cache
+/// volume) — must move the health counter. It had no coverage at all: only the bake path did.
+#[tokio::test]
+async fn a_download_that_produces_no_file_degrades_health_locally() {
+    let dir = temp_dir();
+    let fake = dir.join("yt-writes-nothing");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let err = crate::play::fetch_trailer(state.clone(), "nofilevid01".into())
+        .await
+        .expect_err("no output file is a failure");
+    assert_eq!(err.reason, "incomplete_download", "{err:?}");
+    assert!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the full-disk case moved no health signal"
+    );
+}
+
+/// ...and it has to clear once a trailer is actually produced, or /health stays degraded forever
+/// after the volume is fixed.
+#[tokio::test]
+async fn a_produced_trailer_clears_the_local_failure_signal() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-writes");
+    std::fs::write(
+        &yt,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    state.local_fails.store(5, std::sync::atomic::Ordering::Relaxed);
+
+    crate::play::fetch_trailer(state.clone(), "goodvid0001".into())
+        .await
+        .expect("the download should succeed");
+    assert_eq!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "/health stayed degraded after downloads recovered"
+    );
+}
+
+/// A rename failure is ours — a full or read-only volume, or the destination already there as a
+/// directory — not the extractor's. It was reported as `extraction_failed`, and because both
+/// counters are cleared just before it and the error is built here rather than in download_to, an
+/// instance failing EVERY download at the rename moved no counter and reported ok.
+#[tokio::test]
+async fn a_failed_publish_is_local_and_visible() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-writes");
+    std::fs::write(
+        &yt,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The destination is a non-empty directory, so the rename cannot succeed.
+    let blocked = dir.join("blockedvid1.mp4");
+    std::fs::create_dir_all(blocked.join("in-the-way")).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let err = crate::play::fetch_trailer(state.clone(), "blockedvid1".into())
+        .await
+        .expect_err("the rename cannot succeed");
+    assert_eq!(err.reason, "incomplete_download", "a full volume was blamed on the extractor: {err:?}");
+    assert!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "every download failing at the rename still reported ok"
+    );
+}
+
+/// The retry for "the file was evicted between fetch and open" could not do anything. The driver
+/// task clears the in-flight entry only after its own await returns, and every waiter wakes on that
+/// same completion — so the retry re-entered, joined the still-present entry, got the same
+/// already-resolved future, was handed the same vanished path, and returned 500. Dead code in
+/// exactly the case it exists for.
+///
+/// Driven by planting a resolved entry pointing at a path that does not exist, which is precisely
+/// what the losing side of that race observes.
+#[tokio::test]
+async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
+    use futures_util::FutureExt;
+
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-writes");
+    std::fs::write(
+        &yt,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // A finished download whose file is gone: exactly what the retry is supposed to recover from.
+    let gone = dir.join("evictedvid1.mp4");
+    assert!(!gone.exists(), "the point is that this file is not there");
+    let fut: crate::state::BoxFuture<Result<crate::play::Fetched, crate::ytdlp::PlayError>> =
+        Box::pin(async move { Ok(crate::play::Fetched::cached(gone)) });
+    let shared = fut.shared();
+    let _ = shared.clone().await; // resolve it, so it is a COMPLETED entry
+    state.in_flight.lock().unwrap().insert("evictedvid1".to_string(), (0, shared));
+
+    let resp = crate::play::handle_play(state.clone(), &hyper::HeaderMap::new(), "evictedvid1".into()).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the retry joined the finished download again instead of starting a fresh one"
+    );
+    assert!(dir.join("evictedvid1.mp4").exists(), "the retry never actually re-downloaded");
+}
+
+/// `download_sem` bounds how many downloads RUN at once, but the permit is taken inside
+/// `download_cached` — so every distinct well-formed id got an `in_flight` entry and a spawned
+/// driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. On an instance without
+/// PLAY_SECRET that is request-driven growth, reachable by anyone who can hit /play.
+///
+/// Joining a download already in flight must still be free: that is what the de-duplication is for,
+/// and a viewer waiting on a trailer someone else triggered must never be turned away by the cap.
+#[tokio::test]
+async fn a_flood_of_distinct_ids_cannot_grow_the_in_flight_map_without_bound() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    // A yt-dlp that does not return, so downloads stay outstanding for the whole test. Only
+    // DOWNLOAD_CONCURRENCY of these ever exist — the permit is taken before the spawn, so the rest
+    // of the flood is tasks parked on the semaphore — and they are reaped when this test's runtime
+    // drops. Emphatically NOT cleaned up with `kill_live_groups`: that registry is process-wide, and
+    // the suite runs in parallel, so calling it here killed seven other tests' fake yt-dlps.
+    let yt = dir.join("yt-hangs");
+    std::fs::write(&yt, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // Well past the cap, all distinct and all well-formed.
+    for i in 0..(crate::IN_FLIGHT_MAX + 20) {
+        let st = state.clone();
+        let id = format!("floodvid{i:03}");
+        tokio::spawn(async move { crate::play::fetch_trailer(st, id).await });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let outstanding = state.in_flight.lock().unwrap().len();
+    assert!(outstanding > 0, "nothing was queued, so this test proves nothing");
+    assert!(
+        outstanding <= crate::IN_FLIGHT_MAX,
+        "{outstanding} outstanding downloads against a cap of {}",
+        crate::IN_FLIGHT_MAX
+    );
+
+    // An id already in flight is still joined, not refused.
+    let joined = state.in_flight.lock().unwrap().keys().next().cloned().expect("something is queued");
+    let st = state.clone();
+    let waiter = tokio::spawn(async move { crate::play::fetch_trailer(st, joined).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "a request joining a live download was refused by the cap");
+    waiter.abort();
+}
+
+/// A `/play` verdict was the one thing this service learned and then immediately forgot: the
+/// in-flight entry is cleared however a download ends, so the next request for a video YouTube has
+/// REMOVED spent another of three download permits, and another yt-dlp process, to rediscover it.
+#[tokio::test]
+async fn a_removed_video_is_not_re_extracted_on_every_request() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let spawns = dir.join("spawns");
+    let yt = dir.join("yt-dead");
+    std::fs::write(
+        &yt,
+        format!("#!/bin/sh\necho x >> {}\necho 'ERROR: Video unavailable' >&2\nexit 1\n", spawns.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+
+    let err =
+        crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await.expect_err("the video is gone");
+    assert_eq!(err.reason, "unavailable");
+    assert_eq!(spawn_count(&spawns), 1, "the first request extracts");
+
+    // Same answer, and it must cost nothing.
+    let err = crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await.expect_err("still gone");
+    assert_eq!(err.reason, "unavailable", "the cached failure lost its reason");
+    assert_eq!(spawn_count(&spawns), 1, "a removed video was re-extracted on the next request");
+
+    // ...but it is a cache, not a tombstone.
+    clock.advance(crate::play::fail_ttl_ms("unavailable") + 1);
+    let _ = crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await;
+    assert_eq!(spawn_count(&spawns), 2, "the failure never expired");
+}
+
+/// A /play failure says when it is worth asking again, and the number is not a guess: it is exactly
+/// how long the failure cache will answer this id from memory, so a client that retries sooner gets
+/// the same response with no extraction behind it.
+#[tokio::test]
+async fn a_play_failure_says_when_to_come_back() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-gone");
+    std::fs::write(&yt, "#!/bin/sh\necho 'ERROR: Video unavailable' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir);
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+    let base = spawn_server(state).await;
+    let ttl = crate::play::fail_ttl_ms("unavailable");
+
+    let r = reqwest::get(format!("{base}/play/goneVideo01.mp4")).await.unwrap();
+    assert_eq!(r.status(), 404);
+    let retry_after = |r: &reqwest::Response| -> u64 {
+        r.headers().get("retry-after").unwrap().to_str().unwrap().parse().unwrap()
+    };
+    assert_eq!(retry_after(&r), ttl / 1000, "the first answer is the whole window");
+
+    // Ten minutes later the window is ten minutes shorter, and the header has to say so. Quoting
+    // the full TTL again would tell a client asking near the end to wait another whole window —
+    // up to twice the real cooldown, and unbounded if it keeps polling.
+    clock.advance(600_000);
+    let r = reqwest::get(format!("{base}/play/goneVideo01.mp4")).await.unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(
+        retry_after(&r),
+        (ttl - 600_000) / 1000,
+        "a cached failure quoted the full TTL again instead of what is left of it"
+    );
+}
+
+/// A throttle is YouTube refusing the box, not the video, and has to be told apart from the per-video
+/// refusals — the age wall shares "sign in to confirm" with the bot check.
+#[test]
+fn classify_recognises_a_youtube_throttle() {
+    for stderr in [
+        "ERROR: [youtube] abcdefghijk: Unable to download API page: HTTP Error 429: Too Many Requests",
+        "ERROR: [youtube] abcdefghijk: Sign in to confirm you\u{2019}re not a bot. Use --cookies-from-browser",
+        "ERROR: [youtube] abcdefghijk: Sign in to confirm you're not a bot",
+        "ERROR: [youtube] abcdefghijk: The current session has been rate-limited by YouTube for up to an hour",
+    ] {
+        let e = classify(Some(1), stderr);
+        assert_eq!((e.status, e.reason.as_str()), (503, "throttled"), "{stderr}");
+    }
+    assert_eq!(classify(Some(1), "ERROR: Sign in to confirm your age").reason, "restricted");
+}
+
+/// The pause doubles per episode, never passes its cap, and counts one episode once: requests that
+/// left before the pause report back inside it, and must not double it once each.
+#[test]
+fn a_backoff_doubles_caps_and_counts_one_episode_once() {
+    use crate::backoff::{window_ms, Backoff};
+    assert_eq!(window_ms(1000, 60_000, 1, 0), 1000);
+    assert_eq!(window_ms(1000, 60_000, 3, 0), 4000);
+    assert_eq!(window_ms(1000, 60_000, 3, 199), 4796);
+    assert_eq!(window_ms(1000, 60_000, 30, 199), 60_000);
+
+    let b = Backoff::new("test", 1000, 60_000);
+    assert_eq!(b.remaining_ms(0), None);
+    let first = b.trip(0, None, "refused");
+    assert!((1000..=1200).contains(&first), "{first}");
+    assert_eq!(b.trip(10, None, "refused"), first - 10, "a refusal inside the pause started a new episode");
+    assert_eq!(b.trip(10, Some(5000), "refused"), 5000, "a longer stated delay must extend the pause");
+    let second = b.trip(5010, None, "refused");
+    assert!((2000..=2400).contains(&second), "the next episode did not double: {second}");
+    b.clear();
+    assert_eq!(b.remaining_ms(5011), None, "an answer did not end the pause");
+    let after = b.trip(5011, None, "refused");
+    assert!((1000..=1200).contains(&after), "an answer did not forget the strikes: {after}");
+}
+
+/// Every new extraction waits out a YouTube throttle — a different id is refused without spawning
+/// yt-dlp, with what is left of the pause as `Retry-After` — and one that works ends it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_youtube_throttle_pauses_every_new_extraction_until_one_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let spawns = dir.join("spawns");
+    let ok = dir.join("youtube-answers");
+    let yt = dir.join("yt-throttled");
+    std::fs::write(
+        &yt,
+        format!(
+            "#!/bin/sh\necho x >> \"{}\"\nif [ -f \"{}\" ]; then\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\nexit 0\nfi\necho 'ERROR: [youtube] x: HTTP Error 429: Too Many Requests' >&2\nexit 1\n",
+            spawns.display(),
+            ok.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let clock = TestClock::default();
+    let now = || clock.0.load(Ordering::SeqCst);
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+
+    let err = crate::play::fetch_trailer(state.clone(), "throttled01".into()).await.expect_err("throttled");
+    assert_eq!((err.status, err.reason.as_str()), (503, "throttled"));
+    assert_eq!(spawn_count(&spawns), 1);
+
+    let err = crate::play::fetch_trailer(state.clone(), "different01".into()).await.expect_err("paused");
+    assert_eq!(err.reason, "throttled");
+    assert_eq!(spawn_count(&spawns), 1, "a different id spawned yt-dlp into a throttle");
+    assert!(state.play_fails.lock().unwrap().is_empty(), "a throttle was pinned to an id");
+
+    let base = spawn_server(state.clone()).await;
+    let r = reqwest::get(format!("{base}/play/another0001.mp4")).await.unwrap();
+    assert_eq!(r.status(), 503);
+    let left = state.youtube.remaining_ms(now()).expect("paused");
+    assert_eq!(r.headers()["retry-after"].to_str().unwrap(), left.div_ceil(1000).to_string());
+    let exposed = r.headers()["access-control-expose-headers"].to_str().unwrap();
+    for name in ["Retry-After", "ETag", "Last-Modified", "Content-Range", "Accept-Ranges"] {
+        assert!(exposed.contains(name), "{name} is not readable cross-origin: {exposed}");
+    }
+    assert_eq!(spawn_count(&spawns), 1);
+    let health: Value = reqwest::get(format!("{base}/health")).await.unwrap().json().await.unwrap();
+    assert_eq!(health["reason"], "youtube_throttled");
+
+    // Past the pause the next extraction is a probe. It works, and that ends the episode...
+    clock.advance(left + 1);
+    std::fs::write(&ok, "").unwrap();
+    crate::play::fetch_trailer(state.clone(), "different01".into()).await.expect("YouTube answers again");
+    assert_eq!(spawn_count(&spawns), 2);
+    assert_eq!(state.youtube.remaining_ms(now()), None);
+
+    // ...forgetting its strikes: the next throttle starts from the base window, not double it.
+    std::fs::remove_file(&ok).unwrap();
+    let _ = crate::play::fetch_trailer(state.clone(), "throttled02".into()).await;
+    let again = state.youtube.remaining_ms(now()).expect("paused again");
+    assert!(again <= crate::YOUTUBE_PAUSE_BASE_MS * 6 / 5, "a success did not reset the backoff: {again}ms");
+}
+
+#[test]
+fn retry_after_reads_seconds_and_http_dates() {
+    use crate::upstream::{http_date_ms, rate_limit_spent_ms, retry_after_ms, PAUSE_CAP_MS};
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    let with = |pairs: &[(&'static str, &str)]| {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    };
+    let now = http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT").expect("an IMF-fixdate");
+    assert_eq!(now, 784_111_777_000);
+
+    let ra = |v: &str| retry_after_ms(&with(&[(RETRY_AFTER.as_str(), v)]), now);
+    assert_eq!(ra("120"), Some(120_000));
+    assert_eq!(ra("Sun, 06 Nov 1994 08:51:37 GMT"), Some(120_000));
+    assert_eq!(ra("86400"), Some(PAUSE_CAP_MS), "a day-long Retry-After switched discovery off for a day");
+    // Past, zero or unreadable: no hint, so the caller's own backoff applies rather than "retry now".
+    for v in ["0", "Sun, 06 Nov 1994 08:00:00 GMT", "soon", "-5", "Sunday, 06-Nov-94 08:49:37 GMT"] {
+        assert_eq!(ra(v), None, "{v}");
+    }
+    assert_eq!(retry_after_ms(&HeaderMap::new(), now), None);
+
+    // A present-day clock here: an epoch reset is told from a delay by being past a billion seconds,
+    // which 1994 is not.
+    let now = 1_789_639_200_000;
+    let spent = |pairs: &[(&'static str, &str)]| rate_limit_spent_ms(&with(pairs), now);
+    let epoch_reset = (now / 1000 + 45).to_string();
+    assert_eq!(spent(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "30")]), Some(30_000));
+    assert_eq!(spent(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", &epoch_reset)]), Some(45_000));
+    assert_eq!(spent(&[("x-ratelimit-remaining", "3"), ("x-ratelimit-reset", "30")]), None);
+    assert_eq!(spent(&[("ratelimit", "limit=100, remaining=0, reset=50")]), Some(50_000));
+    assert_eq!(spent(&[("ratelimit", "\"default\";r=0;t=20")]), Some(20_000));
+    assert_eq!(spent(&[("ratelimit", "\"default\";r=5;t=20")]), None);
+}
+
+/// Answer every connection with the same response and count them, so a test can prove a request
+/// was never made.
+async fn serve_counting(head: &'static str, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!("{head}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A 429 is about the host, not the title: the next title is not sent to TMDB while its Retry-After
+/// stands, TMDB still reads as failing on /health, and KinoCheck — a different host — is still asked.
+#[tokio::test]
+async fn a_throttled_tmdb_is_not_asked_again_until_its_retry_after() {
+    const KC: &str = "{\"trailer\":{\"youtube_video_id\":\"dQw4w9WgXcQ\"}}";
+    let (tmdb, tmdb_hits) = serve_counting(
+        "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-type: application/json",
+        "{}",
+    )
+    .await;
+    let (kc, kc_hits) = serve_counting("HTTP/1.1 200 OK\r\ncontent-type: application/json", KC).await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = tmdb;
+    cfg.kinocheck_base = kc;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    assert_eq!(up.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(up.tmdb_candidates("test-key", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1, "a different title was sent to a throttled TMDB");
+    assert!(up.recent_failures() >= 2, "a paused TMDB read as healthy on /health");
+
+    assert_eq!(
+        up.kinocheck_youtube_id(None, "tt0816692", "movie", "en").await,
+        Ok(Some("dQw4w9WgXcQ".to_string())),
+        "a TMDB pause silenced KinoCheck"
+    );
+    assert_eq!(kc_hits.load(Ordering::SeqCst), 1);
+}
+
+/// KinoCheck gets the same pause, from its own exponential window when a 5xx says nothing about how
+/// long. And a good answer that spends the rate limit is used, while the call after it waits.
+#[tokio::test]
+async fn kinocheck_pauses_on_a_5xx_and_a_spent_rate_limit_pauses_after_the_answer() {
+    let (kc, kc_hits) =
+        serve_counting("HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json", "{}").await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.kinocheck_base = kc;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+    assert_eq!(up.kinocheck_youtube_id(None, "tt0816692", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(kc_hits.load(Ordering::SeqCst), 1, "a failing KinoCheck was asked again at once");
+
+    const VIDEOS: &str = "{\"results\":[{\"site\":\"YouTube\",\"key\":\"dQw4w9WgXcQ\",\
+        \"type\":\"Trailer\",\"official\":true,\"iso_639_1\":\"en\"}]}";
+    let (tmdb, tmdb_hits) = serve_counting(
+        "HTTP/1.1 200 OK\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 30\r\ncontent-type: application/json",
+        VIDEOS,
+    )
+    .await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = tmdb;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+    assert_eq!(
+        up.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await,
+        Ok(vec!["dQw4w9WgXcQ".to_string()]),
+        "the answer that spent the limit is still an answer"
+    );
+    assert_eq!(up.tmdb_candidates("test-key", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1, "TMDB was asked past a spent rate limit");
+}
+
+/// Our own refusal says when to come back too, on both endpoints that make it.
+#[tokio::test]
+async fn an_unusable_cache_says_when_to_come_back() {
+    let dir = temp_dir();
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let mut cfg = test_cfg(dir);
+    cfg.cache_dir = file.join("cache");
+    cfg.ytdlp_cache = cfg.cache_dir.join("yt-dlp");
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    for path in ["/play/dQw4w9WgXcQ.mp4", "/crop/dQw4w9WgXcQ.json"] {
+        let r = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(r.status(), 503, "{path}");
+        assert_eq!(r.headers()["retry-after"], "60", "{path}");
+        assert!(r.headers()["access-control-expose-headers"].to_str().unwrap().contains("Retry-After"));
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "cache_unavailable", "{path}");
+    }
+}
+
+/// The TTL has to follow the REASON. One uniform value is wrong in both directions: short enough
+/// not to pin a slow network as a dead trailer means re-extracting a removed video all afternoon;
+/// long enough to stop that means a timeout during one bad minute costs the trailer for hours.
+#[test]
+fn a_failure_ttl_follows_the_reason() {
+    let ttl = crate::play::fail_ttl_ms;
+    assert!(
+        ttl("unavailable") > ttl("geo_blocked"),
+        "a removal is a fact about the world; a region block can lift"
+    );
+    assert!(
+        ttl("geo_blocked") > ttl("timeout"),
+        "a timeout is the reason most likely to be our network rather than the video"
+    );
+    assert!(ttl("timeout") > 0, "a stuck id must not be free to take a download permit every request");
+    assert_eq!(ttl("something-new"), ttl("timeout"), "an unrecognised reason assumes the least");
+}
+
+/// Discovery does not probe, so a candidate that is geo-blocked or removed keeps its upstream rank
+/// forever and every client rediscovers it. /play is the only thing that finds out; /meta should
+/// listen — and should not spend a speculative download on an id it already knows is dead.
+#[tokio::test]
+async fn meta_demotes_and_stops_prewarming_a_candidate_play_found_dead() {
+    let warmed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let rec = warmed.clone();
+    let prewarm: PrewarmFn = Box::new(move |_state, id| rec.lock().unwrap().push(id));
+    let fake = FakeUpstream::new(&["deadFirst01", "liveSecond1"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), prewarm);
+
+    // Exactly what a failed /play leaves behind.
+    let gone = crate::ytdlp::PlayError {
+        status: 404,
+        reason: "unavailable".into(),
+        message: "This trailer is no longer available.".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "deadFirst01", &gone);
+
+    let base = spawn_server(state).await;
+    let resp = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+
+    // An order shaped by a /play failure must not be pinned in every client for a week. The signal
+    // behind it lives 60 seconds at the short end, after which this server has forgotten it.
+    assert_eq!(
+        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public, max-age=3600"),
+        "a demoted ordering went out with the full 7-day max-age"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert!(
+        links[0]["trailers"].as_str().unwrap().ends_with("/play/liveSecond1.mp4"),
+        "the dead candidate was still handed out first: {links:?}"
+    );
+    assert!(
+        links[1]["trailers"].as_str().unwrap().ends_with("/play/deadFirst01.mp4"),
+        "the dead candidate was dropped rather than demoted — it may come back"
+    );
+    assert_eq!(
+        *warmed.lock().unwrap(),
+        vec!["liveSecond1".to_string()],
+        "a prewarm permit was spent on a candidate already known to be dead"
+    );
+}
+
+/// ...but only when the demotion actually moved something. A list already in the right order — a
+/// live candidate ahead of a dead one — produces the same body the untouched path would, and
+/// shortening its life to an hour makes every client re-ask 24 times more often for an answer that
+/// cannot have changed.
+#[tokio::test]
+async fn meta_keeps_its_week_when_the_demotion_changed_nothing() {
+    let fake = FakeUpstream::new(&["liveFirst01", "deadSecond1"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let gone = crate::ytdlp::PlayError {
+        status: 404,
+        reason: "unavailable".into(),
+        message: "This trailer is no longer available.".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "deadSecond1", &gone);
+
+    let base = spawn_server(state).await;
+    let resp = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+
+    assert_eq!(
+        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public, max-age=300, s-maxage=86400, stale-while-revalidate=518400, stale-if-error=604800"),
+        "a response the demotion never touched lost its day of freshness"
+    );
+    // Tagged, so a reel release can drop Cloudflare's copy.
+    assert_eq!(resp.headers().get("cache-tag").and_then(|v| v.to_str().ok()), Some("reel"));
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert!(links[0]["trailers"].as_str().unwrap().ends_with("/play/liveFirst01.mp4"));
+    assert!(links[1]["trailers"].as_str().unwrap().ends_with("/play/deadSecond1.mp4"));
+}
+
+/// A directory at a published trailer's path is served by nothing (the cache-hit check rejects it)
+/// and removed by nothing — `is_published_trailer` matches on name, and both cleanup passes skip
+/// non-files. So every request for that id re-downloads, fails at the rename, and bumps the health
+/// counter, permanently.
+#[test]
+fn a_directory_masquerading_as_a_trailer_is_cleared() {
+    let dir = temp_dir();
+    let impostor = dir.join("impostorvid.mp4");
+    std::fs::create_dir_all(impostor.join("in-the-way")).unwrap();
+    std::fs::write(dir.join("realvideo01.mp4"), b"x").unwrap();
+    std::fs::create_dir_all(dir.join("yt-dlp")).unwrap();
+    std::fs::write(dir.join("yt-dlp").join("player.json"), b"{}").unwrap();
+
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+
+    assert!(!impostor.exists(), "a directory at a trailer's path survived the sweep forever");
+    assert!(dir.join("realvideo01.mp4").exists(), "a real trailer was removed");
+    assert!(dir.join("yt-dlp").join("player.json").exists(), "yt-dlp's own cache was removed");
+}
+
+/// The sweep and the serve path must agree on what a trailer is. `DirEntry::metadata` does not
+/// follow symlinks and `fs::metadata` does, so a symlinked trailer that plays perfectly well read
+/// as "not a file" to the sweep and was unlinked.
+#[test]
+fn a_symlinked_trailer_is_not_swept_away() {
+    let dir = temp_dir();
+    let real = dir.join("payload.bin");
+    std::fs::write(&real, b"a real trailer").unwrap();
+    let link = dir.join("linkedvid01.mp4");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+
+    assert!(link.exists(), "a symlinked trailer the serve path would happily open was removed");
+    assert!(real.exists(), "the symlink's target was removed");
+}
