@@ -37,6 +37,12 @@ pub struct ScrapeQuery {
 pub trait Scraper: Send + Sync {
     fn id(&self) -> Indexer;
     async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError>;
+
+    /// Go's `answerKey`: what `scrapeAllCached` keys this scraper's cached answer by. `None` for a scraper
+    /// whose answers are not cached.
+    fn answer_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Go `parseStremioStreams`: the streams in a Stremio `/stream` response, `source` naming the indexer

@@ -130,6 +130,9 @@ impl fmt::Display for StoreUnavailableError {
 pub enum StoreError {
     DeadLink(DeadLinkError),
     Unavailable(StoreUnavailableError),
+    /// Go `errScoutSide` wrapping a `StoreUnavailableError`: a refusal scout made itself (its own add
+    /// allowance), not the service. `recordRefusal` never remembers it.
+    ScoutSide(StoreUnavailableError),
     /// Go `errAddInFlight`: an add for this release is already out and unanswered.
     AddInFlight,
     /// Go `errAddQueued`: TorBox parked the add behind the account's slot limit.

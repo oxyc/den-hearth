@@ -16,8 +16,9 @@ pub trait Cache: Send + Sync {
     }
 
     /// Go's `persistenceReporter` optional interface (metrics.go): whether entries survive a restart.
-    fn persistent(&self) -> bool {
-        false
+    /// `None` is a backend that does not report it, which the persistence gauge shows as -1.
+    fn persistent(&self) -> Option<bool> {
+        None
     }
 }
 

@@ -26,6 +26,24 @@ pub(crate) const UNKNOWN_OUTCOME_TTL: Duration = Duration::from_secs(30 * 60);
 /// Go `refusalBackoff` (stores.go:1557): how long a refusal holds a store off.
 pub(crate) const REFUSAL_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Go `resolveKey` (stores.go:782): the cached torrent id and file list for a hash on this account. Scoped
+/// by the canonical TorBox identity, because the value is an account-scoped torrent id.
+pub(crate) fn resolve_key(identity: &str, info_hash: &str) -> String {
+    todo!("stores.go resolveKey")
+}
+
+/// Go `torrentIDKey` (stores.go:786): the torrent id alone, kept apart from the resolve entry so a queued
+/// torrent with no file list is still addressable by `Status`.
+pub(crate) fn torrent_id_key(identity: &str, info_hash: &str) -> String {
+    todo!("stores.go torrentIDKey")
+}
+
+/// Go `transportKind` (stores.go:1060): a transport failure described WITHOUT its URL, which for TorBox
+/// carries the account token in its query string.
+pub(crate) fn transport_kind(err: Option<&(dyn std::error::Error + Send + Sync + 'static)>) -> String {
+    todo!("stores.go transportKind")
+}
+
 /// Go `refusedKey` (stores.go:1466): the per-release refusal memory.
 pub(crate) fn refused_key(svc: DebridService, token: &str, info_hash: &str) -> String {
     todo!("stores.go refusedKey")

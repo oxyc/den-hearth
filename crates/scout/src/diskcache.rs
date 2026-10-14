@@ -53,7 +53,7 @@ impl Cache for TieredCache {
         todo!("diskcache.go TieredCache.PutClass")
     }
 
-    fn persistent(&self) -> bool {
+    fn persistent(&self) -> Option<bool> {
         todo!("diskcache.go TieredCache.Persistent")
     }
 }

@@ -22,9 +22,10 @@ chacha20poly1305 = "0.10"
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
+# The handler serves `http::Request`/`http::Response`.
+http = "1"
 
 [dev-dependencies]
-http = "1"
 # Go's `t.TempDir()`.
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }

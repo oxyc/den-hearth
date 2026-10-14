@@ -79,9 +79,33 @@ Test lines per package, in parentheses. Total 21,509.
 | 5 | Ranking, indexers, probing | 3,959 | `rank.rs` 730, `attributes.rs` 387, `label.rs` 165, `season.rs` 566, `client.rs` 185, `probe.rs` 737, `probe_avi.rs` 102, `probe_mp4.rs` 281, `probe_fanout.rs` 415, `scrape.rs` 711, `sources.rs` 153, `indexerconfig.rs` 329, `cinemeta.rs` 149 |
 | 6 | Foundations and plumbing | 3,532 | `config.rs` 474, `id.rs` 70, `play.rs` 89, `util.rs` 35, `seal.rs` 145, `ticket.rs` 155, `cache.rs` 107, `diskcache.rs` 348, `linkcheck.rs` 215, `linkmemo.rs` 132, `validate.rs` 174, `hostlimit.rs` 169, `upstreampause.rs` 236, `decisionlog.rs` 187, `metrics.rs` 379, `loglimit.rs` 49, `reqlog.rs` 112 |
 
-Order: **package 6 first lands `src/tests/mock.rs`** (18 lines; every other package waits on it), then
-`util`, `config`, `seal`, `cache`. Package 3 and the leaf modules of 5 need nothing else. Packages 1 and 2
-need only the frozen types. Package 4 sits on top of everything and is the last to go green.
+Order: `util`, `config`, `seal`, `cache` first (`src/tests/mock.rs` is already ported). The leaf modules
+of 5 need nothing else. Package 3's budget tests need nothing else, but 90 of its 101 tests drive the
+stores or the handler, so they go green only after packages 1, 2 and 4. Package 4 sits on top of
+everything and is the last to go green.
+
+## Integration notes (tests-first phase)
+
+- **Ignored tests carry their port.** A test that needs another package's code is `#[ignore]`d, and its
+  full ported body sits in a nested `#[cfg(any())] fn pending()` (or `async fn`) inside it. That body
+  only has to parse, so the API names in it are unchecked. Enabling one means moving the body up,
+  deleting the wrapper, and reconciling names.
+- **Handler test entry point:** `handler::new_handler(deps) -> Handler`, then
+  `Handler::serve(&self, http::Request<Vec<u8>>)`, with `test_deps(|d| ...)` in `tests/handler.rs`.
+  Pending bodies in packages 1, 2, 3, 5 and 6 were written against `handler::serve(&deps, req)` and
+  `Deps::for_test(...)`; rename them when enabling.
+- **Key helpers in `refusal.rs`:** `resolve_key`, `torrent_id_key` and `transport_kind` sit in package 2's
+  line range but `torbox.rs` calls them throughout. Package 2 implements them first.
+- **`KnownFileSize`** is defined in `linkcheck.go` (package 6), on the pool and the TorBox and
+  Real-Debrid stores.
+- **Helpers used only by pending bodies are not defined yet** (for example `FakeStore`, `AnsweringStore`,
+  `capture_log`, `tempdir`, `broken_body_response`). Each package also kept its own copies of small Go
+  test helpers (`repeat`, `intp`, `H`); fold them into `tests/mock.rs` when convenient.
+- **Not translatable as written:** Go's `runtime.MemStats` allocation budgets need a counting global
+  allocator in the test binary, and `regexp/syntax` program sizes have no Rust equivalent. Those tests
+  are ignored with that reason.
+- **Shared-type changes made at merge:** `StoreError::ScoutSide`, `Scraper::answer_key`, and
+  `Cache::persistent` now returns `Option<bool>` (`None` = not reporting, the gauge's -1).
 
 ### Package 1: Stores I (TorBox) - 3,082 test lines
 
