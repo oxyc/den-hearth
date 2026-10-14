@@ -4,10 +4,9 @@
 //! ignored with their bodies compiled out. `capture_log` is the Go `captureLog` helper; the crate has no log sink
 //! to redirect yet, so it is `todo!()` until the logging owner lands one.
 
-/// Go `captureLog`: runs `f` with the crate's log output captured, and returns it. Not ported yet: the crate has no
-/// log sink to redirect until the request log and the decision log write through one.
+/// Go `captureLog`: runs `f` with the crate's log output captured, and returns it.
 pub(crate) fn capture_log(f: impl FnOnce()) -> String {
-    todo!("captureLog: the crate's log sink is not ported yet")
+    crate::loglimit::capture(f)
 }
 
 /// Stands in for Go's `(?m)^<prefix>\d+<suffix>$` regexes: a line that starts with `prefix` and ends with `suffix`.
