@@ -1315,7 +1315,7 @@ fn serve(
     if status == StatusCode::PARTIAL_CONTENT {
         out = out.header("content-range", format!("bytes {start}-{end}/{total}"));
     }
-    out.body(body(state.http.clone(), urls.to_vec(), parts(layout, start, end))).unwrap()
+    out.body(body(state.media_http.clone(), urls.to_vec(), parts(layout, start, end))).unwrap()
 }
 
 /// Where `vid`'s served file comes from — its video stream, and its audio when `audio` asks and YouTube
@@ -2025,6 +2025,39 @@ pub(crate) mod tests {
                 .collect()
                 .await;
         assert!(result.is_err(), "a clean but short 206 must not silently truncate playback");
+    }
+
+    /// Upstream that sends half of a 10-byte range, then goes quiet for `pause` before the rest.
+    async fn serve_with_pause(pause: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = conn.read(&mut request).await;
+            let head = "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 0-9/20\r\n\r\n01234";
+            conn.write_all(head.as_bytes()).await.unwrap();
+            tokio::time::sleep(pause).await;
+            let _ = conn.write_all(b"56789").await;
+        });
+        base
+    }
+
+    /// The metadata client's 15 s total timeout covers the body, so a relay through it ended the
+    /// response mid-stream whenever the upstream or player went quiet for longer. The media client
+    /// does not carry that timeout. Paused time lets the 30 s pause run instantly.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_outlives_the_metadata_clients_total_timeout() {
+        let parts = || vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }];
+
+        let base = serve_with_pause(Duration::from_secs(30)).await;
+        let metadata = body(crate::state::http_client(), vec![base], parts()).collect().await;
+        assert!(metadata.is_err(), "premise: the 15 s client cuts a 30 s pause off");
+
+        let base = serve_with_pause(Duration::from_secs(30)).await;
+        let media = body(crate::state::media_client(), vec![base], parts()).collect().await;
+        assert_eq!(media.expect("the media client rides out the pause").to_bytes().len(), 10);
     }
 
     /// Prototype evidence: adjacent chunks share an upstream request, while the metadata fetched

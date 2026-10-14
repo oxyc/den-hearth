@@ -124,6 +124,10 @@ pub struct AppState {
     /// Shared rather than a second one: a client is a connection pool, and googlevideo and TMDB are
     /// both plain https with the same TLS stack behind them.
     pub http: reqwest::Client,
+    /// For bulk media relayed to a player (`/progressive`). `http`'s 15 s timeout covers the whole
+    /// request including the body, which would cut a trailer off whenever a player reads slowly or
+    /// pauses; this one bounds only connecting, and the relay enforces its own idle deadlines.
+    pub media_http: reqwest::Client,
     pub prober: ProbeFn,
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
     pub searcher: SearchFn,
@@ -189,13 +193,8 @@ impl AppState {
     /// Production state: real HTTP upstream, real yt-dlp prober, real fetch-on-prewarm.
     pub fn new(cfg: Config) -> Arc<AppState> {
         let cfg = Arc::new(cfg);
-        // rustls client with a modest timeout so a wedged upstream can't pin a request forever.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            // Named, so an upstream operator reading their logs can tell who is calling.
-            .user_agent(format!("den-reel/{}", crate::release_version()))
-            .build()
-            .expect("reqwest client");
+        let http = http_client();
+        let media_http = media_client();
         let upstream = Box::new(HttpUpstream::new(cfg.clone(), http.clone()));
         let probe_sem = Arc::new(Semaphore::new(crate::PROBE_CONCURRENCY));
         let prewarm_sem = Arc::new(Semaphore::new(crate::PREWARM_MAX));
@@ -229,6 +228,7 @@ impl AppState {
             worker: Default::default(),
             upstream,
             http,
+            media_http,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),
             prewarm: default_prewarm(),
@@ -302,6 +302,27 @@ impl AppState {
         eprintln!("{line}");
         Some(line)
     }
+}
+
+/// rustls client for metadata lookups, with a modest total timeout so a wedged upstream can't pin
+/// a request forever.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        // Named, so an upstream operator reading their logs can tell who is calling.
+        .user_agent(format!("den-reel/{}", crate::release_version()))
+        .build()
+        .expect("reqwest client")
+}
+
+/// The client for relaying media: no total or read timeout, because both would count the time a
+/// slow or paused player leaves the response unread. The relay bounds each upstream wait itself.
+pub(crate) fn media_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .user_agent(format!("den-reel/{}", crate::release_version()))
+        .build()
+        .expect("reqwest client")
 }
 
 /// The YouTube throttle pause, with its production window.
