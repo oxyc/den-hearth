@@ -10,7 +10,7 @@ use crate::util::b64url_encode;
 // A fixed libsodium crypto_box_seal vector, generated with PyNaCl (SealedBox) — see
 // docs/SEALED-CONFIG.md. This is the cross-language interop GATE: the Go `open` MUST decrypt a
 // ciphertext produced by a real libsodium binding (the same one /configure uses via libsodium.js).
-const VEC_PRIV_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="; // recipient X25519 private key (seed 00..1f)
+pub(crate) const VEC_PRIV_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="; // recipient X25519 private key (seed 00..1f)
 const VEC_PUB_B64: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8="; // its public key
 const VEC_CT_B64: &str = "YVIKGV1+YCwzCoPC0WNrcle9bYR0iWhBDAsy2ylVhGmDWneqpfb/Oug5izEfwx2Q9j8UDKM2XF/u+Q9Sg1jqQeMb5RNWpLZk+81tVixiI5qFpc/zNGAwfTJSMVj+B48nCbgqRk0rqQzqniVKm1d85g==";
 const VEC_PLAIN: &str = r#"{"debrid":[{"service":"realdebrid","token":"SEALED-VECTOR-OK"}]}"#;

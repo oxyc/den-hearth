@@ -1,7 +1,7 @@
 //! Port of `internal/scout/cache.go`: the cache seam (stream lists and per-hash truth) and its in-memory
 //! TTL + LRU backend, bounded by bytes. `Cache` and `CacheClass` are FROZEN (see PORTING.md).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// FROZEN. Go `Cache`. Thread-safe. `get` returns `None` for a missing or expired key.
 pub trait Cache: Send + Sync {
@@ -33,6 +33,8 @@ pub enum CacheClass {
 /// porter's; only the constructor and the `Cache` impl are the surface.
 pub struct MemoryCache {
     max_bytes: usize,
+    /// Go's `c.now`: the clock expiry reads. A test swaps it for one it can move.
+    pub(crate) now: Box<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 impl MemoryCache {
