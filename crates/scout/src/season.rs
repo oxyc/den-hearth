@@ -5,9 +5,35 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
-use fancy_regex::{Captures, Regex as FancyRegex};
+use fancy_regex::{Captures, Regex as FancyRegex, RegexBuilder as FancyRegexBuilder};
 
+use crate::rank::re2;
 use crate::stores::StoreError;
+use crate::util::go_to_lower;
+
+/// fancy-regex gives up on a match after this many backtracks and reports an error, where Go's regexp2 has no
+/// limit and always answers. Callers read an error as "no match", so with the default (1,000,000) a long enough
+/// title would silently stop matching. These patterns backtrack a bounded amount per start position, so the work
+/// stays linear in the title (an indexer title is capped by the 2 MiB response it arrives in) and the limit is
+/// lifted rather than tuned.
+const BACKTRACK_LIMIT: usize = usize::MAX;
+
+/// Compiles one of this module's .NET-syntax patterns the way regexp2 runs it, with no backtrack ceiling.
+fn fancy(pattern: &str) -> Result<FancyRegex, fancy_regex::Error> {
+    FancyRegexBuilder::new(pattern).backtrack_limit(BACKTRACK_LIMIT).build()
+}
+
+/// .NET's `\w`, which regexp2 uses for `\b`: letters, non-spacing marks, decimal digits and connector
+/// punctuation. The regex crate's `\w` also takes spacing marks, enclosing marks and letter numbers.
+const NET_WORD: &str = r"[\p{L}\p{Mn}\p{Nd}\p{Pc}]";
+
+/// .NET's `\b` spelled out over [`NET_WORD`].
+fn net_word_boundary() -> String {
+    format!("(?:(?<={NET_WORD})(?!{NET_WORD})|(?<!{NET_WORD})(?={NET_WORD}))")
+}
+
+/// .NET's `$` without the multiline option: the end of the text, or just before a final newline.
+const NET_END: &str = r"(?=\n?\z)";
 
 /// FROZEN. Go `TorrentFile`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,9 +54,7 @@ pub(crate) fn err_episode_not_in_torrent() -> StoreError {
 /// Go `episodePatterns`' result: the matchers for one season and episode, in the order Go builds them.
 pub(crate) type EpisodePatterns = Vec<FancyRegex>;
 
-static VIDEO_EXT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$").expect("constant pattern compiles")
-});
+static VIDEO_EXT_RE: LazyLock<regex::Regex> = LazyLock::new(|| re2(r"\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$"));
 
 /// Go `labelledEpisodeRe` — does a filename DECLARE an episode, in a form that can't be anything else?
 ///
@@ -39,8 +63,7 @@ static VIDEO_EXT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// all — "Movie.2019.1080p" is full of three- and four-digit runs. Only the unambiguous forms count, so
 /// the mismatch below is claimed only when a filename really does name a different episode.
 static LABELLED_EPISODE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(s\d{1,2}[ ._-]*e\d{1,3}|\b\d{1,2}x\d{2}\b|season[ ._-]*\d{1,2}[ ._-]*episode[ ._-]*\d{1,3})")
-        .expect("constant pattern compiles")
+    re2(r"(s\d{1,2}[ ._-]*e\d{1,3}|\b\d{1,2}x\d{2}\b|season[ ._-]*\d{1,2}[ ._-]*episode[ ._-]*\d{1,3})")
 });
 
 /// Go `episodeRangeRe` finds a multi-episode label: a season, a first episode, and everything chained onto it.
@@ -51,13 +74,13 @@ static LABELLED_EPISODE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// number, so the third episode matched nothing; the file is labelled, so the miss became a hard refusal
 /// and a third of a playing release answered 404 on all three stores.
 static EPISODE_RANGE_RE: LazyLock<FancyRegex> = LazyLock::new(|| {
-    FancyRegex::new(r"s0*(\d{1,2})[ ._-]*e(\d{1,3})((?:[ ._-]*e\d{1,3}|-\d{1,3})*)(?![\da-z])")
+    fancy(r"s0*(\d{1,2})[ ._-]*e(\d{1,3})((?:[ ._-]*e\d{1,3}|-\d{1,3})*)(?![\da-z])")
         .expect("constant pattern compiles")
 });
 
 /// Go `episodeChainRe` splits the chain into its elements, keeping whether each carried its own `e`.
 static EPISODE_CHAIN_RE: LazyLock<FancyRegex> =
-    LazyLock::new(|| FancyRegex::new(r"(?:[ ._-]*e(\d{1,3})|-(\d{1,3}))").expect("constant pattern compiles"));
+    LazyLock::new(|| fancy(r"(?:[ ._-]*e(\d{1,3})|-(\d{1,3}))").expect("constant pattern compiles"));
 
 /// Go `chainedEpisode`: one number after the first, and whether it named itself with an `e`.
 struct ChainedEpisode {
@@ -69,14 +92,15 @@ struct ChainedEpisode {
 /// Go `episodePatterns` builds the SxxExx / 1x02 / "season 1 episode 2" / 102 / 0102 matchers once per pick.
 /// These NAME the episode: each carries the season with it, so a match is a statement about the file.
 pub(crate) fn episode_patterns(season: i64, episode: i64) -> EpisodePatterns {
+    let b = net_word_boundary();
     let specs = [
         format!(r"s0*{season}[ ._-]*e0*{episode}(?!\d)"),
-        format!(r"\b0*{season}x0*{episode}(?!\d)"),
+        format!(r"{b}0*{season}x0*{episode}(?!\d)"),
         format!(r"season[ ._-]*0*{season}[ ._-]*episode[ ._-]*0*{episode}(?!\d)"),
         // Bare concatenated forms (102 = S1E02) must not swallow a resolution token: a trailing p/i
         // makes "720" (S7E20) match "720p", so exclude those as well as a following digit.
-        format!(r"\b{season}{episode:02}(?![\dpi])"),
-        format!(r"\b{season:02}{episode:02}(?![\dpi])"),
+        format!(r"{b}{season}{episode:02}(?![\dpi])"),
+        format!(r"{b}{season:02}{episode:02}(?![\dpi])"),
         // A double episode names TWO of them, and only the first was ever matched: `Show.S01E05-E06.mkv`,
         // `S01E05E06`, `S01E05-06`, `S01E05.E06`. Asked for the second, nothing matched — and because such
         // a file DOES declare an episode it then ruled itself out of every guess below it, so a pack of
@@ -136,7 +160,7 @@ pub(crate) fn episode_patterns(season: i64, episode: i64) -> EpisodePatterns {
 /// did name the episode — the strong evidence losing to the weak, on the largest file.
 pub(crate) fn bare_episode_patterns(episode: i64) -> EpisodePatterns {
     compile_all(&[
-        format!(r"(?:^|[ _\-\[\]()])0*{episode}(?:[ _\-\[\]()]|\.(?!\d)|$)"),
+        format!(r"(?:^|[ _\-\[\]()])0*{episode}(?:[ _\-\[\]()]|\.(?!\d)|{NET_END})"),
         // `Show - E05 [1080p].mkv` and `Show.E05.1080p.mkv`: an episode number with no season anywhere, so
         // the strong patterns cannot fire and labelledEpisodeRe (which needs the `s`) does not see it
         // either. Every file then looked identical to every other and the largest was served for all
@@ -145,12 +169,12 @@ pub(crate) fn bare_episode_patterns(episode: i64) -> EpisodePatterns {
         // The `e` is what makes this safe where the bare token is not: it is why a dot may open the token
         // and why the trailing rule can relax to any separator. `DDP5.1`, `H.264` and `AAC.2.0` have no
         // `e` against their digits, and a file that names a season is excluded from this tier already.
-        format!(r"(?:^|[ ._\-\[\]()])e0*{episode}(?:[ ._\-\[\]()]|$)"),
+        format!(r"(?:^|[ ._\-\[\]()])e0*{episode}(?:[ ._\-\[\]()]|{NET_END})"),
     ])
 }
 
 fn compile_all(specs: &[String]) -> EpisodePatterns {
-    specs.iter().filter_map(|s| FancyRegex::new(s).ok()).collect()
+    specs.iter().filter_map(|s| fancy(s).ok()).collect()
 }
 
 /// Go `episodeNamer` holds the compiled patterns for ONE (season, episode) so a pick pays for them once
@@ -167,7 +191,7 @@ impl EpisodeNamer {
     }
 
     fn names(&self, name: &str) -> bool {
-        matches_episode(name, &self.patterns) || range_holds_episode(&base_name(name).to_lowercase(), self.season, self.episode)
+        matches_episode(name, &self.patterns) || range_holds_episode(&go_to_lower(base_name(name)), self.season, self.episode)
     }
 }
 
@@ -187,7 +211,7 @@ pub(crate) fn unresolved_season_pack(title: &str, season: i64, episode: i64) -> 
     if matches_episode(title, &cached_episode_patterns(season, episode)) {
         return false;
     }
-    let lower = title.to_lowercase();
+    let lower = go_to_lower(title);
     if range_holds_episode(base_name(&lower), season, episode) {
         return true;
     }
@@ -206,9 +230,8 @@ pub(crate) fn season_only_pattern(season: i64) -> regex::Regex {
     if let Some(re) = map.get(&season) {
         return re.clone();
     }
-    // An integer cannot make this pattern invalid, so a failure here is a bug in the format string.
-    let re = regex::Regex::new(&format!(r"\bs0*{season}\b|\bseason[ ._-]*0*{season}\b"))
-        .expect("a season number makes a valid pattern");
+    // An integer cannot make this pattern invalid, so a failure here is a bug in the format string. RE2, so ASCII `\b`.
+    let re = re2(&format!(r"\bs0*{season}\b|\bseason[ ._-]*0*{season}\b"));
     map.insert(season, re.clone());
     re
 }
@@ -243,7 +266,7 @@ pub(crate) fn cached_episode_patterns(season: i64, episode: i64) -> Arc<EpisodeP
 
 /// Go `matchesEpisode`: whether a release title names the episode `patterns` was built for.
 pub(crate) fn matches_episode(name: &str, patterns: &EpisodePatterns) -> bool {
-    let n = base_name(name).to_lowercase();
+    let n = go_to_lower(base_name(name));
     patterns.iter().any(|re| matches!(re.is_match(&n), Ok(true)))
 }
 
@@ -425,7 +448,7 @@ pub(crate) fn pick_episode_file(files: &[TorrentFile], season: i64, episode: i64
 /// Go `episodeFilePool`: the files an episode may be picked from: the videos, or everything when a list
 /// carries no recognised video extension.
 fn episode_file_pool(files: &[TorrentFile]) -> Vec<&TorrentFile> {
-    let videos: Vec<&TorrentFile> = files.iter().filter(|f| VIDEO_EXT_RE.is_match(&f.name.to_lowercase())).collect();
+    let videos: Vec<&TorrentFile> = files.iter().filter(|f| VIDEO_EXT_RE.is_match(&go_to_lower(&f.name))).collect();
     if videos.is_empty() {
         files.iter().collect()
     } else {
@@ -433,9 +456,11 @@ fn episode_file_pool(files: &[TorrentFile]) -> Vec<&TorrentFile> {
     }
 }
 
-/// Whether a file's own name declares an episode (see `LABELLED_EPISODE_RE`).
-fn declares_episode(name: &str) -> bool {
-    LABELLED_EPISODE_RE.is_match(&base_name(name).to_lowercase())
+/// Whether a file's own name declares an episode (see `LABELLED_EPISODE_RE`): Go's
+/// `labelledEpisodeRe.match(strings.ToLower(baseName(name)))`, which `pickEpisodeFile`, `unlabelledCandidates`
+/// and `otherEpisode` all spell out.
+pub(crate) fn declares_episode(name: &str) -> bool {
+    LABELLED_EPISODE_RE.is_match(&go_to_lower(base_name(name)))
 }
 
 /// Go `largest`: the biggest file, the earliest one on a tie. None for an empty list.
@@ -501,7 +526,7 @@ pub(crate) fn largest_episode_candidate(files: &[TorrentFile]) -> Option<&Torren
 /// least half the size of its largest video. A file whose size is unknown is given the benefit of the doubt.
 pub(crate) fn is_feature_sized(files: &[TorrentFile], f: &TorrentFile) -> bool {
     let pool = episode_file_pool(files);
-    if pool.len() < files.len() && !VIDEO_EXT_RE.is_match(&f.name.to_lowercase()) {
+    if pool.len() < files.len() && !VIDEO_EXT_RE.is_match(&go_to_lower(&f.name)) {
         return false;
     }
     let size = f.size_bytes.unwrap_or(0);

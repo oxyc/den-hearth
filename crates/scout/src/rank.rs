@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 
-use fancy_regex::Regex as LookRegex;
+use fancy_regex::{Regex as LookRegex, RegexBuilder as LookRegexBuilder};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 
@@ -12,6 +12,8 @@ use crate::attributes::stream_attributes;
 use crate::client::ClientPlayable;
 use crate::label::MIB;
 use crate::probe::Probe;
+use crate::season::{declares_episode, names_episode};
+use crate::util::go_to_lower;
 
 /// FROZEN. Go `RawStream`: one release from one indexer.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -111,10 +113,20 @@ impl Matcher {
     fn is_match(&self, s: &str) -> bool {
         match self {
             Matcher::Re2(r) => r.is_match(s),
-            // regexp2's MatchString reports an error as no match; so does this.
+            // regexp2's MatchString reports an error as no match; so does this. fancy-regex's only runtime error
+            // is the backtrack limit, which `look` lifts.
             Matcher::Look(r) => r.is_match(s).unwrap_or(false),
         }
     }
+}
+
+/// Go `mustR2`: a pattern RE2 cannot express, run on fancy-regex as regexp2 runs it. regexp2 has no backtrack
+/// ceiling, where fancy-regex stops after a million and reports an error that `Matcher::is_match` reads as "no
+/// match" — so a long enough title would silently stop being judged. The pattern backtracks a bounded amount per
+/// start position, so lifting the ceiling costs time linear in the title.
+fn look(pattern: &str) -> Matcher {
+    let re = LookRegexBuilder::new(pattern).backtrack_limit(usize::MAX).build().expect("static lookaround pattern");
+    Matcher::Look(re)
 }
 
 /// Go `goodSource`: markers that downgrade a bare cam/ts/scr to non-junk.
@@ -132,11 +144,8 @@ pub(crate) static UNAMBIGUOUS_JUNK: LazyLock<Vec<(&'static str, Matcher)>> = Laz
         ("r5", Matcher::Re2(re2(r"\br5\b"))),
         (
             "upscaled",
-            Matcher::Look(
-                LookRegex::new(
-                    r"1xbet|read[ .\-_]?note|(?<!not[ .\-_])(?<!non[ .\-_])(upscaled?|up[ .\-_]?rez)|ai[ .\-_]?(upscaled?|enhanced?)|re[ .\-_]?graded?",
-                )
-                .expect("static lookaround pattern"),
+            look(
+                r"1xbet|read[ .\-_]?note|(?<!not[ .\-_])(?<!non[ .\-_])(upscaled?|up[ .\-_]?rez)|ai[ .\-_]?(upscaled?|enhanced?)|re[ .\-_]?graded?",
             ),
         ),
     ]
@@ -149,7 +158,9 @@ pub(crate) static RE_BARE_SCR: LazyLock<Regex> = LazyLock::new(|| re2(r"\bscr\b"
 /// Go `containerExt`: a container extension at the end of a file name. `.ts` is MPEG transport stream,
 /// not TeleSync: without this, `Show.S01E01.ts` matched the bare-TS rule and was dropped as junk. Only at
 /// the end of a name (or of a line in a multi-line title); a `.TS.` in the middle is still a TeleSync tag.
-static CONTAINER_EXT: LazyLock<Regex> = LazyLock::new(|| re2(r"\.(?:m2ts|ts|mkv|mp4|avi|m4v|webm)(\s|$)"));
+/// RE2's `\s` is `[\t\n\f\r ]`, without the vertical tab the regex crate's ASCII `\s` adds, so it is spelled out.
+static CONTAINER_EXT: LazyLock<Regex> =
+    LazyLock::new(|| re2(r"\.(?:m2ts|ts|mkv|mp4|avi|m4v|webm)([\t\n\f\r ]|$)"));
 
 /// Go `junkClassOf`: the junk class of an already-lowercased title, or "" for a legit source.
 pub(crate) fn junk_class_of(t: &str) -> &'static str {
@@ -175,7 +186,7 @@ pub(crate) fn junk_class_of(t: &str) -> &'static str {
 
 /// Go `junkClass`: "" if the title is a legit source.
 pub(crate) fn junk_class(title: &str) -> &'static str {
-    junk_class_of(&title.to_lowercase())
+    junk_class_of(&go_to_lower(title))
 }
 
 pub(crate) static RES_2160: LazyLock<Regex> = LazyLock::new(|| re2(r"2160p?"));
@@ -204,7 +215,7 @@ pub(crate) fn detect_resolution_lower(t: &str) -> &'static str {
 
 /// Go `detectResolution`: "" when the title names none.
 pub(crate) fn detect_resolution(title: &str) -> &'static str {
-    detect_resolution_lower(&title.to_lowercase())
+    detect_resolution_lower(&go_to_lower(title))
 }
 
 /// Go `fake4KFloor`: a "2160p" file smaller than this is not 4K in any sense that matters (mislabelled or
@@ -286,7 +297,7 @@ pub(crate) fn cap_seeds(streams: &[RawStream], limit: i64) -> Vec<RawStream> {
 
 /// Go `qualityScore`: additive, higher wins.
 pub(crate) fn quality_score(s: RawStream) -> i64 {
-    let t = s.title.to_lowercase();
+    let t = go_to_lower(&s.title);
     quality_score_lower(&t, &s, junk_class_of(&t))
 }
 
@@ -387,7 +398,7 @@ const RD_BLOCK_DOT_ADJACENT: &[&str] = &["bluray.x264", "hdtv.x264", "hdtv.xvid"
 
 /// Go `realDebridBlocked`.
 pub(crate) fn real_debrid_blocked(title: &str) -> bool {
-    let t = title.to_lowercase();
+    let t = go_to_lower(title);
     RD_BLOCK_SUBSTRINGS.iter().any(|s| t.contains(s)) || RD_BLOCK_DOT_ADJACENT.iter().any(|s| t.contains(s))
 }
 
@@ -406,7 +417,7 @@ const TITLE_STOP: &[&str] = &[
 
 /// Go `yearToken`: a plausible 4-digit film year (1900 to 2039). `release_years` then rejects matches that
 /// are really resolution or codec digits.
-static YEAR_TOKEN: LazyLock<Regex> = LazyLock::new(|| re2(r"19\d\d|20[0-3]\d"));
+pub(crate) static YEAR_TOKEN: LazyLock<Regex> = LazyLock::new(|| re2(r"19\d\d|20[0-3]\d"));
 
 /// Go `foldDiacritics`: maps accented Latin letters onto their plain forms before tokenising. Tokens are
 /// `[a-z0-9]` runs, so without it "Pokémon" split into "pok" and "mon".
@@ -429,7 +440,7 @@ fn fold_diacritics(s: &str) -> String {
 /// Go `titleTokens`: significant lowercase tokens (stopwords, format noise, bare years and single-letter
 /// noise removed). Used to sanity-check a year-less release against the request.
 pub(crate) fn title_tokens(s: &str) -> HashSet<String> {
-    let folded = fold_diacritics(&s.to_lowercase());
+    let folded = fold_diacritics(&go_to_lower(s));
     let mut out = HashSet::new();
     for m in TITLE_TOKEN_RE.find_iter(&folded) {
         let tok = m.as_str();
@@ -449,15 +460,17 @@ pub(crate) fn title_tokens(s: &str) -> HashSet<String> {
 }
 
 /// Go `releasePrefixRe`: what comes before a release's show name and is not part of it (a group tag in
-/// brackets, or a site stamp). It uses `\S` and negated classes, which ASCII mode cannot express, so it
-/// stays in Unicode mode, where a match is a whole codepoint as in RE2.
-static RELEASE_PREFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\s*(\[[^\]]*\]|\([^)]*\)|www\.\S+\s*-))+").expect("static pattern"));
+/// brackets, or a site stamp). It uses negated classes, which ASCII mode cannot express, so it stays in Unicode
+/// mode, where a match is a whole codepoint as in RE2. RE2's `\s` is ASCII-only (`[\t\n\f\r ]`) and `\S` is its
+/// complement, where the regex crate's Unicode `\s` also takes NBSP and the like, so both are spelled out.
+static RELEASE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([\t\n\f\r ]*(\[[^\]]*\]|\([^)]*\)|www\.[^\t\n\f\r ]+[\t\n\f\r ]*-))+").expect("static pattern")
+});
 
 /// Go `showEndRe`: where a release's show name ends (an SxxEyy or 1x02 label, an anime " - 01", or an
 /// E01/EP01 tag).
 static SHOW_END_RE: LazyLock<Regex> = LazyLock::new(|| {
-    re2(r"(?i)(\bs\d{1,2}[ ._-]*e\d{1,4}|\b\d{1,2}x\d{2,3}\b|\s-\s\d{1,4}\b|\bep?\d{1,4}\b)")
+    re2(r"(?i)(\bs\d{1,2}[ ._-]*e\d{1,4}|\b\d{1,2}x\d{2,3}\b|[\t\n\f\r ]-[\t\n\f\r ]\d{1,4}\b|\bep?\d{1,4}\b)")
 });
 
 /// Go `showNoise`: words a release puts between the show and the episode that name neither.
@@ -481,12 +494,10 @@ pub(crate) fn other_show(title: &str, expected: &HashSet<String>) -> bool {
     })
 }
 
-/// Go `otherEpisode`: whether a release's name labels an episode, and not this one.
-///
-/// Not ported yet: Go's `otherEpisode` calls `baseName`, `labelledEpisodeRe` and `namesEpisode`, which live
-/// in `season.go`. `season.rs` does not port them yet, and that module is not this one's to change.
-pub(crate) fn other_episode(_title: &str, _season: i64, _episode: i64) -> bool {
-    todo!("otherEpisode needs season.go's baseName, labelledEpisodeRe and namesEpisode (season.rs)")
+/// Go `otherEpisode` reports whether a release's name labels an episode, and not this one: "Pokemon S00E82"
+/// answered for S1E1. A range that holds the episode names it (`names_episode`).
+pub(crate) fn other_episode(title: &str, season: i64, episode: i64) -> bool {
+    declares_episode(title) && !names_episode(title, season, episode)
 }
 
 /// Go `titleOverlap`: whether the release shares at least one significant token with the expected title.
@@ -496,7 +507,7 @@ pub(crate) fn title_overlap(release_title: &str, expected: &HashSet<String>) -> 
 
 /// Go `releaseYears`: every plausible year in a release name (usually one, e.g. "(2026)").
 pub(crate) fn release_years(title: &str) -> Vec<i64> {
-    let t = title.to_lowercase();
+    let t = go_to_lower(title);
     let bytes = t.as_bytes();
     let mut out = Vec::new();
     for m in YEAR_TOKEN.find_iter(&t) {
@@ -525,6 +536,100 @@ pub(crate) fn year_mismatch(title: &str, expected: i64) -> bool {
     !years.iter().any(|&y| y >= expected - 1 && y <= expected + 1)
 }
 
+/// Rewrites a user's pattern, written for Go's RE2, so the regex crate reads it the way RE2 does.
+///
+/// A `.` must match a whole codepoint, which needs the regex crate's Unicode mode, but in that mode its `\d`,
+/// `\w`, `\s` and `\b` are Unicode-wide, where RE2's are ASCII-only (`\s` is `[\t\n\f\r ]`). So those are
+/// spelled out, inside a class and outside one. Three more differences are mapped: `\Q…\E` (RE2 only), a `[`
+/// inside a class (a nested class to the regex crate, a literal to RE2), and `&&`, `--` and `~~` inside a class
+/// (set operations to the regex crate, literals to RE2).
+///
+/// Not mapped, so a pattern that uses them does not compile and the filter is ignored, as for any malformed
+/// pattern: octal escapes (`\012`) and `\C`.
+fn re2_user_pattern(p: &str) -> String {
+    const SPACE: &str = r"\t\n\x0C\r ";
+    const WORD: &str = "0-9A-Za-z_";
+    let mut out = String::with_capacity(p.len());
+    let mut chars = p.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let Some(n) = chars.next() else {
+                    out.push('\\');
+                    break;
+                };
+                match (n, in_class) {
+                    ('d', false) => out.push_str("[0-9]"),
+                    ('d', true) => out.push_str("0-9"),
+                    ('D', _) => out.push_str("[^0-9]"),
+                    ('w', false) => out.push_str(&format!("[{WORD}]")),
+                    ('w', true) => out.push_str(WORD),
+                    ('W', _) => out.push_str(&format!("[^{WORD}]")),
+                    ('s', false) => out.push_str(&format!("[{SPACE}]")),
+                    ('s', true) => out.push_str(SPACE),
+                    ('S', _) => out.push_str(&format!("[^{SPACE}]")),
+                    ('b', false) => out.push_str(r"(?-u:\b)"),
+                    ('B', false) => out.push_str(r"(?-u:\B)"),
+                    ('Q', _) => {
+                        let mut literal = String::new();
+                        while let Some(l) = chars.next() {
+                            if l == '\\' && chars.peek() == Some(&'E') {
+                                chars.next();
+                                break;
+                            }
+                            literal.push(l);
+                        }
+                        out.push_str(&regex::escape(&literal));
+                    }
+                    _ => {
+                        out.push('\\');
+                        out.push(n);
+                    }
+                }
+            }
+            '[' if in_class => {
+                if chars.peek() == Some(&':') {
+                    // A POSIX class, `[:alpha:]`, which both syntaxes read alike: copied through its `:]`.
+                    out.push('[');
+                    let mut prev = '[';
+                    for l in chars.by_ref() {
+                        out.push(l);
+                        if prev == ':' && l == ']' {
+                            break;
+                        }
+                        prev = l;
+                    }
+                } else {
+                    out.push_str(r"\[");
+                }
+            }
+            '[' => {
+                in_class = true;
+                out.push('[');
+                if chars.peek() == Some(&'^') {
+                    chars.next();
+                    out.push('^');
+                }
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                    out.push_str(r"\]");
+                }
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(']');
+            }
+            '&' | '~' if in_class => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Go `drop`/`dropN`: records `n` releases removed by a named filter. A `None` debug records nothing.
 fn drop_n(debug: &mut Option<&mut RankDebug>, reason: &str, n: i64) {
     if let Some(d) = debug.as_deref_mut() {
@@ -549,7 +654,7 @@ pub(crate) fn rank_streams_debug(
     // Malformed or incompatible regex: nil, and the filter is ignored. Unicode mode, since a user pattern
     // may use `.` and RE2 matches whole codepoints there.
     let exclude_re =
-        if f.exclude_regex.is_empty() { None } else { Regex::new(&format!("(?i){}", f.exclude_regex)).ok() };
+        if f.exclude_regex.is_empty() { None } else { Regex::new(&format!("(?i){}", re2_user_pattern(&f.exclude_regex))).ok() };
     let allowed: HashSet<&str> = f.resolutions.iter().map(String::as_str).collect();
 
     struct Scored {
@@ -559,7 +664,7 @@ pub(crate) fn rank_streams_debug(
     }
     let mut out: Vec<Scored> = Vec::new();
     for (i, s) in streams.iter().enumerate() {
-        let lower = s.title.to_lowercase();
+        let lower = go_to_lower(&s.title);
         let junk = junk_class_of(&lower);
         if f.exclude_cam && !junk.is_empty() {
             drop_n(&mut debug, junk, 1);
