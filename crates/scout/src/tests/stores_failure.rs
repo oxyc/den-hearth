@@ -19,9 +19,22 @@ use crate::rank::real_debrid_blocked;
 use crate::scrape::{DoError, Doer};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
+use crate::stores::torbox::support::{no_file_list, torrent_gone};
+use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{ResolveTarget, Store, StoreError, RESOLVE_CACHE_TTL};
 
+use super::loglimit::age_log_limit;
 use super::mock::resp;
+
+/// Go `errNoFileList`.
+fn err_no_file_list() -> StoreError {
+    no_file_list()
+}
+
+/// Go `errTorrentGone`.
+fn err_torrent_gone() -> StoreError {
+    torrent_gone()
+}
 
 /// Go `H` (stores_test.go:19).
 const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -298,10 +311,7 @@ async fn premiumize_resolve_failure_modes() {
 // TorBox's add is the step that decides whether a release is queued at all — and a failure here is what
 // left `Status` with no torrent id to report during the outage.
 #[tokio::test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
 async fn torbox_resolve_add_failures() {
-    #[cfg(any())]
-    async fn pending() {
         let cases: Vec<(&str, Route)> = vec![
             ("transport error", boom()),
             ("rate limited", status(429)),
@@ -316,16 +326,11 @@ async fn torbox_resolve_add_failures() {
             // here is a wait the viewer sits through forever.
             assert!(s.status(&target(H)).await.is_none(), "claimed a download after the add failed");
         }
-    }
-    todo!("pending: stores_failure_test.go:221")
 }
 
 // A lost torrent id is rediscovered from the account list — but only when the account actually holds it.
 #[tokio::test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
 async fn find_torrent_by_hash_failure_modes() {
-    #[cfg(any())]
-    async fn pending() {
         let cases: Vec<(&str, Route)> = vec![
             ("transport error", boom()),
             ("http error", status(500)),
@@ -335,22 +340,22 @@ async fn find_torrent_by_hash_failure_modes() {
         ];
         for (name, f) in cases {
             let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: Some(Arc::new(MemoryCache::new(1 << 16))), client: fallback_only(f) };
-            let found = s.find_torrent_by_hash(H).await;
-            assert!(found.is_none(), "{name}: claimed to find a torrent id");
+            let (_, found, _) = s.find_torrent_by_hash(H).await;
+            assert!(!found, "{name}: claimed to find a torrent id");
         }
-    }
-    todo!("pending: stores_failure_test.go:248")
 }
 
 // listFiles says WHY it has no files, because the callers need different things from each answer. It was
 // once best-effort — "a pack whose file list can't be read is still playable by index" — and that was
 // wrong twice over: the index comes from the indexer, not the pack, so playing by it serves the wrong
 // episode; and TorBox's own "no such torrent" is an answer that heals by re-adding, not a failure.
+/// The two tests that read what `list_files` logs, or log through the same keys, take this turn. Go ran them one
+/// at a time; the log limiter is process-wide, so one test's line would otherwise silence the other's.
+static LIST_FILES_LOG_TURN: Mutex<()> = Mutex::new(());
+
 #[tokio::test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
 async fn torbox_list_files_says_why_it_has_no_files() {
-    #[cfg(any())]
-    async fn pending() {
+        let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
         // A 400 says nothing about the account; a 500 or a 401 does, and is classified separately in
         // TestTorBoxListFiles_classifiesTheRemainingShapes so it can raise the account-wide backoff.
         let cases: Vec<(&str, Route, Option<StoreError>)> = vec![
@@ -366,12 +371,13 @@ async fn torbox_list_files_says_why_it_has_no_files() {
         ];
         for (name, f, want) in cases {
             let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: None, client: fallback_only(f) };
-            let (files, err) = s.list_files(1).await;
+            let (files, err) = match s.list_files(1).await {
+                Ok(files) => (files, None),
+                Err(e) => (Vec::new(), Some(e)),
+            };
             assert!(files.is_empty(), "{name}: expected no files, got {}", files.len());
             assert_eq!(err, want, "{name}: got {err:?}, want {want:?} — the caller decides whether to re-add on this");
         }
-    }
-    todo!("pending: stores_failure_test.go:274")
 }
 
 // Fauda S1E3 hit errNoFileList repeatedly with nothing more specific anywhere in the log — every branch
@@ -379,10 +385,8 @@ async fn torbox_list_files_says_why_it_has_no_files() {
 // were indistinguishable from the log alone. Each branch now writes its own line; this is what finds the
 // cause the NEXT time this happens, rather than only ever rediscovering it as "no usable answer" again.
 #[tokio::test]
-#[ignore = "needs stores/torbox.rs (package 1) and the log helpers (package 6)"]
 async fn torbox_list_files_logs_which_branch_failed() {
-    #[cfg(any())]
-    async fn pending() {
+        let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
         // Each branch writes its own line, keyed by a name the test ages out of the log limiter first.
         let cases: Vec<(&str, &str, Route, &str)> = vec![
             ("a transport blip", "mylist-transport", boom(), "torbox mylist 1: connection reset"),
@@ -394,15 +398,22 @@ async fn torbox_list_files_logs_which_branch_failed() {
             ("an array with no matching entry", "mylist-no-match", ok(r#"{"data":[{"id":5}]}"#), "torbox mylist 1: 1 entries, none named it"),
         ];
         for (name, key, f, want) in cases {
-            let out = capture_log();
             // Every one of these shares its key with the test above, which exercises the same branches for the
             // ERROR identity rather than the log line — ageLogLimit keeps that earlier coverage from silencing
             // this one under logLimited's one-line-a-minute rule.
-            age_log_limit(key);
             let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: None, client: fallback_only(f) };
-            let _ = s.list_files(1).await;
-            assert!(out.contains(want), "{name}: log = {:?}, want it to contain {want:?}", out.contents());
+            // The log is captured per thread, so the call is driven from a thread of its own that holds the capture.
+            // The key is aged on that thread, as late as it can be: other tests log these same keys at the same time,
+            // and one line of theirs in between would silence this one.
+            let handle = tokio::runtime::Handle::current();
+            let out = tokio::task::spawn_blocking(move || {
+                age_log_limit(key);
+                crate::loglimit::capture(|| {
+                    let _ = handle.block_on(s.list_files(1));
+                })
+            })
+            .await
+            .expect("the capturing thread");
+            assert!(out.contains(want), "{name}: log = {out:?}, want it to contain {want:?}");
         }
-    }
-    todo!("pending: stores_failure_test.go:309")
 }

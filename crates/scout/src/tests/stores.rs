@@ -1588,30 +1588,24 @@ fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
     todo!("pending: stores_test.go:935 TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut")
 }
 
-#[test]
-#[ignore = "needs metrics.backgroundPanic from package 6"]
-fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
-    // Enable when package 6 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A panic inside the listing fetch is abandoned, not fatal.
-        let before = metrics::background_panic();
-        let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
-        let s = Arc::new(s);
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let s = s.clone();
-            tasks.push(tokio::spawn(async move {
-                let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
-                ok || !ids.is_empty()
-            }));
-        }
-        for t in tasks {
-            assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
-        }
-        assert!(metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
+#[tokio::test]
+async fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
+    // A panic inside the listing fetch is abandoned, not fatal.
+    let before = crate::metrics::background_panic();
+    let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
+    let s = Arc::new(s);
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
+            ok || !ids.is_empty()
+        }));
     }
-    todo!("pending: stores_test.go:1231 TestAccountListing_aPanicInTheFetchIsAbandonedNotFatal")
+    for t in tasks {
+        assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
+    }
+    assert!(crate::metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
 }
 
 #[test]

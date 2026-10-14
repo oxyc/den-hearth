@@ -116,6 +116,8 @@ async fn resolve_queued_add_promoted_to_a_torrent() {
 async fn add_magnet_queued_charge_is_not_refunded() {
     use crate::addbudget::{budget_account, global_add_budget};
 
+    // The process-wide budget, held for this test: other tests swap it, and Go's ran one at a time.
+    let _budget = crate::tests::addbudget::install_budget(crate::tests::addbudget::HOUR, 50);
     let account = format!("tb-queued-budget-{}", "x".repeat(8));
     let s = TorBoxStore {
         token: account,
