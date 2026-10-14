@@ -284,7 +284,7 @@ static HELD_COPY_OPEN: AtomicBool = AtomicBool::new(false);
 /// The part of a `hold` copy, in tenths of its length, that is served at once.
 const HELD_FROM_TENTHS: usize = 9;
 
-/// What the restart tests' titles (`tt000003N`) asked of the fake scout: `list ttNNN` and `play resumeNN`.
+/// What the restart tests' titles (`tt000004N`) asked of the fake scout: `list 4N` and `play 4N`.
 static RESUME_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn resume_calls(tag: &str) -> usize {
@@ -406,7 +406,7 @@ async fn origin_handle(
             return origin_full(400, r#"{"error":"bad_config"}"#);
         }
         let p = if scoped { "p/s" } else { "p" };
-        if imdb.starts_with("tt000003") {
+        if imdb.starts_with("tt000004") {
             RESUME_CALLS.lock().unwrap().push(format!("list {}", &imdb[7..]));
         }
         if imdb == "tt0000005" {
@@ -505,13 +505,13 @@ async fn origin_handle(
             "tt0000011" => "av1.mkv",
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
-            "tt0000030" => "resume30/h264.mkv",
-            "tt0000031" => "resume31/h264.mkv",
-            "tt0000032" => "resume32/hevc.mkv",
-            "tt0000033" => "resume33/h264.mkv",
-            "tt0000034" => "resume34/slow/h264.mkv",
-            "tt0000035" => "resume35/h264.mkv",
-            "tt0000036" => "resume36/h264.mkv",
+            "tt0000040" => "resume40/h264.mkv",
+            "tt0000041" => "resume41/h264.mkv",
+            "tt0000042" => "resume42/hevc.mkv",
+            "tt0000043" => "resume43/h264.mkv",
+            "tt0000044" => "resume44/slow/h264.mkv",
+            "tt0000045" => "resume45/h264.mkv",
+            "tt0000046" => "resume46/h264.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             // Two episodes sharing an intro and end credits (testdata/README.md); there is no episode 3.
             "tt0000020:1:1" if path.contains("/stream/series/") => "segments-a.mkv",
@@ -3494,12 +3494,12 @@ async fn resumable(state: &Arc<AppState>, origin: &str, imdb: &str, extra: &str)
 async fn a_session_is_rebuilt_after_a_restart_with_the_playlists_its_player_holds() {
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
-    let (sid, master_url) = resumable(&a, &origin, "tt0000030", r#","startAt":9"#).await;
+    let (sid, master_url) = resumable(&a, &origin, "tt0000040", r#","startAt":9"#).await;
     let media_url = master_url.replace("master.m3u8", "media.m3u8");
     let master = call(&a, "GET", &master_url, None, "").await.text();
     let media = call(&a, "GET", &media_url, None, "").await.text();
     assert!(media.contains("#EXT-X-START:TIME-OFFSET=9"), "{media}");
-    let asked = resume_calls("30");
+    let asked = resume_calls("40");
 
     let b = restarted(&a, &origin).await;
     assert!(b.session(&sid).is_none());
@@ -3516,7 +3516,7 @@ async fn a_session_is_rebuilt_after_a_restart_with_the_playlists_its_player_hold
     }
     assert_eq!(b.sessions().len(), 1, "built once");
     assert!(!b.session(&sid).unwrap().resolved(), "serving playlists needs no release");
-    assert_eq!(resume_calls("30"), asked, "nothing was asked of scout");
+    assert_eq!(resume_calls("40"), asked, "nothing was asked of scout");
 
     let c = restarted(&b, &origin).await;
     let sig = master_url.split('/').nth(4).unwrap();
@@ -3535,8 +3535,8 @@ async fn a_session_is_rebuilt_after_a_restart_with_the_playlists_its_player_hold
 async fn an_ended_or_expired_session_is_not_brought_back() {
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
-    let (_, ended) = resumable(&a, &origin, "tt0000033", "").await;
-    let (sid, expiring) = resumable(&a, &origin, "tt0000033", "").await;
+    let (_, ended) = resumable(&a, &origin, "tt0000043", "").await;
+    let (sid, expiring) = resumable(&a, &origin, "tt0000043", "").await;
     assert_eq!(
         call(&a, "DELETE", &ended.replace("/master.m3u8", ""), None, "").await.status,
         StatusCode::NO_CONTENT
@@ -3564,7 +3564,7 @@ async fn a_transcode_comes_back_only_where_the_gpu_does() {
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
     a.transcode_ok.store(true, Relaxed);
-    let (sid, master_url) = resumable(&a, &origin, "tt0000032", r#","videoCodecs":["h264"]"#).await;
+    let (sid, master_url) = resumable(&a, &origin, "tt0000042", r#","videoCodecs":["h264"]"#).await;
     let master = call(&a, "GET", &master_url, None, "").await.text();
     assert!(master.contains("avc1.640029"), "{master}");
 
@@ -3620,20 +3620,20 @@ async fn a_revoked_guest_is_not_resumed() {
 async fn a_release_relisted_without_a_file_identity_ends_the_session() {
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
-    let (sid, master_url) = resumable(&a, &origin, "tt0000035", "").await;
+    let (sid, master_url) = resumable(&a, &origin, "tt0000045", "").await;
     let b = restarted(&a, &origin).await;
     let dir = b.cfg.scratch_dir.join(format!("s-{sid}"));
     let mut rec = crate::resume::read(&dir, &b.cfg.url_key, &sid).unwrap();
     rec.file_key = None;
     rec.play_url = format!("{origin}/expired-ticket");
     crate::resume::write(&dir, &b.cfg.url_key, &rec).unwrap();
-    let listed = resume_calls("list 35");
+    let listed = resume_calls("list 45");
 
     let r = call(&b, "GET", &master_url.replace("master.m3u8", "seg0.m4s"), None, "").await;
     assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
     assert!(b.session(&sid).is_none(), "ended");
     assert!(!dir.join(crate::resume::RECORD_FILE).exists(), "and not to be rebuilt again");
-    assert_eq!(resume_calls("list 35"), listed + 1, "the title was listed again to find it");
+    assert_eq!(resume_calls("list 45"), listed + 1, "the title was listed again to find it");
 }
 
 /// A fetch of a rebuilt session's release cut short — a request's deadline, a dropped connection — still counts as a
@@ -3642,14 +3642,14 @@ async fn a_release_relisted_without_a_file_identity_ends_the_session() {
 async fn a_cancelled_fetch_backs_off_like_a_failed_one() {
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
-    let (sid, master_url) = resumable(&a, &origin, "tt0000036", "").await;
+    let (sid, master_url) = resumable(&a, &origin, "tt0000046", "").await;
     let b = restarted(&a, &origin).await;
     assert_eq!(call(&b, "GET", &master_url, None, "").await.status, StatusCode::OK);
     let s = b.session(&sid).unwrap();
     assert!(tokio::time::timeout(Duration::ZERO, s.resolve_again(&b)).await.is_err(), "cut short");
-    let asked = resume_calls("36");
+    let asked = resume_calls("46");
     assert!(!s.resolve_again(&b).await, "backing off");
-    assert_eq!(resume_calls("36"), asked, "nothing asked of scout");
+    assert_eq!(resume_calls("46"), asked, "nothing asked of scout");
     assert!(!s.resolved());
     b.end_all("test").await;
 }
@@ -3662,7 +3662,7 @@ async fn an_end_cut_short_never_comes_back() {
     use futures_util::FutureExt;
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
-    let (sid, master_url) = resumable(&a, &origin, "tt0000034", "").await;
+    let (sid, master_url) = resumable(&a, &origin, "tt0000044", "").await;
     let r = call(&a, "GET", &master_url.replace("master.m3u8", "init.mp4"), None, "").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(a.session(&sid).unwrap().job_pid().is_some(), "its run is still reading the slow release");
@@ -3685,7 +3685,7 @@ async fn an_end_cut_short_never_comes_back() {
 async fn after_a_restart_scratch_is_served_at_once_and_the_rest_is_made_ahead_of_need() {
     let origin = origin().await;
     let a = test_state(&origin, 2, Duration::from_secs(600));
-    let (sid, master_url) = resumable(&a, &origin, "tt0000031", "").await;
+    let (sid, master_url) = resumable(&a, &origin, "tt0000041", "").await;
     let file = |name: &str| master_url.replace("master.m3u8", name);
     let get = |state: &Arc<AppState>, name: &str| {
         let (state, url) = (state.clone(), file(name));
@@ -3714,12 +3714,12 @@ async fn after_a_restart_scratch_is_served_at_once_and_the_rest_is_made_ahead_of
     for g in crate::resume::adopt(&dir, &keyframes, 30.021).gops.iter().filter(|g| g.start >= 19.4) {
         std::fs::remove_file(&g.path).unwrap();
     }
-    let asked = resume_calls("31");
+    let asked = resume_calls("41");
     assert_eq!(get(&b, "master.m3u8").await, master);
     assert_eq!(get(&b, "init.mp4").await, init, "the init the player holds");
     assert_eq!(get(&b, "seg0.m4s").await, seg0, "served from scratch");
     let s = b.session(&sid).unwrap();
-    assert_eq!(resume_calls("31"), asked, "nothing asked of scout for what scratch holds");
+    assert_eq!(resume_calls("41"), asked, "nothing asked of scout for what scratch holds");
     assert!(!s.resolved() && s.job_pid().is_none(), "no release and no ffmpeg yet");
 
     assert_eq!(get(&b, "seg1.m4s").await, seg1);
@@ -3737,7 +3737,7 @@ async fn after_a_restart_scratch_is_served_at_once_and_the_rest_is_made_ahead_of
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(resume_calls("31"), asked + 1, "one play URL followed, the ticket the session was made with");
+    assert_eq!(resume_calls("41"), asked + 1, "one play URL followed, the ticket the session was made with");
 
     let made = get(&b, &format!("seg{missing}.m4s")).await;
     let joined = b.cfg.scratch_dir.join("resumed.mp4");
