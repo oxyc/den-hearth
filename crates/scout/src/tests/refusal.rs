@@ -285,14 +285,14 @@ fn tiered_cache_disables_once_and_keeps_serving() {
 fn tiered_cache_persists_and_expires() {
     let dir = tempfile::TempDir::new().expect("a temp dir");
     let c = TieredCache::new(1 << 20, dir.path());
-    c.put("live", "value", Duration::from_secs(60));
-    c.put("dead", "gone", Duration::from_millis(1));
+    c.put("live", "value", Duration::from_secs(3600));
+    // A file that expired while the process was down, as the directory of an earlier run holds.
+    crate::diskcache::write_file(&c.path("dead"), "1\ngone").expect("an expired entry file");
 
     // A fresh cache over the same directory: memory is empty, so a hit proves it came off disk.
     let reopened = TieredCache::new(1 << 20, dir.path());
     let got = reopened.get("live");
     assert_eq!(got.as_deref(), Some("value"), "an entry did not survive a restart: {got:?}");
-    std::thread::sleep(Duration::from_millis(5));
     assert!(reopened.get("dead").is_none(), "an expired entry was served from disk");
     assert!(reopened.get("never-written").is_none(), "a key that was never written must miss");
 }

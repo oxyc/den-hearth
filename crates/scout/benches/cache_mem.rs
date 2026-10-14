@@ -70,7 +70,7 @@ fn mixed_90_10(bencher: Bencher) {
     bencher.bench(|| {
         let i = thread_slot();
         let k = &keys[i % HIT_KEYS];
-        if i % 10 == 0 {
+        if i.is_multiple_of(10) {
             cache.put(k, black_box(&value), Duration::from_secs(3600));
         }
         black_box(cache.get(k))

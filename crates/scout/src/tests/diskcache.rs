@@ -26,6 +26,96 @@ fn file_count(dir: &Path) -> usize {
     fs::read_dir(dir).expect("read_dir").count()
 }
 
+/// An entry file that has already expired, as an earlier run (or a release that wrote short-lived entries
+/// through) leaves behind. The cache no longer writes these itself.
+fn seed_expired(c: &TieredCache, key: &str) {
+    write_file(&c.path(key), "1\nv").unwrap();
+}
+
+const DAY: Duration = Duration::from_secs(24 * 3600);
+
+// An entry that expires within minutes is not a fact worth a restart: it is served from memory, never
+// written, and a file an earlier put left for the key is retired so it cannot come back.
+#[test]
+fn tiered_cache_short_lived_entries_stay_in_memory_and_retire_the_file() {
+    let dir = TempDir::new().unwrap();
+    let c = TieredCache::new(1 << 20, dir.path());
+    c.put("answer", "five minutes", Duration::from_secs(300));
+    c.put("tombstone", "", Duration::from_nanos(1));
+    assert_eq!(c.get("answer").as_deref(), Some("five minutes"), "memory stopped serving it");
+    assert_eq!(file_count(dir.path()), 0, "a short-lived entry reached disk");
+    assert_eq!(c.disk_counts().writes, 0);
+
+    c.put("k", "old", DAY);
+    assert_eq!(file_count(dir.path()), 1);
+    c.put("k", "", Duration::from_nanos(1)); // a tombstone retires the durable value
+    assert_eq!(file_count(dir.path()), 0, "the tombstone left the old file behind");
+    assert!(TieredCache::new(1 << 20, dir.path()).get("k").is_none(), "the retired value came back");
+}
+
+// The same value again, with most of its life left on the file, writes nothing; a changed value, or one
+// whose file is running out, writes.
+#[test]
+fn tiered_cache_does_not_rewrite_an_unchanged_value() {
+    let dir = TempDir::new().unwrap();
+    let c = TieredCache::new(1 << 20, dir.path());
+    for _ in 0..5 {
+        c.put("id", "12345", DAY);
+    }
+    let counts = c.disk_counts();
+    assert_eq!((counts.writes, counts.skipped), (1, 4), "want one write and four skips, got {counts:?}");
+
+    c.put("id", "67890", DAY);
+    assert_eq!(c.disk_counts().writes, 2, "a changed value was not written");
+    assert_eq!(TieredCache::new(1 << 20, dir.path()).get("id").as_deref(), Some("67890"));
+
+    // A longer life than the file has left is a different fact: 1 day on disk, 10 days asked for.
+    c.put("id", "67890", 10 * DAY);
+    assert_eq!(c.disk_counts().writes, 3, "the extended expiry was not written");
+}
+
+// What the directory holds is known from one scan at open: asking for a key with no file, or one the sweep
+// has no reason to open, touches nothing.
+#[test]
+fn tiered_cache_reads_the_directory_once() {
+    let dir = TempDir::new().unwrap();
+    {
+        let first = TieredCache::new(1 << 20, dir.path());
+        for i in 0..10 {
+            first.put(&format!("fact-{i}"), "v", DAY);
+        }
+    }
+    let c = TieredCache::new(1, dir.path());
+    let opened = c.disk_counts();
+    assert_eq!(opened.reads, 10, "the scan should read each file's expiry once, got {opened:?}");
+    for i in 0..500 {
+        assert!(c.get(&format!("never-written-{i}")).is_none());
+    }
+    c.sweep();
+    c.sweep();
+    let after = c.disk_counts();
+    assert_eq!(after.reads, opened.reads, "lookups and sweeps opened files the index already described");
+    assert_eq!(after.readdirs, opened.readdirs + 2, "a sweep should list the directory and do nothing else");
+    assert_eq!(c.get("fact-3").as_deref(), Some("v"), "a known entry was not read back");
+}
+
+// The live box has a populated directory in the format this cache has always written; it must open and serve.
+#[test]
+fn tiered_cache_serves_files_an_earlier_run_wrote() {
+    let dir = TempDir::new().unwrap();
+    let far = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600;
+    let name = TieredCache::new(1, dir.path()).path("probe:v1:abc");
+    write_file(&name, &format!("{far}\n{{\"audio\":[\"eng\"]}}")).unwrap();
+
+    let c = TieredCache::new(1 << 20, dir.path());
+    assert_eq!(c.get("probe:v1:abc").as_deref(), Some(r#"{"audio":["eng"]}"#), "an old entry was stranded");
+    // And it is rewritten like any other: a day asked for against an hour left on the file is a write, after
+    // which the same put is not.
+    c.put("probe:v1:abc", r#"{"audio":["eng"]}"#, DAY);
+    c.put("probe:v1:abc", r#"{"audio":["eng"]}"#, DAY);
+    assert_eq!(c.disk_counts().skipped, 1);
+}
+
 // The point of the durable tier is a redeploy: the container restarts on every image push, and a probe
 // costs a debrid resolve to rebuild. A fresh cache over the same directory must still know what the old
 // one learned.
@@ -76,7 +166,12 @@ fn tiered_cache_volatile_overwrite_retires_durable_value() {
             }
             "memory eviction" => {
                 for i in 0..20 {
-                    c.put_class(&format!("filler{i}"), &"x".repeat(30), Duration::from_secs(3600), CacheClass::Volatile);
+                    c.put_class(
+                        &format!("filler{i}"),
+                        &"x".repeat(30),
+                        Duration::from_secs(3600),
+                        CacheClass::Volatile,
+                    );
                 }
                 c
             }
@@ -136,10 +231,9 @@ fn tiered_cache_sweep_reclaims_what_nobody_reads_back() {
     // A tiny memory tier, so nothing is served from memory and the disk state is what's under test.
     let c = TieredCache::new(1, dir.path());
     for i in 0..20 {
-        c.put(&format!("dead-{i}"), "v", Duration::from_millis(1));
+        seed_expired(&c, &format!("dead-{i}"));
     }
     c.put("alive", "v", Duration::from_secs(3600));
-    std::thread::sleep(Duration::from_millis(10));
 
     assert_eq!(c.sweep(), 20, "swept entries, want the 20 expired ones");
     assert_eq!(file_count(dir.path()), 1, "files left on disk, want only the unexpired one");
@@ -195,8 +289,7 @@ fn tiered_cache_hashes_awkward_keys() {
 async fn tiered_cache_sweep_every_runs_and_stops() {
     let dir = TempDir::new().unwrap();
     let c = Arc::new(TieredCache::new(1, dir.path()));
-    c.put("dead", "v", Duration::from_millis(1));
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    seed_expired(&c, "dead");
 
     let task = tokio::spawn({
         let c = Arc::clone(&c);
@@ -232,9 +325,8 @@ fn tiered_cache_sweep_survives_a_write_failure() {
     let dir = TempDir::new().unwrap();
     let c = TieredCache::new(1, dir.path());
     for i in 0..5 {
-        c.put(&format!("dead-{i}"), "v", Duration::from_millis(1));
+        seed_expired(&c, &format!("dead-{i}"));
     }
-    std::thread::sleep(Duration::from_millis(10));
 
     c.disable("write", &"no space left on device");
     assert_eq!(

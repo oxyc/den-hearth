@@ -113,9 +113,9 @@ fn main() {
             _ => 4.0,
         };
         let n_requests = {
-            let lambda = 1.0 * mult;
+            let lambda: f64 = mult;
             let mut n = 0;
-            let mut p = (-lambda as f64).exp();
+            let mut p = (-lambda).exp();
             let mut s = p;
             let u = rng.unit();
             while u > s && n < 50 {
@@ -141,14 +141,22 @@ fn main() {
                 builds += 1;
                 // The indexer answer (keep_answer) and cinemeta, both plain puts.
                 let answer_key = format!("answer:v1:tt{title:07}:cfg{cfg}");
-                cache.put(&answer_key, &padded("[", 30_000 + rng.below(20_000)), Duration::from_secs(LIST_TTL));
+                cache.put(
+                    &answer_key,
+                    &padded("[", 30_000 + rng.below(20_000)),
+                    Duration::from_secs(LIST_TTL),
+                );
                 let meta_key = format!("cinemeta:v1:tt{title:07}");
                 gets += 1;
                 if cache.get(&meta_key).is_none() {
                     if rng.unit() < 0.1 {
                         cache.put(&meta_key, "", Duration::from_secs(600)); // a miss, remembered ten minutes
                     } else {
-                        cache.put(&meta_key, &padded("{\"meta\":", 3_000), Duration::from_secs(7 * 24 * 3600));
+                        cache.put(
+                            &meta_key,
+                            &padded("{\"meta\":", 3_000),
+                            Duration::from_secs(7 * 24 * 3600),
+                        );
                         durable.insert(meta_key, now + 7 * 24 * 3600);
                     }
                 }
@@ -158,7 +166,11 @@ fn main() {
                     let probe_key = format!("probe:v1:tt{title:07}:{release:02}:e{}", release_epoch[title]);
                     gets += 1;
                     if cache.get(&probe_key).is_none() {
-                        cache.put(&probe_key, &padded("{\"audio\":[\"eng\"]", 700), Duration::from_secs(PROBE_TTL));
+                        cache.put(
+                            &probe_key,
+                            &padded("{\"audio\":[\"eng\"]", 700),
+                            Duration::from_secs(PROBE_TTL),
+                        );
                         durable.insert(probe_key, now + PROBE_TTL);
                     }
                 }
@@ -186,9 +198,19 @@ fn main() {
                     for poll in 0..(90 * 12) {
                         offset.store(now + poll * 5 / 12, Ordering::Relaxed); // stays inside this minute
                         let c = CacheClass::Volatile;
-                        cache.put_class(&format!("tb:status:acct:{hash}"), "downloading 41%", Duration::from_secs(5), c);
+                        cache.put_class(
+                            &format!("tb:status:acct:{hash}"),
+                            "downloading 41%",
+                            Duration::from_secs(5),
+                            c,
+                        );
                         if poll % 6 == 0 {
-                            cache.put_class("tb:summary:acct", "{\"plan\":\"pro\"}", Duration::from_secs(30), c);
+                            cache.put_class(
+                                "tb:summary:acct",
+                                "{\"plan\":\"pro\"}",
+                                Duration::from_secs(30),
+                                c,
+                            );
                             cache.put_class("tb:listing:acct", "[1,2,3]", Duration::from_secs(15), c);
                         }
                         gets += 1;
@@ -200,7 +222,6 @@ fn main() {
                 }
             }
         }
-        bench_api::replay_tick(&cache);
         if minute % 60 == 59 {
             bench_api::replay_hourly(&cache);
         }
@@ -209,7 +230,6 @@ fn main() {
             release_epoch[rng.below(TITLES)] += 1;
         }
     }
-    bench_api::replay_shutdown(&cache);
     let counts = cache.disk_counts();
     let (files, bytes) = dir_stats(dir.path());
     drop(cache);
@@ -234,7 +254,17 @@ fn main() {
 
     let h = hours as f64;
     let per_hour = |n: u64| (n as f64 / h * 10.0).round() / 10.0;
-    let DiskCounts { writes, bytes_written, fsyncs, reads, bytes_read, unlinks, readdirs } = counts;
+    let DiskCounts {
+        writes,
+        bytes_written,
+        fsyncs,
+        reads,
+        bytes_read,
+        unlinks,
+        readdirs,
+        stat_calls,
+        skipped,
+    } = counts;
     let line = serde_json::json!({
             "suite": "scout-cache-replay", "label": label, "hours": hours,
             "requests": requests, "builds": builds, "plays": plays,
@@ -242,7 +272,8 @@ fn main() {
             "writes_per_hour": per_hour(writes), "bytes_written_per_hour": per_hour(bytes_written),
             "fsyncs_per_hour": per_hour(fsyncs), "reads_per_hour": per_hour(reads),
             "bytes_read_per_hour": per_hour(bytes_read), "unlinks_per_hour": per_hour(unlinks),
-            "readdirs_per_hour": per_hour(readdirs),
+            "readdirs_per_hour": per_hour(readdirs), "stats_per_hour": per_hour(stat_calls),
+            "skipped_unchanged": skipped,
             "disk_files_end": files, "disk_bytes_end": bytes,
             "restart_startup_ms": (startup_ms * 10.0).round() / 10.0,
             "restart_startup_reads": after_start.reads, "restart_startup_bytes_read": after_start.bytes_read,

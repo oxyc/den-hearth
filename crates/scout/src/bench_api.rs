@@ -70,6 +70,9 @@ pub fn pick_episode_file(files: &[TorrentFile], season: i64, episode: i64) -> Op
 /// The cache a replay drives: production settings, time read from `clock` so days of traffic run in seconds.
 /// The replay reaches the cache's housekeeping only through the functions below, so the same replay file
 /// measures the cache before and after its policy changes.
+///
+/// A write-behind variant (hold a changed entry for N minutes, write it once) was measured through this file and
+/// removed; see `bench/results/scout-cache/replay-24h.jsonl` (labels `policy+wb*`).
 pub fn replay_cache(
     memory_bytes: usize,
     dir: &Path,
@@ -82,10 +85,6 @@ pub fn replay_cache(
 pub fn replay_hourly(cache: &TieredCache) -> i64 {
     cache.sweep()
 }
-
-/// What the process does between requests and at shutdown. Nothing is deferred yet.
-pub fn replay_tick(_cache: &TieredCache) {}
-pub fn replay_shutdown(_cache: &TieredCache) {}
 
 /// A tiered cache with the disk budget off, so a long write benchmark measures the write and not the sweep a
 /// burst past the budget starts (the Go benchmark does the same).
