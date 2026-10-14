@@ -2,8 +2,8 @@
 //!
 //! About a third of it goes through the handler (`TestHandleProbe_*`, `TestHandlePlay_*`,
 //! `TestProbeAndPlay_*`) and `TestTieredCache_*` needs `diskcache` (work package 6); those stay red until
-//! those modules land. Tests that need TorBox, the add budget or `scrape_all` are ignored stubs too: the
-//! Go line is in each `todo!`, and the body is ported when the module it needs lands.
+//! those modules land. Ignored tests keep the full Go body in a `#[cfg(any())]` item, so it parses now and
+//! is enabled by moving it up when its package lands.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -99,7 +99,39 @@ fn store_unavailable_error_names_the_service() {
 #[test]
 #[ignore = "needs stores/torbox.rs (package 1) and the pool reporter"]
 fn recent_refusal_reads_what_the_queueing_path_wrote() {
-    todo!("port refusal_test.go:33 once package 1 lands")
+    #[cfg(any())]
+    fn pending() {
+        let cache = MemoryCache::new(1 << 20);
+        let store = TorBoxStore {
+            token: "tok".into(),
+            cache: Some(cache.clone()),
+            api: "https://api.example".into(),
+            client: answer(200, r#"{"data":[]}"#),
+        };
+        let pool = StorePool { stores: vec![Box::new(store.clone())] };
+
+        assert!(pool.recent_refusal("hash-none").is_none(), "nothing was refused, so nothing should be reported");
+
+        cache.put(
+            &refused_key(DebridService::TorBox, &store.account_identity(), "hash-refused"),
+            "createtorrent http 429",
+            Duration::from_secs(60),
+        );
+        let (svc, reason) = pool.recent_refusal("hash-refused").expect("refusal not reported");
+        assert!(svc == DebridService::TorBox && reason.contains("429"), "refusal not reported: {svc:?} {reason:?}");
+
+        // A store with no cache remembers nothing, and must not claim otherwise.
+        let bare = StorePool {
+            stores: vec![Box::new(TorBoxStore {
+                token: "tok".into(),
+                cache: None,
+                api: "https://api.example".into(),
+                client: answer(200, r#"{"data":[]}"#),
+            })],
+        };
+        assert!(bare.recent_refusal("hash-refused").is_none(), "a store with no cache cannot report a refusal");
+    }
+    todo!("pending: refusal_test.go:33")
 }
 
 // The disk tier turns itself off on the first write failure rather than logging the same fact per entry.
@@ -107,7 +139,18 @@ fn recent_refusal_reads_what_the_queueing_path_wrote() {
 #[test]
 #[ignore = "needs diskcache.rs (package 6)"]
 fn tiered_cache_disables_once_and_keeps_serving() {
-    todo!("port refusal_test.go:59 once package 6 lands")
+    #[cfg(any())]
+    fn pending() {
+        // A path that cannot be created: the parent is a file, not a directory.
+        let c = TieredCache::new(1 << 20, "/dev/null/not-a-dir");
+        c.put("k", "v", Duration::from_secs(60));
+        assert!(c.disabled(), "a failing disk tier should disable itself");
+        c.put("k2", "v2", Duration::from_secs(60)); // must not panic once off
+
+        // The memory tier still answers — losing persistence is not losing the cache.
+        assert_eq!(c.get("k"), Some("v".to_string()), "memory tier stopped serving after the disk tier failed");
+    }
+    todo!("pending: refusal_test.go:59")
 }
 
 // The disk tier round-trips a value and expires it. This is what makes a restart cheap: the container is
@@ -115,7 +158,21 @@ fn tiered_cache_disables_once_and_keeps_serving() {
 #[test]
 #[ignore = "needs diskcache.rs (package 6)"]
 fn tiered_cache_persists_and_expires() {
-    todo!("port refusal_test.go:76 once package 6 lands")
+    #[cfg(any())]
+    fn pending() {
+        let dir = tempdir();
+        let c = TieredCache::new(1 << 20, &dir);
+        c.put("live", "value", Duration::from_secs(60));
+        c.put("dead", "gone", Duration::from_millis(1));
+
+        // A fresh cache over the same directory: memory is empty, so a hit proves it came off disk.
+        let reopened = TieredCache::new(1 << 20, &dir);
+        assert_eq!(reopened.get("live"), Some("value".to_string()), "an entry did not survive a restart");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(reopened.get("dead").is_none(), "an expired entry was served from disk");
+        assert!(reopened.get("never-written").is_none(), "a key that was never written must miss");
+    }
+    todo!("pending: refusal_test.go:76")
 }
 
 // A probe answers what is already true and starts nothing. `handleProbe` is the route that exists so a
@@ -124,7 +181,27 @@ fn tiered_cache_persists_and_expires() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn handle_probe_reports_without_queueing() {
-    todo!("port refusal_test.go:99 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let r = resolves.clone();
+        // The store ANSWERED and said it does not hold this — "not queued" is a fact here, not a
+        // shrug. A store that could not be asked gets a different answer, tested below.
+        let deps = Deps::for_test(|_| {
+            vec![fake_store(DebridService::TorBox)
+                .check(&[("abc", false)])
+                .resolve_with(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    Ok(String::new())
+                })]
+        });
+        let rec = serve(&deps, probe_request(&probe_config(), "abc")).await;
+
+        assert_eq!(resolves.load(Ordering::SeqCst), 0, "a probe resolved — resolving adds the torrent");
+        assert_eq!(rec.status(), 404, "nothing queued should be 404 not_queued");
+        assert!(rec.body().contains("not_queued"), "the body must say which kind of empty this is: {}", rec.body());
+    }
+    todo!("pending: refusal_test.go:99")
 }
 
 // The probe's other three answers. Each is a different fact, and the app renders each differently — a
@@ -133,7 +210,52 @@ fn handle_probe_reports_without_queueing() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn handle_probe_distinguishes_its_answers() {
-    todo!("port refusal_test.go:131 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        // Downloading → 202 with whatever progress the store reported.
+        let downloading = probe_with(vec![fake_store(DebridService::TorBox)
+            .status(StoreStatus { progress: 0.42, eta_seconds: Some(120), ..Default::default() })])
+        .await;
+        assert_eq!(downloading.status(), 202, "a download in progress should be 202");
+        assert!(downloading.body().contains("0.42"), "progress must reach the client: {}", downloading.body());
+
+        // Held by the store → 200 ready, without minting a link (that is /play's job).
+        // Held AND resolvable without an add: both are required, because a cache check alone cannot say the
+        // account can serve it — TorBox reports what TorBox has, not what this account has.
+        let ready = probe_with(vec![fake_store(DebridService::TorBox)
+            .check(&[("abc", true)])
+            .resolve_ok("https://cdn/x")])
+        .await;
+        assert!(
+            ready.status() == 200 && ready.body().contains("ready"),
+            "a held release should be 200 ready: {} {}",
+            ready.status(),
+            ready.body()
+        );
+
+        // Recently refused → 503, naming the service. Never 404: the account was turned away, which says
+        // nothing at all about whether the release exists.
+        let cache = mem();
+        let refused_store = TorBoxStore {
+            token: "tok".into(),
+            cache: Some(cache.clone()),
+            api: "https://api.example".into(),
+            client: answer(200, r#"{"data":[]}"#),
+        };
+        cache.put(
+            &refused_key(DebridService::TorBox, &refused_store.account_identity(), "abc"),
+            "createtorrent http 429",
+            Duration::from_secs(60),
+        );
+        let rec = probe_with_cache(cache, vec![Box::new(refused_store)]).await;
+        assert_eq!(rec.status(), 503, "a refused account should be 503");
+        assert!(
+            rec.body().contains("store_unavailable"),
+            "the client must be able to tell a refusal from an absence: {}",
+            rec.body()
+        );
+    }
+    todo!("pending: refusal_test.go:131")
 }
 
 // Every store draws the same line: being turned away is a fact about the account, not the release.
@@ -182,7 +304,29 @@ async fn every_store_reports_a_refusal_as_a_refusal() {
 #[test]
 #[ignore = "needs scrape.rs scrape_all (package 5)"]
 fn scrape_all_unaskable_indexer_does_not_block_an_empty_verdict() {
-    todo!("port refusal_test.go:222 once package 5 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let answered_empty = FakeScraper { id: "torrentio", result: Ok(vec![]) };
+        let unaskable = UnaskableScraper { indexer: "mediafusion" };
+
+        let (_, ok, _) =
+            scrape_all(&[&answered_empty, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
+        assert!(ok, "every askable indexer answered, so the empty result is authoritative");
+
+        // A non-empty list is trusted whatever the coverage: whatever came back is real.
+        let found = FakeScraper {
+            id: "torrentio",
+            result: Ok(vec![RawStream { info_hash: "d".repeat(40), title: "a release".into(), ..Default::default() }]),
+        };
+        let (seeds, ok, _) = scrape_all(&[&found, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
+        assert!(ok && seeds.len() == 1, "a non-empty result stands on its own: {} seeds, ok={ok}", seeds.len());
+
+        // A real failure still withholds the verdict — that is the rule this must not weaken.
+        let failed = FakeScraper { id: "torrentio", result: Err("502".into()) };
+        let (_, ok, _) = scrape_all(&[&failed, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
+        assert!(!ok, "an indexer that failed means the empty result is not authoritative");
+    }
+    todo!("pending: refusal_test.go:222")
 }
 
 // Season and episode are read off the stream id, and a movie has neither. A wrong answer here sends the
@@ -190,7 +334,17 @@ fn scrape_all_unaskable_indexer_does_not_block_an_empty_verdict() {
 #[test]
 #[ignore = "needs probe_fanout.rs seasonOf/episodeOf (package 5)"]
 fn season_episode_of() {
-    todo!("port refusal_test.go:251 once package 5 lands")
+    #[cfg(any())]
+    fn pending() {
+        // nil, not zero: episode 0 is a real episode on some series, so "no episode" needs its own value.
+        assert!(season_of(None).is_none() && episode_of(None).is_none(), "a nil id has neither a season nor an episode");
+        let sid = StreamId { kind: "series".into(), imdb: "tt1".into(), season: 3, episode: 7, has_ep: true };
+        assert_eq!(season_of(Some(&sid)), Some(3), "season not read");
+        assert_eq!(episode_of(Some(&sid)), Some(7), "episode not read");
+        let movie = StreamId { kind: "movie".into(), imdb: "tt2".into(), ..Default::default() };
+        assert!(season_of(Some(&movie)).is_none() && episode_of(Some(&movie)).is_none(), "a movie has neither");
+    }
+    todo!("pending: refusal_test.go:251")
 }
 
 // The backoff belongs to every store that can be refused, not just the one whose refusal was noticed
@@ -261,7 +415,27 @@ fn refusal_backoff_ignores_cancellation() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn handle_probe_never_queues_and_says_when_it_cannot_tell() {
-    todo!("port refusal_test.go:351 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        // A store that resolves happily UNLESS told not to add — exactly like the real ones. A fake that
+        // refuses either way cannot tell "the probe asked for a read-only resolve" from "the probe let it
+        // queue", which is the whole assertion.
+        let saw_no_add = Arc::new(AtomicBool::new(false));
+        let held = NoAddAwareStore { svc: DebridService::TorBox, cached: "abc", saw_no_add: saw_no_add.clone() };
+        let rec = probe_with(vec![Box::new(held)]).await;
+        assert_ne!(rec.status(), 200, "cached-but-not-held answered 200 ready; playing it would start with a download");
+        assert!(
+            saw_no_add.load(Ordering::SeqCst),
+            "the probe resolved WITHOUT NoAdd — it is free to queue the torrent it exists to avoid"
+        );
+
+        // The check could not be reached at all → say so, rather than claiming nothing is queued.
+        let down = fake_store(DebridService::TorBox).check_error(ERR_CHECK_FAILED);
+        let rec = probe_with(vec![Box::new(down)]).await;
+        assert_eq!(rec.status(), 503, "an unreachable cache check should be 503, got {}: {}", rec.status(), rec.body());
+        assert!(rec.body().contains("cache_check_unavailable"), "the body must name the reason: {}", rec.body());
+    }
+    todo!("pending: refusal_test.go:351")
 }
 
 // One step further out than the case above: the cache check WORKED, and the status read is the part that
@@ -274,7 +448,37 @@ fn handle_probe_never_queues_and_says_when_it_cannot_tell() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn handle_probe_an_indeterminate_status_is_not_an_absence() {
-    todo!("port refusal_test.go:389 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        // The cache check succeeds and honestly reports "not cached"; the status read cannot tell. Without
+        // the status read, this is the ordinary 404 path — which is what the definitive case below asserts.
+        let uncertain = AnsweringStore {
+            inner: fake_store(DebridService::TorBox)
+                .check(&[("abc", false)])
+                .resolve_err(DeadLinkError { reason: "not held".into() }),
+            answer: StatusAnswer::Unknown,
+        };
+        let rec = probe_with(vec![Box::new(uncertain.clone())]).await;
+        assert_eq!(rec.status(), 503, "an indeterminate status read should be 503, got {}: {}", rec.status(), rec.body());
+        assert!(
+            rec.body().contains("status_unavailable"),
+            "the body must distinguish this from an unreachable cache check: {}",
+            rec.body()
+        );
+
+        // The same fixture answering DEFINITIVELY still 404s, or the branch above would just be a blanket 503
+        // and the route would never report an absence at all.
+        let definitive = AnsweringStore { answer: StatusAnswer::No, ..uncertain };
+        let rec = probe_with(vec![Box::new(definitive)]).await;
+        assert_eq!(
+            rec.status(),
+            404,
+            "a store that answered should still be able to say nothing is queued, got {}: {}",
+            rec.status(),
+            rec.body()
+        );
+    }
+    todo!("pending: refusal_test.go:389")
 }
 
 // Scout's own refusals reach the CLIENT as scout's, not as the debrid's.
@@ -286,7 +490,37 @@ fn handle_probe_an_indeterminate_status_is_not_an_absence() {
 #[test]
 #[ignore = "needs handler.rs (package 4), addbudget.rs (package 3)"]
 fn handle_play_names_scout_not_the_debrid_for_its_own_refusals() {
-    todo!("port refusal_test.go:454 once packages 3 and 4 land")
+    #[cfg(any())]
+    async fn pending() {
+        let prev = global_add_budget_swap(new_add_budget(Duration::from_secs(3600), 0)); // nothing left this hour
+        let _restore = Restore::new(move || {
+            global_add_budget_swap(prev);
+        });
+
+        let cache = mem();
+        let deps = Deps::for_test_with(cache.clone(), |_| {
+            vec![Box::new(TorBoxStore {
+                token: "tok".into(),
+                client: answer(200, r#"{"data":[]}"#),
+                cache: Some(cache.clone()),
+                api: TORBOX_API.into(),
+            })]
+        });
+        let rec = serve(
+            &deps,
+            play_request(&valid_blob(), &encode_play_token(&PlayTarget { info_hash: H.into(), ..Default::default() })),
+        )
+        .await;
+
+        assert_eq!(rec.status(), 503, "a spent allowance is still 'not now': got {} {}", rec.status(), rec.body());
+        let body = rec.body();
+        assert!(
+            !body.contains("torbox") && !body.contains("store_unavailable"),
+            "scout's own ceiling was blamed on the debrid: {body}"
+        );
+        assert!(body.contains("scout_busy"), "the client cannot tell whose refusal this is: {body}");
+    }
+    todo!("pending: refusal_test.go:454")
 }
 
 // A read-only resolve is answered before the ADD backoff, and is never blocked by an add already in
@@ -294,7 +528,25 @@ fn handle_play_names_scout_not_the_debrid_for_its_own_refusals() {
 #[test]
 #[ignore = "needs stores/torbox.rs (package 1)"]
 fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
-    todo!("port refusal_test.go:485 once package 1 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let cache = mem();
+        record_refusal(&*cache, DebridService::TorBox, "tok", H, &refused(DebridService::TorBox, "429"));
+        note_add_attempt(&*cache, DebridService::TorBox, "tok", H);
+
+        let s = TorBoxStore {
+            token: "tok".into(),
+            client: answer(200, r#"{"data":[]}"#),
+            cache: Some(cache.clone()),
+            api: TORBOX_API.into(),
+        };
+        let err = s.resolve(&ResolveTarget { no_add: true, ..target(H) }).await;
+        assert!(
+            matches!(&err, Err(StoreError::DeadLink(d)) if d.reason == ERR_WOULD_ADD),
+            "a read-only resolve was blocked by an add-path guard: {err:?}"
+        );
+    }
+    todo!("pending: refusal_test.go:485")
 }
 
 // An add scout already sent is answered 202 "coming", not 503 "refused".
@@ -305,7 +557,34 @@ fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn handle_play_an_in_flight_add_is_queued_not_refused() {
-    todo!("port refusal_test.go:504 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let cache = mem();
+        note_add_attempt(&*cache, DebridService::TorBox, "tok", H); // an add went out and was abandoned
+
+        let deps = Deps::for_test_with(cache.clone(), |_| {
+            vec![Box::new(TorBoxStore {
+                token: "tok".into(),
+                cache: Some(cache.clone()),
+                api: TORBOX_API.into(),
+                // nothing queued that Status can see yet
+                client: answer(200, r#"{"data":[]}"#),
+            })]
+        });
+        let rec = serve(
+            &deps,
+            play_request(&valid_blob(), &encode_play_token(&PlayTarget { info_hash: H.into(), ..Default::default() })),
+        )
+        .await;
+
+        assert_eq!(rec.status(), 202, "an add already in flight is 202 coming, got {}: {}", rec.status(), rec.body());
+        assert!(
+            !rec.body().contains("store_unavailable"),
+            "a release scout itself queued was reported as the debrid refusing: {}",
+            rec.body()
+        );
+    }
+    todo!("pending: refusal_test.go:504")
 }
 
 // A spent clock must not be remembered as the STORE refusing.
@@ -319,12 +598,36 @@ fn handle_play_an_in_flight_add_is_queued_not_refused() {
 //
 // All three stores, because only TorBox's guard had a test and the other two were free to drift.
 //
-// Not portable as written: a Rust store takes no context (PORTING.md: cancellation is dropping the
-// future), so "a resolve on a spent clock" needs a decision on how a spent deadline reaches the store.
-#[test]
-#[ignore = "needs a decision: a Rust store takes no context (PORTING.md); also stores/torbox.rs (package 1)"]
-fn resolve_a_spent_clock_is_not_remembered_as_the_store_refusing() {
-    todo!("port refusal_test.go:538 once the deadline seam is decided")
+// Ported with `tokio::time::timeout(Duration::ZERO, ...)` standing in for the spent context: a Rust
+// store takes no context (PORTING.md), so a zero deadline is the closest seam.
+#[tokio::test]
+#[ignore = "needs stores/torbox.rs (package 1) and the deadline seam (PORTING.md)"]
+async fn resolve_a_spent_clock_is_not_remembered_as_the_store_refusing() {
+    #[cfg(any())]
+    async fn pending() {
+        for svc in [DebridService::TorBox, DebridService::RealDebrid, DebridService::Premiumize] {
+            let token = format!("clock-{svc:?}");
+            let hash = "7".repeat(40);
+            let cache = mem();
+            let quiet = answer(200, r#"{"data":{}}"#);
+            let store = store_for_any(svc, &token, &cache, quiet);
+
+            let err = match tokio::time::timeout(Duration::ZERO, store.resolve(&target(&hash))).await {
+                Err(_elapsed) => StoreError::Cancelled,
+                Ok(Ok(_)) => panic!("a resolve on a spent clock should not succeed"),
+                Ok(Err(e)) => e,
+            };
+            assert!(
+                matches!(err, StoreError::Cancelled),
+                "a spent clock reported {err:?} — not marked as scout's own, so recordRefusal files it and the store is blamed for a request it never saw"
+            );
+            assert!(
+                backed_off(&*cache, svc, &token, &hash).is_none(),
+                "a spent clock left a refusal against {svc:?} — the next poll skips a healthy store for a minute, on both /play and ?probe=1"
+            );
+        }
+    }
+    todo!("pending: refusal_test.go:538")
 }
 
 // The probe stops believing an add at the same moment /play does.
@@ -365,7 +668,28 @@ fn add_in_flight_stops_believing_an_add_at_the_give_up() {
 #[test]
 #[ignore = "needs stores/torbox.rs (package 1)"]
 fn store_pool_add_in_flight_asks_every_store() {
-    todo!("port refusal_test.go:607 once package 1 lands")
+    #[cfg(any())]
+    fn pending() {
+        let token = "pool-loop";
+        let hash = "6".repeat(40);
+        let cache = mem();
+        note_add_attempt(&*cache, DebridService::Premiumize, token, &hash); // the marker is on the LAST store
+
+        let pool = StorePool {
+            stores: vec![
+                Box::new(TorBoxStore {
+                    token: token.into(),
+                    cache: Some(cache.clone()),
+                    api: TORBOX_API.into(),
+                    client: answer(200, "{}"),
+                }),
+                Box::new(real_debrid(token, &cache, answer(200, "{}"))),
+                Box::new(premiumize(token, &cache, answer(200, "{}"))),
+            ],
+        };
+        assert!(pool.add_in_flight(&hash), "the pool missed an add in flight on a store that was not the first one asked");
+    }
+    todo!("pending: refusal_test.go:607")
 }
 
 // A release Real-Debrid already holds is READY on the probe route, not "not queued".
@@ -378,7 +702,37 @@ fn store_pool_add_in_flight_asks_every_store() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_a_torrent_real_debrid_already_holds_reads_as_ready() {
-    todo!("port refusal_test.go:629 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "rd-held";
+        let hash = "f".repeat(40);
+        let cache = mem();
+        let target = ResolveTarget { info_hash: hash.clone(), ..Default::default() };
+        cache.put(&rd_torrent_key(token, &hash, &target), "RDID123", Duration::from_secs(3600)); // already bought
+
+        let client = routed_doer(
+            vec![
+                ("/torrents/info/", ok_body(r#"{"id":"RDID123","status":"downloaded","files":[{"id":1,"path":"/Movie.mkv","bytes":100,"selected":1}],"links":["https://rd.example/link"]}"#)),
+                ("/unrestrict/link", ok_body(r#"{"download":"https://rd.example/final.mkv"}"#)),
+            ],
+            ok_body("{}"),
+        );
+
+        // The config must name the same service the pool holds, or the route stops at "cache check
+        // unavailable" — hasCacheTruth reads the CONFIG — before reaching the branch under test.
+        let rd_only = blob(r#"{"debrid":[{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}"#);
+        let deps = Deps::for_test_with(cache.clone(), |_| vec![Box::new(real_debrid(token, &cache, client))]);
+        let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+        let probe = serve(&deps, play_request(&rd_only, &format!("{tok}?probe=1"))).await;
+        assert_ne!(
+            probe.status(),
+            404,
+            "?probe=1 answered 404 for a torrent the account already holds: {} — /play resolves it from the same cache entry, so the client is told a release it can play does not exist",
+            probe.body().trim()
+        );
+        assert_eq!(probe.status(), 200, "?probe=1 = {}, want 200 ready: {}", probe.status(), probe.body().trim());
+    }
+    todo!("pending: refusal_test.go:629")
 }
 
 // NOTE ON THIS TEST'S SCOPE: it pins premiumizeStore.AddInFlight at three marker ages and nothing else.
@@ -430,7 +784,45 @@ fn premiumize_add_in_flight_believes_a_queued_transfer_only_until_the_give_up() 
 #[test]
 #[ignore = "needs stores/torbox.rs (package 1)"]
 fn holding_services_asks_every_store_and_keys_episodes_correctly() {
-    todo!("port refusal_test.go:721 once package 1 lands")
+    #[cfg(any())]
+    fn pending() {
+        let token = "holding";
+        let hash = "3".repeat(40);
+        let cache = mem();
+        let target = ResolveTarget { info_hash: hash.clone(), season: Some(2), episode: Some(5), ..Default::default() };
+        // Written the way /play writes it, episode selector and all, on the store asked LAST.
+        cache.put(&rd_torrent_key(token, &hash, &target), "RDID-S2E5", Duration::from_secs(3600));
+
+        let pool = StorePool {
+            stores: vec![
+                Box::new(TorBoxStore {
+                    token: token.into(),
+                    cache: Some(cache.clone()),
+                    api: TORBOX_API.into(),
+                    client: answer(200, "{}"),
+                }),
+                Box::new(real_debrid(token, &cache, answer(200, "{}"))),
+            ],
+        };
+
+        let held = pool.holding_services(&target);
+        assert!(
+            held.len() == 1 && held[0] == DebridService::RealDebrid,
+            "HoldingServices = {held:?}, want [realdebrid] — either the loop stopped at the first store, or the episode selector is missing from the key, which makes the whole enquiry a no-op for series"
+        );
+        // A different episode of the same pack is a different entry, so it must NOT match.
+        let other = ResolveTarget { episode: Some(6), ..target.clone() };
+        assert!(pool.holding_services(&other).is_empty(), "episode 6 matched episode 5's entry");
+        // And a different SEASON, same episode number. Without this the key could discriminate on episode
+        // alone — measured: dropping the season from rdTorrentKey's selector passed the whole suite, because
+        // every probe here used season 2.
+        let other_season = ResolveTarget { season: Some(3), ..target };
+        assert!(
+            pool.holding_services(&other_season).is_empty(),
+            "S03E05 matched S02E05's entry — the key is not discriminating on season"
+        );
+    }
+    todo!("pending: refusal_test.go:721")
 }
 
 // EveryAddRefusedByScout means EVERY, and an empty pool refuses nothing.
@@ -442,7 +834,47 @@ fn holding_services_asks_every_store_and_keys_episodes_correctly() {
 #[test]
 #[ignore = "needs stores/torbox.rs (package 1), addbudget.rs (package 3)"]
 fn every_add_refused_by_scout_needs_every_account_spent() {
-    todo!("port refusal_test.go:760 once packages 1 and 3 land")
+    #[cfg(any())]
+    fn pending() {
+        let spent = "spent-every_add_refused_by_scout_needs_every_account_spent";
+        let healthy = "healthy-every_add_refused_by_scout_needs_every_account_spent";
+        for _ in 0..ADD_BUDGET_LIMIT {
+            global_add_budget().take(&budget_account(DebridService::TorBox, spent), false);
+        }
+        let cache = mem();
+
+        let mixed = StorePool {
+            stores: vec![
+                Box::new(TorBoxStore {
+                    token: spent.into(),
+                    cache: Some(cache.clone()),
+                    api: TORBOX_API.into(),
+                    client: answer(200, "{}"),
+                }),
+                Box::new(real_debrid(healthy, &cache, answer(200, "{}"))),
+            ],
+        };
+        assert!(
+            !mixed.every_add_refused_by_scout(),
+            "one spent account out of two reported as every add refused — the probe would answer 503 scout_busy for a release the healthy account can still fetch"
+        );
+
+        let all_spent = StorePool {
+            stores: vec![Box::new(TorBoxStore {
+                token: spent.into(),
+                cache: Some(cache.clone()),
+                api: TORBOX_API.into(),
+                client: answer(200, "{}"),
+            })],
+        };
+        assert!(all_spent.every_add_refused_by_scout(), "the only account's allowance is spent and it was not reported");
+
+        assert!(
+            !StorePool { stores: vec![] }.every_add_refused_by_scout(),
+            "an empty pool refused every add — vacuously true is not true here"
+        );
+    }
+    todo!("pending: refusal_test.go:760")
 }
 
 // A refusal on record outranks the queue marker, and NOT the other way round.
@@ -487,7 +919,50 @@ fn premiumize_add_in_flight_an_add_in_flight_outranks_a_stale_refusal() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_and_play_agree_when_a_queued_premiumize_transfer_is_refused() {
-    todo!("port refusal_test.go:815 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "pm-refused";
+        let hash = "5".repeat(40);
+        let cache = mem();
+        cache.put(&pm_queued_key(token, &hash), &unix_secs_ago(Duration::ZERO), QUEUED_TTL);
+
+        // The shape an account out of space returns: HTTP 200, status error.
+        let client = answer(200, r#"{"status":"error","message":"not enough space"}"#);
+        let deps = Deps::for_test_with(cache.clone(), |_| vec![Box::new(premiumize(token, &cache, client))]);
+        let pm_blob = blob(&format!(r#"{{"debrid":[{{"service":"premiumize","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+        let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+
+        // The PROBE goes first, which is the order a real client uses — it polls to draw its progress bar
+        // and only calls /play when told the release is ready. An earlier version issued a /play first,
+        // which recorded the refusal on the probe's behalf and so hid whether the probe could learn it alone.
+        let probe_first = serve(&deps, play_request(&pm_blob, &format!("{tok}?probe=1"))).await;
+        assert_ne!(
+            probe_first.status(),
+            202,
+            "the first ?probe=1 says downloading ({}) for a transfer Premiumize refused on that very call — nothing withdraws the queue marker's claim, so the client sits on a spinner it cannot fall through",
+            probe_first.body().trim()
+        );
+
+        let probe = serve(&deps, play_request(&pm_blob, &format!("{tok}?probe=1"))).await;
+        let play = serve(&deps, play_request(&pm_blob, &tok)).await;
+        assert!(
+            !(probe.status() == 202 && play.status() != 202),
+            "?probe=1 still says 202 downloading ({}) while /play says {} ({}) — the client sits on a 0% spinner for ten minutes with nothing behind it",
+            probe.body().trim(),
+            play.status(),
+            play.body().trim()
+        );
+        assert_eq!(
+            probe.status(),
+            play.status(),
+            "?probe=1 = {} ({}), /play = {} ({}) — one vocabulary, two answers",
+            probe.status(),
+            probe.body().trim(),
+            play.status(),
+            play.body().trim()
+        );
+    }
+    todo!("pending: refusal_test.go:815")
 }
 
 // A Premiumize transfer that has COMPLETED must read as ready, not as still downloading.
@@ -507,7 +982,43 @@ fn probe_and_play_agree_when_a_queued_premiumize_transfer_is_refused() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_and_play_agree_when_a_premiumize_transfer_completes() {
-    todo!("port refusal_test.go:876 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let cases: [(&str, Box<dyn Fn() -> Answer + Send + Sync>); 5] = [
+            ("cache check says cached", Box::new(|| Ok(resp(200, r#"{"status":"success","response":[true]}"#)))),
+            ("cache check says not cached", Box::new(|| Ok(resp(200, r#"{"status":"success","response":[false]}"#)))),
+            ("cache check throttled", Box::new(|| Ok(resp(429, "{}")))),
+            ("cache check transport error", Box::new(|| Err("context deadline exceeded".into()))),
+            ("cache check unreadable", Box::new(|| Ok(resp(200, "not json")))),
+        ];
+        for (name, cache_check) in cases {
+            let token = format!("pm-complete-{name}");
+            let hash = "2".repeat(40);
+            let cache = mem();
+            cache.put(&pm_queued_key(&token, &hash), &unix_secs_ago(Duration::ZERO), QUEUED_TTL);
+
+            let client = routed_doer(
+                vec![("cache/check", Box::new(cache_check))],
+                ok_body(r#"{"status":"success","content":[{"path":"Movie.mkv","link":"https://pm.example/final.mkv","size":100}]}"#),
+            );
+            let deps = Deps::for_test_with(cache.clone(), |_| vec![Box::new(premiumize(&token, &cache, client))]);
+            let pm_blob = blob(&format!(r#"{{"debrid":[{{"service":"premiumize","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+            let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+
+            // THREE polls, because a client polls. One poll cannot see a route that destroys the state
+            // its own next answer depends on: the readiness enquiry used to clear the queue marker, so
+            // the probe reported ready once and 404 "not queued" forever after, while /play kept serving
+            // the same transfer.
+            for i in 1..=3 {
+                let probe = serve(&deps, play_request(&pm_blob, &format!("{tok}?probe=1"))).await;
+                assert_ne!(probe.status(), 202, "{name}: poll {i}: ?probe=1 says downloading ({}) for a completed transfer", probe.body().trim());
+                assert_eq!(probe.status(), 200, "{name}: poll {i}: ?probe=1 = {} ({}), want 200 ready", probe.status(), probe.body().trim());
+            }
+            let play = serve(&deps, play_request(&pm_blob, &tok)).await;
+            assert_eq!(play.status(), 302, "/play = {}, want 302 — the fixture is not serving a completed transfer", play.status());
+        }
+    }
+    todo!("pending: refusal_test.go:876")
 }
 
 // A read-only probe poll must not write Premiumize's ADD-path in-flight marker.
@@ -558,7 +1069,10 @@ async fn probe_a_read_only_poll_writes_no_premiumize_add_memory() {
         ),
     );
     let link = served.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
-    assert!(matches!(&link, Ok(l) if !l.is_empty()), "the read-only resolve should serve a completed transfer: {link:?}");
+    assert!(
+        matches!(&link, Ok(l) if !l.is_empty()),
+        "the read-only resolve should serve a completed transfer: {link:?}"
+    );
     assert!(
         already_queued(&*cache, token, &hash),
         "a read-only poll cleared the queue marker — the next poll names no holder and answers 404 not_queued \
@@ -616,7 +1130,56 @@ async fn premiumize_a_read_only_poll_records_an_answered_refusal() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_and_play_agree_when_the_account_key_is_rejected() {
-    todo!("port refusal_test.go:1043 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "dead-key";
+        let hash = "0".repeat(40);
+        let cache = mem();
+        note_add_attempt(&*cache, DebridService::TorBox, token, &hash); // an add of ours is out
+        record_refusal(
+            &*cache,
+            DebridService::TorBox,
+            token,
+            &"f".repeat(40), // ...and the key is rejected
+            &StoreError::Unavailable(StoreUnavailableError {
+                service: DebridService::TorBox,
+                status: 401,
+                reason: "createtorrent http 401".into(),
+            }),
+        );
+
+        let deps = Deps::for_test_with(cache.clone(), |_| {
+            vec![Box::new(TorBoxStore {
+                token: token.into(),
+                cache: Some(cache.clone()),
+                api: TORBOX_API.into(),
+                client: answer(200, r#"{"success":true,"data":[]}"#),
+            })]
+        });
+        let tb_blob = blob(&format!(r#"{{"debrid":[{{"service":"torbox","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+        let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+
+        let probe = serve(&deps, play_request(&tb_blob, &format!("{tok}?probe=1"))).await;
+        let play = serve(&deps, play_request(&tb_blob, &tok)).await;
+
+        assert!(
+            !(probe.status() == 202 && play.status() != 202),
+            "?probe=1 says downloading ({}) while /play says {} ({}) — the viewer watches a spinner for a release nothing is fetching, on an account whose key needs replacing",
+            probe.body().trim(),
+            play.status(),
+            play.body().trim()
+        );
+        assert_eq!(
+            probe.status(),
+            play.status(),
+            "?probe=1 = {} ({}), /play = {} ({}) — one vocabulary, two answers",
+            probe.status(),
+            probe.body().trim(),
+            play.status(),
+            play.body().trim()
+        );
+    }
+    todo!("pending: refusal_test.go:1043")
 }
 
 // A dead key on ONE account must not outrank a live add on ANOTHER.
@@ -633,7 +1196,46 @@ fn probe_and_play_agree_when_the_account_key_is_rejected() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_and_play_agree_when_one_accounts_key_is_dead_and_another_is_fetching() {
-    todo!("port refusal_test.go:1092 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "two-accounts";
+        let hash = "b".repeat(40);
+        let cache = mem();
+        // TorBox's key is rejected...
+        cache.put(&account_refused_key(DebridService::TorBox, token), "createtorrent http 401", REFUSAL_BACKOFF);
+        // ...while Real-Debrid has an add out for the release being watched.
+        note_add_attempt(&*cache, DebridService::RealDebrid, token, &hash);
+
+        let quiet = answer(200, r#"{"success":true,"data":[]}"#);
+        let deps = Deps::for_test_with(cache.clone(), |_| {
+            vec![
+                Box::new(TorBoxStore {
+                    token: token.into(),
+                    cache: Some(cache.clone()),
+                    api: TORBOX_API.into(),
+                    client: quiet.clone(),
+                }),
+                Box::new(real_debrid(token, &cache, quiet)),
+            ]
+        });
+        let two_blob = blob(&format!(r#"{{"debrid":[{{"service":"torbox","token":"{token}"}},{{"service":"realdebrid","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+        let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+
+        let probe = serve(&deps, play_request(&two_blob, &format!("{tok}?probe=1"))).await;
+        let play = serve(&deps, play_request(&two_blob, &tok)).await;
+
+        assert_eq!(
+            probe.status(),
+            play.status(),
+            "?probe=1 = {} ({}), /play = {} ({}) — a dead key on one account is outranking a live add on another, so the probe names a store that is not the one fetching",
+            probe.status(),
+            probe.body().trim(),
+            play.status(),
+            play.body().trim()
+        );
+        assert_eq!(probe.status(), 202, "?probe=1 = {}, want 202 — Real-Debrid is fetching it", probe.status());
+    }
+    todo!("pending: refusal_test.go:1092")
 }
 
 // TorBox must rank its own add in flight above a refusal recorded in the meantime, as RD and PM do.
@@ -646,7 +1248,48 @@ fn probe_and_play_agree_when_one_accounts_key_is_dead_and_another_is_fetching() 
 #[test]
 #[ignore = "needs stores/torbox.rs (package 1)"]
 fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
-    todo!("port refusal_test.go:1139 once package 1 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "tb-order";
+        let hash = "a".repeat(40);
+        let cache = mem();
+        note_add_attempt(&*cache, DebridService::TorBox, token, &hash);
+        cache.put(&refused_key(DebridService::TorBox, token, &hash), "createtorrent http 429", REFUSAL_BACKOFF);
+
+        let s = TorBoxStore {
+            token: token.into(),
+            cache: Some(cache.clone()),
+            api: TORBOX_API.into(),
+            client: answer(200, r#"{"success":true,"data":[]}"#),
+        };
+
+        let err = s.resolve(&target(&hash)).await;
+        assert!(
+            matches!(&err, Err(StoreError::AddInFlight)),
+            "torbox answered {err:?}, want errAddInFlight — it is blaming the store for a release scout has an add out for, which is the one answer this file says never to give"
+        );
+
+        // PAST the give-up, the refusal must be heard again. The gate is skipped only while the add is still
+        // BELIEVABLE, not merely while its marker exists — weakening it to the bare marker left the suite
+        // green while suppressing a real refusal behind a marker nothing will ever settle.
+        //
+        // Asserted on WHICH error surfaces, not on the absence of errAddInFlight: past the give-up both the
+        // shipped gate and the weakened one stop saying "in flight", and they differ in what they say
+        // instead. The gate lets the recorded refusal through (503, agreeing with the probe); the bare
+        // marker falls to addInFlight's give-up branch and answers a dead link (404), which is /play calling
+        // a release dead on the strength of a marker nothing settled.
+        cache.put(
+            &unknown_outcome_key(DebridService::TorBox, token, &hash),
+            &unix_secs_ago(ADD_GIVE_UP + Duration::from_secs(60)),
+            UNKNOWN_OUTCOME_TTL,
+        );
+        let late = s.resolve(&target(&hash)).await;
+        assert!(
+            matches!(&late, Err(e) if is_refusal(e)),
+            "past addGiveUp torbox answered {late:?}, want the recorded refusal — a dead link here is /play calling a release dead while the probe reports the refusal, and it comes from trusting a marker past the point scout stops believing it"
+        );
+    }
+    todo!("pending: refusal_test.go:1139")
 }
 
 // /play must not buy a release another configured account already holds.
@@ -663,7 +1306,73 @@ fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
 #[test]
 #[ignore = "needs handler.rs (package 4), stores/torbox.rs (package 1), addbudget.rs (package 3)"]
 fn play_does_not_buy_a_release_another_account_already_holds() {
-    todo!("port refusal_test.go:1187 once packages 1, 3 and 4 land")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "prefer-held";
+        let hash = "d".repeat(40);
+        let cache = mem();
+        let rt = ResolveTarget { info_hash: hash.clone(), ..Default::default() };
+        cache.put(&rd_torrent_key(token, &hash, &rt), "RDID-HELD", Duration::from_secs(3600)); // RD bought it earlier
+
+        let creates = Arc::new(AtomicUsize::new(0));
+        let c = creates.clone();
+        let tb = routed_doer_fn(move |path| {
+            if path.contains("createtorrent") {
+                c.fetch_add(1, Ordering::SeqCst);
+                ok_body(r#"{"data":{"torrent_id":9}}"#)
+            } else if path.contains("checkcached") {
+                // TorBox reports it CACHED, which is the ordinary case for anything popular — and the case
+                // that matters, because a cache hit still costs a createtorrent while RD's held id does not.
+                // Answering "nothing cached" here left HeldBy empty, so RD was the only preferred service and
+                // the ordering was never actually under test.
+                ok_body(&format!(r#"{{"data":{{"{hash}":{{}}}}}}"#))
+            } else if path.contains("requestdl") {
+                ok_body(r#"{"success":true,"data":"https://tb.example/link.mkv"}"#)
+            } else {
+                ok_body(r#"{"success":true,"data":[]}"#)
+            }
+        });
+        let rd = routed_doer_fn(|path| {
+            if path.contains("/torrents/info/") {
+                ok_body(r#"{"id":"RDID-HELD","status":"downloaded","files":[{"id":1,"path":"/Movie.mkv","bytes":100,"selected":1}],"links":["https://rd.example/link"]}"#)
+            } else if path.contains("/unrestrict/link") {
+                ok_body(r#"{"download":"https://rd.example/final.mkv"}"#)
+            } else {
+                ok_body("{}")
+            }
+        });
+
+        let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, token));
+        // TorBox first, as the config orders it — the whole point is that order must not decide this.
+        let deps = Deps::for_test_with(cache.clone(), |_| {
+            vec![
+                Box::new(TorBoxStore { token: token.into(), cache: Some(cache.clone()), api: TORBOX_API.into(), client: tb }),
+                Box::new(real_debrid(token, &cache, rd)),
+            ]
+        });
+        let two_blob = blob(&format!(r#"{{"debrid":[{{"service":"torbox","token":"{token}"}},{{"service":"realdebrid","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+
+        let play = serve(
+            &deps,
+            play_request(&two_blob, &encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() })),
+        )
+        .await;
+        assert_eq!(
+            play.status(),
+            302,
+            "/play = {} ({}), want 302 from the account that already holds it",
+            play.status(),
+            play.body().trim()
+        );
+        assert_eq!(
+            creates.load(Ordering::SeqCst),
+            0,
+            "TorBox was asked to create a torrent for a release Real-Debrid already held — that is one of the fifty per hour, and a duplicate torrent on the account"
+        );
+        let after = global_add_budget().remaining(&budget_account(DebridService::TorBox, token));
+        assert_eq!(after, before, "TorBox's hourly allowance went {before} → {after} for a release another account held");
+    }
+    todo!("pending: refusal_test.go:1187")
 }
 
 // A season pack Premiumize has already served must not read as "not queued" for its next episode.
@@ -678,7 +1387,41 @@ fn play_does_not_buy_a_release_another_account_already_holds() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_and_play_agree_on_a_later_episode_after_premiumize_served_the_first() {
-    todo!("port refusal_test.go:1262 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "pm-pack";
+        let hash = "e".repeat(40);
+        let cache = mem();
+        cache.put(&pm_queued_key(token, &hash), &unix_secs_ago(Duration::ZERO), QUEUED_TTL);
+
+        // The cache check answers NOT cached, so HeldBy names nobody and the held mark is the only thing
+        // that can. With it answering `true` the holder came from the cache truth instead, and reverting
+        // HoldsTorrent's held-mark arm left the whole suite green.
+        let client = routed_doer(
+            vec![("cache/check", ok_body(r#"{"status":"success","response":[false]}"#))],
+            ok_body(r#"{"status":"success","content":[{"path":"Show.S01E01.mkv","link":"https://pm.example/e1.mkv","size":100},{"path":"Show.S01E02.mkv","link":"https://pm.example/e2.mkv","size":100}]}"#),
+        );
+        let deps = Deps::for_test_with(cache.clone(), |_| vec![Box::new(premiumize(token, &cache, client))]);
+        let pm_blob = blob(&format!(r#"{{"debrid":[{{"service":"premiumize","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+        let ep = |n: i64| encode_play_token(&PlayTarget { info_hash: hash.clone(), season: Some(1), episode: Some(n), ..Default::default() });
+
+        // Episode 1 plays, which settles the queue marker.
+        let first = serve(&deps, play_request(&pm_blob, &ep(1))).await;
+        assert_eq!(first.status(), 302, "playing episode 1 = {}, want 302", first.status());
+
+        // Episode 2 of the same pack, polled the way a client polls.
+        for i in 1..=3 {
+            let probe = serve(&deps, play_request(&pm_blob, &format!("{}?probe=1", ep(2)))).await;
+            assert_ne!(
+                probe.status(),
+                404,
+                "poll {i}: ?probe=1 answered 404 not_queued for a pack Premiumize just served an episode of — the client blacklists a release /play resolves in the same breath"
+            );
+        }
+        let play = serve(&deps, play_request(&pm_blob, &ep(2))).await;
+        assert_eq!(play.status(), 302, "playing episode 2 = {}, want 302", play.status());
+    }
+    todo!("pending: refusal_test.go:1262")
 }
 
 // A Premiumize release that has been EVICTED must not let read-only polls buy it back, uncharged.
@@ -696,7 +1439,49 @@ fn probe_and_play_agree_on_a_later_episode_after_premiumize_served_the_first() {
 #[test]
 #[ignore = "needs addbudget.rs (package 3)"]
 fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
-    todo!("port refusal_test.go:1325 once package 3 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "pm-evicted";
+        let hash = "7".repeat(40);
+        let cache = mem();
+        note_held(&*cache, token, &hash); // the account held it when /play last served it
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer {
+            c.fetch_add(1, Ordering::SeqCst);
+            // Evicted: directdl succeeds by QUEUEING a fresh transfer, and returns nothing to serve.
+            Ok(resp(200, r#"{"status":"success","content":[]}"#))
+        }));
+        let s = premiumize(token, &cache, client);
+
+        let before = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
+        let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
+
+        let after = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
+        assert_ne!(
+            after,
+            before,
+            "a directdl that queued a transfer was not charged (allowance {before} → {after}) — the held mark is suppressing the charge, so the hourly ceiling never sees these and a polling client makes one real add every couple of seconds"
+        );
+        assert!(
+            !held_recently(&*cache, token, &hash),
+            "the held mark survived a directdl that returned no content — that answer proves the account does not hold it, and nothing else can ever clear the mark"
+        );
+        assert!(
+            already_queued(&*cache, token, &hash),
+            "no queue marker was written for a transfer this call queued — nothing bounds the 'coming' claim, so /play answers 202 downloading with no give-up"
+        );
+
+        // And the next poll must not walk the same path again.
+        let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
+        assert!(
+            calls.load(Ordering::SeqCst) <= 2,
+            "{} directdl calls across two polls — the read-only path is re-queueing on every poll",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+    todo!("pending: refusal_test.go:1325")
 }
 
 // A Real-Debrid release that is DOWNLOADING must not read as dead on either route.
@@ -712,7 +1497,62 @@ fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn real_debrid_a_downloading_release_is_not_reported_dead() {
-    todo!("port refusal_test.go:1372 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        let cases = [
+            ("downloading", true),
+            ("magnet_conversion", true),
+            ("queued", true),
+            ("compressing", true),
+            ("uploading", true),
+            ("error", false),
+            ("virus", false),
+            ("dead", false),
+            ("magnet_error", false),
+            ("waiting_files_selection", false),
+        ];
+        for (status, want_wait) in cases {
+            let token = format!("rd-{status}");
+            let hash = "a".repeat(40);
+            let cache = mem();
+            let rt = ResolveTarget { info_hash: hash.clone(), ..Default::default() };
+            cache.put(&rd_torrent_key(&token, &hash, &rt), "RDID1", Duration::from_secs(3600));
+
+            let client = routed_doer_fn(move |path| {
+                if path.contains("/torrents/info/") {
+                    ok_body(&format!(r#"{{"id":"RDID1","status":"{status}","progress":37,"files":[{{"id":1,"path":"/Movie.mkv","bytes":100,"selected":1}}],"links":[]}}"#))
+                } else {
+                    ok_body("{}")
+                }
+            });
+            let deps = Deps::for_test_with(cache.clone(), |_| vec![Box::new(real_debrid(&token, &cache, client))]);
+            let rd_blob = blob(&format!(r#"{{"debrid":[{{"service":"realdebrid","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+            let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+
+            let play = serve(&deps, play_request(&rd_blob, &tok)).await;
+            let probe = serve(&deps, play_request(&rd_blob, &format!("{tok}?probe=1"))).await;
+
+            if want_wait {
+                assert_eq!(
+                    play.status(),
+                    202,
+                    "{status}: /play = {} ({}), want 202 — the account is fetching this right now, and the add is already spent",
+                    play.status(),
+                    play.body().trim()
+                );
+                assert_eq!(probe.status(), 202, "{status}: ?probe=1 = {} ({}), want 202", probe.status(), probe.body().trim());
+            } else {
+                // A dead or errored torrent must NOT become a promise scout cannot keep.
+                assert!(
+                    play.status() != 202 && probe.status() != 202,
+                    "status {status:?} reported as downloading (play={} probe={}) — a failure has been turned into a wait the client can never come out of",
+                    play.status(),
+                    probe.status()
+                );
+            }
+        }
+    }
+    todo!("pending: refusal_test.go:1372")
 }
 
 // A refusal SCOUT made must not read as "nothing is queued".
@@ -725,7 +1565,54 @@ fn real_debrid_a_downloading_release_is_not_reported_dead() {
 #[test]
 #[ignore = "needs handler.rs (package 4), stores/torbox.rs (package 1), addbudget.rs (package 3)"]
 fn probe_and_play_agree_when_scouts_own_budget_is_spent() {
-    todo!("port refusal_test.go:1445 once packages 1, 3 and 4 land")
+    #[cfg(any())]
+    async fn pending() {
+        let token = "budget-probe_and_play_agree_when_scouts_own_budget_is_spent";
+        let hash = "4".repeat(40);
+        // Spend the account's allowance the way a busy hour does.
+        for _ in 0..ADD_BUDGET_LIMIT {
+            global_add_budget().take(&budget_account(DebridService::TorBox, token), false);
+        }
+
+        let cache = mem();
+        // The upstream must answer DEFINITIVELY, or the probe stops at "a store could not answer" and both
+        // routes return 503 for unrelated reasons — which is a green test that proves nothing.
+        // checkcached needs a decodable object; the account listing needs a valid empty envelope so Status
+        // says "not downloading" rather than "could not find out".
+        let client = routed_doer_fn(|path| {
+            if path.contains("checkcached") {
+                ok_body(r#"{"data":{}}"#)
+            } else {
+                ok_body(r#"{"success":true,"data":[]}"#)
+            }
+        });
+        let deps = Deps::for_test_with(cache.clone(), |_| {
+            vec![Box::new(TorBoxStore { token: token.into(), cache: Some(cache.clone()), api: TORBOX_API.into(), client })]
+        });
+        let tb_blob = blob(&format!(r#"{{"debrid":[{{"service":"torbox","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#));
+        let tok = encode_play_token(&PlayTarget { info_hash: hash.clone(), ..Default::default() });
+
+        let probe = serve(&deps, play_request(&tb_blob, &format!("{tok}?probe=1"))).await;
+        let play = serve(&deps, play_request(&tb_blob, &tok)).await;
+
+        assert_ne!(
+            probe.status(),
+            404,
+            "?probe=1 answered 404 not_queued while scout's own allowance is spent (/play = {} {}) — scout could not ask, which is not the same as nobody having it",
+            play.status(),
+            play.body().trim()
+        );
+        assert_eq!(
+            probe.status(),
+            play.status(),
+            "?probe=1 = {} ({}), /play = {} ({}) — one vocabulary, two answers",
+            probe.status(),
+            probe.body().trim(),
+            play.status(),
+            play.body().trim()
+        );
+    }
+    todo!("pending: refusal_test.go:1445")
 }
 
 // ?probe=1 and /play must give the SAME answer about an add scout has out.
@@ -754,5 +1641,53 @@ fn probe_and_play_agree_when_scouts_own_budget_is_spent() {
 #[test]
 #[ignore = "needs handler.rs (package 4)"]
 fn probe_and_play_agree_that_an_in_flight_add_is_downloading() {
-    todo!("port refusal_test.go:1513 once package 4 lands")
+    #[cfg(any())]
+    async fn pending() {
+        for svc in [DebridService::TorBox, DebridService::RealDebrid, DebridService::Premiumize] {
+            let cache = mem();
+            note_add_attempt(&*cache, svc, "tok", H); // an add went out and nothing came back
+
+            // Every upstream answers a well-formed "nothing here", so the marker is the only evidence either
+            // route has. `{"data":{}}` rather than `{"data":[]}`: the cache check decodes data as an object,
+            // so an array fails the decode and the probe stops at "cache check unavailable" before it ever
+            // reaches the branch under test.
+            let quiet = answer(200, r#"{"data":{}}"#);
+            let store: Box<dyn Store> = match svc {
+                DebridService::RealDebrid => Box::new(real_debrid("tok", &cache, quiet)),
+                DebridService::Premiumize => Box::new(premiumize("tok", &cache, quiet)),
+                DebridService::TorBox => Box::new(TorBoxStore {
+                    token: "tok".into(),
+                    cache: Some(cache.clone()),
+                    api: TORBOX_API.into(),
+                    client: quiet,
+                }),
+            };
+            let deps = Deps::for_test_with(cache.clone(), |_| vec![store]);
+            let tok = encode_play_token(&PlayTarget { info_hash: H.into(), ..Default::default() });
+
+            let probe = serve(&deps, play_request(&valid_blob(), &format!("{tok}?probe=1"))).await;
+            let play = serve(&deps, play_request(&valid_blob(), &tok)).await;
+
+            // The agreement is the invariant. Comparing the two routes rather than asserting one number
+            // keeps this pinned to the defect — a disagreement — instead of to whichever status a
+            // fixture happens to produce.
+            assert_eq!(
+                probe.status(),
+                play.status(),
+                "?probe=1 answered {} ({}) while /play answered {} ({}) for the same release at the same instant — the two routes are one vocabulary, and the client polls the probe to draw its progress bar",
+                probe.status(),
+                probe.body().trim(),
+                play.status(),
+                play.body().trim()
+            );
+            assert_ne!(
+                probe.status(),
+                404,
+                "?probe=1 answered 404 for a release scout has an add out for: {} — the client reads that as a release nobody has and blacklists it",
+                probe.body()
+            );
+            assert_eq!(probe.status(), 202, "?probe=1 = {}, want 202 downloading: {}", probe.status(), probe.body());
+        }
+    }
+    todo!("pending: refusal_test.go:1513")
 }
