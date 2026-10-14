@@ -141,6 +141,22 @@ fn cache_get_mem_hit(bencher: Bencher) {
     });
 }
 
+/// The serve path's read: a refcounted view of the cached body, no copy.
+#[divan::bench]
+fn cache_get_shared_hit(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    for i in 0..64 {
+        cache.put(format!("dl:{i}"), body.clone(), Duration::from_secs(3600));
+    }
+    let mut i = 0usize;
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get_shared(black_box(&format!("dl:{}", i & 63)));
+        i += 1;
+        hit
+    });
+}
+
 #[divan::bench]
 fn cache_put_disk(bencher: Bencher) {
     let dir = tempfile::tempdir().unwrap();

@@ -133,24 +133,35 @@ pub const SETTLED_SRT: &str = "private, max-age=31536000, immutable";
 
 /// A settled subtitle (see `SETTLED_SRT`).
 pub fn srt(body: String) -> Response<Body> {
+    srt_cached(Bytes::from(body), SETTLED_SRT)
+}
+
+/// `srt` for a body that is already shared (a cache hit): the response holds a view of the cached
+/// allocation instead of a copy.
+pub fn srt_shared(body: Bytes) -> Response<Body> {
     srt_cached(body, SETTLED_SRT)
+}
+
+/// `srt_provisional` for a shared body.
+pub fn srt_provisional_shared(body: Bytes) -> Response<Body> {
+    srt_cached(body, "private, no-cache")
 }
 
 /// A subtitle we may yet serve differently — the requested alignment failed and this is the raw
 /// fallback. `immutable` would pin the client to it for a year, so it is stored but revalidated on
 /// every use; the ETag makes that revalidation a 304 while the body has not changed.
 pub fn srt_provisional(body: String) -> Response<Body> {
-    srt_cached(body, "private, no-cache")
+    srt_cached(Bytes::from(body), "private, no-cache")
 }
 
-fn srt_cached(body: String, cache_control: &str) -> Response<Body> {
-    let etag = etag_of(body.as_bytes());
+fn srt_cached(body: Bytes, cache_control: &str) -> Response<Body> {
+    let etag = etag_of(&body);
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/x-subrip; charset=utf-8")
         .header(CACHE_CONTROL, cache_control)
         .header(ETAG, etag)
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(body))
         .unwrap()
 }
 

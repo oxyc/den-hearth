@@ -1283,6 +1283,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    /// A cached hit is served as a view of the cached bytes; the body on the wire must still be
+    /// exactly what was stored, however many times it is read.
+    #[tokio::test]
+    async fn a_cache_hit_serves_the_stored_bytes_unchanged() {
+        let seg = os_only_segment();
+        let uri = format!("/{seg}/subtitle/91004.srt");
+        let warm = isolated_state("hit-bytes");
+        warm.cache.put("os:91004".into(), SRT.into(), Duration::from_secs(60));
+        for _ in 0..2 {
+            let resp = get_with(warm.clone(), &uri, None).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_string(resp).await, SRT);
+        }
+    }
+
     /// Tenths of a millisecond, the format every den addon's `total` uses.
     #[tokio::test]
     async fn server_timing_total_has_tenths_of_a_millisecond() {

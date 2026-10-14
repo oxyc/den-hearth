@@ -178,6 +178,12 @@ fn serve_line(
     line.rid(ctx.rid).finish()
 }
 
+/// A cached body as text for the serve log. Cache values are only ever written from a `String`, so
+/// the `None` is unreachable; it would only drop the cue stats from the line, never the response.
+fn cached_text(body: &bytes::Bytes) -> Option<&str> {
+    std::str::from_utf8(body).ok()
+}
+
 /// Prints what `serve_line` builds. The split exists for the test above it: this one call site is
 /// the only thing between `log_serve` and the journal.
 fn log_serve(
@@ -869,9 +875,9 @@ pub async fn handle_subtitle_file(
         episode: None,
         lang,
     };
-    if let Some(hit) = state.cache.get(&cache_key) {
-        log_serve(state, ctx, "served", "cache_hit", None, "hit", Some(&hit));
-        let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt(hit));
+    if let Some(hit) = state.cache.get_shared(&cache_key) {
+        log_serve(state, ctx, "served", "cache_hit", None, "hit", cached_text(&hit));
+        let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit));
         return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
     }
     let Some(http) = state.http.as_ref() else {
@@ -884,9 +890,9 @@ pub async fn handle_subtitle_file(
     // request metadata only, then observes the settled cache entry before spending a download.
     let flight = if resync_url.is_some() || ref_id.is_some() {
         let guard = state.inflight.acquire(&cache_key).await;
-        if let Some(hit) = state.cache.get(&cache_key) {
-            log_serve(state, ctx, "served", "cache_hit", None, "hit", Some(&hit));
-            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt(hit));
+        if let Some(hit) = state.cache.get_shared(&cache_key) {
+            log_serve(state, ctx, "served", "cache_hit", None, "hit", cached_text(&hit));
+            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit));
             return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
         }
         Some(guard)
@@ -1078,9 +1084,9 @@ async fn sync_and_cache(
             None => state.inflight.acquire(&cache_key).await,
         };
         // Settled while we waited: the alignment we were about to run has already been run.
-        if let Some(hit) = state.cache.get(&cache_key) {
-            log_serve(state, log, "served", "settled_while_waiting", None, "hit", Some(&hit));
-            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt(hit));
+        if let Some(hit) = state.cache.get_shared(&cache_key) {
+            log_serve(state, log, "served", "settled_while_waiting", None, "hit", cached_text(&hit));
+            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit));
             return httputil::add_timing(resp, CACHE_HIT);
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
@@ -2242,9 +2248,9 @@ pub async fn handle_translate(
     // translation that exists and had just been confirmed.
     // The `Server-Timing` phase for the translated text: `cache;desc=hit`, or how long the run took.
     let settled = if cache_key == body_key {
-        cached_body.as_ref().map(|body| body.srt.clone())
+        cached_body.as_ref().map(|body| bytes::Bytes::from(body.srt.clone()))
     } else {
-        state.cache.get(&cache_key)
+        state.cache.get_shared(&cache_key)
     };
     let phase = if let Some(settled) = settled {
         if !want_json {
@@ -2254,10 +2260,10 @@ pub async fn handle_translate(
             // client told `immutable` will not come back for a year.
             let outcome = if anchor_unknown { "degraded" } else { "served" };
             let reason = if anchor_unknown { "anchor_unknown" } else { "cache_hit" };
-            log_serve(state, ctx, outcome, reason, None, "hit", Some(&settled));
+            log_serve(state, ctx, outcome, reason, None, "hit", cached_text(&settled));
             let resp = match anchor_unknown {
-                true => httputil::degraded(httputil::srt_provisional(settled), "upstream_unavailable"),
-                false => httputil::srt(settled),
+                true => httputil::degraded(httputil::srt_provisional_shared(settled), "upstream_unavailable"),
+                false => httputil::srt_shared(settled),
             };
             let resp = with_cached_subtitle_offset(state, &cache_key, resp);
             return httputil::add_timing(resp, CACHE_HIT);

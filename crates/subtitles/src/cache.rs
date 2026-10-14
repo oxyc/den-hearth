@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use bytes::Bytes;
 
 /// The three namespaces `evict_rank` prices, defined HERE because this is the module that reads
 /// them back and acts on them. They were spelled as literals at both ends — built in `addon.rs`,
@@ -33,7 +34,9 @@ pub const TRANSLATE_NS: &str = "translate:";
 pub const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 struct Entry {
-    value: String,
+    /// Shared, not owned by one reader: a hit hands out a refcounted view of this allocation, so
+    /// concurrent serves of a hot body hold one copy between them rather than one each.
+    value: Bytes,
     size: usize,
     expires: Instant,
     /// Monotonic touch counter for LRU (cheaper than reordering a list under a mutex).
@@ -242,12 +245,22 @@ impl Cache {
         }
     }
 
+    /// An owned copy of the value. For small markers and counters; a body that is served should go
+    /// through `get_shared`, which copies nothing.
     pub fn get(&self, key: &str) -> Option<String> {
+        // Only `String`s go in, so the bytes are always valid UTF-8 and this never substitutes.
+        self.get_shared(key).map(|v| String::from_utf8_lossy(&v).into_owned())
+    }
+
+    /// The value as a refcounted view of the cached allocation: no copy, and it stays valid after the
+    /// entry is evicted or expires (the memory is then freed with the last reader).
+    pub fn get_shared(&self, key: &str) -> Option<Bytes> {
         if let Some(v) = self.mem_get(key) {
             return Some(v);
         }
         // Memory miss: fall back to disk, then repopulate memory for the next hit.
         if let Some((value, remaining)) = self.disk_get(key) {
+            let value = Bytes::from(value);
             self.mem_put(key.to_string(), value.clone(), remaining);
             return Some(value);
         }
@@ -256,7 +269,7 @@ impl Cache {
 
     pub fn put(&self, key: String, value: String, ttl: Duration) {
         self.disk_put(&key, &value, ttl);
-        self.mem_put(key, value, ttl);
+        self.mem_put(key, Bytes::from(value), ttl);
     }
 
     /// How long `key` has left, if it is present — for a marker whose lifetime is the answer, like a
@@ -270,7 +283,7 @@ impl Cache {
             }
         }
         let (value, remaining) = self.disk_get(key)?;
-        self.mem_put(key.to_string(), value, remaining);
+        self.mem_put(key.to_string(), Bytes::from(value), remaining);
         Some(remaining)
     }
 
@@ -291,7 +304,7 @@ impl Cache {
     /// paid for. That is the trade. A retry by the same process, which is the common case and the
     /// one the viewer is sitting in front of, is unaffected.
     pub fn put_mem(&self, key: String, value: String, ttl: Duration) {
-        self.mem_put(key, value, ttl);
+        self.mem_put(key, Bytes::from(value), ttl);
     }
 
     /// Forget a key in both tiers. For an entry that has been proven wrong rather than merely stale
@@ -323,12 +336,12 @@ impl Cache {
     /// a disk probe that, for a key only ever written by `put_mem`, cannot hit — a blocking `open`
     /// per lookup, ~150 of them per resumed film, all of them ENOENT.
     pub fn get_mem(&self, key: &str) -> Option<String> {
-        self.mem_get(key)
+        self.mem_get(key).map(|v| String::from_utf8_lossy(&v).into_owned())
     }
 
     // ---- memory tier -------------------------------------------------------
 
-    fn mem_get(&self, key: &str) -> Option<String> {
+    fn mem_get(&self, key: &str) -> Option<Bytes> {
         let mut g = self.inner.lock().unwrap();
         g.tick += 1;
         let tick = g.tick;
@@ -346,7 +359,10 @@ impl Cache {
         }
     }
 
-    fn mem_put(&self, key: String, value: String, ttl: Duration) {
+    /// `size` counts the value once, however many readers hold a view of it: an evicted entry's bytes
+    /// are freed when its last reader finishes, so a body still being served is briefly resident
+    /// outside the budget, but never duplicated by it.
+    fn mem_put(&self, key: String, value: Bytes, ttl: Duration) {
         let mut g = self.inner.lock().unwrap();
         g.tick += 1;
         let size = key.len() + value.len();
@@ -751,6 +767,30 @@ mod tests {
         c.put("c".into(), "0123456789".into(), HOUR);
         assert_eq!(c.get("b"), None, "the least recently used entry should have gone");
         assert_eq!(c.get("a"), Some("0123456789".into()));
+    }
+
+    #[test]
+    fn a_shared_hit_is_a_view_of_the_cached_bytes_and_counts_once() {
+        let c = Cache::new(1 << 20, None);
+        c.put("k".into(), "0123456789".into(), HOUR);
+        let a = c.get_shared("k").unwrap();
+        let b = c.get_shared("k").unwrap();
+        assert_eq!(&a[..], b"0123456789");
+        assert_eq!(a.as_ptr(), b.as_ptr(), "a hit copied the body");
+        assert_eq!(c.stats().bytes, "k".len() + 10, "readers must not add to the budget");
+        // A reader outlives the entry's eviction and still sees the same bytes.
+        c.remove("k");
+        assert_eq!(&a[..], b"0123456789");
+        assert_eq!(c.stats().bytes, 0);
+    }
+
+    #[test]
+    fn a_disk_hit_repopulates_memory_as_a_shared_body() {
+        let dir = tmpdir("shared-disk");
+        Cache::new(1 << 20, Some(dir.clone())).put("k".into(), "v1".into(), HOUR);
+        let fresh = Cache::new(1 << 20, Some(dir));
+        assert_eq!(&fresh.get_shared("k").unwrap()[..], b"v1");
+        assert_eq!(fresh.get_mem("k"), Some("v1".into()), "the disk hit was not hoisted into memory");
     }
 
     #[test]
