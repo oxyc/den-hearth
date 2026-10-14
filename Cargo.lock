@@ -386,8 +386,10 @@ name = "den-scout"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "http",
  "reqwest",
  "serde",
+ "tokio",
 ]
 
 [[package]]
