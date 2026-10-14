@@ -153,6 +153,7 @@ fn play_ticket_payload_keys_open_whatever_their_spelling() {
         ("upper case", format!(r#"{{"H":"{hash}","F":4,"D":[["torbox","tb"]],"X":{x}}}"#)),
         ("one key off", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"X":{x}}}"#)),
         ("an unknown key", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x},"extra":[1]}}"#)),
+        // `h` is `h`: only a decoder that unescapes keys finds it.
         ("an escaped key", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
         ("a repeated key", format!(r#"{{"h":"nope","h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
         (
