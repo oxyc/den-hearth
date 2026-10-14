@@ -36,6 +36,7 @@ mod playlist;
 mod probe;
 mod redact;
 mod report;
+mod resume;
 mod scout;
 mod segments;
 mod session;
@@ -916,13 +917,21 @@ where
         return session_not_found();
     }
     let key = &state.cfg.url_key;
-    let Some(s) = state.session(sid) else {
+    let s = match state.session(sid) {
+        Some(s) => s,
         // An ended session answers 410 — but only to someone holding its URL; to anyone else it is as
         // absent as a session that never existed.
-        return match state.tombstone(sid) {
-            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => valid_session(session::gone()),
-            _ => session_not_found(),
-        };
+        None => match state.tombstone(sid) {
+            Some(exp) if auth::url_sig_ok(key, sid, exp, sig) => return valid_session(session::gone()),
+            Some(_) => return session_not_found(),
+            // One an earlier process of this service started, which its record in scratch rebuilds.
+            None => match session::revive(state, sid, sig).await {
+                session::Revived::Session(s) => s,
+                session::Revived::Unknown => return session_not_found(),
+                session::Revived::Gone => return valid_session(session::gone()),
+                session::Revived::Busy => return valid_session(session::busy()),
+            },
+        },
     };
     if !auth::url_sig_ok(key, sid, s.exp, sig) {
         return session_not_found();
@@ -1040,7 +1049,7 @@ fn session_not_found() -> Response<Body> {
 /// requests to `handle_request` itself.
 pub async fn init(cfg: Config) -> Arc<AppState> {
     let state = AppState::new(cfg);
-    state::sweep_scratch(&state.cfg.scratch_dir);
+    state.take_up_scratch();
     state.scratch_ok.store(state::check_scratch(&state.cfg.scratch_dir), Relaxed);
     state.load_unplayable();
     state.load_probe_cache();
@@ -1066,10 +1075,11 @@ pub async fn init(cfg: Config) -> Arc<AppState> {
     state
 }
 
-/// Everything the service does after its last request: end every session, which kills and reaps its
-/// ffmpeg and deletes its scratch, then sweep the process groups that slipped between them.
+/// Everything the service does after its last request: suspend every session, which kills and reaps its
+/// ffmpeg and keeps its scratch for the next process to resume it from (`resume`), then sweep the process
+/// groups that slipped between them.
 pub async fn finish(state: &Arc<AppState>) {
-    state.end_all("shutdown").await;
+    state.suspend_all().await;
     let killed = job::kill_live_groups();
     if killed > 0 {
         eprintln!("shutdown: killed {killed} ffmpeg process group(s)");

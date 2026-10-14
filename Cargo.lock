@@ -500,6 +500,7 @@ version = "0.47.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "chacha20poly1305",
  "den-http",
  "den-media",
  "den-upstream",

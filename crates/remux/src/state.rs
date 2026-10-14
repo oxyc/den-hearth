@@ -122,8 +122,9 @@ const PROBE_KEYFRAMES_MAX: usize = 65_536;
 const PROBE_TRACKS_MAX: usize = 128;
 const PROBE_STRING_MAX: usize = 256;
 
+/// Also what a session's restart record carries of its release (`resume`).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct StoredMediaInfo {
+pub(crate) struct StoredMediaInfo {
     container: String,
     duration: f64,
     video: crate::probe::VideoCodec,
@@ -170,7 +171,7 @@ impl From<&MediaInfo> for StoredMediaInfo {
 }
 
 impl StoredMediaInfo {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let short = |s: &str| s.len() <= PROBE_STRING_MAX;
         let finite_time = |n: f64| n.is_finite() && n >= 0.0 && n <= self.duration + 1.0;
         let ordered_times =
@@ -209,7 +210,7 @@ impl StoredMediaInfo {
             && byte_index
     }
 
-    fn into_media(self) -> Option<MediaInfo> {
+    pub(crate) fn into_media(self) -> Option<MediaInfo> {
         let container = match self.container.as_str() {
             "matroska" => "matroska",
             "mp4" => "mp4",
@@ -512,6 +513,11 @@ pub struct AppState {
     pub segments: crate::segments::Segments,
     /// Can this ffmpeg write PCM to a pipe (`segments::check_ffmpeg`)? Scanning is off without it.
     pub segments_ffmpeg: AtomicBool,
+    /// One rebuild of a session from its restart record at a time (`session::revive`).
+    pub(crate) revive_lock: tokio::sync::Mutex<()>,
+    /// The sessions an earlier process suspended that may still be resumed (`take_up_scratch`): only these are ever
+    /// rebuilt, so a session this process started and ended can't come back however its URL is asked for.
+    resumable: Mutex<HashMap<String, crate::resume::Kept>>,
 }
 
 /// A session replacing another of the same owner mid-film, which plays on until this one has started.
@@ -620,6 +626,8 @@ impl AppState {
             doors: Default::default(),
             segments: Default::default(),
             segments_ffmpeg: AtomicBool::new(false),
+            revive_lock: tokio::sync::Mutex::new(()),
+            resumable: Mutex::new(HashMap::new()),
         })
     }
 
@@ -939,6 +947,96 @@ impl AppState {
         self.sessions().insert(s.sid.clone(), s);
     }
 
+    /// Publish a session rebuilt after a restart, if its owner's share and `MAX_SESSIONS` have room for it — counting
+    /// what is being set up as `reserve` does. A rebuild never evicts: the owner may have started another session
+    /// since, which is the one it wants now.
+    pub fn insert_revived(&self, s: Arc<Session>) -> bool {
+        let share = match s.owner.as_str() {
+            o if crate::auth::is_grant_owner(o) => self.cfg.guest_max_sessions,
+            o if o.starts_with("install:") => self.cfg.max_sessions_per_install,
+            _ => 1,
+        };
+        let mut map = self.sessions();
+        let creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = map.values().filter(|o| o.owner == s.owner).count()
+            + creating.get(&s.owner).copied().unwrap_or(0);
+        if mine >= share || map.len() + creating.values().sum::<usize>() >= self.cfg.max_sessions {
+            return false;
+        }
+        map.insert(s.sid.clone(), s);
+        true
+    }
+
+    /// For a shutdown: stop every session's ffmpeg and keep its scratch, so the next process resumes it
+    /// (`session::revive`). Nothing is ended and no tombstone is written.
+    pub async fn suspend_all(&self) {
+        let all: Vec<Arc<Session>> = self.sessions().drain().map(|(_, s)| s).collect();
+        for s in &all {
+            s.suspend(self).await;
+        }
+        if !all.is_empty() {
+            eprintln!("shutdown: suspended {} session(s); their scratch is kept to resume them", all.len());
+        }
+    }
+
+    /// At startup: take up the sessions an earlier process suspended (`resume::sweep`), whose scratch counts against
+    /// `SCRATCH_MAX_BYTES` from now on, and forget those no player comes back for within `SESSION_IDLE_SECS`.
+    pub fn take_up_scratch(self: &Arc<Self>) {
+        let kept = crate::resume::sweep(&self.cfg.scratch_dir, &self.cfg.url_key, self.cfg.session_idle);
+        self.scratch_bytes.fetch_add(kept.values().map(|k| k.bytes).sum(), Relaxed);
+        let any = !kept.is_empty();
+        *self.resumable() = kept;
+        if any {
+            let st = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(st.cfg.session_idle).await;
+                st.forget_unresumed().await;
+            });
+        }
+    }
+
+    fn resumable(&self) -> MutexGuard<'_, HashMap<String, crate::resume::Kept>> {
+        self.resumable.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The suspended session `sid`, if it is still to be resumed.
+    pub(crate) fn kept(&self, sid: &str) -> Option<crate::resume::Kept> {
+        self.resumable().get(sid).cloned()
+    }
+
+    /// No longer to be resumed: rebuilt, or gone. Its scratch is no longer counted here.
+    pub(crate) fn unkeep(&self, sid: &str) -> Option<crate::resume::Kept> {
+        let k = self.resumable().remove(sid)?;
+        self.scratch_bytes.fetch_sub(k.bytes.min(self.scratch_bytes.load(Relaxed)), Relaxed);
+        Some(k)
+    }
+
+    /// The scratch of sessions an earlier process left that no player has come back for within `SESSION_IDLE_SECS`
+    /// of the start: idle that long, they would have ended anyway.
+    pub async fn forget_unresumed(&self) {
+        let _one = self.revive_lock.lock().await;
+        let sids: Vec<String> = self.resumable().keys().cloned().collect();
+        let gone: Vec<_> = sids
+            .iter()
+            .filter(|sid| self.unkeep(sid).is_some())
+            .map(|sid| self.cfg.scratch_dir.join(format!("s-{sid}")))
+            .collect();
+        let n = gone.len();
+        let _ = tokio::task::spawn_blocking(move || gone.iter().for_each(|d| crate::resume::remove(d))).await;
+        if n > 0 {
+            eprintln!("scratch: removed {n} session dir(s) no player came back for after the restart");
+        }
+    }
+
+    fn bury(&self, sid: &str, exp: u64) {
+        let mut t = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
+        let now = unix_now();
+        t.retain(|_, exp| *exp > now);
+        if t.len() < TOMBSTONES_MAX {
+            t.insert(sid.to_string(), exp);
+        }
+    }
+
     /// The expiry an ended session's URLs were signed with.
     pub fn tombstone(&self, sid: &str) -> Option<u64> {
         self.tombstones.lock().unwrap_or_else(|e| e.into_inner()).get(sid).copied()
@@ -956,23 +1054,33 @@ impl AppState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, r| r.old != *sid && r.new.as_deref() != Some(sid.as_str()));
-        {
-            let mut t = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
-            let now = unix_now();
-            t.retain(|_, exp| *exp > now);
-            if t.len() < TOMBSTONES_MAX {
-                t.insert(sid.to_string(), s.exp);
-            }
-        }
+        self.bury(sid, s.exp);
         // `Session::end` writes the one summary line for this, naming `why`: nothing more to log here.
         s.end(self, why).await;
     }
 
-    /// End every session `owner` has published, as a client's DELETE does; how many there were.
+    /// End every session `owner` has — published, or suspended by an earlier process and not yet resumed — as a
+    /// client's DELETE does; how many there were.
     pub async fn end_owner(&self, owner: &str, why: &str) -> usize {
+        // Held across the in-memory sweep too, so a rebuild under way finishes first and is ended below.
+        let _one = self.revive_lock.lock().await;
+        let kept: Vec<(String, u64)> = self
+            .resumable()
+            .iter()
+            .filter(|(_, k)| k.owner == owner)
+            .map(|(sid, k)| (sid.clone(), k.exp))
+            .collect();
+        let mut ended = 0;
+        for (sid, exp) in kept {
+            self.unkeep(&sid);
+            self.bury(&sid, exp);
+            let dir = self.cfg.scratch_dir.join(format!("s-{sid}"));
+            let _ = tokio::task::spawn_blocking(move || crate::resume::remove(&dir)).await;
+            eprintln!("session {}: suspended by the previous process, ended: {why}", &sid[..6]);
+            ended += 1;
+        }
         let sids: Vec<String> =
             self.sessions().values().filter(|s| s.owner == owner).map(|s| s.sid.clone()).collect();
-        let mut ended = 0;
         for sid in sids {
             let Some(s) = self.sessions().remove(&sid) else { continue };
             self.end_removed(s, why).await;
@@ -981,26 +1089,12 @@ impl AppState {
         ended
     }
 
+    #[cfg(test)]
     pub async fn end_all(&self, why: &str) {
         let sids: Vec<String> = self.sessions().keys().cloned().collect();
         for sid in sids {
             self.end_session(&sid, why).await;
         }
-    }
-}
-
-/// Remove what a previous process left in scratch. Sessions live in memory only, so every `s-*`
-/// directory found at boot belongs to one that no longer exists.
-pub fn sweep_scratch(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut removed = 0;
-    for e in rd.flatten() {
-        if e.file_name().to_string_lossy().starts_with("s-") && std::fs::remove_dir_all(e.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        eprintln!("scratch: removed {removed} session dir(s) left by the previous process");
     }
 }
 

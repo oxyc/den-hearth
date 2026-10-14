@@ -284,6 +284,13 @@ static HELD_COPY_OPEN: AtomicBool = AtomicBool::new(false);
 /// The part of a `hold` copy, in tenths of its length, that is served at once.
 const HELD_FROM_TENTHS: usize = 9;
 
+/// What the restart tests' titles (`tt000004N`) asked of the fake scout: `list 4N` and `play 4N`.
+static RESUME_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn resume_calls(tag: &str) -> usize {
+    RESUME_CALLS.lock().unwrap().iter().filter(|c| c.ends_with(tag)).count()
+}
+
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
 /// asks for.
 const SCOPED: &str = "c2NvcGVk";
@@ -399,6 +406,9 @@ async fn origin_handle(
             return origin_full(400, r#"{"error":"bad_config"}"#);
         }
         let p = if scoped { "p/s" } else { "p" };
+        if imdb.starts_with("tt000004") {
+            RESUME_CALLS.lock().unwrap().push(format!("list {}", &imdb[7..]));
+        }
         if imdb == "tt0000005" {
             return origin_full(
                 200,
@@ -495,6 +505,13 @@ async fn origin_handle(
             "tt0000011" => "av1.mkv",
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
+            "tt0000040" => "resume40/h264.mkv",
+            "tt0000041" => "resume41/h264.mkv",
+            "tt0000042" => "resume42/hevc.mkv",
+            "tt0000043" => "resume43/h264.mkv",
+            "tt0000044" => "resume44/slow/h264.mkv",
+            "tt0000045" => "resume45/h264.mkv",
+            "tt0000046" => "resume46/h264.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             // Two episodes sharing an intro and end credits (testdata/README.md); there is no episode 3.
             "tt0000020:1:1" if path.contains("/stream/series/") => "segments-a.mkv",
@@ -519,6 +536,13 @@ async fn origin_handle(
         if rest.starts_with("never/") {
             NEVER_OPENED.fetch_add(1, Relaxed);
         }
+        let rest = match rest.strip_prefix("resume").and_then(|r| r.split_once('/')) {
+            Some((n, file)) => {
+                RESUME_CALLS.lock().unwrap().push(format!("play {n}"));
+                file
+            }
+            None => rest,
+        };
         let rest = match rest.strip_prefix("counted/") {
             Some(r) => {
                 COUNTED_PLAYS.fetch_add(1, Relaxed);
@@ -3438,4 +3462,293 @@ async fn a_scan_finds_the_intro_and_credits_two_episodes_share() {
     let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":2}"#).await;
     assert_eq!(r.json()["status"], "done");
     assert!(state.cfg.scratch_dir.join("segments/tt0000020-1.season.json").exists());
+}
+
+// ---- a restart --------------------------------------------------------------------------------------
+
+/// A second process over `old`'s scratch, after `old` has shut down as `finish` does and the new one has started as
+/// `init` does.
+async fn restarted(old: &Arc<AppState>, origin: &str) -> Arc<AppState> {
+    old.suspend_all().await;
+    let mut cfg = test_config(origin, 2, Duration::from_secs(600), Some(SCOUT_KEY));
+    let _ = std::fs::remove_dir_all(&cfg.scratch_dir);
+    cfg.scratch_dir = old.cfg.scratch_dir.clone();
+    let new = state_from(cfg);
+    new.take_up_scratch();
+    new
+}
+
+/// An install's session of `imdb`: its sid and its master playlist's path.
+async fn resumable(state: &Arc<AppState>, origin: &str, imdb: &str, extra: &str) -> (String, String) {
+    let body = format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg"{extra}}}"#);
+    let r = call(state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = r.json();
+    (j["sid"].as_str().unwrap().to_string(), j["playlist"].as_str().unwrap().to_string())
+}
+
+/// What a player holds — the playlists, cut for where it resumed — is what the next process serves, from the session's
+/// record alone: many requests arriving at once rebuild it once, and nothing is asked of scout. A forged signature
+/// finds nothing to rebuild.
+#[tokio::test]
+async fn a_session_is_rebuilt_after_a_restart_with_the_playlists_its_player_holds() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000040", r#","startAt":9"#).await;
+    let media_url = master_url.replace("master.m3u8", "media.m3u8");
+    let master = call(&a, "GET", &master_url, None, "").await.text();
+    let media = call(&a, "GET", &media_url, None, "").await.text();
+    assert!(media.contains("#EXT-X-START:TIME-OFFSET=9"), "{media}");
+    let asked = resume_calls("40");
+
+    let b = restarted(&a, &origin).await;
+    assert!(b.session(&sid).is_none());
+    let replies: Vec<_> = (0..8)
+        .map(|k| {
+            let (b, url) = (b.clone(), if k % 2 == 0 { master_url.clone() } else { media_url.clone() });
+            tokio::spawn(async move { call(&b, "GET", &url, None, "").await })
+        })
+        .collect();
+    for (k, reply) in replies.into_iter().enumerate() {
+        let r = reply.await.unwrap();
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(&r.text(), if k % 2 == 0 { &master } else { &media }, "the playlist the player holds");
+    }
+    assert_eq!(b.sessions().len(), 1, "built once");
+    assert!(!b.session(&sid).unwrap().resolved(), "serving playlists needs no release");
+    assert_eq!(resume_calls("40"), asked, "nothing was asked of scout");
+
+    let c = restarted(&b, &origin).await;
+    let sig = master_url.split('/').nth(4).unwrap();
+    let forged = master_url.replace(sig, "AAAAAAAAAAAAAAAAAAAAAA");
+    assert_eq!(call(&c, "GET", &forged, None, "").await.status, StatusCode::NOT_FOUND);
+    assert!(c.sessions().is_empty(), "a forged signature rebuilds nothing");
+    let unknown = master_url.replace(&sid, "BBBBBBBBBBBBBBBBBBBBBB");
+    assert_eq!(call(&c, "GET", &unknown, None, "").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(call(&c, "GET", &master_url, None, "").await.text(), master);
+    c.end_all("test").await;
+}
+
+/// Ending a session deletes its record with its scratch, so the next process has nothing to bring back; and a record
+/// whose expiry has passed is refused, and deleted, even under the signature it was made for.
+#[tokio::test]
+async fn an_ended_or_expired_session_is_not_brought_back() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (_, ended) = resumable(&a, &origin, "tt0000043", "").await;
+    let (sid, expiring) = resumable(&a, &origin, "tt0000043", "").await;
+    assert_eq!(
+        call(&a, "DELETE", &ended.replace("/master.m3u8", ""), None, "").await.status,
+        StatusCode::NO_CONTENT
+    );
+
+    let b = restarted(&a, &origin).await;
+    assert_eq!(call(&b, "GET", &ended, None, "").await.status, StatusCode::NOT_FOUND, "nothing to rebuild");
+
+    let dir = b.cfg.scratch_dir.join(format!("s-{sid}"));
+    let mut rec = crate::resume::read(&dir, &b.cfg.url_key, &sid).expect("its record");
+    rec.exp = crate::state::unix_now() - 1;
+    crate::resume::write(&dir, &b.cfg.url_key, &rec).unwrap();
+    let sig = crate::auth::url_sig(&b.cfg.url_key, &sid, rec.exp);
+    let expired = format!("/remux/s/{sid}/{sig}/master.m3u8");
+    assert_eq!(call(&b, "GET", &expired, None, "").await.status, StatusCode::GONE);
+    assert!(!dir.exists(), "an expired record is deleted");
+    assert_eq!(call(&b, "GET", &expiring, None, "").await.status, StatusCode::NOT_FOUND);
+    assert!(b.sessions().is_empty());
+}
+
+/// A transcode comes back as the transcode it was — the same playlists, still counted against the one GPU when it
+/// runs — and, on a process without a GPU, not at all: it would never make a segment.
+#[tokio::test]
+async fn a_transcode_comes_back_only_where_the_gpu_does() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    a.transcode_ok.store(true, Relaxed);
+    let (sid, master_url) = resumable(&a, &origin, "tt0000042", r#","videoCodecs":["h264"]"#).await;
+    let master = call(&a, "GET", &master_url, None, "").await.text();
+    assert!(master.contains("avc1.640029"), "{master}");
+
+    let b = restarted(&a, &origin).await;
+    b.transcode_ok.store(true, Relaxed);
+    assert_eq!(call(&b, "GET", &master_url, None, "").await.text(), master);
+    let s = b.session(&sid).unwrap();
+    assert!(s.transcoded && s.preset == crate::job::HD1080);
+
+    let c = restarted(&b, &origin).await;
+    assert_eq!(call(&c, "GET", &master_url, None, "").await.status, StatusCode::GONE);
+    assert!(c.sessions().is_empty());
+}
+
+/// Revoking a guest's grant reaches the sessions an earlier process suspended, which are not in memory until a
+/// player comes back for them: they end then and there, and their scratch with them, rather than coming back to play
+/// on to their expiry. Another grant's suspended session is untouched. What they hold counts against
+/// `SCRATCH_MAX_BYTES` from the start.
+#[tokio::test]
+async fn a_revoked_guest_is_not_resumed() {
+    let origin = origin().await;
+    let a = test_state(&origin, 6, Duration::from_secs(600));
+    let mut started = Vec::new();
+    for owner in ["grant:0a1b2c3d", "grant:deadbeef"] {
+        let r = start_with(&a, &origin, None, &edge(owner)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        let j = r.json();
+        started.push((j["sid"].as_str().unwrap().to_string(), j["playlist"].as_str().unwrap().to_string()));
+    }
+    let b = restarted(&a, &origin).await;
+    assert!(b.scratch_bytes.load(Relaxed) > 0, "the suspended sessions' scratch is counted");
+
+    let body = r#"{"owner":"grant:0a1b2c3d"}"#;
+    let r =
+        call_with(&b, "POST", "/remux/admin/kill", None, &[("x-den-edge-secret", EDGE_SECRET)], body).await;
+    assert_eq!(r.json(), serde_json::json!({"ended": 1}), "the suspended session counts as one ended");
+    let (revoked, playlist) = &started[0];
+    assert_eq!(call(&b, "GET", playlist, None, "").await.status, StatusCode::GONE);
+    assert!(b.session(revoked).is_none(), "not rebuilt");
+    assert!(!b.cfg.scratch_dir.join(format!("s-{revoked}")).exists(), "its scratch is gone");
+    assert_eq!(
+        call(&b, "GET", &started[1].1, None, "").await.status,
+        StatusCode::OK,
+        "another grant's resumes"
+    );
+    b.end_all("test").await;
+}
+
+/// A rebuilt session whose ticket no longer plays finds its release in a fresh listing by name and size. Where the
+/// release named no size when it was opened, nothing proves the one found is the same file, so the session ends
+/// rather than serving segments of another file under the playlist the player holds.
+#[tokio::test]
+async fn a_release_relisted_without_a_file_identity_ends_the_session() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000045", "").await;
+    let b = restarted(&a, &origin).await;
+    let dir = b.cfg.scratch_dir.join(format!("s-{sid}"));
+    let mut rec = crate::resume::read(&dir, &b.cfg.url_key, &sid).unwrap();
+    rec.file_key = None;
+    rec.play_url = format!("{origin}/expired-ticket");
+    crate::resume::write(&dir, &b.cfg.url_key, &rec).unwrap();
+    let listed = resume_calls("list 45");
+
+    let r = call(&b, "GET", &master_url.replace("master.m3u8", "seg0.m4s"), None, "").await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
+    assert!(b.session(&sid).is_none(), "ended");
+    assert!(!dir.join(crate::resume::RECORD_FILE).exists(), "and not to be rebuilt again");
+    assert_eq!(resume_calls("list 45"), listed + 1, "the title was listed again to find it");
+}
+
+/// A fetch of a rebuilt session's release cut short — a request's deadline, a dropped connection — still counts as a
+/// try: the next request within `RESOLVE_RETRY` doesn't go straight back to scout.
+#[tokio::test]
+async fn a_cancelled_fetch_backs_off_like_a_failed_one() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000046", "").await;
+    let b = restarted(&a, &origin).await;
+    assert_eq!(call(&b, "GET", &master_url, None, "").await.status, StatusCode::OK);
+    let s = b.session(&sid).unwrap();
+    assert!(tokio::time::timeout(Duration::ZERO, s.resolve_again(&b)).await.is_err(), "cut short");
+    let asked = resume_calls("46");
+    assert!(!s.resolve_again(&b).await, "backing off");
+    assert_eq!(resume_calls("46"), asked, "nothing asked of scout");
+    assert!(!s.resolved());
+    b.end_all("test").await;
+}
+
+/// An end cut short — a DELETE whose connection drops, a shutdown's drain running out — still leaves nothing the next
+/// process could rebuild the session from: its record goes before the first thing the end waits for.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn an_end_cut_short_never_comes_back() {
+    use futures_util::FutureExt;
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000044", "").await;
+    let r = call(&a, "GET", &master_url.replace("master.m3u8", "init.mp4"), None, "").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(a.session(&sid).unwrap().job_pid().is_some(), "its run is still reading the slow release");
+    assert!(
+        a.end_session(&sid, "deleted").now_or_never().is_none(),
+        "the end waits on ffmpeg, and is dropped there"
+    );
+
+    let b = restarted(&a, &origin).await;
+    assert_eq!(call(&b, "GET", &master_url, None, "").await.status, StatusCode::NOT_FOUND);
+    assert!(b.sessions().is_empty());
+}
+
+/// The restart the owner asked for: after it, what scratch holds — `init.mp4` and every finished segment — is served
+/// at once and byte for byte, with nothing asked of scout. Once the player comes within `RESUME_LEAD` segments of the
+/// first one that isn't there, the release is fetched again and a run started there in the background, before the
+/// player asks for it; then that segment arrives like any other.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn after_a_restart_scratch_is_served_at_once_and_the_rest_is_made_ahead_of_need() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000041", "").await;
+    let file = |name: &str| master_url.replace("master.m3u8", name);
+    let get = |state: &Arc<AppState>, name: &str| {
+        let (state, url) = (state.clone(), file(name));
+        async move {
+            let r = call(&state, "GET", &url, None, "").await;
+            assert_eq!(r.status, StatusCode::OK, "{url}: {}", r.text());
+            r.body
+        }
+    };
+    let master = get(&a, "master.m3u8").await;
+    let init = get(&a, "init.mp4").await;
+    let seg0 = get(&a, "seg0.m4s").await;
+    let seg1 = get(&a, "seg1.m4s").await;
+    let s = a.session(&sid).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while s.job_pid().is_some() {
+        assert!(Instant::now() < deadline, "the run never reached the end");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let keyframes = s.info.keyframes.clone();
+    drop(s);
+
+    let b = restarted(&a, &origin).await;
+    // The run had not reached 19.5 s yet: the segments from there on are not on disk.
+    let dir = b.cfg.scratch_dir.join(format!("s-{sid}"));
+    for g in crate::resume::adopt(&dir, &keyframes, 30.021).gops.iter().filter(|g| g.start >= 19.4) {
+        std::fs::remove_file(&g.path).unwrap();
+    }
+    let asked = resume_calls("41");
+    assert_eq!(get(&b, "master.m3u8").await, master);
+    assert_eq!(get(&b, "init.mp4").await, init, "the init the player holds");
+    assert_eq!(get(&b, "seg0.m4s").await, seg0, "served from scratch");
+    let s = b.session(&sid).unwrap();
+    assert_eq!(resume_calls("41"), asked, "nothing asked of scout for what scratch holds");
+    assert!(!s.resolved() && s.job_pid().is_none(), "no release and no ffmpeg yet");
+
+    assert_eq!(get(&b, "seg1.m4s").await, seg1);
+    let missing = s.segments.iter().position(|g| g.start >= 19.4).unwrap();
+    for n in 2..missing - 2 {
+        get(&b, &format!("seg{n}.m4s")).await;
+    }
+    assert!(!s.resolved(), "nothing fetched while the first missing segment is further off");
+    get(&b, &format!("seg{}.m4s", missing - 2)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(s.resolved() && b.jobs_started.load(Relaxed) == 1) {
+        assert!(
+            Instant::now() < deadline,
+            "a run for the first missing segment starts before it is asked for"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(resume_calls("41"), asked + 1, "one play URL followed, the ticket the session was made with");
+
+    let made = get(&b, &format!("seg{missing}.m4s")).await;
+    let joined = b.cfg.scratch_dir.join("resumed.mp4");
+    std::fs::write(&joined, [init.as_ref(), made.as_ref()].concat()).unwrap();
+    let packets = video_packets(&joined);
+    let first = packets.iter().map(|(pts, _)| *pts).fold(f64::INFINITY, f64::min);
+    let seg = s.segments[missing];
+    // ffmpeg 8's one-GOP seek rewind, as `end_to_end` allows it locally; the image's ffmpeg lands exactly.
+    let before = keyframes.iter().copied().filter(|k| *k < seg.start - 0.05).fold(0.0, f64::max);
+    let rewound = ffmpeg_major() == Some(8) && (first - before).abs() < 0.05;
+    assert!((first - seg.start).abs() < 0.05 || rewound, "it starts on its keyframe, {}: {first}", seg.start);
+    assert!(packets.iter().all(|(pts, _)| *pts < seg.end - 0.01), "and ends where the next begins");
+    b.end_all("test").await;
 }
