@@ -255,6 +255,29 @@ impl Drop for AbandonedAnswer<'_> {
     }
 }
 
+/// The torrent id `resolveHeldTorrent` remembers unconditionally, written for it when its caller goes away while the
+/// pack's file list is being read: the id (with the status snapshot cleared) is what Go's flow leaves behind once the
+/// cancelled read has come back as "no answer". Armed across that one await.
+struct UnwrittenId<'a> {
+    store: &'a TorBoxStore,
+    info_hash: &'a str,
+    torrent_id: i64,
+    armed: bool,
+}
+
+impl Drop for UnwrittenId<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(cache) = &self.store.cache {
+            let identity = self.store.account_identity();
+            cache.put(&torrent_id_key(&identity, self.info_hash), &self.torrent_id.to_string(), RESOLVE_CACHE_TTL);
+            clear_torbox_status(cache.as_ref(), &identity, self.info_hash);
+        }
+    }
+}
+
 impl TorBoxStore {
     /// A store's cache, or the one that holds nothing where Go has a nil `Cache`.
     fn cache(&self) -> &dyn Cache {
@@ -1402,7 +1425,13 @@ impl TorBoxStore {
         let identity = self.account_identity();
         let mut files: Vec<TorrentFile> = Vec::new();
         if need_files {
-            match self.list_files(torrent_id).await {
+            // Go reads the list on the caller's context, so a caller that goes away during it gets errNoFileList
+            // and the id write below still happens. Dropping this future must leave the same id behind: it is
+            // the id createtorrent just handed us, and losing it buys the torrent again on the next poll.
+            let mut unwritten = UnwrittenId { store: self, info_hash: &t.info_hash, torrent_id, armed: true };
+            let listed = self.list_files(torrent_id).await;
+            unwritten.armed = false;
+            match listed {
                 Ok(f) => files = f,
                 Err(err) if is_torrent_gone(&err) => {
                     // Returned HERE, above the id re-stamp below, and left for the caller to act on: this is

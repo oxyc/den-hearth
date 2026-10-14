@@ -16,6 +16,7 @@ use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
 use crate::stores::refusal::{add_outcome_unknown, backed_off};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
+use crate::stores::{ResolveTarget, Store};
 use crate::tests::addbudget::{install_budget, HOUR};
 use crate::tests::mock::resp;
 use crate::util::DetachedFlight;
@@ -90,6 +91,31 @@ async fn a_shared_flight_reports_shared_to_the_caller_that_started_it_too() {
     // Alone, nothing was shared.
     let alone = LONE_FLIGHT.run("k", || async { 9 }).await;
     assert_eq!(alone, (Some(9), false), "a caller nobody joined");
+}
+
+// resolveHeldTorrent writes the torrent id createtorrent just returned whatever listFiles said, and a listFiles
+// whose context has ended says "no answer" — so a client that backs out while an episode's file list is being read
+// still leaves the id behind. Dropped here, the id was lost, the next poll knew of no torrent and bought another
+// one: an add per poll against the hourly allowance, the loop that write exists to stop.
+#[tokio::test(start_paused = true)]
+async fn a_resolve_dropped_while_listing_files_keeps_the_id_it_was_just_handed() {
+    let _budget = install_budget(HOUR, 50);
+    let hash = "b".repeat(40);
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let s = store(
+        "tb-review-id-write",
+        &cache,
+        Arc::new(Stalling(|req| match base(req).as_str() {
+            "createtorrent" => Some(resp(200, r#"{"success":true,"data":{"torrent_id":42}}"#)),
+            // The file list never comes back.
+            "mylist" => None,
+            _ => Some(resp(404, "{}")),
+        })),
+    );
+    let target = ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
+    let dropped = tokio::time::timeout(Duration::from_secs(1), s.resolve(&target)).await;
+    assert!(dropped.is_err(), "the resolve should still have been waiting for the file list");
+    assert_eq!(s.known_torrent_id(&hash), (42, true), "the id createtorrent returned must be remembered");
 }
 
 // createtorrent answered 400 "already queued", and the lookup that finds the queue entry is abandoned. Go's lookup
