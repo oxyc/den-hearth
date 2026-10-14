@@ -998,6 +998,35 @@ fn the_request_log_redacts_the_config_segment() {
     }
 }
 
+/// A path with extra leading slashes is redacted at the segment the router would read as the config (or the
+/// capability), not logged whole behind an empty first segment.
+#[test]
+fn the_request_log_redacts_behind_extra_leading_slashes() {
+    let r = |p: &str| crate::redact_path(p).into_owned();
+    assert_eq!(r("//sealed.AbC-_9/manifest.json"), "/<config>/manifest.json");
+    assert_eq!(r("//m/s/eyJpIjoiY2FwIn0"), "/m/s/<cap>");
+    assert_eq!(r("//_internal/validate/m/s/eyJpIjoiY2FwIn0"), "/_internal/validate/m/s/<cap>");
+    assert_eq!(r("//health"), "//health", "our own route is not a credential");
+}
+
+/// Clients and Cloudflare cache on these strings: the validator of a cacheable JSON body is the FNV-1a-64 of the
+/// bytes and their length in hex, quoted, and a `no-store` body has none.
+#[test]
+fn a_cacheable_body_carries_the_pinned_etag() {
+    let cacheable = crate::httputil::json(
+        hyper::StatusCode::OK,
+        &serde_json::json!({"a": 1}),
+        &[("cache-control", "public, max-age=60")],
+    );
+    assert_eq!(cacheable.headers()["etag"], "\"9c3e82dd6fcae8b1-7\"");
+    let private = crate::httputil::json(
+        hyper::StatusCode::OK,
+        &serde_json::json!({"a": 1}),
+        &[("cache-control", "no-store")],
+    );
+    assert!(private.headers().get("etag").is_none());
+}
+
 /// The caller's X-Request-Id ends the line, so it can be matched to the app's own log; a hostile
 /// value is cut down to the safe alphabet and 32 characters, and no header means no `rid`.
 #[test]

@@ -14,40 +14,24 @@
 use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
-use bytes::Bytes;
-use http_body_util::Full;
-use hyper::header::{HeaderMap, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
+use den_http::prom::series;
+use hyper::header::{HeaderMap, CACHE_CONTROL, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
-use subtle::ConstantTimeEq;
 
-use crate::httputil::{self, Body};
+use crate::httputil::{self, full, Body};
 use crate::state::{AppState, SyncTier};
 
 pub fn handle(state: &AppState, headers: &HeaderMap) -> Response<Body> {
-    if !authorized(headers, &state.cfg.metrics_token) {
+    // An empty token disables the route rather than matching an empty header.
+    if !den_http::metrics_authorized(headers, Some(state.cfg.metrics_token.as_str())) {
         return httputil::not_found();
     }
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
         .header(CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::from(render(state))))
+        .body(full(render(state)))
         .unwrap()
-}
-
-/// `Authorization: Bearer <token>`, compared in constant time so the reply's timing does not say how
-/// much of a guess was right. An empty token disables the route rather than matching an empty header.
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let given = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("")
-        .trim();
-    bool::from(given.as_bytes().ct_eq(token.as_bytes()))
 }
 
 fn render(state: &AppState) -> String {
@@ -161,11 +145,4 @@ fn sync_series(out: &mut String, state: &AppState) {
                 writeln!(out, "subtitles_sync_jobs_total{{tier=\"{tier}\",outcome=\"{outcome}\"}} {value}");
         }
     }
-}
-
-/// One HELP/TYPE block and its single sample. An empty `labels` is an unlabelled series.
-fn series(out: &mut String, name: &str, kind: &str, help: &str, labels: &str, value: impl std::fmt::Display) {
-    let labels = if labels.is_empty() { String::new() } else { format!("{{{labels}}}") };
-    // Writing to a String cannot fail.
-    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name}{labels} {value}");
 }

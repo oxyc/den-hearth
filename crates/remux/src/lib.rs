@@ -51,7 +51,7 @@ mod tests;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -84,35 +84,11 @@ pub fn user_agent() -> &'static str {
     AGENT.get_or_init(|| format!("den-remux/{}", release_version()))
 }
 
-/// How often one failure condition may write a line.
-const LOG_EVERY: Duration = Duration::from_secs(60);
-
-/// Log a failure at most once per `LOG_EVERY` per `condition`, saying how many were held back — the
-/// log is for state changes, and in an outage every request fails the same way. den-reel's helper.
+/// Log a failure at most once a minute per `condition`, saying how many were held back — the log is for state
+/// changes, and in an outage every request fails the same way (`den_http::log::LimitedLog`).
 pub fn log_limited(condition: &str, line: impl FnOnce() -> String) {
-    static SEEN: std::sync::Mutex<Vec<(String, std::time::Instant, u32)>> = std::sync::Mutex::new(Vec::new());
-    let now = std::time::Instant::now();
-    let held = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        match seen.iter_mut().find(|(c, _, _)| c == condition) {
-            Some((_, at, held)) if now.duration_since(*at) < LOG_EVERY => {
-                *held += 1;
-                return;
-            }
-            Some((_, at, held)) => {
-                *at = now;
-                std::mem::take(held)
-            }
-            None => {
-                seen.push((condition.to_string(), now, 0));
-                0
-            }
-        }
-    };
-    match held {
-        0 => eprintln!("{}", line()),
-        n => eprintln!("{} ({n} more like it since the last line)", line()),
-    }
+    static LIMITED: den_http::log::LimitedLog = den_http::log::LimitedLog::new();
+    LIMITED.log(condition, line);
 }
 
 /// The /health verdict: `None` when ok, else the first reason sessions cannot work and what to do.
@@ -153,31 +129,17 @@ fn health_body(state: &AppState) -> serde_json::Value {
     }
 }
 
-/// Only with a configured token presented as `Authorization: Bearer <token>`, compared in constant
-/// time — how every Den addon gates it.
-fn metrics_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
-    use subtle::ConstantTimeEq;
-    let Some(token) = state.cfg.metrics_token.as_deref() else { return false };
-    let presented = headers
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    presented.is_some_and(|p| p.as_bytes().ct_eq(token.as_bytes()).into())
-}
-
 /// Prometheus text, by hand. Every number is an atomic or a map length; nothing walks the disk.
 fn metrics_body(state: &AppState) -> String {
-    use std::fmt::Write;
     let mut b = String::with_capacity(2048);
     let mut metric = |name: &str, kind: &str, help: &str, labels: &str, v: u64| {
-        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name}{labels} {v}");
+        den_http::prom::series(&mut b, name, kind, help, labels, v)
     };
     metric(
         "remux_build_info",
         "gauge",
         "The running build.",
-        &format!("{{version=\"{}\"}}", release_version()),
+        &format!("version=\"{}\"", release_version()),
         1,
     );
     let sessions = state.sessions();
@@ -279,14 +241,9 @@ fn metrics_body(state: &AppState) -> String {
 fn add_cors(resp: &mut Response<Body>) {
     use hyper::header::HeaderValue;
     let h = resp.headers_mut();
-    h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    den_http::cors_stamp(h, "Content-Range, Content-Length, ETag");
     h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, POST, DELETE, OPTIONS"));
     h.insert("access-control-allow-headers", HeaderValue::from_static("Range, If-Range, X-Request-Id"));
-    h.insert(
-        "access-control-expose-headers",
-        HeaderValue::from_static("Content-Range, Content-Length, ETag"),
-    );
-    h.insert("timing-allow-origin", HeaderValue::from_static("*"));
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
 }
 
@@ -331,17 +288,13 @@ where
         resp.headers_mut().append("vary", hyper::header::HeaderValue::from_static("origin"));
     }
     if state.cfg.log_requests {
-        let mut line = format!(
-            "{} {} {} {}ms",
-            parts.method,
-            redact::path(parts.uri.path()),
+        let mut line = den_http::log::request_head(
+            parts.method.as_str(),
+            &redact::path(parts.uri.path()),
             resp.status().as_u16(),
-            start.elapsed().as_millis()
+            start.elapsed().as_millis(),
         );
-        if let Some(rid) = redact::request_id(&parts.headers) {
-            line.push_str(" rid=");
-            line.push_str(&rid);
-        }
+        den_http::log::push_rid(&mut line, redact::request_id(&parts.headers).as_deref());
         // Joins this line to every one the session itself goes on to write, including its end-of-session
         // summary, by the same id.
         if let Some(sid) = &created_session {
@@ -424,7 +377,7 @@ where
         // probe each route's `<url>/health` (den-spec routes-v1).
         "/health" | "/remux/health" if get => httputil::json(StatusCode::OK, &health_body(state), &[]),
         "/metrics" if get => {
-            if !metrics_authorized(state, &parts.headers) {
+            if !den_http::metrics_authorized(&parts.headers, state.cfg.metrics_token.as_deref()) {
                 return httputil::not_found();
             }
             let body = metrics_body(state);

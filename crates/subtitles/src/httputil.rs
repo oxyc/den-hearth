@@ -1,73 +1,18 @@
-//! Small hyper response helpers (same shape as den-reel's httputil).
+//! Subtitles' HTTP plumbing: the shared builders from `den-http`, plus the subtitle-specific bodies (SRT, WebVTT)
+//! and the validators only they carry.
 
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::header::{
-    HeaderMap, HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_MAX_AGE, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-};
+use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use hyper::{Response, StatusCode};
 use serde::Serialize;
 
-pub type Body = Full<Bytes>;
-
-/// Which phases a resource response spent its time in — `opensubtitles`, `download`, `sync`,
-/// `translate`, or `cache;desc=hit` — and `total`, in milliseconds. Phase names only: never a title,
-/// an install or a URL.
-pub const SERVER_TIMING: &str = "server-timing";
-/// `X-Den-Degraded: <reason>` marks an answer that is a fallback: a list left empty because the search
-/// failed, a subtitle served unaligned because its sync failed. Absent on a normal answer. Reasons are
-/// the /health slugs, so the app can read the header without knowing which addon sent it.
-pub const X_DEN_DEGRADED: &str = "x-den-degraded";
-
-/// Append one `Server-Timing` entry to whatever the response already names.
-pub fn add_timing(mut resp: Response<Body>, entry: &str) -> Response<Body> {
-    let value = match resp.headers().get(SERVER_TIMING).and_then(|v| v.to_str().ok()) {
-        Some(prior) => format!("{prior}, {entry}"),
-        None => entry.to_string(),
-    };
-    if let Ok(v) = HeaderValue::from_str(&value) {
-        resp.headers_mut().insert(SERVER_TIMING, v);
-    }
-    resp
-}
-
-/// Mark a response as a fallback. The first reason stands: it is the one closest to the cause, and a
-/// later layer adding its own would describe a consequence.
-pub fn degraded(mut resp: Response<Body>, reason: &'static str) -> Response<Body> {
-    resp.headers_mut().entry(X_DEN_DEGRADED).or_insert(HeaderValue::from_static(reason));
-    resp
-}
-
-/// A strong, quoted ETag derived from the response body. Non-crypto is plenty — an ETag only needs
-/// to change when the bytes change, not resist an adversary — but it must be `stable_hash` and not
-/// std's `DefaultHasher`, for the reason spelled out below: an ETag outlives the process, in client
-/// and proxy caches, so a toolchain bump would invalidate every one of them at once. Length is
-/// folded in as a cheap extra guard against collisions.
-pub(crate) fn etag_of(bytes: &[u8]) -> String {
-    format!("\"{:016x}-{:x}\"", stable_hash(bytes), bytes.len())
-}
-
-/// FNV-1a-64: a FIXED, non-crypto hash — deterministic across restarts AND toolchain versions.
-///
-/// Anything whose value outlives the process must use this rather than std's `DefaultHasher`, whose
-/// algorithm std may change between compiler releases. A toolchain bump would otherwise silently
-/// rename every hashed cache file, reset every install's daily allowance, and move every failure
-/// marker — all at once, and invisibly.
-pub fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-    }
-    h
-}
-
-/// Whether a response is a cacheable success that should carry a validator (ETag): a 200 with a
-/// caching directive that isn't `no-store`. Errors and `no-store` bodies never get an ETag.
-fn cacheable(status: StatusCode, cache_control: &str) -> bool {
-    status == StatusCode::OK && !cache_control.is_empty() && !cache_control.contains("no-store")
-}
+pub use den_http::{
+    add_timing, apply_conditional, degraded, etag_of, full, not_found, percent_decode, percent_decode_path,
+    preflight, stable_hash, Body,
+};
+/// The header names the tests read a response by.
+#[cfg(test)]
+pub use den_http::{SERVER_TIMING, X_DEN_DEGRADED};
 
 /// An error reply: `{"error":"<slug>"}`, the body shape every den addon uses, and always `no-store` —
 /// a transient upstream failure must never be cached, or a cached 502 would wedge a subtitle until
@@ -84,46 +29,18 @@ pub fn retry_after(mut resp: Response<Body>, wait: std::time::Duration) -> Respo
     resp
 }
 
-/// The 404 every den addon answers for a path it does not serve. A refused /metrics answers the same,
-/// so a box with no token configured does not advertise that the route exists.
-pub fn not_found() -> Response<Body> {
-    json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), "no-store")
-}
-
-/// The CORS preflight answer, for any path. `handle_request` adds the allow-origin header to it along
-/// with every other reply; the max-age lets a browser cache the preflight for a day instead of
-/// repeating it before every request.
-pub fn preflight() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
-        .header(ACCESS_CONTROL_ALLOW_HEADERS, "*")
-        .header(ACCESS_CONTROL_MAX_AGE, "86400")
-        .body(Full::new(Bytes::new()))
-        .unwrap()
-}
-
+/// HTML with the `Cache-Control` it may be kept under (and an ETag when that lets it be kept).
 pub fn html(status: StatusCode, body: &'static str, cache_control: &str) -> Response<Body> {
-    let mut b = Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(CACHE_CONTROL, HeaderValue::from_str(cache_control).unwrap());
-    if cacheable(status, cache_control) {
-        b = b.header(ETAG, etag_of(body.as_bytes()));
-    }
-    b.body(Full::new(Bytes::from_static(body.as_bytes()))).unwrap()
+    den_http::html(status, body, &[("cache-control", cache_control)])
 }
 
-pub fn json<T: Serialize>(status: StatusCode, value: &T, cache_control: &str) -> Response<Body> {
-    let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let mut b = Response::builder().status(status).header(CONTENT_TYPE, "application/json");
-    if !cache_control.is_empty() {
-        b = b.header(CACHE_CONTROL, cache_control);
+/// JSON under `cache_control` (none when empty). A cacheable 200 carries an ETag; see `den_http::json`.
+pub fn json<T: Serialize + ?Sized>(status: StatusCode, value: &T, cache_control: &str) -> Response<Body> {
+    if cache_control.is_empty() {
+        den_http::json(status, value, &[])
+    } else {
+        den_http::json(status, value, &[("cache-control", cache_control)])
     }
-    if cacheable(status, cache_control) {
-        b = b.header(ETAG, etag_of(&bytes));
-    }
-    b.body(Full::new(Bytes::from(bytes))).unwrap()
 }
 
 /// The caching directive of a settled subtitle: this file_id/sync variant is byte-stable forever, so
@@ -165,7 +82,7 @@ fn srt_cached(body: Bytes, cache_control: &str, etag: &str) -> Response<Body> {
         .header(CONTENT_TYPE, "application/x-subrip; charset=utf-8")
         .header(CACHE_CONTROL, cache_control)
         .header(ETAG, etag)
-        .body(Full::new(body))
+        .body(full(body))
         .unwrap()
 }
 
@@ -179,8 +96,10 @@ pub fn identity_etag(identity: &str) -> String {
 
 /// Whether a request's `If-None-Match` matches `etag`.
 pub fn if_none_match(req_headers: &HeaderMap, etag: &str) -> bool {
-    let Ok(etag) = HeaderValue::from_str(etag) else { return false };
-    req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, &etag))
+    req_headers
+        .get(IF_NONE_MATCH)
+        .and_then(|inm| inm.to_str().ok())
+        .is_some_and(|inm| den_http::if_none_match_matches(inm, etag))
 }
 
 /// A bodiless `304 Not Modified` carrying the validator and the caching directive it revalidated.
@@ -189,7 +108,7 @@ pub fn not_modified(etag: &str, cache_control: &str) -> Response<Body> {
         .status(StatusCode::NOT_MODIFIED)
         .header(CACHE_CONTROL, cache_control)
         .header(ETAG, etag)
-        .body(Full::new(Bytes::new()))
+        .body(full(""))
         .unwrap()
 }
 
@@ -241,7 +160,7 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
             return not_modified(etag, &cache_control);
         }
     }
-    // `Full` is already in memory, so this await resolves immediately and cannot stall the thread.
+    // The body is a `full` buffer, already in memory, so this await resolves immediately and cannot stall the thread.
     let (mut parts, body) = resp.into_parts();
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -256,101 +175,7 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     let etag = derived.unwrap_or_else(|| etag_of(vtt.as_bytes()));
     parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"));
     parts.headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
-    Response::from_parts(parts, Full::new(Bytes::from(vtt)))
-}
-
-/// Honor a conditional GET: if the request's `If-None-Match` matches the response's `ETag`,
-/// collapse to a `304 Not Modified` that keeps the `ETag` + `Cache-Control` headers and drops the
-/// body. A no-op for responses without an ETag (errors, `no-store`) or a non-matching request.
-pub fn apply_conditional(resp: Response<Body>, req_headers: &HeaderMap) -> Response<Body> {
-    let Some(etag) = resp.headers().get(ETAG) else {
-        return resp;
-    };
-    let matched = req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, etag));
-    if !matched {
-        return resp;
-    }
-    let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
-    let headers = b.headers_mut().expect("fresh builder has headers");
-    if let Some(v) = resp.headers().get(ETAG) {
-        headers.insert(ETAG, v.clone());
-    }
-    if let Some(v) = resp.headers().get(CACHE_CONTROL) {
-        headers.insert(CACHE_CONTROL, v.clone());
-    }
-    b.body(Full::new(Bytes::new())).unwrap()
-}
-
-/// A HEAD response must not carry a body (RFC 9110 §9.3.2) — drop it, keeping every header (including
-/// the `Content-Length` a GET would have returned). The router builds full-body responses regardless of
-/// method and hyper does not auto-strip, so the HEAD path must do it explicitly.
-pub fn strip_body(resp: Response<Body>) -> Response<Body> {
-    let (parts, _body) = resp.into_parts();
-    Response::from_parts(parts, Full::new(Bytes::new()))
-}
-
-/// RFC 9110 `If-None-Match`: `*` matches anything; otherwise any entry in the comma-separated list
-/// that equals the ETag matches. Our ETags are strong, but we compare with the weak-validator
-/// prefix (`W/`) stripped from both sides so a proxy that weakened it still gets its 304.
-fn if_none_match_matches(inm: &HeaderValue, etag: &HeaderValue) -> bool {
-    let (Ok(inm), Ok(etag)) = (inm.to_str(), etag.to_str()) else {
-        return false;
-    };
-    let etag = etag.trim_start_matches("W/");
-    inm.split(',').any(|candidate| {
-        let candidate = candidate.trim();
-        candidate == "*" || candidate.trim_start_matches("W/") == etag
-    })
-}
-
-/// Minimal percent-decode (`%XX` + `+`→space) — enough for the extra-args a Stremio client sends.
-pub fn percent_decode(s: &str) -> String {
-    decode(s, true)
-}
-
-/// Percent-decoding for a PATH segment, where `+` is a literal plus. Form-decoding a path turns
-/// "HDR10+.WEB-DL" into "HDR10 .WEB-DL", which is then what the release name is ranked on.
-pub fn percent_decode_path(s: &str) -> String {
-    decode(s, false)
-}
-
-fn decode(s: &str, plus_is_space: bool) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hi = hex(bytes[i + 1]);
-                let lo = hex(bytes[i + 2]);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    out.push(h << 4 | l);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' if plus_is_space => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    Response::from_parts(parts, full(vtt))
 }
 
 #[cfg(test)]
@@ -434,6 +259,39 @@ mod tests {
         let cc = |r: Response<Body>| r.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
         assert_eq!(cc(srt(SRT.to_string())), "private, max-age=31536000, immutable");
         assert_eq!(cc(srt_provisional(SRT.to_string())), "private, no-cache");
+    }
+
+    /// Clients and Cloudflare cache on these strings. The validator of a settled subtitle, of a cacheable JSON body
+    /// and of the page is FNV-1a-64 of the bytes plus their length in hex, quoted — and `no-store` has none.
+    #[test]
+    fn the_validators_are_pinned() {
+        let etag = |r: Response<Body>| r.headers().get(ETAG).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            etag(srt("1\n00:00:01,000 --> 00:00:02,000\nHi\n".to_string())).as_deref(),
+            Some("\"fdef2c0328292f7c-23\"")
+        );
+        assert_eq!(
+            etag(json(StatusCode::OK, &serde_json::json!({"a": 1}), "public, max-age=60")).as_deref(),
+            Some("\"9c3e82dd6fcae8b1-7\"")
+        );
+        assert_eq!(
+            etag(html(StatusCode::OK, "<p>hi</p>", "public, max-age=60")).as_deref(),
+            Some("\"2af7677882c30339-9\"")
+        );
+        assert_eq!(etag(json(StatusCode::OK, &serde_json::json!({"a": 1}), "no-store")), None);
+        assert_eq!(etag(error(StatusCode::BAD_GATEWAY, "upstream_unavailable")), None);
+    }
+
+    /// An error body is `{"error":"<slug>"}` and never cached; the 404 is the one every addon sends.
+    #[tokio::test]
+    async fn errors_are_the_slug_body_and_no_store() {
+        let err = error(StatusCode::BAD_GATEWAY, "upstream_unavailable");
+        assert_eq!(err.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body_of(err).await, r#"{"error":"upstream_unavailable"}"#);
+        let missing = not_found();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body_of(missing).await, r#"{"error":"not_found"}"#);
     }
 
     /// An identity validator can never collide with a body-hash one: a stand-in's ETag must not be

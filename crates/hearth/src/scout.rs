@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::{Request, Response, StatusCode};
 
 use den_scout::cache::Cache;
@@ -104,13 +104,13 @@ impl Scout {
         };
         let handler = if own_listener { &self.legacy } else { &self.mount };
         let resp = handler.serve(Request::from_parts(parts, body)).await;
-        crate::boxed(resp.map(|bytes| Full::new(Bytes::from(bytes))))
+        resp.map(den_http::full)
     }
 
     /// Scout's own `/health`, for hearth's combined one.
     pub async fn health(&self) -> Response<Body> {
         let req = Request::get("/health").body(Vec::new()).expect("static request");
-        crate::boxed(self.mount.serve(req).await.map(|bytes| Full::new(Bytes::from(bytes))))
+        self.mount.serve(req).await.map(den_http::full)
     }
 }
 

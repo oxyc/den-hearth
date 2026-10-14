@@ -1,72 +1,10 @@
-//! Tiny HTTP plumbing shared by the handlers: a unified response-body type, JSON/HTML/error
-//! response builders, and hand-rolled query/percent-decode helpers (no url/regex dependency).
+//! Reel's HTTP plumbing: the shared builders from `den-http`, plus the query-string and byte-range helpers only the
+//! trailer routes need.
 
-use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::header::{
-    HeaderMap, HeaderValue, CACHE_CONTROL, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE,
+pub use den_http::percent_decode_path as percent_decode;
+pub use den_http::{
+    apply_conditional, error, etag_of, full, html, if_range_holds, json, not_found, timed, timing, Body,
 };
-use hyper::{Method, Response, StatusCode};
-
-/// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can
-/// fail mid-flight, full-buffer bodies never do).
-pub type Body = BoxBody<Bytes, std::io::Error>;
-
-/// A fully-buffered body from anything byte-ish.
-pub fn full(data: impl Into<Bytes>) -> Body {
-    Full::new(data.into()).map_err(|never| match never {}).boxed()
-}
-
-/// A strong, quoted ETag derived from the response body. A fast non-crypto hash (std
-/// `DefaultHasher`) is plenty — an ETag only needs to change when the bytes change, not resist an
-/// adversary. Length is folded in as a cheap extra guard against hash collisions.
-pub fn etag_of(bytes: &[u8]) -> String {
-    // FNV-1a-64: a FIXED, non-crypto hash — deterministic across restarts AND toolchain versions
-    // (unlike std's DefaultHasher, whose algorithm std may change between compiler releases, which
-    // would shift every ETag once). Length is folded in as a cheap extra guard against collisions.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-    }
-    format!("\"{h:016x}-{:x}\"", bytes.len())
-}
-
-/// The `Cache-Control` value from a handler's extra-header slice, if any (case-insensitive key).
-fn cache_control_of<'a>(extra: &'a [(&str, &str)]) -> Option<&'a str> {
-    extra.iter().find(|(k, _)| k.eq_ignore_ascii_case("cache-control")).map(|(_, v)| *v)
-}
-
-/// Whether a response is a cacheable success that should carry a validator (ETag): a 200 with a
-/// caching directive that isn't `no-store`. Errors and `no-store` bodies never get an ETag.
-fn cacheable(status: StatusCode, cache_control: Option<&str>) -> bool {
-    status == StatusCode::OK && cache_control.is_some_and(|cc| !cc.is_empty() && !cc.contains("no-store"))
-}
-
-/// `sendJson` equivalent: JSON + explicit Content-Length, plus any extra headers (e.g.
-/// Cache-Control). CORS is not set here: `handle_request` stamps it on every response on the way
-/// out. Serialization can't fail for our own types, but stay total just in case.
-pub fn json(status: StatusCode, value: &serde_json::Value, extra: &[(&str, &str)]) -> Response<Body> {
-    let s = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let mut b = Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .header("content-length", s.len());
-    let cc = cache_control_of(extra);
-    for (k, v) in extra {
-        b = b.header(*k, *v);
-    }
-    // Errors must never be cached (a transient 502/503/504 mustn't stick in a client/proxy cache).
-    if !status.is_success() && cc.is_none() {
-        b = b.header("cache-control", "no-store");
-    }
-    // Attach a strong validator to cacheable 200s so a conditional GET can collapse to a 304.
-    if cacheable(status, cc) {
-        b = b.header(ETAG, etag_of(&s));
-    }
-    b.body(full(s)).unwrap()
-}
 
 /// The `Vary` for a body built from [`crate::addon::self_base`]. Its play URLs come from the
 /// forwarded host and scheme, or from `Host` when nothing is forwarded, so all three are part of what
@@ -75,150 +13,6 @@ pub fn json(status: StatusCode, value: &serde_json::Value, extra: &[(&str, &str)
 /// would split a cache for nothing.
 pub const VARY_SELF_BASE: (&str, &str) = ("vary", "X-Forwarded-Host, X-Forwarded-Proto, Host");
 
-/// HTML response (the embedded /configure page), plus any extra headers (e.g. Cache-Control).
-pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> Response<Body> {
-    let mut b = Response::builder()
-        .status(status)
-        .header("content-type", "text/html; charset=utf-8")
-        .header("content-length", body.len());
-    let cc = cache_control_of(extra);
-    for (k, v) in extra {
-        b = b.header(*k, *v);
-    }
-    if cacheable(status, cc) {
-        b = b.header(ETAG, etag_of(body.as_bytes()));
-    }
-    b.body(full(body)).unwrap()
-}
-
-/// One `Server-Timing` entry: a phase and how long it took, in milliseconds.
-pub fn timing(name: &str, d: std::time::Duration) -> String {
-    format!("{name};dur={:.1}", d.as_secs_f64() * 1000.0)
-}
-
-/// Name what a handler spent its time on in `Server-Timing`; `handle_request` appends `total`.
-/// An empty list sends nothing.
-pub fn timed(mut resp: Response<Body>, phases: &str) -> Response<Body> {
-    if !phases.is_empty() {
-        if let Ok(v) = HeaderValue::from_str(phases) {
-            resp.headers_mut().insert("server-timing", v);
-        }
-    }
-    resp
-}
-
-/// The one 404 every Den addon answers, for an unknown path and a refused `/metrics` alike, so a
-/// refusal cannot be told apart from a route that does not exist.
-pub fn not_found() -> Response<Body> {
-    json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), &[("cache-control", "no-store")])
-}
-
-/// A typed error body `{ "error": <code>, "detail": <text> }` — the shape every Den addon answers
-/// with (no-store applied via `json`).
-pub fn error(status: StatusCode, code: &str, detail: &str) -> Response<Body> {
-    json(status, &serde_json::json!({ "error": code, "detail": detail }), &[])
-}
-
-/// Honor a conditional GET/HEAD: if the request's `If-None-Match` matches the response's `ETag` —
-/// or, when it sends none, its `If-Modified-Since` is no earlier than the response's `Last-Modified`
-/// — collapse to a `304 Not Modified` that keeps the validators + `Cache-Control` and drops the
-/// body. A no-op for unsafe methods, responses without an ETag (errors, `no-store`), or a
-/// non-matching request.
-pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Response<Body>) -> Response<Body> {
-    if !matches!(*method, Method::GET | Method::HEAD) {
-        return resp;
-    }
-    // Never collapse a partial/non-200 or a `Range` request to a bare `304`: a range request must get
-    // its bytes, not an empty body — a 304 there silently breaks player seeks. Such responses still
-    // get HEAD-stripped. A plain GET of the `/play` video DOES collapse: its ETag is stable for the
-    // cached file, and a revalidation that re-sent the whole trailer was tens of megabytes for nothing.
-    if resp.status() != StatusCode::OK || req_headers.contains_key(RANGE) {
-        return head_stripped(method, resp);
-    }
-    let Some(etag) = resp.headers().get(ETAG) else {
-        return head_stripped(method, resp);
-    };
-    // RFC 9110 §13.2.2: If-Modified-Since is only consulted when If-None-Match is absent.
-    let matched = match req_headers.get(IF_NONE_MATCH) {
-        Some(inm) => if_none_match_matches(inm, etag),
-        None => not_modified_since(req_headers.get(IF_MODIFIED_SINCE), resp.headers().get(LAST_MODIFIED)),
-    };
-    if !matched {
-        return head_stripped(method, resp);
-    }
-    let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
-    let headers = b.headers_mut().expect("fresh builder has headers");
-    for name in [ETAG, LAST_MODIFIED] {
-        if let Some(v) = resp.headers().get(&name) {
-            headers.insert(name, v.clone());
-        }
-    }
-    if let Some(v) = resp.headers().get(CACHE_CONTROL) {
-        headers.insert(CACHE_CONTROL, v.clone());
-    }
-    // RFC 9110 §15.4.5: a 304 carries the Vary the 200 would have. Caches keep the stored one, but
-    // it is the header this response exists to be correct about. Every line of it: a body can vary on a
-    // client report and on the host both, sent as two.
-    for v in resp.headers().get_all("vary") {
-        headers.append("vary", v.clone());
-    }
-    // What the handler did, and whether the answer is a fallback, describe THIS response; the
-    // client's stored copy can say neither. The same body can be fresh one hour and a stand-in the
-    // next, so the ETag alone would hide the change.
-    for name in ["server-timing", "x-den-degraded"] {
-        if let Some(v) = resp.headers().get(name) {
-            headers.insert(name, v.clone());
-        }
-    }
-    b.body(full("")).unwrap()
-}
-
-/// A HEAD response must not carry a body (RFC 9110 §9.3.2) — drop it while keeping every header
-/// (including the `Content-Length` a GET would have returned). A no-op for GET.
-fn head_stripped(method: &Method, resp: Response<Body>) -> Response<Body> {
-    if *method == Method::HEAD {
-        let (parts, _body) = resp.into_parts();
-        return Response::from_parts(parts, full(""));
-    }
-    resp
-}
-
-/// RFC 9110 `If-None-Match`: `*` matches anything; otherwise any entry in the comma-separated list
-/// that equals the ETag matches. Our ETags are strong, but we compare with the weak-validator
-/// prefix (`W/`) stripped from both sides so a proxy that weakened it still gets its 304.
-fn if_none_match_matches(inm: &HeaderValue, etag: &HeaderValue) -> bool {
-    let (Ok(inm), Ok(etag)) = (inm.to_str(), etag.to_str()) else {
-        return false;
-    };
-    let etag = etag.trim_start_matches("W/");
-    inm.split(',').any(|candidate| {
-        let candidate = candidate.trim();
-        candidate == "*" || candidate.trim_start_matches("W/") == etag
-    })
-}
-
-/// RFC 9110 `If-Modified-Since`: unchanged when the response's `Last-Modified` is no later than the
-/// date the client holds. Both are whole seconds, so comparing the parsed dates is exact. False when
-/// either is missing or unreadable, which serves the body.
-fn not_modified_since(since: Option<&HeaderValue>, last_modified: Option<&HeaderValue>) -> bool {
-    let date = |v: Option<&HeaderValue>| v?.to_str().ok().and_then(|s| httpdate::parse_http_date(s).ok());
-    matches!((date(since), date(last_modified)), (Some(since), Some(modified)) if modified <= since)
-}
-
-/// RFC 9110 §13.1.5 `If-Range`: whether a range still applies to the representation being served.
-/// An entity tag must match strongly — a weak one never does — and a date must equal `Last-Modified`.
-/// When it does not hold, the caller serves the whole representation instead of a part of it.
-pub fn if_range_holds(if_range: &str, etag: &str, last_modified: &str) -> bool {
-    let if_range = if_range.trim();
-    if if_range.starts_with('"') || if_range.starts_with("W/") {
-        return if_range == etag;
-    }
-    match (httpdate::parse_http_date(if_range), httpdate::parse_http_date(last_modified)) {
-        (Ok(asked), Ok(modified)) => asked == modified,
-        _ => false,
-    }
-}
-
 /// Look up a query-string parameter without pulling in a URL parser. Returns the decoded value of
 /// the first occurrence of `key`.
 pub fn query_param(query: &str, key: &str) -> Option<String> {
@@ -226,35 +20,6 @@ pub fn query_param(query: &str, key: &str) -> Option<String> {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         (percent_decode(k) == key).then(|| percent_decode(v))
     })
-}
-
-/// Minimal percent-decoding (`%XX` → byte, lossy UTF-8). Enough for Den's `tt…`/`tt…:S:E` ids and
-/// our short query params; we never emit encoded paths ourselves.
-pub fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// A parsed `Range: bytes=start-end`, `bytes=start-` or `bytes=-length` against a known file size. A header
@@ -311,22 +76,5 @@ mod tests {
         assert_eq!(at("bytes=10-19", 1000), Some((10, 19)));
         assert!(parse_range(Some("bytes=-"), 1000).is_none());
         assert!(parse_range(Some("bytes=0-1,5-6"), 1000).is_none(), "several ranges: the whole file");
-    }
-
-    #[test]
-    fn a_304_keeps_every_vary_the_200_had() {
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header(ETAG, "\"a\"")
-            .header("vary", "X-Den-Playable")
-            .header("vary", "Host")
-            .body(full("x"))
-            .unwrap();
-        let mut req = HeaderMap::new();
-        req.insert(IF_NONE_MATCH, HeaderValue::from_static("\"a\""));
-        let out = apply_conditional(&Method::GET, &req, resp);
-        assert_eq!(out.status(), StatusCode::NOT_MODIFIED);
-        let vary: Vec<&str> = out.headers().get_all("vary").iter().map(|v| v.to_str().unwrap()).collect();
-        assert_eq!(vary, ["X-Den-Playable", "Host"]);
     }
 }

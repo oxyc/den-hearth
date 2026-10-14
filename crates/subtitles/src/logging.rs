@@ -19,31 +19,17 @@ pub fn redact_path(path: &str) -> String {
     if FIXED_ROUTES.contains(&path) {
         return path.to_string();
     }
-    let rest = path.trim_start_matches('/');
-    match rest.find('/') {
-        Some(i) => format!("/<config>{}", &rest[i..]),
-        None => "/<config>".to_string(),
-    }
+    // No routes to keep: every other path has its first segment replaced, `/health/x` included.
+    den_http::log::redact_first_segment(path, &[]).into_owned()
 }
 
-/// The caller's `X-Request-Id`, fit for the log: only `[A-Za-z0-9_-]`, at most 32 characters. It is
-/// what joins this line to the app's own log line for the same request. Anything else in the header is
-/// dropped rather than escaped, so a caller cannot forge a second field or a second line; nothing left
-/// means no id.
-pub fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
-    let raw = headers.get("x-request-id")?.to_str().ok()?;
-    let id: String =
-        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(32).collect();
-    (!id.is_empty()).then_some(id)
-}
+/// The caller's `X-Request-Id`, fit for the log (`den_http::log`): what joins this line to the app's own log line
+/// for the same request.
+pub use den_http::log::request_id;
 
 /// One request log line: `<METHOD> <redacted path> <status> <ms>ms[ rid=<id>]`.
 pub fn request_line(method: &str, path: &str, status: u16, ms: u128, rid: Option<&str>) -> String {
-    let line = format!("{method} {} {status} {ms}ms", redact_path(path));
-    match rid {
-        Some(rid) => format!("{line} rid={rid}"),
-        None => line,
-    }
+    den_http::log::request_line(method, &redact_path(path), status, ms, rid)
 }
 
 /// One structured decision-log line, in the convention shared across den services: `event=<token>
@@ -172,6 +158,9 @@ mod tests {
         // A config segment with nothing after it, and a path with extra leading slashes.
         assert_eq!(redact_path("/eyJvc0tleSI6InNlY3JldCJ9"), "/<config>");
         assert_eq!(redact_path("//eyJvc0tleSI6InNlY3JldCJ9/manifest.json"), "/<config>/manifest.json");
+        // Only a fixed route's exact path is kept: anything hanging off one is the first segment's business.
+        assert_eq!(redact_path("/health/eyJvc0tleSI6InNlY3JldCJ9"), "/<config>/eyJvc0tleSI6InNlY3JldCJ9");
+        assert_eq!(redact_path("/configure/"), "/configure/");
     }
 
     #[test]

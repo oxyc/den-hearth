@@ -32,7 +32,6 @@ pub mod bench_api;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
-use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
 use hyper::{Request, Response, StatusCode};
 
 pub use crate::config::Config;
@@ -101,13 +100,14 @@ fn config_key_invalid_health() -> serde_json::Value {
 /// The 503 an install-config request gets while `CONFIG_KEY` is malformed. Retry-After is a hint to
 /// clients, not a promise: only an operator fixing the variable and restarting clears it.
 fn config_key_invalid_response() -> Response<Body> {
-    let mut resp = httputil::json(
-        StatusCode::SERVICE_UNAVAILABLE,
-        &serde_json::json!({"error": "config_key_invalid"}),
-        "no-store",
-    );
-    resp.headers_mut().insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("60"));
-    resp
+    httputil::retry_after(
+        httputil::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({"error": "config_key_invalid"}),
+            "no-store",
+        ),
+        std::time::Duration::from_secs(60),
+    )
 }
 
 // Generic over the request body: this handler routes on path/query only and discards the body, so tests
@@ -119,15 +119,9 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         // A CORS preflight is answered for any path, before routing.
         hyper::Method::OPTIONS => httputil::preflight(),
         // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
-        // collapses to a 304.
+        // collapses to a 304. A HEAD answer never has a body (the router builds one regardless of method).
         hyper::Method::GET | hyper::Method::HEAD => {
-            let resp = httputil::apply_conditional(route(&state, &parts).await, &parts.headers);
-            // HEAD must not carry a body (the router builds one regardless of method).
-            if parts.method == hyper::Method::HEAD {
-                httputil::strip_body(resp)
-            } else {
-                resp
-            }
+            httputil::apply_conditional(&parts.method, &parts.headers, route(&state, &parts).await)
         }
         // Every route is a read. Routing on the path alone let a POST reach the same handlers — and a
         // subtitle or translate route spends a metered download or an LLM bill.
@@ -135,25 +129,15 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     };
     // `total` closes the header on any response whose handler named its phases, in tenths of a
     // millisecond like every other den addon.
-    if resp.headers().contains_key(httputil::SERVER_TIMING) {
-        let total = format!("total;dur={:.1}", started.elapsed().as_secs_f64() * 1000.0);
-        resp = httputil::add_timing(resp, &total);
-    }
-    // Every reply is readable from a browser-based Stremio client. Nothing here rides on a cookie —
-    // an install's credentials are in its path — so a wildcard origin grants a page nothing it could
-    // not already fetch. Added here, last, so the 304 and VTT paths that rebuild a response keep it.
-    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
-    // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
-    // Retry-After and the RateLimit pair are on refusals, and are how a browser client knows when to
-    // come back. ETag is what a client that keeps its own cache sends back as If-None-Match.
-    resp.headers_mut().insert(
-        "access-control-expose-headers",
-        HeaderValue::from_static(
-            "Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy, ETag",
-        ),
+    resp = den_http::with_total_timing(resp, started.elapsed());
+    // Every reply is readable from a browser-based Stremio client. Added here, last, so the 304 and VTT paths
+    // that rebuild a response keep it. Retry-After and the RateLimit pair are on refusals, and are how a browser
+    // client knows when to come back. ETag is what a client that keeps its own cache sends back as
+    // If-None-Match.
+    den_http::cors_stamp(
+        resp.headers_mut(),
+        "Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy, ETag",
     );
-    resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
     // Off by default, and then this bool is the whole cost. The path is redacted and the query left
     // out: a config segment is an install's credentials, and `?resync=` carries a stream URL. The
     // caller's X-Request-Id rides along so the line can be matched to the app's.
@@ -461,6 +445,7 @@ pub fn startup_line(state: &AppState) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+    use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
     use std::time::Duration;
 
     // Same fixed vector key + browser-minted sealed segment the seal/userconfig unit tests use, so the

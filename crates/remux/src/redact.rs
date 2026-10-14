@@ -69,14 +69,8 @@ pub fn player_message(raw: &str) -> String {
     scrub(flat.split_whitespace().collect::<Vec<_>>().join(" ").as_str(), &[]).chars().take(160).collect()
 }
 
-/// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is written into the
-/// log verbatim, so nothing that could forge a line or carry a secret gets through.
-pub fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
-    let raw = headers.get("x-request-id")?.to_str().ok()?;
-    let id: String =
-        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(32).collect();
-    (!id.is_empty()).then_some(id)
-}
+/// The caller's `X-Request-Id`, reduced to what cannot forge a line or carry a secret (`den_http::log`).
+pub use den_http::log::request_id;
 
 #[cfg(test)]
 mod tests {

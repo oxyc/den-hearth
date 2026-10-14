@@ -9,6 +9,8 @@ license = "MIT"
 [dependencies]
 # The public-address classifier resync hops are vetted with, shared with Scout and Remux.
 den-net = { path = "../net" }
+# Response builders, conditional GETs, CORS, the request log line and the metrics bearer check, shared with Reel and Remux.
+den-http = { path = "../http" }
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
@@ -25,8 +27,6 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 base64 = "0.23"
 # The sealed-config keyring and the install-revocation policy, shared with Scout and Reel.
 den-seal = { path = "../seal" }
-# Constant-time comparison of the /metrics bearer token. Already in the tree under crypto_box.
-subtle = "2"
 # Subtitle files are whatever encoding the uploader's editor saved (Windows-1250/1251, ISO-8859-x,
 # UTF-16), and the player downstream drops any cue that is not UTF-8. chardetng guesses the legacy
 # encoding the way Firefox does for unlabeled pages; encoding_rs decodes it.

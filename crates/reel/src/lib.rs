@@ -43,8 +43,6 @@ pub mod bench_api;
 #[cfg(test)]
 mod tests;
 
-use std::time::Duration;
-
 use hyper::{Request, Response, StatusCode};
 
 pub use crate::config::Config;
@@ -143,42 +141,11 @@ pub fn is_valid_vid(id: &str) -> bool {
     id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// How often one failure condition may write a line.
-const LOG_EVERY: Duration = Duration::from_secs(60);
-
-/// Log a failure at most once per `LOG_EVERY` per `condition`, saying how many were held back since
-/// the last line. The log is for state changes: in an outage every lookup and every download fails
-/// the same way, and one line a minute says so as well as a thousand.
-///
-/// No timer. A held-back count is reported when the condition next occurs after its window, and a
-/// condition that has stopped occurring has nothing left to say. `line` is only built when it is
-/// written. Conditions are a closed set — an upstream and a status, a failure reason — so the list
-/// stays a handful long.
+/// Log a failure at most once a minute per `condition`, saying how many were held back since the last
+/// line (`den_http::log::LimitedLog`). `line` is only built when it is written.
 pub fn log_limited(condition: &str, line: impl FnOnce() -> String) {
-    static SEEN: std::sync::Mutex<Vec<(String, std::time::Instant, u32)>> = std::sync::Mutex::new(Vec::new());
-    let now = std::time::Instant::now();
-    let held = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        match seen.iter_mut().find(|(c, _, _)| c == condition) {
-            Some((_, at, held)) if now.duration_since(*at) < LOG_EVERY => {
-                *held += 1;
-                return;
-            }
-            Some((_, at, held)) => {
-                *at = now;
-                std::mem::take(held)
-            }
-            None => {
-                seen.push((condition.to_string(), now, 0));
-                0
-            }
-        }
-    };
-    // Written after the lock is released: stderr is a pipe someone else drains.
-    match held {
-        0 => eprintln!("{}", line()),
-        n => eprintln!("{} ({n} more like it since the last line)", line()),
-    }
+    static LIMITED: den_http::log::LimitedLog = den_http::log::LimitedLog::new();
+    LIMITED.log(condition, line);
 }
 
 /// Consecutive hard upstream faults before /health reports `degraded` (ADDON-02).
@@ -268,27 +235,11 @@ fn health_verdict(
     }
 }
 
-/// May this request read `/metrics`? Only when a token is configured and the request presents it as
-/// `Authorization: Bearer <token>` — the prefix required, the token trimmed, as every Den addon reads
-/// it. Compared in constant time, so a caller cannot recover the token a byte at a time from how
-/// long a refusal took.
-fn metrics_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
-    use subtle::ConstantTimeEq;
-    let Some(token) = state.cfg.metrics_token.as_deref() else { return false };
-    let presented = headers
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    presented.is_some_and(|p| p.as_bytes().ct_eq(token.as_bytes()).into())
-}
-
 /// The `/metrics` body in the Prometheus text exposition format, written by hand: the format is a
 /// few dozen lines of printing, and a client library would be a dependency for it. Every number is
 /// either an atomic load or the length of a map we hold briefly — no I/O, no directory walk — and
 /// none of it is computed until a scrape asks.
 fn metrics_body(state: &AppState) -> String {
-    use std::fmt::Write;
     use std::sync::atomic::Ordering::Relaxed;
     fn len<K, V>(m: &std::sync::Mutex<std::collections::HashMap<K, V>>) -> u64 {
         m.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
@@ -297,14 +248,7 @@ fn metrics_body(state: &AppState) -> String {
     // One HELP/TYPE block and its samples; an empty label set is an unlabelled series. Every series
     // here is a gauge — a level read now. Even the failure counts go down: a success resets them.
     let mut gauge = |name: &str, help: &str, samples: &[(&str, u64)]| {
-        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} gauge");
-        for (labels, v) in samples {
-            if labels.is_empty() {
-                let _ = writeln!(b, "{name} {v}");
-            } else {
-                let _ = writeln!(b, "{name}{{{labels}}} {v}");
-            }
-        }
+        den_http::prom::family(&mut b, name, "gauge", help, samples)
     };
     let trailer_bytes = state.cache_trailer_bytes.load(Relaxed);
     let scratch_bytes = state.cache_scratch_bytes.load(Relaxed);
@@ -417,14 +361,7 @@ fn metrics_body(state: &AppState) -> String {
     );
     // What the web's trailers cost: counts only rise, so these are counters.
     let mut counter = |name: &str, help: &str, samples: &[(&str, u64)]| {
-        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} counter");
-        for (labels, v) in samples {
-            if labels.is_empty() {
-                let _ = writeln!(b, "{name} {v}");
-            } else {
-                let _ = writeln!(b, "{name}{{{labels}}} {v}");
-            }
-        }
+        den_http::prom::family(&mut b, name, "counter", help, samples)
     };
     let (video, audio) = (&state.index_video, &state.index_audio);
     counter(
@@ -514,10 +451,7 @@ fn metrics_body(state: &AppState) -> String {
     );
     // The last of each, for a glance without a second scrape to take a difference over.
     let mut gauge = |name: &str, help: &str, samples: &[(&str, u64)]| {
-        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} gauge");
-        for (labels, v) in samples {
-            let _ = writeln!(b, "{name}{{{labels}}} {v}");
-        }
+        den_http::prom::family(&mut b, name, "gauge", help, samples)
     };
     gauge(
         "reel_last_milliseconds",
@@ -540,15 +474,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     let mut resp = if parts.method == hyper::Method::OPTIONS {
         // CORS preflight, on any path: everything here is credential-free, and a browser-based
         // client asks before it sends anything with a header of its own.
-        Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header("access-control-allow-origin", "*")
-            .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
-            .header("access-control-allow-headers", "*")
-            // A day, so a browser stops preflighting every request.
-            .header("access-control-max-age", "86400")
-            .body(httputil::full(""))
-            .unwrap()
+        den_http::preflight()
     } else if !matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) {
         // Every route here is a read. Routing on the path alone meant a POST to /play started a
         // download like a GET would.
@@ -566,19 +492,15 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // Stamped here rather than in each builder, so no response can go out without it — the video,
     // the page, a plain-text error and a 304 included. A browser that cannot read an error body
     // reports a CORS failure instead of the error.
-    resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
-    // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
-    // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
-    // Retry-After as well, or a browser client cannot honour the cooldown a refusal carries, and the
-    // validators, or it cannot make the conditional and If-Range requests they exist for. Content-Range and
-    // Accept-Ranges, or a Media Source player fetching parts cannot learn a file's size or that it may seek.
-    resp.headers_mut().insert(
-        "access-control-expose-headers",
-        hyper::header::HeaderValue::from_static(
-            "Server-Timing, X-Den-Degraded, Retry-After, ETag, Last-Modified, Content-Range, Accept-Ranges",
-        ),
+    //
+    // The debug headers readable too: Server-Timing and X-Den-Degraded. Retry-After as well, or a browser client
+    // cannot honour the cooldown a refusal carries, and the validators, or it cannot make the conditional and
+    // If-Range requests they exist for. Content-Range and Accept-Ranges, or a Media Source player fetching parts
+    // cannot learn a file's size or that it may seek.
+    den_http::cors_stamp(
+        resp.headers_mut(),
+        "Server-Timing, X-Den-Degraded, Retry-After, ETag, Last-Modified, Content-Range, Accept-Ranges",
     );
-    resp.headers_mut().insert("timing-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // What a shared cache may keep is named, so the deploy that changes it can drop it by name: den's
     // `den-cloudflare-purge reel` runs after every reel release. Cloudflare removes the header before a
     // browser sees the answer.
@@ -592,15 +514,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     }
     // Time to headers: a streamed /play body is still being written when this runs.
     let elapsed = start.elapsed();
-    // `total` only where a handler named its phases, so it is never the whole of the header.
-    let timing = resp
-        .headers()
-        .get("server-timing")
-        .and_then(|v| v.to_str().ok())
-        .map(|phases| format!("{phases}, {}", httputil::timing("total", elapsed)));
-    if let Some(v) = timing.and_then(|t| hyper::header::HeaderValue::from_str(&t).ok()) {
-        resp.headers_mut().insert("server-timing", v);
-    }
+    let resp = den_http::with_total_timing(resp, elapsed);
     if log {
         eprintln!("{}", request_line(&parts, resp.status(), elapsed));
     }
@@ -614,21 +528,17 @@ fn request_line(
     status: StatusCode,
     elapsed: std::time::Duration,
 ) -> String {
-    let mut line = format!(
-        "{} {} {} {}ms",
-        parts.method,
-        redact_path(parts.uri.path()),
+    let mut line = den_http::log::request_head(
+        parts.method.as_str(),
+        &redact_path(parts.uri.path()),
         status.as_u16(),
-        elapsed.as_millis()
+        elapsed.as_millis(),
     );
     if let Some(ask) = sources_ask(&parts.uri) {
         line.push(' ');
         line.push_str(&ask);
     }
-    if let Some(rid) = request_id(&parts.headers) {
-        line.push_str(" rid=");
-        line.push_str(&rid);
-    }
+    den_http::log::push_rid(&mut line, den_http::log::request_id(&parts.headers).as_deref());
     line
 }
 
@@ -656,31 +566,23 @@ fn sources_ask(uri: &hyper::Uri) -> Option<String> {
     Some(ask)
 }
 
-/// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is written into the
-/// log verbatim, so nothing that could forge a line or carry a secret gets through. Empty = absent.
-fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
-    let raw = headers.get("x-request-id")?.to_str().ok()?;
-    let id: String =
-        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(32).collect();
-    (!id.is_empty()).then_some(id)
-}
-
 /// The request path as the request log may show it. The query string never gets this far — `?s=`
 /// is a play signature — and a per-install config segment carries a BYOK key, sealed or not, so any
 /// first segment that is not one of our own routes is written as `<config>`. That covers
 /// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
-/// or pasting the bare segment, which would otherwise put the key in the log through a 404.
+/// or pasting the bare segment, which would otherwise put the key in the log through a 404. Extra leading
+/// slashes are skipped, so `//<config>/…` and `//m/s/<cap>` are redacted as their one-slash forms are.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if let Some(rest) = path.strip_prefix("/m/") {
+    let rest = path.trim_start_matches('/');
+    if let Some(rest) = rest.strip_prefix("m/") {
         if let Some((filed @ ("n" | "s"), _)) = rest.split_once('/') {
             return format!("/m/{filed}/<cap>").into();
         }
     }
-    if path.starts_with("/_internal/validate/m/s/") {
+    if rest.starts_with("_internal/validate/m/s/") {
         return "/_internal/validate/m/s/<cap>".into();
     }
-    const ROUTES: [&str; 16] = [
-        "",
+    const ROUTES: [&str; 15] = [
         "health",
         "metrics",
         "manifest.json",
@@ -697,18 +599,7 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
         "sources",
         "m",
     ];
-    let rest = path.strip_prefix('/').unwrap_or(path);
-    let (first, tail) = match rest.split_once('/') {
-        Some((first, tail)) => (first, Some(tail)),
-        None => (rest, None),
-    };
-    if ROUTES.contains(&first) {
-        return path.into();
-    }
-    match tail {
-        Some(tail) => format!("/<config>/{tail}").into(),
-        None => "/<config>".into(),
-    }
+    den_http::log::redact_first_segment(path, &ROUTES)
 }
 
 async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
@@ -742,7 +633,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // does not give away. A refusal is the same 404 an unknown path gets, with or without a token
     // configured, so nobody is told there is something here to poke at.
     if path == "/metrics" {
-        if !metrics_authorized(&state, &parts.headers) {
+        if !den_http::metrics_authorized(&parts.headers, state.cfg.metrics_token.as_deref()) {
             return httputil::not_found();
         }
         let body = metrics_body(&state);

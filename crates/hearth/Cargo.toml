@@ -15,6 +15,8 @@ den-reel = { path = "../reel" }
 den-subtitles = { path = "../subtitles" }
 den-remux = { path = "../remux" }
 den-scout = { path = "../scout" }
+# The body type every service answers with, the JSON builders and the metrics bearer check.
+den-http = { path = "../http" }
 # The services were written for a current_thread runtime; one process serving all of them has more to
 # do, so hearth runs a small multi-thread pool instead (HEARTH_WORKER_THREADS).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
@@ -28,8 +30,6 @@ serde_json = "1"
 # Bound the kernel's TCP queues as well as Rust's buffers (see sock.rs): Linux otherwise autotunes them
 # to megabytes per slow reader, charged to the container's cgroup and invisible in RSS.
 socket2 = "0.6"
-# Constant-time comparison of the /metrics bearer token, as in the services.
-subtle = "2"
 # The global allocator (alloc.rs, BENCHMARKS.md "Allocators"); the -ctl crate reads its settings back for the startup line.
 tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 tikv-jemalloc-ctl = "0.7"
