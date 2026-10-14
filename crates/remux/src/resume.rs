@@ -131,8 +131,22 @@ pub(crate) fn read(dir: &Path, url_key: &[u8], sid: &str) -> Option<Record> {
 
 /// Delete a session's scratch, its record first: whatever else is left behind, the session can't come back.
 pub(crate) fn remove(dir: &Path) {
-    let _ = std::fs::remove_file(dir.join(RECORD_FILE));
+    forget(dir);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Delete the record alone: the session can't come back, whatever of its scratch is still to be deleted.
+pub(crate) fn forget(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(RECORD_FILE));
+}
+
+/// Mark the record as written now, at a suspension, so startup tells a session suspended moments ago from one a crash
+/// left long ago (`sweep`).
+pub(crate) fn touch(dir: &Path) {
+    let record = std::fs::OpenOptions::new().write(true).open(dir.join(RECORD_FILE));
+    if let Err(e) = record.and_then(|f| f.set_modified(std::time::SystemTime::now())) {
+        crate::log_limited("record_touch", || format!("scratch: a suspended session's record: {e}"));
+    }
 }
 
 /// Note the keyframe run `dir` starts on, for `adopt` after a restart.
@@ -207,20 +221,66 @@ pub(crate) fn adopt(dir: &Path, keyframes: &[f64], duration: f64) -> Adopted {
     a
 }
 
-/// At startup: keep the scratch of every session a record still vouches for — one that opens under this key and has
-/// not expired — and delete the rest, as every session directory was deleted before. The sids kept.
-pub(crate) fn sweep(scratch: &Path, url_key: &[u8], now: u64) -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(scratch) else { return Vec::new() };
-    let (mut kept, mut removed) = (Vec::new(), 0);
+/// A session an earlier process suspended, as startup found it (`sweep`).
+#[derive(Clone, Debug)]
+pub(crate) struct Kept {
+    /// Whom it counts against, so a revocation reaches it before it is resumed (`AppState::end_owner`).
+    pub owner: String,
+    /// What its URLs were signed with, for its tombstone.
+    pub exp: u64,
+    /// What its directory holds, counted against `SCRATCH_MAX_BYTES` until it is resumed or deleted.
+    pub bytes: u64,
+}
+
+/// Every file's bytes in a session's directory and its runs' directories, and the newest modification among them.
+fn measure(dir: &Path) -> (u64, Option<std::time::SystemTime>) {
+    let (mut bytes, mut newest) = (0, None);
+    let mut walk = |d: &Path, deeper: &mut Vec<PathBuf>| {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                deeper.push(e.path());
+            } else {
+                bytes += meta.len();
+                newest = newest.max(meta.modified().ok());
+            }
+        }
+    };
+    let mut runs = Vec::new();
+    walk(dir, &mut runs);
+    for run in runs {
+        walk(&run, &mut Vec::new());
+    }
+    (bytes, newest)
+}
+
+/// At startup: keep the scratch of every session a record still vouches for — one that opens under this key, has
+/// not expired, and was written to (a run's GOP, or the record touched at suspension) within `idle` — and delete the
+/// rest. A process that crashed has suspended nothing, so a crash loop doesn't keep a session's scratch until its
+/// expiry. The sessions kept, by sid.
+pub(crate) fn sweep(
+    scratch: &Path,
+    url_key: &[u8],
+    idle: std::time::Duration,
+) -> std::collections::HashMap<String, Kept> {
+    let mut kept = std::collections::HashMap::new();
+    let Ok(rd) = std::fs::read_dir(scratch) else { return kept };
+    let (now, mut removed) = (crate::state::unix_now(), 0);
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(sid) = name.strip_prefix("s-") else { continue };
-        let live = crate::auth::is_id(sid) && read(&e.path(), url_key, sid).is_some_and(|r| r.exp > now);
-        if live {
-            kept.push(sid.to_string());
-        } else {
-            remove(&e.path());
-            removed += 1;
+        let rec =
+            crate::auth::is_id(sid).then(|| read(&e.path(), url_key, sid)).flatten().filter(|r| r.exp > now);
+        let (bytes, newest) = measure(&e.path());
+        let recent = newest.and_then(|t| t.elapsed().ok()).is_some_and(|age| age < idle);
+        match rec {
+            Some(r) if recent => {
+                kept.insert(sid.to_string(), Kept { owner: r.owner, exp: r.exp, bytes });
+            }
+            _ => {
+                remove(&e.path());
+                removed += 1;
+            }
         }
     }
     if removed > 0 {
@@ -314,12 +374,21 @@ mod tests {
     fn startup_keeps_only_live_records_and_runs_are_placed_where_they_started() {
         let scratch = std::env::temp_dir().join(format!("den-remux-resume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
-        let (live, expired) = (crate::auth::random_id(), crate::auth::random_id());
-        for (sid, exp) in [(&live, 2_000_000_000), (&expired, 10)] {
+        let (live, expired, stale) =
+            (crate::auth::random_id(), crate::auth::random_id(), crate::auth::random_id());
+        for (sid, exp) in [(&live, 2_000_000_000), (&expired, 10), (&stale, 2_000_000_000)] {
             let dir = scratch.join(format!("s-{sid}"));
             std::fs::create_dir_all(&dir).unwrap();
             write(&dir, b"key", &Record { exp, ..record(sid) }).unwrap();
         }
+        // Unexpired, but nothing written for longer than a session sits idle: what a crash loop leaves.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(scratch.join(format!("s-{stale}")).join(RECORD_FILE))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         std::fs::create_dir_all(scratch.join("s-norecord")).unwrap();
         // A run from 2.5 s with three GOPs, the first pruned; and one that never noted its start.
         let dir = scratch.join(format!("s-{live}"));
@@ -335,8 +404,22 @@ mod tests {
         std::fs::write(run.join("g2.m4s"), b"two!").unwrap();
         std::fs::create_dir_all(dir.join("j7")).unwrap();
 
-        assert_eq!(sweep(&scratch, b"key", 1_000), vec![live.clone()]);
-        assert!(!scratch.join(format!("s-{expired}")).exists() && !scratch.join("s-norecord").exists());
+        let kept = sweep(&scratch, b"key", std::time::Duration::from_secs(600));
+        assert_eq!(kept.keys().collect::<Vec<_>>(), vec![&live]);
+        for gone in [format!("s-{expired}"), format!("s-{stale}"), "s-norecord".into()] {
+            assert!(!scratch.join(&gone).exists(), "{gone} is deleted");
+        }
+        let k = &kept[&live];
+        assert_eq!(k.owner, "install:0011223344556677");
+        let on_disk = |p: PathBuf| std::fs::metadata(p).unwrap().len();
+        let files = [
+            dir.join(RECORD_FILE),
+            run.join("start"),
+            run.join("gops.m3u8"),
+            run.join("g1.m4s"),
+            run.join("g2.m4s"),
+        ];
+        assert_eq!(k.bytes, files.into_iter().map(on_disk).sum::<u64>(), "its scratch is counted");
 
         let a = adopt(&dir, &[0.0, 2.5, 5.0, 8.0], 30.0);
         assert_eq!(a.next_job, 8);

@@ -432,19 +432,25 @@ impl Session {
     /// Put a job's init segment where the session serves it. A kept Dolby Vision profile 5 with no record in its
     /// container has no side data for ffmpeg's muxer to write a `dvcC` from, so it is added here; a layout this
     /// can't patch is not served, and the session fails as any whose init never appears.
+    ///
+    /// Written beside it and renamed into place: a process that dies midway leaves no short `init.mp4` for the next
+    /// one to rebuild the session with (`resume::adopt`).
     fn write_init(&self, from: &Path, to: &Path) -> bool {
         let recordless = self.dovi == job::Dovi::Keep && self.info.dolby_vision_recordless;
-        let Some(dv) = self.info.dolby_vision.filter(|_| recordless) else {
-            return std::fs::copy(from, to).is_ok();
+        let init = std::fs::read(from).map_err(|e| e.to_string());
+        let init = match self.info.dolby_vision.filter(|_| recordless) {
+            Some(dv) => init.and_then(|init| job::add_dovi_record(&init, dv.profile, dv.level)),
+            None => init,
         };
-        let patched = std::fs::read(from)
-            .map_err(|e| e.to_string())
-            .and_then(|init| job::add_dovi_record(&init, dv.profile, dv.level));
-        match patched.and_then(|init| std::fs::write(to, init).map_err(|e| e.to_string())) {
+        let tmp = to.with_extension("mp4.tmp");
+        let written = init.and_then(|init| {
+            std::fs::write(&tmp, init).and_then(|()| std::fs::rename(&tmp, to)).map_err(|e| e.to_string())
+        });
+        match written {
             Ok(()) => true,
             Err(e) => {
-                crate::log_limited("init_dovi_record", || {
-                    format!("session {}: init.mp4 could not take a Dolby Vision record: {e}", self.short())
+                crate::log_limited("init_write", || {
+                    format!("session {}: init.mp4 was not written: {e}", self.short())
                 });
                 false
             }
@@ -919,6 +925,18 @@ impl Session {
             }
             i.play_url.clone()
         };
+        /// Counts a fetch that didn't succeed as failed for `RESOLVE_RETRY` — also one cancelled midway, by a request's
+        /// deadline (`start_producer`) or a dropped connection, which would otherwise send the next request straight
+        /// back to scout.
+        struct Backoff<'a>(&'a Session, bool);
+        impl Drop for Backoff<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.lock().resolve_failed = Some(Instant::now());
+                }
+            }
+        }
+        let mut backoff = Backoff(self, true);
         let started = Instant::now();
         let secrets = [self.source.base.as_str(), play_url.as_str()];
         let fetched = match self.fetch_release(st, &play_url).await {
@@ -932,20 +950,27 @@ impl Session {
                         rid_tail(self.rid.as_deref())
                     )
                 });
-                self.lock().resolve_failed = Some(Instant::now());
                 return Err(());
             }
         };
         let (r, relisted) = fetched;
-        if self.file_key.is_some() && file_key(&r) != self.file_key {
+        // Without a file identity only the ticket the session was made with is trusted to lead to its file: a release
+        // matched in a new listing by its name and size alone might not be the same one.
+        let changed = match &self.file_key {
+            Some(k) => file_key(&r).as_ref() != Some(k),
+            None => relisted.is_some(),
+        };
+        if changed {
             eprintln!(
-                "session {}: the release's link now leads to another file; ending it{}",
+                "session {}: the release fetched again can't be shown to be the file the session was made from; \
+                 ending it{}",
                 self.short(),
                 rid_tail(self.rid.as_deref())
             );
             st.end_session(&self.sid, "release changed").await;
             return Err(());
         }
+        backoff.1 = false;
         let door = r.size.map(|size| st.doors.open(st.source_http.clone(), &r.url, &r.head, size));
         let _ = self.door.set(door);
         {
@@ -993,6 +1018,12 @@ impl Session {
     #[cfg(test)]
     pub fn resolved(&self) -> bool {
         self.door.get().is_some()
+    }
+
+    /// `ensure_resolved`, for a test to cancel or repeat.
+    #[cfg(test)]
+    pub async fn resolve_again(&self, st: &AppState) -> bool {
+        self.ensure_resolved(st).await.is_ok()
     }
 
     pub async fn serve_segment(
@@ -1397,6 +1428,9 @@ impl Session {
                 return false;
             }
             i.ended = true;
+            // Before anything this can be cancelled at: a dropped request ending it, or a shutdown's cut, must never
+            // leave a record a process after this one rebuilds an ended session from.
+            crate::resume::forget(&self.dir);
             st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
             i.bytes = 0;
             i.gops.clear();
@@ -1469,6 +1503,8 @@ impl Session {
             }
             j.stop().await;
         }
+        let dir = self.dir.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::resume::touch(&dir)).await;
         self.wake.notify_one();
     }
 
@@ -1637,10 +1673,20 @@ pub enum Revived {
 /// and `sig` signs it (`resume`). One rebuild at a time, so many requests arriving together after a restart build it
 /// once and the rest find it built. Nothing here calls scout: the session serves what scratch holds, and fetches its
 /// release only as that runs out.
+///
+/// Only a session startup found suspended (`AppState::take_up_scratch`) and nothing has since ended or revoked is ever
+/// rebuilt: any other sid is unknown without a look at the disk.
 pub async fn revive(st: &Arc<AppState>, sid: &str, sig: &str) -> Revived {
+    if st.kept(sid).is_none() {
+        return Revived::Unknown;
+    }
     let _one = st.revive_lock.lock().await;
     if let Some(s) = st.session(sid) {
         return Revived::Session(s);
+    }
+    // Revoked, or forgotten, while this waited its turn.
+    if st.kept(sid).is_none() {
+        return Revived::Unknown;
     }
     let dir = st.cfg.scratch_dir.join(format!("s-{sid}"));
     let (key, owned_sid, owned_sig, d) =
@@ -1663,6 +1709,7 @@ pub async fn revive(st: &Arc<AppState>, sid: &str, sig: &str) -> Revived {
     let short = &sid[..6];
     let gone = |why: &str| {
         eprintln!("session {short}: not resumed after a restart: {why}");
+        st.unkeep(sid);
         let dir = dir.clone();
         tokio::task::spawn_blocking(move || crate::resume::remove(&dir))
     };
@@ -1687,6 +1734,8 @@ pub async fn revive(st: &Arc<AppState>, sid: &str, sig: &str) -> Revived {
         });
         return Revived::Busy;
     }
+    // Its scratch is the session's to count now: what startup measured gives way to what it adopted.
+    st.unkeep(sid);
     st.scratch_bytes.fetch_add(bytes, Relaxed);
     eprintln!(
         "session {short}: resumed after a restart with {gops} GOP(s){} from scratch{}",

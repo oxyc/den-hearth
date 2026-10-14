@@ -509,6 +509,9 @@ async fn origin_handle(
             "tt0000031" => "resume31/h264.mkv",
             "tt0000032" => "resume32/hevc.mkv",
             "tt0000033" => "resume33/h264.mkv",
+            "tt0000034" => "resume34/slow/h264.mkv",
+            "tt0000035" => "resume35/h264.mkv",
+            "tt0000036" => "resume36/h264.mkv",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             // Two episodes sharing an intro and end credits (testdata/README.md); there is no episode 3.
             "tt0000020:1:1" if path.contains("/stream/series/") => "segments-a.mkv",
@@ -3471,7 +3474,7 @@ async fn restarted(old: &Arc<AppState>, origin: &str) -> Arc<AppState> {
     let _ = std::fs::remove_dir_all(&cfg.scratch_dir);
     cfg.scratch_dir = old.cfg.scratch_dir.clone();
     let new = state_from(cfg);
-    crate::resume::sweep(&new.cfg.scratch_dir, &new.cfg.url_key, crate::state::unix_now());
+    new.take_up_scratch();
     new
 }
 
@@ -3574,6 +3577,103 @@ async fn a_transcode_comes_back_only_where_the_gpu_does() {
     let c = restarted(&b, &origin).await;
     assert_eq!(call(&c, "GET", &master_url, None, "").await.status, StatusCode::GONE);
     assert!(c.sessions().is_empty());
+}
+
+/// Revoking a guest's grant reaches the sessions an earlier process suspended, which are not in memory until a
+/// player comes back for them: they end then and there, and their scratch with them, rather than coming back to play
+/// on to their expiry. Another grant's suspended session is untouched. What they hold counts against
+/// `SCRATCH_MAX_BYTES` from the start.
+#[tokio::test]
+async fn a_revoked_guest_is_not_resumed() {
+    let origin = origin().await;
+    let a = test_state(&origin, 6, Duration::from_secs(600));
+    let mut started = Vec::new();
+    for owner in ["grant:0a1b2c3d", "grant:deadbeef"] {
+        let r = start_with(&a, &origin, None, &edge(owner)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        let j = r.json();
+        started.push((j["sid"].as_str().unwrap().to_string(), j["playlist"].as_str().unwrap().to_string()));
+    }
+    let b = restarted(&a, &origin).await;
+    assert!(b.scratch_bytes.load(Relaxed) > 0, "the suspended sessions' scratch is counted");
+
+    let body = r#"{"owner":"grant:0a1b2c3d"}"#;
+    let r =
+        call_with(&b, "POST", "/remux/admin/kill", None, &[("x-den-edge-secret", EDGE_SECRET)], body).await;
+    assert_eq!(r.json(), serde_json::json!({"ended": 1}), "the suspended session counts as one ended");
+    let (revoked, playlist) = &started[0];
+    assert_eq!(call(&b, "GET", playlist, None, "").await.status, StatusCode::GONE);
+    assert!(b.session(revoked).is_none(), "not rebuilt");
+    assert!(!b.cfg.scratch_dir.join(format!("s-{revoked}")).exists(), "its scratch is gone");
+    assert_eq!(
+        call(&b, "GET", &started[1].1, None, "").await.status,
+        StatusCode::OK,
+        "another grant's resumes"
+    );
+    b.end_all("test").await;
+}
+
+/// A rebuilt session whose ticket no longer plays finds its release in a fresh listing by name and size. Where the
+/// release named no size when it was opened, nothing proves the one found is the same file, so the session ends
+/// rather than serving segments of another file under the playlist the player holds.
+#[tokio::test]
+async fn a_release_relisted_without_a_file_identity_ends_the_session() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000035", "").await;
+    let b = restarted(&a, &origin).await;
+    let dir = b.cfg.scratch_dir.join(format!("s-{sid}"));
+    let mut rec = crate::resume::read(&dir, &b.cfg.url_key, &sid).unwrap();
+    rec.file_key = None;
+    rec.play_url = format!("{origin}/expired-ticket");
+    crate::resume::write(&dir, &b.cfg.url_key, &rec).unwrap();
+    let listed = resume_calls("list 35");
+
+    let r = call(&b, "GET", &master_url.replace("master.m3u8", "seg0.m4s"), None, "").await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
+    assert!(b.session(&sid).is_none(), "ended");
+    assert!(!dir.join(crate::resume::RECORD_FILE).exists(), "and not to be rebuilt again");
+    assert_eq!(resume_calls("list 35"), listed + 1, "the title was listed again to find it");
+}
+
+/// A fetch of a rebuilt session's release cut short — a request's deadline, a dropped connection — still counts as a
+/// try: the next request within `RESOLVE_RETRY` doesn't go straight back to scout.
+#[tokio::test]
+async fn a_cancelled_fetch_backs_off_like_a_failed_one() {
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000036", "").await;
+    let b = restarted(&a, &origin).await;
+    assert_eq!(call(&b, "GET", &master_url, None, "").await.status, StatusCode::OK);
+    let s = b.session(&sid).unwrap();
+    assert!(tokio::time::timeout(Duration::ZERO, s.resolve_again(&b)).await.is_err(), "cut short");
+    let asked = resume_calls("36");
+    assert!(!s.resolve_again(&b).await, "backing off");
+    assert_eq!(resume_calls("36"), asked, "nothing asked of scout");
+    assert!(!s.resolved());
+    b.end_all("test").await;
+}
+
+/// An end cut short — a DELETE whose connection drops, a shutdown's drain running out — still leaves nothing the next
+/// process could rebuild the session from: its record goes before the first thing the end waits for.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn an_end_cut_short_never_comes_back() {
+    use futures_util::FutureExt;
+    let origin = origin().await;
+    let a = test_state(&origin, 2, Duration::from_secs(600));
+    let (sid, master_url) = resumable(&a, &origin, "tt0000034", "").await;
+    let r = call(&a, "GET", &master_url.replace("master.m3u8", "init.mp4"), None, "").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(a.session(&sid).unwrap().job_pid().is_some(), "its run is still reading the slow release");
+    assert!(
+        a.end_session(&sid, "deleted").now_or_never().is_none(),
+        "the end waits on ffmpeg, and is dropped there"
+    );
+
+    let b = restarted(&a, &origin).await;
+    assert_eq!(call(&b, "GET", &master_url, None, "").await.status, StatusCode::NOT_FOUND);
+    assert!(b.sessions().is_empty());
 }
 
 /// The restart the owner asked for: after it, what scratch holds — `init.mp4` and every finished segment — is served

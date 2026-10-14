@@ -419,7 +419,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `MAX_ACTIVE_REMUXES` | `2` | ffmpeg producers active at once. Extra sessions wait fairly when media is requested. |
 | `PRODUCER_IDLE_SECS` | `10` | Reap a producer paused on a full ahead window after this long, or promptly under producer contention; keep its logical session and finished GOPs. |
 | `SESSION_IDLE_SECS` | `600` | A session with no request for this long is ended (min 30). |
-| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. Stable probe metadata and unplayable verdicts persist here without credentials. |
+| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: at start every `s-*` directory is deleted but a session's that a shutdown suspended — its sealed record opens and is unexpired, and it was written to within `SESSION_IDLE_SECS` — which is kept to resume (`ARCHITECTURE.md`) and deleted if no player returns within `SESSION_IDLE_SECS`. Must be on disk, not a tmpfs, for sessions to survive a restart. Stable probe metadata and unplayable verdicts persist here without credentials. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |
 | `FFMPEG_PATH` | `ffmpeg` | The image sets `/usr/local/bin/ffmpeg`. (There is no `FFPROBE_PATH`: probing is done in-process.) |
 | `MAX_TRANSCODES` | `1` | Active producers transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |

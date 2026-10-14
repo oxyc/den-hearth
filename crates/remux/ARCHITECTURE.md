@@ -40,14 +40,18 @@ identity is the exact file size plus SHA-256 of the probed head, and the file ha
 A session survives a restart (`resume.rs`). Creation writes one record into its scratch, `s-<sid>/session.rec`, sealed
 with XChaCha20-Poly1305 under a key derived from `REMUX_URL_KEY` (the sid authenticated with it): the probe, the chosen
 audio/subtitles/transcode, the playlists as sent, and scout's install and play URL. Each run notes its start keyframe in
-`j<N>/start`. Shutdown kills ffmpeg but keeps scratch; startup keeps every directory whose record opens and is unexpired
-and deletes the rest, and deletes those no player returns to within `SESSION_IDLE_SECS`. An unknown sid whose record
-opens and whose URL signature verifies against the record's expiry is rebuilt (one at a time) without calling scout:
-the playlists, `init.mp4` and finished GOPs are served from scratch as they were. Within two segments of the first
-missing one the release is resolved again through its ticket — or a fresh listing of the same release — the file
-identity is checked, and a run starts there, inside the player's buffer. Rebuilds count against `MAX_SESSIONS` and the
-owner's share without evicting; a transcode is not rebuilt on a process that cannot transcode; ending a session deletes
-its record first, so an ended session never returns.
+`j<N>/start`. Shutdown kills ffmpeg but keeps scratch and touches the record; startup keeps every directory whose record
+opens, is unexpired and was written to within `SESSION_IDLE_SECS` (a crash loop's are not), counts it against
+`SCRATCH_MAX_BYTES`, and deletes the rest, then those no player returns to within `SESSION_IDLE_SECS`. Only the sids
+startup kept are ever rebuilt, and a grant's revocation ends kept ones too. A kept sid whose record opens and whose URL
+signature verifies against the record's expiry is rebuilt (one at a time) without calling scout: the playlists,
+`init.mp4` and finished GOPs are served from scratch as they were. Within two segments of the first missing one the
+release is resolved again through its ticket — or a fresh listing of the same release — the file identity is checked
+(a session with none ends rather than trust a re-listing), and a run starts there, inside the player's buffer. A
+den-subtitles rendition fetches the release sooner: its list is asked with the file's hash, which reads the file's tail.
+Rebuilds count against `MAX_SESSIONS` and the owner's share without evicting; a transcode is not rebuilt on a process
+that cannot transcode; ending a session deletes its record before anything it can be cancelled at, so an ended session
+never returns.
 
 ## Operations
 

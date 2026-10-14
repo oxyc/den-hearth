@@ -1049,14 +1049,7 @@ fn session_not_found() -> Response<Body> {
 /// requests to `handle_request` itself.
 pub async fn init(cfg: Config) -> Arc<AppState> {
     let state = AppState::new(cfg);
-    let kept = resume::sweep(&state.cfg.scratch_dir, &state.cfg.url_key, unix_now());
-    if !kept.is_empty() {
-        let st = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(st.cfg.session_idle).await;
-            st.forget_unresumed(kept).await;
-        });
-    }
+    state.take_up_scratch();
     state.scratch_ok.store(state::check_scratch(&state.cfg.scratch_dir), Relaxed);
     state.load_unplayable();
     state.load_probe_cache();
