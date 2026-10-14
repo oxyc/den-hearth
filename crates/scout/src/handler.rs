@@ -25,7 +25,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
 
-use crate::addbudget::{budget_account, global_add_budget, is_play_reserve, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
+use crate::addbudget::{global_add_budget, is_play_reserve, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
 use crate::attributes::stream_attributes;
 use crate::availability::verdict_prefix;
 use crate::client::{web_ready, ClientPlayable};
@@ -1686,7 +1686,7 @@ impl Inner {
             &scrapers,
             &q,
             self.deps.scrape_timeout,
-            Some(&*self.deps.cache),
+            Some(self.deps.cache.clone()),
             self.deps.list_ttl,
         )
         .await;
@@ -3403,25 +3403,12 @@ fn write_unavailable(wait: Duration, body: &serde_json::Value) -> Out {
     out
 }
 
-/// Go `pool.ScoutBusyFor(prefetch)`: how long until any of the pool's accounts may add again for this intent, for the
-/// Retry-After of a scout_busy or reserved_for_play answer.
-///
-/// CROSS-MODULE NEED: Go asks each store for its `budgetAccount()`, which the frozen `Store` trait has no method for
-/// (and `StorePool` lives in `stores/`, which this branch does not edit). Until `Store::budget_account` lands, the
-/// answer is "zero", which both routes render as the one-second floor of Retry-After.
 fn scout_busy_for(pool: &StorePool, prefetch: bool) -> Duration {
-    let _ = (pool, prefetch, budget_account(DebridService::TorBox, ""), global_add_budget());
-    Duration::ZERO
+    pool.scout_busy_for(prefetch)
 }
 
-/// Go `pool.KnownFileSize(rt)`: the first size any store knows for this file.
-///
-/// CROSS-MODULE NEED: Go's `fileSizer` is an optional interface on the stores; the frozen `Store` trait has no
-/// `known_file_size`, so a pool cannot ask (`RealDebridStore::known_file_size` is an inherent method, and the TorBox
-/// store's is not written yet). Until it lands this answers "unknown", which is what a store with nothing cached says.
 fn known_file_size(pool: &StorePool, rt: &ResolveTarget) -> Option<i64> {
-    let _ = (pool, rt);
-    None
+    pool.known_file_size(rt)
 }
 
 /// Go `torboxPlanName` maps TorBox's plan code (user/me's `plan`) to a name for the account line. No slot-count
