@@ -1,0 +1,26 @@
+{"kind": "meta", "commit": "ae0fc1d", "load": [28.73828125, 25.982421875, 31.39013671875], "runs": 3, "cargo_args": [], "label": "before"}
+{"kind": "build", "case": "clean", "run": 0, "wall": 275.72, "cpu": 386.35, "rc": 0, "label": "before"}
+{"kind": "build", "case": "clean", "run": 1, "wall": 166.34, "cpu": 401.15, "rc": 0, "label": "before"}
+{"kind": "build", "case": "clean", "run": 2, "wall": 100.35, "cpu": 313.26, "rc": 0, "label": "before"}
+{"kind": "run", "case": "cargo test (warm)", "run": 0, "wall": 37.95, "cpu": 28.88, "rc": 0, "label": "before"}
+{"kind": "run", "case": "cargo test (warm)", "run": 1, "wall": 26.72, "cpu": 25.12, "rc": 0, "label": "before"}
+{"kind": "run", "case": "cargo test (warm)", "run": 2, "wall": 29.01, "cpu": 26.96, "rc": 0, "label": "before"}
+{"kind": "run", "case": "nextest (warm)", "run": 0, "wall": 23.4, "cpu": 50.45, "rc": 0, "label": "before"}
+{"kind": "run", "case": "nextest (warm)", "run": 1, "wall": 23.1, "cpu": 47.45, "rc": 0, "label": "before"}
+{"kind": "run", "case": "nextest (warm)", "run": 2, "wall": 13.32, "cpu": 45.08, "rc": 0, "label": "before"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 0, "wall": 3.45, "cpu": 5.3, "rc": 0, "label": "before"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 1, "wall": 2.18, "cpu": 4.74, "rc": 0, "label": "before"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 2, "wall": 2.11, "cpu": 4.76, "rc": 0, "label": "before"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 0, "wall": 1.93, "cpu": 4.18, "rc": 0, "label": "before"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 1, "wall": 1.49, "cpu": 4.24, "rc": 0, "label": "before"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 2, "wall": 1.78, "cpu": 4.53, "rc": 0, "label": "before"}
+{"seconds": 13.452, "binary": "den-scout", "test": "tests::rank::lookaround_patterns_answer_for_a_title_of_any_length", "kind": "slowest", "label": "before"}
+{"seconds": 5.426, "binary": "den-subtitles", "test": "srt::tests::escaping_a_hostile_line_stays_linear", "kind": "slowest", "label": "before"}
+{"seconds": 5.161, "binary": "den-reel", "test": "tests::a_lingering_descendant_does_not_pin_a_finished_download", "kind": "slowest", "label": "before"}
+{"seconds": 4.033, "binary": "den-scout", "test": "tests::stores_pick::cached_episode_patterns_answers_for_the_episode_asked_about", "kind": "slowest", "label": "before"}
+{"seconds": 2.528, "binary": "den-remux", "test": "source::tests::growing_ranges_need_far_fewer_round_trips_on_a_controlled_high_bdp_path", "kind": "slowest", "label": "before"}
+{"seconds": 2.506, "binary": "den-remux", "test": "source::tests::a_read_paused_longer_than_any_total_timeout_carries_on", "kind": "slowest", "label": "before"}
+{"seconds": 2.41, "binary": "den-scout", "test": "tests::stores_pick::names_episode_a_range_holds_every_episode_in_it", "kind": "slowest", "label": "before"}
+{"seconds": 2.294, "binary": "den-scout", "test": "tests::stores_pick::names_episode_reads_every_episode_in_a_chain", "kind": "slowest", "label": "before"}
+{"seconds": 2.184, "binary": "den-scout", "test": "tests::stores_pick::episode_patterns_a_tight_dash_is_not_enough_to_make_a_range", "kind": "slowest", "label": "before"}
+{"seconds": 2.173, "binary": "den-scout", "test": "tests::stores_pick::episode_patterns_bare_ranges_span_a_whole_season", "kind": "slowest", "label": "before"}

@@ -481,7 +481,7 @@ async fn indexer_base_with_config_map_stays_bounded_under_a_flood() {
 // Not in the Go suite, which relies on `singleflight.Group`. `Flight` is the port of it, and these pin what the
 // callers rely on: concurrent callers share one run and its result, and nothing outlives the flight, an error
 // included.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn flight_shares_concurrent_calls_and_does_not_keep_an_error() {
     use crate::indexerconfig::Flight;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -520,7 +520,7 @@ async fn flight_shares_concurrent_calls_and_does_not_keep_an_error() {
 }
 
 // A caller that goes away mid-flight must not strand the callers waiting on it, or leave its key behind.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn flight_survives_a_caller_that_goes_away() {
     use crate::indexerconfig::Flight;
     use std::sync::Arc;

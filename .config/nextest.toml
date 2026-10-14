@@ -1,0 +1,29 @@
+# cargo-nextest: one process per test, so a global (env var, static, cwd) cannot leak between tests, and a hung
+# test is killed on its own instead of stalling the run.
+#
+#   nix run nixpkgs#cargo-nextest -- nextest run --workspace              # local
+#   nix run nixpkgs#cargo-nextest -- nextest run --workspace --profile ci # CI
+#
+# `cargo test --workspace` stays supported; nextest does not run doctests (none are written here).
+
+[profile.default]
+retries = 0
+# Mark a test slow after 20 s and kill it after 3 periods (60 s): the slowest test in a debug build is well under
+# that, so reaching it means a hang, not a slow test.
+slow-timeout = { period = "20s", terminate-after = 3 }
+fail-fast = false
+
+# The season benchmarks are #[ignore]d and take about a minute; when someone runs them on purpose they get room.
+[[profile.default.overrides]]
+filter = "test(season_bench)"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+[profile.ci]
+retries = 0
+slow-timeout = { period = "20s", terminate-after = 3 }
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"
