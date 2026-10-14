@@ -112,14 +112,8 @@ async fn resolve_queued_add_promoted_to_a_torrent() {
 // The add charge is NOT refunded for a queued_id answer — createtorrent genuinely accepted the add; it is
 // merely parked. Refunding it would let an account loop past its own hourly allowance by polling a
 // release that is, correctly, always answered as "queued".
-//
-// Gated until package 3 lands `global_add_budget` and `budget_account` (addbudget.rs).
-#[test]
-#[ignore = "needs global_add_budget and budget_account from package 3"]
-fn add_magnet_queued_charge_is_not_refunded() {
-    // Enable when package 3 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
+#[tokio::test]
+async fn add_magnet_queued_charge_is_not_refunded() {
     use crate::addbudget::{budget_account, global_add_budget};
 
     let account = format!("tb-queued-budget-{}", "x".repeat(8));
@@ -134,8 +128,6 @@ fn add_magnet_queued_charge_is_not_refunded() {
     s.add_magnet(&"a".repeat(40), false, false).await.expect("add_magnet");
     let after = global_add_budget().remaining(&budget_key());
     assert_eq!(after, before - 1, "remaining budget after a queued add (charged, not refunded)");
-    }
-    todo!("pending: queued_test.go:103 TestAddMagnet_queuedChargeIsNotRefunded")
 }
 
 // createtorrent answering 400 DIFF_ISSUE "Download already queued." for a hash with no queued-id marker
