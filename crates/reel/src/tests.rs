@@ -6391,6 +6391,38 @@ async fn a_removed_video_is_not_re_extracted_on_every_request() {
     assert_eq!(spawn_count(&spawns), 2, "the failure never expired");
 }
 
+/// The driver task that clears a finished download's `in_flight` entry runs AFTER the download's
+/// waiters wake, so a request can arrive while a FINISHED entry is still in the map. It must start a
+/// new download, not be handed the old verdict: that is what let a failure outlive its TTL by however
+/// long the driver was descheduled (and what made the test above fail one run in fifty under load).
+#[tokio::test]
+async fn a_request_does_not_join_a_download_that_already_finished() {
+    use futures_util::FutureExt;
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let spawns = dir.join("spawns");
+    let yt = dir.join("yt-dead");
+    std::fs::write(&yt, format!("#!/bin/sh\necho x >> {}\nexit 1\n", spawns.display())).unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // A download that has finished with a stale verdict, whose driver has not yet removed it.
+    let stale: crate::state::BoxFuture<Result<crate::play::Fetched, crate::ytdlp::PlayError>> =
+        Box::pin(async { Err(crate::ytdlp::PlayError::throttled()) });
+    let stale = stale.shared();
+    let _ = stale.clone().await;
+    assert!(stale.peek().is_some());
+    state.in_flight.lock().unwrap().insert("deadvideo01".into(), (0, stale));
+
+    let _ = crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await;
+    assert_eq!(spawn_count(&spawns), 1, "the request joined a finished download instead of starting one");
+}
+
 /// A /play failure says when it is worth asking again, and the number is not a guess: it is exactly
 /// how long the failure cache will answer this id from memory, so a client that retries sooner gets
 /// the same response with no extraction behind it.
