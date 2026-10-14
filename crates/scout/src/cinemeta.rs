@@ -28,21 +28,24 @@
 //! speculative for series: the junk it was written to remove has only ever been observed on movies. So no
 //! drop filter is applied to them.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{HeaderValue, ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
-use crate::indexerconfig::{read_capped, Flight, SCRAPE_USER_AGENT};
+use crate::indexerconfig::{null_default, read_capped, Flight, SCRAPE_USER_AGENT};
+use crate::rank::YEAR_TOKEN;
 use crate::scrape::Doer;
-use crate::util::key_hash;
+use crate::util::{go_to_lower, key_hash};
 
 /// Go `cinemetaBase`: the public Cinemeta service.
 pub(crate) const CINEMETA_BASE: &str = "https://v3-cinemeta.strem.io";
 
-/// Go `maxScrapeBytes`: the most of an addon response body that is read (scrape.go).
+/// Go `maxScrapeBytes`: the most of an addon response body that is read (scrape.go). It belongs in scrape.rs, with
+/// `SCRAPE_USER_AGENT` (kept in indexerconfig.rs for now); scrape.rs is not part of this module's review, so both
+/// wait there for whoever ports scrape.go.
 const MAX_SCRAPE_BYTES: usize = 2 << 20;
 
 /// Go `cinemetaHitTTL` is how long a lookup is remembered. A film's title and year do not change, so an
@@ -63,10 +66,6 @@ pub(crate) struct CineMeta {
     #[serde(rename = "Year")]
     pub year: i64,
 }
-
-/// Go `yearToken`, which `firstYear` reads a year out with (rank.go).
-static YEAR_TOKEN: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"19\d\d|20[0-3]\d").expect("constant pattern compiles"));
 
 /// Go `cinemetaFlight`: concurrent builds of one film (several installs, or a list and its rebuild) share one
 /// lookup.
@@ -126,18 +125,23 @@ pub(crate) fn cinemeta_key(base: &str, typ: &str, imdb: &str) -> String {
 }
 
 /// The record Cinemeta answers a lookup with, as far as it is read.
+///
+/// A JSON `null` leaves a field empty, as it does in Go's decoder, where serde would refuse the whole answer.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct CinemetaBody {
+    #[serde(deserialize_with = "null_default")]
     meta: CinemetaMeta,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct CinemetaMeta {
+    #[serde(deserialize_with = "null_default")]
     name: String,
+    #[serde(deserialize_with = "null_default")]
     year: String,
-    #[serde(rename = "releaseInfo")]
+    #[serde(rename = "releaseInfo", deserialize_with = "null_default")]
     release_info: String,
 }
 
@@ -167,5 +171,5 @@ async fn fetch_cinemeta(client: &dyn Doer, base: &str, typ: &str, imdb: &str) ->
 
 /// Go `firstYear` pulls the first plausible 4-digit year out of a string like "2026" or "2019–2023".
 fn first_year(s: &str) -> i64 {
-    YEAR_TOKEN.find(&s.to_lowercase()).and_then(|m| m.as_str().parse().ok()).unwrap_or(0)
+    YEAR_TOKEN.find(&go_to_lower(s)).and_then(|m| m.as_str().parse().ok()).unwrap_or(0)
 }

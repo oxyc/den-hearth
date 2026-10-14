@@ -242,13 +242,8 @@ fn play_token() {
     assert!(decode_play_token(&blob(r#"{"h":"short"}"#)).is_none(), "short hash should be rejected");
 }
 
-// Needs `pickEpisodeFile` from season.go (work package 5). The body is ported and compiled out until it lands.
 #[test]
-#[ignore = "needs pick_episode_file from season.rs (package 5)"]
 fn pick_episode_file() {
-    // Enable when package 5 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
         use crate::season::{pick_episode_file, TorrentFile};
         let files = vec![
             TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
@@ -279,8 +274,6 @@ fn pick_episode_file() {
         assert!(matches!(got, Ok(Some(4))), "a lone unlabelled video is still the answer: got {got:?} want 4");
         let got = pick_episode_file(&[], 1, 1);
         assert!(matches!(got, Ok(None)), "no files → nil: got {got:?}");
-    }
-    todo!("pending: core_test.go:203 TestPickEpisodeFile")
 }
 
 // Needs `selectFileID` from stores.go (work package 1, torbox.rs). The body is ported and compiled out until it lands.
@@ -343,13 +336,8 @@ fn pick_file_id_prefers_episode_match() {
     todo!("pending: core_test.go:262 TestPickFileIDPrefersEpisodeMatch")
 }
 
-// Needs `cleanLabel` and `sizeLabel` from label.go (work package 5). The body is ported and compiled out until it lands.
 #[test]
-#[ignore = "needs clean_label / size_label from label.rs (package 5)"]
 fn clean_label_and_size() {
-    // Enable when package 5 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
         use crate::label::{clean_label, size_label};
         use crate::rank::RawStream;
         const GIB: i64 = 1 << 30;
@@ -360,18 +348,12 @@ fn clean_label_and_size() {
         assert_eq!(size_label(sz as i64), "3.4 GB", "sizeLabel small");
         assert_eq!(size_label(700 * MIB), "700 MB", "sizeLabel mb");
         assert_eq!(clean_label(&RawStream { title: "mysterious".into(), ..Default::default() }), "Stream", "cleanLabel empty");
-    }
-    todo!("pending: core_test.go:280 TestCleanLabelAndSize")
 }
 
 // Fauda S1E3: the picker must say what this stream actually is (1.1 GB) and name the pack only as
 // context, never the other way round.
 #[test]
-#[ignore = "needs clean_label from label.rs (package 5)"]
 fn clean_label_pack_size_is_context_not_the_headline() {
-    // Enable when package 5 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
         use crate::label::clean_label;
         use crate::rank::RawStream;
         const GIB: i64 = 1 << 30;
@@ -383,8 +365,6 @@ fn clean_label_pack_size_is_context_not_the_headline() {
         };
         let want = "1080p • WEB-DL • 1.1 GB · from a 68 GB pack";
         assert_eq!(clean_label(&s), want, "cleanLabel");
-    }
-    todo!("pending: core_test.go:299 TestCleanLabel_packSizeIsContextNotTheHeadline")
 }
 
 // A never-opened pack (unresolvedSeasonPack left SizeBytes nil): the label must name the number as a
@@ -392,32 +372,22 @@ fn clean_label_pack_size_is_context_not_the_headline() {
 // and must not also repeat it as trailing "· from a 68 GB pack" context, since there is no separate,
 // trusted episode number for that context to sit beside.
 #[test]
-#[ignore = "needs clean_label from label.rs (package 5)"]
 fn clean_label_unknown_episode_size_names_the_pack_in_the_headline() {
-    // Enable when package 5 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
         use crate::label::clean_label;
         use crate::rank::RawStream;
         const GIB: i64 = 1 << 30;
         let s = RawStream { title: "Fauda.S01.COMPLETE.1080p.WEB-DL".into(), pack_size_bytes: Some(68 * GIB), ..Default::default() };
         assert_eq!(clean_label(&s), "1080p • WEB-DL • 68 GB pack", "cleanLabel");
-    }
-    todo!("pending: core_test.go:312 TestCleanLabel_unknownEpisodeSizeNamesThePackInTheHeadline")
 }
 
 // Needs `streamAttributes` and `StreamAttributes` from attributes.go (work package 5). The body is ported and
 // compiled out until it lands.
 #[test]
-#[ignore = "needs stream_attributes from attributes.rs (package 5)"]
 fn stream_attributes() {
-    // Enable when package 5 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
         use crate::attributes::stream_attributes;
         use crate::rank::RawStream;
         const GIB: i64 = 1 << 30;
-        let a = stream_attributes(&RawStream {
+        let a = stream_attributes(RawStream {
             title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos".into(),
             size_bytes: Some(40 * GIB),
             seeders: Some(12),
@@ -442,9 +412,9 @@ fn stream_attributes() {
         // Cachedness is reported only when it was observed. A failed cache check leaves `Cached` at its zero
         // value, and sending that as `false` is a claim nobody made — the client reads a definite "must
         // download" and queues a fetch for a release the debrid may already hold.
-        let unknown = stream_attributes(&RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: false, ..Default::default() });
+        let unknown = stream_attributes(RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: false, ..Default::default() });
         assert!(unknown.cached.is_none(), "unchecked cachedness must be omitted, got {:?}", unknown.cached);
-        let held = stream_attributes(&RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: true, ..Default::default() });
+        let held = stream_attributes(RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: true, ..Default::default() });
         assert_eq!(held.cached, Some(false), "an observed 'not held' must be reported as false");
 
         // HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
@@ -456,7 +426,7 @@ fn stream_attributes() {
             ("Movie 1080p BluRay x264", ""),
         ];
         for (title, want) in hdr_cases {
-            let got = stream_attributes(&RawStream { title: title.into(), ..Default::default() }).hdr_format.unwrap_or_default();
+            let got = stream_attributes(RawStream { title: title.into(), ..Default::default() }).hdr_format.unwrap_or_default();
             assert_eq!(got, want, "hdrFormat({title:?})");
         }
 
@@ -471,7 +441,7 @@ fn stream_attributes() {
             ("Movie 1080p BluRay AC3 2.0 x264", "ac3", "2.0", false),
         ];
         for (title, codec, channels, atmos) in audio_cases {
-            let g = stream_attributes(&RawStream { title: title.into(), ..Default::default() });
+            let g = stream_attributes(RawStream { title: title.into(), ..Default::default() });
             let got_codec = g.audio_codec.unwrap_or_default();
             let got_chans = g.audio_channels.unwrap_or_default();
             assert!(
@@ -480,7 +450,7 @@ fn stream_attributes() {
                 g.atmos
             );
         }
-        assert!(stream_attributes(&RawStream { title: "Movie 2160p WEB-DL KORSUB HEVC".into(), ..Default::default() }).hardcoded_subs, "KORSUB → hardcodedSubs");
+        assert!(stream_attributes(RawStream { title: "Movie 2160p WEB-DL KORSUB HEVC".into(), ..Default::default() }).hardcoded_subs, "KORSUB → hardcodedSubs");
         let sources = [
             ("X 1080p WEB-DL", "webdl"),
             ("X 1080p WEBRip", "webrip"),
@@ -490,14 +460,12 @@ fn stream_attributes() {
             ("X 2024 HDCAM", "cam"),
         ];
         for (title, want) in sources {
-            let s = stream_attributes(&RawStream { title: title.into(), ..Default::default() }).source;
+            let s = stream_attributes(RawStream { title: title.into(), ..Default::default() }).source;
             assert_eq!(s.as_deref(), Some(want), "source({title:?})");
         }
-        assert!(stream_attributes(&RawStream { title: "X mystery".into(), ..Default::default() }).source.is_none(), "no source → nil");
-        let a = stream_attributes(&RawStream { title: "Movie 2160p WEB-DL HDR10".into(), ..Default::default() });
+        assert!(stream_attributes(RawStream { title: "X mystery".into(), ..Default::default() }).source.is_none(), "no source → nil");
+        let a = stream_attributes(RawStream { title: "Movie 2160p WEB-DL HDR10".into(), ..Default::default() });
         assert!(a.hdr && !a.dolby_vision, "HDR10 without DV");
-    }
-    todo!("pending: core_test.go:321 TestStreamAttributes")
 }
 
 #[test]

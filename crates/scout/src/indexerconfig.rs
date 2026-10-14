@@ -23,13 +23,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
 use reqwest::header::{HeaderValue, CONTENT_TYPE, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use tokio::sync::OnceCell;
 
 use crate::config::{Config, DebridAccount, DebridService, Indexer};
@@ -59,6 +60,22 @@ pub(crate) const MINT_TIMEOUT: Duration = Duration::from_secs(3);
 /// A legitimate install has one entry per (indexer, account): four indexers and a handful of accounts,
 /// so under twenty. 256 is an order of magnitude above that.
 pub(crate) const MAX_MINTED_ENTRIES: usize = 256;
+
+/// Go `mintIndexerConfigs`: opt-in, because it decides who holds the debrid token. Set by MINT_INDEXER_CONFIGS at
+/// startup.
+static MINT_INDEXER_CONFIGS: AtomicBool = AtomicBool::new(false);
+
+/// Go `EnableIndexerConfigMinting` is called once from BuildDeps. A package-level switch rather than a field
+/// on Config, because it is an operator decision about credential handling — not an install's preference,
+/// and not something a request should be able to turn on.
+pub fn enable_indexer_config_minting(on: bool) {
+    MINT_INDEXER_CONFIGS.store(on, Ordering::Relaxed);
+}
+
+/// Go's read of `mintIndexerConfigs` (scrape.go's `makeScrapers`).
+pub(crate) fn mint_indexer_configs_enabled() -> bool {
+    MINT_INDEXER_CONFIGS.load(Ordering::Relaxed)
+}
 
 /// Go `mintedConfig`: one minted indexer URL, when it was minted and when it was last used.
 ///
@@ -107,15 +124,55 @@ impl<T: Clone> Flight<T> {
     }
 
     /// Runs `call` for the first caller of `key`; a caller that arrives while it is in flight waits for it and
-    /// takes the same answer. The key is forgotten once the call has finished, so the next caller runs again.
+    /// takes the same answer. The key is forgotten the moment the call has finished, so a caller that arrives
+    /// after it (an error included) runs the call again: nothing is cached, as in Go.
+    ///
+    /// A caller that is dropped mid-flight (the request went away) does not fail the others: one of the
+    /// callers still waiting runs its own `call` instead, where Go's waiters would share the leader's
+    /// cancelled error.
     pub(crate) async fn run<F: Future<Output = T>>(&self, key: &str, call: F) -> T {
         let cell = Arc::clone(lock(&self.0).entry(key.to_owned()).or_default());
-        let value = cell.get_or_init(|| call).await.clone();
+        let _forget = Forget { calls: &self.0, key, cell: &cell };
+        let in_flight = &cell;
+        cell.get_or_init(|| async move {
+            let value = call.await;
+            self.forget(key, in_flight);
+            value
+        })
+        .await
+        .clone()
+    }
+
+    /// How many keys are in flight, for the tests.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        lock(&self.0).len()
+    }
+
+    /// Removes `key` if it still names `cell`, so a flight started since is left alone.
+    fn forget(&self, key: &str, cell: &Arc<OnceCell<T>>) {
         let mut calls = lock(&self.0);
-        if calls.get(key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+        if calls.get(key).is_some_and(|c| Arc::ptr_eq(c, cell)) {
             calls.remove(key);
         }
-        value
+    }
+}
+
+/// Drops a flight nobody is waiting on. A caller dropped before the call finished would otherwise leave an
+/// empty entry behind for every distinct key it ever started.
+struct Forget<'a, T> {
+    calls: &'a Mutex<BTreeMap<String, Arc<OnceCell<T>>>>,
+    key: &'a str,
+    cell: &'a Arc<OnceCell<T>>,
+}
+
+impl<T> Drop for Forget<'_, T> {
+    fn drop(&mut self) {
+        let mut calls = lock(self.calls);
+        // The map holds one reference and this guard's caller another: any more is a waiter still to be served.
+        if Arc::strong_count(self.cell) <= 2 && calls.get(self.key).is_some_and(|c| Arc::ptr_eq(c, self.cell)) {
+            calls.remove(self.key);
+        }
     }
 }
 
@@ -244,16 +301,31 @@ pub(crate) async fn mint_media_fusion_url(account: &DebridAccount, client: Optio
     answer.unwrap_or_default()
 }
 
-/// The answer of MediaFusion's `/encrypt-user-data`.
+/// The answer of MediaFusion's `/encrypt-user-data`. A JSON `null` leaves a field empty, as it does in Go's
+/// decoder, where serde would refuse the whole answer.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct MediaFusionMint {
+    #[serde(deserialize_with = "null_default")]
     encrypted_str: String,
+    #[serde(deserialize_with = "null_default")]
     status: String,
+    #[serde(deserialize_with = "null_default")]
     message: String,
 }
 
-/// Go `scrapeUserAgent` (scrape.go), the user agent every indexer and minting request is sent with.
+/// Reads a JSON `null` as the type's default, which is what Go's `encoding/json` does to a plain field.
+pub(crate) fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Go `scrapeUserAgent` (scrape.go), the user agent every indexer and minting request is sent with. It belongs in
+/// scrape.rs with `MAX_SCRAPE_BYTES` (cinemeta.rs keeps a copy of that too); scrape.rs is not part of this
+/// module's review, so both wait there for whoever ports scrape.go.
 pub(crate) const SCRAPE_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 

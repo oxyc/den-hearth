@@ -96,15 +96,13 @@ impl Doer for StubDoer {
 // The comet config is built locally — it carries the debrid token, which is the whole reason this is
 // opt-in, so the shape is worth pinning.
 #[test]
-#[ignore = "needs a base64 decoder and serde_json as dev-dependencies (neither in crates/scout/Cargo.toml yet)"]
 fn mint_comet_url_carries_the_account() {
-    #[cfg(any())]
-    fn pending() {
         use crate::indexerconfig::mint_comet_url;
+        use base64::Engine as _;
         let got = mint_comet_url(&torbox("tb-token"));
         let prefix = format!("{}/", default_url("comet"));
         assert!(got.starts_with(&prefix), "not a comet URL: {got}");
-        let raw = base64_decode(&got[prefix.len()..]).expect("config segment is base64");
+        let raw = base64::engine::general_purpose::STANDARD.decode(&got[prefix.len()..]).expect("config segment is base64");
         let cfg: serde_json::Value = serde_json::from_slice(&raw).expect("config segment is JSON");
         assert!(
             cfg["debridService"] == "torbox" && cfg["debridApiKey"] == "tb-token",
@@ -112,8 +110,6 @@ fn mint_comet_url_carries_the_account() {
             cfg["debridService"],
             cfg["debridApiKey"]
         );
-    }
-    todo!("pending: indexerconfig_test.go TestMintCometURL_carriesTheAccount")
 }
 
 // MediaFusion encrypts server-side, so a mint is a round trip that can fail — and a failure must not
@@ -438,4 +434,82 @@ async fn indexer_base_with_config_map_stays_bounded_under_a_flood() {
         );
     }
     reset_minted();
+}
+
+// Not in the Go suite, which relies on `singleflight.Group`. `Flight` is the port of it, and these pin what the
+// callers rely on: concurrent callers share one run and its result, and nothing outlives the flight, an error
+// included.
+#[tokio::test]
+async fn flight_shares_concurrent_calls_and_does_not_keep_an_error() {
+    use crate::indexerconfig::Flight;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let flight: Arc<Flight<Result<u32, String>>> = Arc::new(Flight::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let callers: Vec<_> = (0..8)
+        .map(|_| {
+            let (flight, runs) = (Arc::clone(&flight), Arc::clone(&runs));
+            tokio::spawn(async move {
+                flight
+                    .run("k", async {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Err::<u32, String>("boom".into())
+                    })
+                    .await
+            })
+        })
+        .collect();
+    for c in callers {
+        assert_eq!(c.await.expect("caller"), Err("boom".to_owned()), "a caller did not get the shared result");
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "concurrent callers ran the call more than once");
+    assert_eq!(flight.in_flight(), 0, "a finished flight was kept");
+
+    // The error was not cached: the next caller runs the call again, and can succeed.
+    let again = flight.run("k", async { Ok(7) }).await;
+    assert_eq!(again, Ok(7), "a later caller was handed the earlier error");
+    assert_eq!(flight.in_flight(), 0);
+}
+
+// A caller that goes away mid-flight must not strand the callers waiting on it, or leave its key behind.
+#[tokio::test]
+async fn flight_survives_a_caller_that_goes_away() {
+    use crate::indexerconfig::Flight;
+    use std::sync::Arc;
+
+    let flight: Arc<Flight<u32>> = Arc::new(Flight::new());
+    let leader = {
+        let flight = Arc::clone(&flight);
+        tokio::spawn(async move {
+            flight
+                .run("k", async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    1
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let waiter = {
+        let flight = Arc::clone(&flight);
+        tokio::spawn(async move { flight.run("k", async { 2 }).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    leader.abort();
+    let got = tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("the waiter was stranded").expect("waiter");
+    assert_eq!(got, 2, "the waiter should run its own call once the leader is gone");
+    assert_eq!(flight.in_flight(), 0, "a finished flight was kept");
+
+    // A lone caller that goes away leaves nothing behind either.
+    let lone = {
+        let flight = Arc::clone(&flight);
+        tokio::spawn(async move { flight.run("other", std::future::pending::<u32>()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(flight.in_flight(), 1);
+    lone.abort();
+    let _ = lone.await;
+    assert_eq!(flight.in_flight(), 0, "an abandoned flight was kept");
 }
