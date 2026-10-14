@@ -99,6 +99,22 @@ fn tiered_cache_reads_the_directory_once() {
     assert_eq!(c.get("fact-3").as_deref(), Some("v"), "a known entry was not read back");
 }
 
+// A file removed underneath the index (a concurrent retire, something outside the process) is a miss, and the
+// index forgets it: the next get for the key opens nothing.
+#[test]
+fn tiered_cache_forgets_an_indexed_file_that_has_gone() {
+    let dir = TempDir::new().unwrap();
+    TieredCache::new(1 << 20, dir.path()).put("k", "v", DAY);
+    let c = TieredCache::new(1 << 20, dir.path()); // indexes the file, memory empty
+    fs::remove_file(c.path("k")).unwrap();
+
+    let before = c.disk_counts().reads;
+    assert!(c.get("k").is_none(), "a file that is gone was served");
+    assert_eq!(c.disk_counts().reads, before + 1, "the first get should have tried the file once");
+    assert!(c.get("k").is_none());
+    assert_eq!(c.disk_counts().reads, before + 1, "the index still listed the missing file");
+}
+
 // The live box has a populated directory in the format this cache has always written; it must open and serve.
 #[test]
 fn tiered_cache_serves_files_an_earlier_run_wrote() {
