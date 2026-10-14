@@ -67,6 +67,9 @@ pub struct AppState {
     pub os_limits: crate::opensubtitles::Limits,
     /// The same for translation providers, per provider and key, across batches and runs.
     pub llm_pauses: crate::ratelimit::Pauses,
+    /// The scout bases this process serves itself, set once by den-hearth when Scout runs beside this service: a
+    /// resync target's scout hop at one of them is a call, not a connection (`resync::Relay::open`). Unset alone.
+    pub local_scout: std::sync::OnceLock<den_http::Local>,
 }
 
 /// The one client for OpenSubtitles, the translation providers and the subtitle CDN. Bounded so an upstream that
@@ -127,6 +130,7 @@ impl AppState {
             os_fails: AtomicU32::new(0),
             os_limits: Default::default(),
             llm_pauses: Default::default(),
+            local_scout: std::sync::OnceLock::new(),
         })
     }
 

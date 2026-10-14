@@ -243,13 +243,51 @@ fn temp_dir() -> PathBuf {
 /// that trickles out, for a job that is still running when the test wants it to be. Config `cfg` is an
 /// ordinary install; config `SCOPED` behaves as den-scout's scope=availability config.
 async fn origin() -> String {
+    origin_counting().await.url
+}
+
+/// The fake scout and its file host, and how many connections the scout's port has accepted.
+struct FakeScout {
+    url: String,
+    scout: std::net::SocketAddr,
+    files: std::net::SocketAddr,
+    connections: Arc<AtomicU32>,
+}
+
+impl FakeScout {
+    /// Serve this scout in process to `state`, as den-hearth does with its own Scout: at the fake's origin, so a
+    /// request to that origin is a call and never a connection.
+    fn serve_in_process(&self, state: &AppState) {
+        let (sa, fa) = (self.scout, self.files);
+        let mut local = den_http::Local::default();
+        local
+            .add(
+                &self.url,
+                Arc::new(move |req: Request<Bytes>| {
+                    Box::pin(async move {
+                        origin_handle(sa, fa, req)
+                            .await
+                            .map(|body| body.map_err(|never: Infallible| match never {}).boxed())
+                    })
+                }),
+            )
+            .unwrap();
+        assert!(state.local_scout.set(local).is_ok(), "the in-process scout is set once");
+    }
+}
+
+async fn origin_counting() -> FakeScout {
     let scout = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let files = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (sa, fa) = (scout.local_addr().unwrap(), files.local_addr().unwrap());
-    for listener in [scout, files] {
+    let connections = Arc::new(AtomicU32::new(0));
+    for (listener, counted) in [(scout, Some(connections.clone())), (files, None)] {
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { continue };
+                if let Some(counted) = &counted {
+                    counted.fetch_add(1, Relaxed);
+                }
                 tokio::spawn(async move {
                     let service = hyper::service::service_fn(move |req| async move {
                         Ok::<_, Infallible>(origin_handle(sa, fa, req).await)
@@ -261,7 +299,7 @@ async fn origin() -> String {
             }
         });
     }
-    format!("http://{sa}")
+    FakeScout { url: format!("http://{sa}"), scout: sa, files: fa, connections }
 }
 
 type OriginBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -311,10 +349,10 @@ fn origin_degraded(status: u16, reason: &str) -> Response<OriginBody> {
         .unwrap()
 }
 
-async fn origin_handle(
+async fn origin_handle<B>(
     addr: std::net::SocketAddr,
     files: std::net::SocketAddr,
-    req: Request<hyper::body::Incoming>,
+    req: Request<B>,
 ) -> Response<OriginBody> {
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
@@ -814,9 +852,26 @@ async fn end_to_end(
     scoped: bool,
     extra: &str,
 ) -> (String, Bytes, PathBuf) {
+    end_to_end_via(imdb, fixture_name, codec_prefix, scoped, extra, false).await
+}
+
+/// `end_to_end`, with scout served over HTTP or, `in_process`, as den-hearth serves it beside Remux: then the
+/// session must play without a single connection to scout's port.
+async fn end_to_end_via(
+    imdb: &str,
+    fixture_name: &str,
+    codec_prefix: &str,
+    scoped: bool,
+    extra: &str,
+    in_process: bool,
+) -> (String, Bytes, PathBuf) {
     let ffmpeg8 = ffmpeg_major() == Some(8);
-    let origin = origin().await;
+    let fake = origin_counting().await;
+    let origin = fake.url.clone();
     let state = test_state(&origin, 2, Duration::from_secs(600));
+    if in_process {
+        fake.serve_in_process(&state);
+    }
     let cookie = login(&state, "phone-key").await;
     // The scoped scout URL is the primary path; without one the server's own install is the fallback.
     let body = match scoped {
@@ -1072,6 +1127,11 @@ async fn end_to_end(
     assert_eq!(late.status, StatusCode::GONE, "a report after the end is refused");
     assert!(!dir.exists(), "scratch left behind");
     assert_eq!(state.scratch_bytes.load(Relaxed), 0);
+    if in_process {
+        assert_eq!(fake.connections.load(Relaxed), 0, "a session with scout in process connected to scout");
+    } else {
+        assert!(fake.connections.load(Relaxed) > 0, "the HTTP path never reached scout");
+    }
     (master.text(), init.body, whole)
 }
 
@@ -1149,6 +1209,14 @@ async fn the_releases_list_says_how_each_plays_for_the_player_that_asked() {
 #[ignore]
 async fn h264_matroska_end_to_end() {
     end_to_end("tt0000001", "h264.mkv", "avc1.64", true, "").await;
+}
+
+/// The same session, with scout in process as in den-hearth: it lists, resolves (scout's 302 answered in process,
+/// the file host's hop over HTTP) and plays exactly as over HTTP, without one connection to scout's port.
+#[tokio::test]
+#[ignore]
+async fn h264_matroska_end_to_end_with_scout_in_process() {
+    end_to_end_via("tt0000001", "h264.mkv", "avc1.64", true, "", true).await;
 }
 
 #[tokio::test]
@@ -1623,6 +1691,127 @@ async fn a_full_install_url_is_its_own_credential() {
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
     assert_eq!(r.json()["error"], "scout_refused");
     state.end_all("test").await;
+}
+
+/// The two tests above with scout in process, as den-hearth runs it: every answer and refusal is the same — the
+/// scoped config lists only with the key, an availability-only install needs a login, a refused install is
+/// refused — and scout's port never sees a connection. The key still never reaches the file host, which fails
+/// any request carrying it.
+#[tokio::test]
+async fn scout_in_process_answers_and_refuses_as_over_http() {
+    let fake = origin_counting().await;
+    let origin = fake.url.clone();
+    let scoped = |scout: &str| format!(r#"{{"imdb":"tt0000001","scout":"{scout}"}}"#);
+    let good = format!("{origin}/{SCOPED}");
+
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    fake.serve_in_process(&state);
+    let cookie = login(&state, "phone-key").await;
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    state.end_all("test").await;
+    let with = |config: &str| format!(r#"{{"imdb":"tt0000001","scout":"{origin}/{config}"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &with("cfg")).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = call(&state, "POST", "/remux/session", None, &with(SCOPED)).await;
+    assert_eq!((r.status, r.json()["error"].clone()), (StatusCode::UNAUTHORIZED, "not_logged_in".into()));
+    let r = call(&state, "POST", "/remux/session", None, &with("cmV2b2tlZA")).await;
+    assert_eq!((r.status, r.json()["error"].clone()), (StatusCode::FORBIDDEN, "scout_refused".into()));
+    state.end_all("test").await;
+
+    let keyless = state_with(&origin, 2, Duration::from_secs(600), None);
+    fake.serve_in_process(&keyless);
+    let cookie = login(&keyless, "phone-key").await;
+    let r = call(&keyless, "POST", "/remux/session", Some(&cookie), &scoped(&good)).await;
+    assert_eq!((r.status, r.json()["error"].clone()), (StatusCode::FORBIDDEN, "scout_refused".into()));
+
+    assert_eq!(fake.connections.load(Relaxed), 0, "scout in process was reached over a socket");
+}
+
+/// The same fixture through both paths gives the same list and the same resolved release: in process, a stream
+/// list and a play URL's head, link and size are what HTTP gives, and only HTTP touches scout's port.
+#[tokio::test]
+async fn a_list_and_a_resolve_are_the_same_in_process_and_over_http() {
+    use crate::scout::{list, resolve, ScoutSource, SourceGuard};
+    let fake = origin_counting().await;
+    let over_http = test_state(&fake.url, 2, Duration::from_secs(600));
+    let in_process = test_state(&fake.url, 2, Duration::from_secs(600));
+    fake.serve_in_process(&in_process);
+    let source =
+        |config: &str| ScoutSource { base: format!("{}/{config}", fake.url), key: Some(SCOUT_KEY.into()) };
+    for (config, id) in
+        [("cfg", "tt0000001"), (SCOPED, "tt0000005"), ("cfg", "tt0000004:1:2"), ("cfg", "tt9")]
+    {
+        let a = list(over_http.scout_via(), &source(config), id, None).await.ok().unwrap();
+        let b = list(in_process.scout_via(), &source(config), id, None).await.ok().unwrap();
+        let names = |l: &[crate::scout::Stream]| {
+            l.iter().map(|s| (s.url.clone(), s.filename().to_string())).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&a), names(&b), "{config} {id}");
+        for s in &a {
+            let a = resolve(over_http.scout_via(), &s.url, &source(config), SourceGuard::for_build()).await;
+            let b = resolve(in_process.scout_via(), &s.url, &source(config), SourceGuard::for_build()).await;
+            match (a, b) {
+                (Ok(a), Ok(b)) => assert_eq!((a.url, a.head, a.size), (b.url, b.head, b.size), "{}", s.url),
+                (Err(a), Err(b)) => assert_eq!(a, b, "{}", s.url),
+                (a, b) => panic!("{}: over HTTP {:?}, in process {:?}", s.url, a.err(), b.err()),
+            }
+        }
+    }
+    // Refusals carry the same status both ways: a scoped config without the key, and a config scout won't open.
+    for (config, key) in [(SCOPED, None), ("bad", Some(SCOUT_KEY))] {
+        let src = ScoutSource { base: format!("{}/{config}", fake.url), key: key.map(String::from) };
+        let a = list(over_http.scout_via(), &src, "tt0000001", None).await.err().unwrap();
+        let b = list(in_process.scout_via(), &src, "tt0000001", None).await.err().unwrap();
+        assert_eq!((a.status, a.detail), (b.status, b.detail), "{config}");
+    }
+    let http_connections = fake.connections.load(Relaxed);
+    assert!(http_connections > 0);
+
+    // Only the in-process side again: not one more connection.
+    list(in_process.scout_via(), &source("cfg"), "tt0000001", None).await.ok().unwrap();
+    assert_eq!(fake.connections.load(Relaxed), http_connections);
+}
+
+/// In process or not, the hop scout's play URL redirects to is fetched over HTTP behind the guard: a redirect to
+/// a private address is refused before a byte is sent, and the key never goes with it.
+#[tokio::test]
+async fn a_redirect_from_scout_in_process_to_a_private_address_is_refused() {
+    use crate::scout::{resolve, ScoutSource, SourceGuard, Via};
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            "http://scout.invalid",
+            Arc::new(|req: Request<Bytes>| {
+                let to = match req.uri().path() {
+                    "/p/meta" => "http://169.254.169.254/latest/meta-data",
+                    "/p/lan" => "http://192.168.86.193:8090/scout/p/x",
+                    _ => "http://127.0.0.1:9/x",
+                };
+                Box::pin(async move {
+                    Response::builder().status(302).header("location", to).body(den_http::full("")).unwrap()
+                })
+            }),
+        )
+        .unwrap();
+    // An address the process also serves, off scout's origin: a hop there is still a guarded HTTP hop.
+    local
+        .add(
+            "http://192.168.86.193:8090/scout",
+            Arc::new(|_| Box::pin(async { Response::new(den_http::full("served in process")) })),
+        )
+        .unwrap();
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let via = Via { http: &client, local: Some(&local) };
+    let src = ScoutSource { base: "http://scout.invalid/cfg".into(), key: Some(SCOUT_KEY.into()) };
+    for ticket in ["meta", "lan", "loop"] {
+        let err = resolve(via, &format!("http://scout.invalid/p/{ticket}"), &src, SourceGuard::strict())
+            .await
+            .err()
+            .expect(ticket);
+        assert!(err.contains("not on the public internet"), "{ticket}: {err}");
+    }
 }
 
 /// An install plays `MAX_SESSIONS_PER_INSTALL` (2 here) at once and its oldest gives way to a new one, so

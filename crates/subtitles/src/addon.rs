@@ -1189,8 +1189,13 @@ async fn sync_and_cache(
         // ffmpeg is handed a loopback relay, never `url`: it would re-resolve the name and follow
         // redirects on its own (see `resync.rs`). The relay follows the redirect chain here, before
         // the permit, for the reason Tier 1 fetches its reference first — it is network work.
-        let aligned = match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases)
-            .await
+        let aligned = match resync::Relay::open(
+            &url,
+            &state.cfg.scout_origins,
+            &state.cfg.scout_aliases,
+            state.local_scout.get(),
+        )
+        .await
         {
             Ok(relay) => {
                 let prepared = reservation.take().expect("Tier-2 sync was reserved before retaining bodies");

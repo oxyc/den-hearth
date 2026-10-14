@@ -224,28 +224,66 @@ async fn pinned_client(url: &Url, origins: &[Origin]) -> Result<reqwest::Client,
     profile.build().map_err(|e| format!("resync client: {e}"))
 }
 
-/// Follow `start`'s redirects to the URL that serves the bytes, vetting each hop, and return it with
-/// the client pinned to its address. Error text never carries a URL: a debrid link is a credential.
-async fn follow(start: Url, origins: &[Origin]) -> Result<(reqwest::Client, Url), String> {
-    let mut url = start;
-    for _ in 0..=MAX_HOPS {
-        let client = pinned_client(&url, origins).await?;
-        // One byte: this request only asks where the bytes are, and the relay's requests fetch them.
-        let resp = timeout(HOP_BUDGET, client.get(url.clone()).header(RANGE, "bytes=0-0").send())
+/// The most of an in-process scout answer read: a redirect has no body, and a refusal is a line of JSON.
+const LOCAL_CAP: usize = 64 << 10;
+
+/// One hop's status and `Location`, in process when `url` is a listed origin that `in_process` serves (den-hearth's
+/// own Scout), over a pinned client otherwise, which is returned with it. The listed origin is what makes a hop
+/// eligible, so a hop the operator did not name — a redirect to an address hearth happens to answer on included — is
+/// fetched and vetted exactly as before.
+async fn hop(
+    url: &Url,
+    origins: &[Origin],
+    in_process: Option<&den_http::Local>,
+) -> Result<(StatusCode, Option<String>, Option<reqwest::Client>), String> {
+    let listed = origin_of(url).is_some_and(|o| origins.contains(&o));
+    // One byte: this request only asks where the bytes are, and the relay's requests fetch them.
+    if let Some(call) = in_process.filter(|_| listed).and_then(|served| {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(RANGE, hyper::header::HeaderValue::from_static("bytes=0-0"));
+        let agent = format!("den-subtitles/{}", crate::release_version());
+        if let Ok(agent) = agent.parse() {
+            headers.insert(hyper::header::USER_AGENT, agent);
+        }
+        served.get(url.as_str(), headers, LOCAL_CAP)
+    }) {
+        let resp = timeout(HOP_BUDGET, call)
             .await
             .map_err(|_| "resync target timed out".to_string())?
-            .map_err(|e| format!("resync target: {}", e.without_url()))?;
-        let status = resp.status();
+            .map_err(|e| format!("resync target: {e}"))?;
+        let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+        return Ok((resp.status(), location, None));
+    }
+    let client = pinned_client(url, origins).await?;
+    let resp = timeout(HOP_BUDGET, client.get(url.clone()).header(RANGE, "bytes=0-0").send())
+        .await
+        .map_err(|_| "resync target timed out".to_string())?
+        .map_err(|e| format!("resync target: {}", e.without_url()))?;
+    let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+    Ok((resp.status(), location, Some(client)))
+}
+
+/// Follow `start`'s redirects to the URL that serves the bytes, vetting each hop, and return it with
+/// the client pinned to its address. Error text never carries a URL: a debrid link is a credential.
+async fn follow(
+    start: Url,
+    origins: &[Origin],
+    in_process: Option<&den_http::Local>,
+) -> Result<(reqwest::Client, Url), String> {
+    let mut url = start;
+    for _ in 0..=MAX_HOPS {
+        let (status, location, client) = hop(&url, origins, in_process).await?;
         if status.is_redirection() {
-            let location = resp
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or("resync redirect without a location")?;
-            url = url.join(location).map_err(|_| "resync redirect to an unparseable location")?;
+            let location = location.ok_or("resync redirect without a location")?;
+            url = url.join(&location).map_err(|_| "resync redirect to an unparseable location")?;
             continue;
         }
         if status.is_success() {
+            // The relay reads the bytes over HTTP: a hop answered in process still needs a client for that.
+            let client = match client {
+                Some(client) => client,
+                None => pinned_client(&url, origins).await?,
+            };
             return Ok((client, url));
         }
         return Err(format!("resync target answered {status}"));
@@ -276,15 +314,17 @@ impl Drop for Relay {
 
 impl Relay {
     /// Resolve `target` (already passed through `vet`) to the bytes and start relaying them. A target on
-    /// a public name in `aliases` starts at its LAN address; the hops after it are the debrid's.
+    /// a public name in `aliases` starts at its LAN address; the hops after it are the debrid's. A hop at
+    /// a listed origin that `in_process` serves (den-hearth's own Scout) is a call rather than a connection.
     pub async fn open(
         target: &str,
         origins: &[Origin],
         aliases: &[(Origin, Origin)],
+        in_process: Option<&den_http::Local>,
     ) -> Result<Relay, String> {
         let start = Url::parse(target).map_err(|_| "resync target is not a URL".to_string())?;
         let start = local(start, aliases);
-        let (client, target) = follow(start, origins).await?;
+        let (client, target) = follow(start, origins, in_process).await?;
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(|e| format!("relay bind: {e}"))?;
         let addr = listener.local_addr().map_err(|e| format!("relay bind: {e}"))?;
@@ -651,7 +691,7 @@ mod tests {
             let (scout, _) = server(move |_, _| redirect(location.clone())).await;
             let list = origins(&format!("http://{scout}"));
             let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-            let err = Relay::open(target.as_str(), &list, &[]).await.err();
+            let err = Relay::open(target.as_str(), &list, &[], None).await.err();
             assert!(err.is_some(), "followed a redirect to an internal address");
         }
         assert_eq!(victim_hits.load(Ordering::SeqCst), 0, "the internal address was contacted");
@@ -670,7 +710,8 @@ mod tests {
         .await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-        let relay = Relay::open(target.as_str(), &list, &[]).await.expect("a legitimate target was refused");
+        let relay =
+            Relay::open(target.as_str(), &list, &[], None).await.expect("a legitimate target was refused");
         assert!(relay.url().starts_with("http://127.0.0.1:"), "{}", relay.url());
 
         let resp = client().get(relay.url()).header(RANGE, "bytes=2-5").send().await.unwrap();
@@ -699,7 +740,8 @@ mod tests {
         .await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/p/AbC-_09"), &list).expect("a ticket URL was refused");
-        let relay = Relay::open(target.as_str(), &list, &[]).await.expect("a ticket target was not relayed");
+        let relay =
+            Relay::open(target.as_str(), &list, &[], None).await.expect("a ticket target was not relayed");
         let whole = client().get(relay.url()).send().await.unwrap();
         assert_eq!(whole.bytes().await.unwrap(), MEDIA);
     }
@@ -720,8 +762,9 @@ mod tests {
         assert_eq!(aliases.len(), 1);
         let target =
             vet("https://d-play.invalid/p/AbC-_09", &list).expect("the public ticket URL was refused");
-        let relay =
-            Relay::open(target.as_str(), &list, &aliases).await.expect("the aliased ticket was not relayed");
+        let relay = Relay::open(target.as_str(), &list, &aliases, None)
+            .await
+            .expect("the aliased ticket was not relayed");
         assert_eq!(client().get(relay.url()).send().await.unwrap().bytes().await.unwrap(), MEDIA);
         assert!(hits.load(Ordering::SeqCst) >= 2, "scout's LAN address served the ticket and the bytes");
         let moved = local(Url::parse("https://d-play.invalid/p/x?q=1").unwrap(), &aliases);
@@ -742,7 +785,7 @@ mod tests {
         .await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-        let relay = Relay::open(target.as_str(), &list, &[]).await.unwrap();
+        let relay = Relay::open(target.as_str(), &list, &[], None).await.unwrap();
 
         let resp = client().get(relay.url()).send().await.unwrap();
         assert_eq!(resp.status(), 502);
@@ -750,12 +793,87 @@ mod tests {
         assert_eq!(victim_hits.load(Ordering::SeqCst), 0);
     }
 
+    /// den-hearth's Scout served in process at `base`: `/p/<ticket>` answers `answer(ticket)` with no body.
+    fn scout_in_process(base: &str, answer: fn(&str) -> (u16, Option<String>)) -> den_http::Local {
+        let mut local = den_http::Local::default();
+        local
+            .add(
+                base,
+                Arc::new(move |req: Request<Bytes>| {
+                    let ticket = req.uri().path().strip_prefix("/p/").unwrap_or("").to_string();
+                    let (status, location) = answer(&ticket);
+                    Box::pin(async move {
+                        let mut resp = Response::builder().status(status);
+                        if let Some(location) = location {
+                            resp = resp.header(LOCATION, location);
+                        }
+                        resp.body(den_http::full("")).unwrap()
+                    })
+                }),
+            )
+            .unwrap();
+        local
+    }
+
+    /// With Scout in process, its hop is a call: scout's port sees no request, the redirect it answers is followed
+    /// over HTTP to the file host, and the relay serves the same bytes as over HTTP.
+    #[tokio::test]
+    async fn a_scout_hop_in_process_never_reaches_scouts_port() {
+        const MEDIA: &[u8] = b"in process";
+        let (cdn, _) = server(|req, _| ranged(req, MEDIA)).await;
+        let (scout, scout_hits) = server(move |_, _| redirect("/elsewhere".into())).await;
+        let list = origins(&format!("http://{scout},http://{cdn}"));
+        static CDN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CDN.set(format!("http://{cdn}/film.mkv")).unwrap();
+        let local = scout_in_process(&format!("http://{scout}"), |_| (302, CDN.get().cloned()));
+        let target = vet(&format!("http://{scout}/p/AbC-_09"), &list).unwrap();
+
+        let relay = Relay::open(target.as_str(), &list, &[], Some(&local)).await.expect("relayed in process");
+        assert_eq!(client().get(relay.url()).send().await.unwrap().bytes().await.unwrap(), MEDIA);
+        assert_eq!(scout_hits.load(Ordering::SeqCst), 0, "scout's port was asked");
+    }
+
+    /// In process or not, the vetting is the same: a refusal from scout is the same error, a redirect scout answers
+    /// to an internal address is refused before anything connects to it, and an origin that is not listed is never
+    /// served in process, even one the process serves.
+    #[tokio::test]
+    async fn vetting_is_the_same_with_scout_in_process() {
+        let (victim, victim_hits) = server(|_, _| (200, vec![], Bytes::from_static(b"secret"))).await;
+        static VICTIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VICTIM.set(format!("http://{victim}/latest/meta-data/")).unwrap();
+        let (scout, _) = server(|_, _| (403, vec![], Bytes::new())).await;
+        let list = origins(&format!("http://{scout}"));
+        let mut local = scout_in_process(&format!("http://{scout}"), |ticket| match ticket {
+            "refused" => (403, None),
+            "unlisted" => (302, Some("http://127.0.0.1:9/x".into())),
+            _ => (302, VICTIM.get().cloned()),
+        });
+        // An origin the process also serves, but that is not a listed scout origin.
+        let served_unlisted: den_http::local::Serve =
+            Arc::new(|_| Box::pin(async { Response::new(den_http::full("served in process")) }));
+        local.add("http://127.0.0.1:9", served_unlisted).unwrap();
+        let target = |ticket: &str| vet(&format!("http://{scout}/p/{ticket}"), &list).unwrap();
+
+        let over_http = Relay::open(target("refused").as_str(), &list, &[], None).await.err().unwrap();
+        let in_process =
+            Relay::open(target("refused").as_str(), &list, &[], Some(&local)).await.err().unwrap();
+        assert_eq!(over_http, in_process);
+
+        let err = Relay::open(target("internal").as_str(), &list, &[], Some(&local)).await.err().unwrap();
+        assert_eq!(err, "resync hop is not a public address");
+        assert_eq!(victim_hits.load(Ordering::SeqCst), 0, "the internal address was contacted");
+
+        // A redirect to an origin the process serves but the operator did not list is vetted as any unlisted hop.
+        let err = Relay::open(target("unlisted").as_str(), &list, &[], Some(&local)).await.err().unwrap();
+        assert_eq!(err, "resync hop is not a public address");
+    }
+
     #[tokio::test]
     async fn an_endless_redirect_chain_is_cut_off() {
         let (scout, hits) = server(|_, n| redirect(format!("/cfg/play/tok{n}"))).await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-        assert!(Relay::open(target.as_str(), &list, &[]).await.is_err());
+        assert!(Relay::open(target.as_str(), &list, &[], None).await.is_err());
         assert_eq!(hits.load(Ordering::SeqCst), MAX_HOPS + 1);
     }
 }

@@ -446,7 +446,7 @@ pub fn source_client(connect: Duration, read_idle: Duration) -> reqwest::Client 
 fn service_profile() -> ClientProfile {
     ClientProfile::new()
         .connect(CONNECT_TIMEOUT)
-        .total(Duration::from_secs(60))
+        .total(crate::scout::SCOUT_TOTAL)
         .user_agent(crate::user_agent())
 }
 
@@ -471,6 +471,9 @@ pub struct AppState {
     pub scout_http: reqwest::Client,
     /// Which hosts a play URL may lead to off scout's origin (`scout::resolve`).
     pub source_guard: crate::scout::SourceGuard,
+    /// The scout bases this process serves itself, set once by den-hearth when Scout runs beside this service.
+    /// A request to scout at one of them is a call, not a connection (`scout::Via`). Unset when Remux runs alone.
+    pub local_scout: std::sync::OnceLock<den_http::Local>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Ended sessions and the expiry their URLs were signed with.
     tombstones: Mutex<HashMap<String, u64>>,
@@ -600,6 +603,7 @@ impl AppState {
             source_http: source_client(CONNECT_TIMEOUT, SOURCE_READ_IDLE),
             scout_http: scout_profile().build().expect("reqwest client"),
             source_guard: crate::scout::SourceGuard::for_build(),
+            local_scout: std::sync::OnceLock::new(),
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashMap::new()),
@@ -629,6 +633,11 @@ impl AppState {
             revive_lock: tokio::sync::Mutex::new(()),
             resumable: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// How scout is reached: in process for a URL hearth serves itself (`local_scout`), over `scout_http` otherwise.
+    pub fn scout_via(&self) -> crate::scout::Via<'_> {
+        crate::scout::Via { http: &self.scout_http, local: self.local_scout.get() }
     }
 
     /// Is scanning on: an ffmpeg that can do it.

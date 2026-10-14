@@ -711,7 +711,7 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
     let secrets = [base.clone()];
     let scrub = |text: &str| crate::redact::scrub(text, &[secrets[0].as_str()]);
     let src = crate::scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
-    let list = crate::scout::list(&st.scout_http, &src, &ep.id(), None)
+    let list = crate::scout::list(st.scout_via(), &src, &ep.id(), None)
         .await
         .map_err(|e| Failure::Failed(format!("scout: {}", scrub(&e.detail))))?;
     let picks = cheapest(&list);
@@ -765,7 +765,7 @@ async fn open(
     s: &crate::scout::Stream,
 ) -> Result<(crate::scout::Resolved, f64, u64), String> {
     let play = crate::config::local(&s.url, &st.cfg.origin_aliases);
-    let r = crate::scout::resolve(&st.scout_http, &play, src, st.source_guard).await?;
+    let r = crate::scout::resolve(st.scout_via(), &play, src, st.source_guard).await?;
     let size = r.size.ok_or("the release has no size")?;
     let key = crate::state::probe_key(r.size, &r.head);
     let info = match key.as_deref().and_then(|k| st.probe(k)) {

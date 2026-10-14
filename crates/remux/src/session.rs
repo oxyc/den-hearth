@@ -888,7 +888,7 @@ impl Session {
         // The next session for this release must not be handed the link that just failed.
         st.opened().forget(&self.opened_key);
         let play_url = crate::config::local(&self.lock().play_url, &st.cfg.origin_aliases);
-        match scout::resolve(&st.scout_http, &play_url, &self.source, st.source_guard).await {
+        match scout::resolve(st.scout_via(), &play_url, &self.source, st.source_guard).await {
             Ok(r) => {
                 if let Some(door) = self.door.get().and_then(Option::as_ref) {
                     door.set_upstream(&r.url);
@@ -999,18 +999,18 @@ impl Session {
     ) -> Result<(scout::Resolved, Option<String>), String> {
         let local = |url: &str| crate::config::local(url, &st.cfg.origin_aliases);
         let first =
-            match scout::resolve(&st.scout_http, &local(play_url), &self.source, st.source_guard).await {
+            match scout::resolve(st.scout_via(), &local(play_url), &self.source, st.source_guard).await {
                 Ok(r) => return Ok((r, None)),
                 Err(e) => e,
             };
-        let list = scout::list(&st.scout_http, &self.source, &self.imdb, None)
+        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None)
             .await
             .map_err(|e| format!("{first}; listing the title again: {}", e.detail))?;
         let again = list
             .iter()
             .find(|s| opened_key(&self.source.base, s) == self.opened_key)
             .ok_or_else(|| format!("{first}; the title's listing no longer has the release"))?;
-        let r = scout::resolve(&st.scout_http, &local(&again.url), &self.source, st.source_guard).await?;
+        let r = scout::resolve(st.scout_via(), &local(&again.url), &self.source, st.source_guard).await?;
         Ok((r, Some(again.url.clone())))
     }
 
@@ -2008,7 +2008,7 @@ async fn open(
     }
     // A ticket on scout's public name (d-play) is fetched at its LAN address, like the install it came from.
     let r = scout::resolve(
-        &st.scout_http,
+        st.scout_via(),
         &crate::config::local(&s.url, &st.cfg.origin_aliases),
         src,
         st.source_guard,
@@ -2639,7 +2639,7 @@ async fn scout_list(
     playable: Option<&Playable>,
 ) -> Result<Vec<scout::Stream>, ApiError> {
     let secrets = [source.base.as_str()];
-    scout::list(&st.scout_http, source, id, playable).await.map_err(|e| match e.status {
+    scout::list(st.scout_via(), source, id, playable).await.map_err(|e| match e.status {
         // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
         // logged-in browser alone.
         Some(403) if by_install => api(

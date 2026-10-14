@@ -177,6 +177,22 @@ Scout is built twice for this (same client and cache, one handler per origin), s
 are one instance each, so while one has its own listener `HEARTH_PUBLIC_BASE_URL` is not applied to it (the
 prefixed paths on :8090 then follow its own `PUBLIC_BASE_URL`, or the request's `Host`, without the prefix).
 
+## Scout in process
+
+Remux (stream lists, play URLs) and Subtitles (a resync target's play redirect) reach Scout by calling hearth's own
+request path when the scout URL is one of hearth's own Scout bases, and over HTTP otherwise (`crates/hearth/src/inproc.rs`).
+A call goes through everything a request on the socket does: admission lanes, Scout's handler with its scope and
+revocation checks and `X-Den-Remux-Key`, the request log and metrics; the caller's timeouts still bound it. Only the
+Scout hop moves: the debrid's redirect is still fetched over HTTP behind the address guard. The bases, listed on the
+startup line `scout in process for remux and subs at: ...`, are only what hearth knows to be itself: Scout's own port
+on the loopback names, Scout's `PUBLIC_BASE_URL`, `http://<host>:<HEARTH_SCOUT_PORT>` when `HEARTH_PUBLIC_BASE_URL` is
+`http://<host>:<PORT>`, and `/scout` on the main port (loopback and `HEARTH_PUBLIC_BASE_URL`). A scout on another
+machine, or a name hearth was not told is its own, stays HTTP. `ORIGIN_ALIASES`/`SCOUT_ALIASES` still map a public
+name to the LAN address first, and that address is then one of the bases.
+
+The LAN base is inferred from `HEARTH_PUBLIC_BASE_URL`, so when that is `http://<host>:<PORT>` the host must be hearth
+itself: a request to that host on Scout's port is answered in process and never sent.
+
 ## Configuration
 
 The allocator is jemalloc with its purge tuning compiled in (`crates/hearth/src/alloc.rs`; the startup line
