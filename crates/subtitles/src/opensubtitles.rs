@@ -546,13 +546,18 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
 /// timing), with trust/ratings/downloads as tie-breakers. Machine/AI-translated subs are pushed below
 /// everything, foreign-parts-only tracks included.
 pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
+    fit_score_against(s, filename.map(FileFit::new).as_ref())
+}
+
+/// `fit_score` with the playing file's side already read, so ranking a list reads it once.
+fn fit_score_against(s: &Subtitle, file: Option<&FileFit>) -> i64 {
     const HASH: i64 = 1_000_000;
     let mut score = text_score(s);
     if s.hash_match {
         score += HASH;
     }
-    if let Some(f) = filename {
-        score += release_fit(f, &s.release);
+    if let Some(f) = file {
+        score += f.release_fit(&s.release);
     }
     score
 }
@@ -607,15 +612,27 @@ pub fn text_score(s: &Subtitle) -> i64 {
 /// that already knows its own audio language (den-remux does) can rank this track against an
 /// embedded one rather than trust `rank`'s language-blind ordering alone.
 pub(crate) fn looks_dubbed(release: &str) -> bool {
-    tokenize(release).iter().any(|t| t == "dubbed" || t == "dub")
+    tokens(release).any(|t| t.eq_ignore_ascii_case("dubbed") || t.eq_ignore_ascii_case("dub"))
 }
 
 /// Order subtitles for the picker: grouped by language, best-fit first within each language. The
 /// app's own dedupe-keep-first then naturally keeps the optimal sub per language.
+///
+/// Each subtitle is scored once and the playing file is read once; the sort then compares plain
+/// integers and borrowed language codes. Equal scores keep their input order (the sort is stable).
 pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
-    subs.sort_by(|a, b| {
-        a.lang.cmp(&b.lang).then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
-    });
+    let file = filename.map(FileFit::new);
+    let scores: Vec<i64> = subs.iter().map(|s| fit_score_against(s, file.as_ref())).collect();
+    let mut order: Vec<usize> = (0..subs.len()).collect();
+    order.sort_by(|&a, &b| subs[a].lang.cmp(&subs[b].lang).then_with(|| scores[b].cmp(&scores[a])));
+    // Move element `order[i]` to slot `i` in place: swap it in from wherever earlier swaps left it.
+    for i in 0..order.len() {
+        let mut j = order[i];
+        while j < i {
+            j = order[j];
+        }
+        subs.swap(i, j);
+    }
 }
 
 /// Compact, log-safe tokens saying why `rank` placed `s` where it did — the deciding factors behind
@@ -653,24 +670,54 @@ pub fn ranking_factors(s: &Subtitle, filename: Option<&str>) -> Vec<&'static str
 /// Significant release tokens shared between the file name and a sub's release string imply the same
 /// encode (hence the same timing). Weight resolution/source/codec, and reward a matching group tag.
 fn release_fit(filename: &str, release: &str) -> i64 {
-    if release.is_empty() {
-        return 0;
+    FileFit::new(filename).release_fit(release)
+}
+
+/// The playing file's half of `release_fit`: which `SIGNIFICANT` tokens it carries (one bit each) and
+/// its release group. Read once, then every candidate's release string is compared against it
+/// without allocating.
+struct FileFit<'a> {
+    significant: u32,
+    group: Option<&'a str>,
+}
+
+impl<'a> FileFit<'a> {
+    fn new(filename: &'a str) -> Self {
+        FileFit { significant: significant_tokens(filename), group: release_group(filename) }
     }
-    let f = tokenize(filename);
-    let r = tokenize(release);
-    let mut score = 0i64;
-    for (tok, weight) in SIGNIFICANT {
-        if f.iter().any(|t| t == tok) && r.iter().any(|t| t == tok) {
-            score += weight;
+
+    fn release_fit(&self, release: &str) -> i64 {
+        if release.is_empty() {
+            return 0;
+        }
+        let shared = self.significant & significant_tokens(release);
+        let mut score = 0i64;
+        for (bit, (_, weight)) in SIGNIFICANT.iter().enumerate() {
+            if shared & (1 << bit) != 0 {
+                score += weight;
+            }
+        }
+        // The release group (the tag after the last '-') is the strongest same-encode signal.
+        if let (Some(gf), Some(gr)) = (self.group, release_group(release)) {
+            if gf.eq_ignore_ascii_case(gr) {
+                score += 3000;
+            }
+        }
+        score
+    }
+}
+
+/// A bit per `SIGNIFICANT` entry that appears as a token of `s`, whatever its case.
+fn significant_tokens(s: &str) -> u32 {
+    let mut found = 0u32;
+    for t in tokens(s) {
+        for (bit, (tok, _)) in SIGNIFICANT.iter().enumerate() {
+            if t.eq_ignore_ascii_case(tok) {
+                found |= 1 << bit;
+            }
         }
     }
-    // The release group (the tag after the last '-') is the strongest same-encode signal.
-    if let (Some(gf), Some(gr)) = (release_group(filename), release_group(release)) {
-        if gf == gr {
-            score += 3000;
-        }
-    }
-    score
+    found
 }
 
 /// Resolution/source/codec tokens and their weights (higher = stronger same-encode evidence).
@@ -698,19 +745,16 @@ const SIGNIFICANT: &[(&str, i64)] = &[
     ("avc", 200),
 ];
 
-/// Lowercase alphanumeric tokens.
-fn tokenize(s: &str) -> Vec<String> {
-    s.to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
+/// Alphanumeric tokens, borrowed and in their original case (compare with `eq_ignore_ascii_case`).
+fn tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty())
 }
 
-/// The release group tag — the single token after the last '-'. Rejects a hyphen that's part of the
-/// *title* (e.g. "Spider-Man.2002.1080p.BluRay.x264" → tail "Man.2002.1080p…" has dots → not a
-/// group), which would otherwise force a bogus group match between unrelated encodes.
-fn release_group(s: &str) -> Option<String> {
+/// The release group tag — the single token after the last '-', in its original case. Rejects a
+/// hyphen that's part of the *title* (e.g. "Spider-Man.2002.1080p.BluRay.x264" → tail
+/// "Man.2002.1080p…" has dots → not a group), which would otherwise force a bogus group match
+/// between unrelated encodes.
+fn release_group(s: &str) -> Option<&str> {
     // Strip a trailing file extension so "…-GROUP.mkv" → "…-GROUP".
     let stem = match s.rsplit_once('.') {
         Some((head, ext))
@@ -725,7 +769,7 @@ fn release_group(s: &str) -> Option<String> {
     if tail.is_empty() || tail.contains('.') || tail.contains(' ') {
         return None;
     }
-    Some(tail.to_ascii_lowercase())
+    Some(tail)
 }
 
 #[cfg(test)]
@@ -847,8 +891,8 @@ mod tests {
         assert_eq!(release_group("Spider-Man.2002.1080p.BluRay.x264.mkv"), None);
         assert_eq!(release_group("Spider-Man.2002.480p.DVDRip"), None);
         // A real trailing group tag still resolves (with or without extension).
-        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE"), Some("amiable".into()));
-        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv"), Some("amiable".into()));
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE"), Some("AMIABLE"));
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv"), Some("AMIABLE"));
     }
 
     #[test]
