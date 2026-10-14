@@ -1,0 +1,19 @@
+{
+  "B-default": {"worker": "variant_worker.py", "request": {}},
+  "B-visionos": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=visionos"}},
+  "B-visionos-fresh": {"worker": "variant_worker.py", "env": {"BENCH_FRESH": "1"}, "request": {"extractor_args": "youtube:player_client=visionos"}},
+  "B-visionos-skip": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=visionos;player_skip=webpage,configs"}},
+  "B-visionos-skipconfigs": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=visionos;player_skip=configs"}},
+  "B-visionos-skipdash": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=visionos;skip=dash"}},
+  "B-visionos-skiphls": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=visionos;skip=hls"}},
+  "C-web-pot": {"worker": "variant_worker.py", "env": {"XDG_CONFIG_HOME": "{SCRATCH}/xdg"}, "request": {"extractor_args": "youtube:player_client=web"}},
+  "C-visionos-pot": {"worker": "variant_worker.py", "env": {"XDG_CONFIG_HOME": "{SCRATCH}/xdg"}, "request": {"extractor_args": "youtube:player_client=visionos"}},
+  "D-VISIONOS": {"worker": "{SCRATCH}/ytjs/ytjs_worker.mjs", "cmd": ["deno", "run", "-A", "--node-modules-dir=manual", "{script}"], "request": {"client": "VISIONOS"}},
+  "D-TV": {"worker": "{SCRATCH}/ytjs/ytjs_worker.mjs", "cmd": ["deno", "run", "-A", "--node-modules-dir=manual", "{script}"], "request": {"client": "TV"}},
+  "D-WEB_EMBEDDED": {"worker": "{SCRATCH}/ytjs/ytjs_worker.mjs", "cmd": ["deno", "run", "-A", "--node-modules-dir=manual", "{script}"], "request": {"client": "WEB_EMBEDDED"}},
+  "B-visionos-nocache": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=visionos", "cache": ""}},
+  "B-tv": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=tv"}},
+  "B-web_embedded": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=web_embedded"}},
+  "B-tv_downgraded": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=tv_downgraded"}},
+  "B-web": {"worker": "variant_worker.py", "request": {"extractor_args": "youtube:player_client=web"}}
+}

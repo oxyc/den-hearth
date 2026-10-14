@@ -31,26 +31,58 @@ from yt_dlp import YoutubeDL  # noqa: E402  (only importable once the path above
 from yt_dlp.utils import DownloadError  # noqa: E402
 
 
+def extractor_args(spec):
+    """`youtube:player_client=a,b;player_skip=x` as the Python API wants it.
+
+    The API takes every value as a LIST, as the CLI's parser produces; a bare string is iterated
+    character by character, so a pin like `visionos` reached the extractor as `v`, `i`, `s`, ... and
+    was skipped as unsupported clients — the pin silently did nothing.
+    """
+    key, _, value = spec.partition(":")
+    pairs = (p.split("=", 1) for p in value.split(";") if "=" in p)
+    return {key: {name: [v for v in values.split(",") if v] for name, values in pairs}}
+
+
+# One YoutubeDL per distinct set of options, kept for the life of the process. A YoutubeDL owns the
+# HTTP session, so reusing it keeps the TLS connection to youtube.com and the player API warm instead
+# of paying the handshakes again for every trailer. The key is tiny because Reel sends only a handful of
+# distinct (format, extractor_args) pairs: the full ladder and one per `?height=` rung.
+_instances = {}
+_MAX_INSTANCES = 4
+
+
+def downloader(request):
+    key = (request["format"], request.get("extractor_args") or "", request.get("cache") or "")
+    ydl = _instances.get(key)
+    if ydl is None:
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 15,
+            "format": request["format"],
+            "cachedir": request.get("cache") or False,
+        }
+        if request.get("extractor_args"):
+            options["extractor_args"] = extractor_args(request["extractor_args"])
+        if len(_instances) >= _MAX_INSTANCES:
+            _instances.pop(next(iter(_instances))).close()
+        ydl = _instances[key] = YoutubeDL(options)
+    return key, ydl
+
+
 def answer(request):
     """Resolve one id into the same three things `/direct` returns."""
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "socket_timeout": 15,
-        "format": request["format"],
-        "cachedir": request.get("cache") or False,
-    }
-    if request.get("extractor_args"):
-        # Same shape as the CLI's `--extractor-args youtube:player_client=...`.
-        key, _, value = request["extractor_args"].partition(":")
-        options["extractor_args"] = {key: dict(p.split("=", 1) for p in value.split(";") if "=" in p)}
-
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            "https://www.youtube.com/watch?v=" + request["id"], download=False
-        )
+    key, ydl = downloader(request)
+    try:
+        info = ydl.extract_info("https://www.youtube.com/watch?v=" + request["id"], download=False)
+    except DownloadError:
+        raise
+    except Exception:
+        # Anything else leaves the instance in an unknown state; the next request builds a new one.
+        _instances.pop(key, None)
+        raise
 
     # What the CLI's `--print urls` prints: the selected formats, in the order the selector named
     # them (video then audio), or the one format when the selection was already muxed.
