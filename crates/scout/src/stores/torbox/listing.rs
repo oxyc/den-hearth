@@ -151,6 +151,20 @@ impl<R: Remaining> TruncationDetector<R> {
 
 const BUF_LEN: usize = 32 * 1024;
 
+/// The bytes that end a run of plain string text: the closing quote, a backslash, and the control characters
+/// JSON forbids raw.
+static ENDS_RUN: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 0x20 {
+        t[i] = true;
+        i += 1;
+    }
+    t[b'"' as usize] = true;
+    t[b'\\' as usize] = true;
+    t
+};
+
 /// A reader over the body that parses JSON a piece at a time.
 struct Reader<R> {
     r: R,
@@ -159,11 +173,13 @@ struct Reader<R> {
     end: usize,
     /// The input ended or failed; nothing more will be read.
     done: bool,
+    /// `skip_value`'s stack of open containers, kept between calls.
+    open: Vec<bool>,
 }
 
 impl<R: Read> Reader<R> {
     fn new(r: R) -> Reader<R> {
-        Reader { r, buf: vec![0; BUF_LEN], pos: 0, end: 0, done: false }
+        Reader { r, buf: vec![0; BUF_LEN], pos: 0, end: 0, done: false, open: Vec::new() }
     }
 
     /// Reads the next block. False at the end of the input or on a read error, both of which Go's decoder
@@ -212,11 +228,32 @@ impl<R: Read> Reader<R> {
     }
 
     /// The next byte that is not whitespace, not consumed. Go's `dec.peek()`.
+    #[inline]
     fn skip_ws(&mut self) -> Option<u8> {
         loop {
-            match self.peek()? {
-                b' ' | b'\t' | b'\n' | b'\r' => self.bump(),
+            if self.pos == self.end && !self.fill() {
+                return None;
+            }
+            match self.buf[self.pos] {
+                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
                 c => return Some(c),
+            }
+        }
+    }
+
+    /// Consumes the ASCII digits that come next, a block at a time, handing each to `digit`.
+    #[inline]
+    fn digits(&mut self, mut digit: impl FnMut(u8)) {
+        loop {
+            if self.pos == self.end && !self.fill() {
+                return;
+            }
+            let chunk = &self.buf[self.pos..self.end];
+            let n = chunk.iter().position(|b| !b.is_ascii_digit()).unwrap_or(chunk.len());
+            chunk[..n].iter().for_each(|&d| digit(d));
+            self.pos += n;
+            if self.pos < self.end {
+                return;
             }
         }
     }
@@ -231,34 +268,21 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
-    /// Reads a string whose opening quote is next. The text is kept up to `cap` bytes; None when it ran past
-    /// that, in which case the string is still read and checked to its closing quote.
+    /// Reads a string whose opening quote is next, handing its decoded bytes to `sink` a run at a time, and
+    /// checks it to its closing quote. What the sink keeps is its business: [`Discard`] keeps nothing and
+    /// [`Stack`] keeps a bounded prefix, so no string is ever copied to the heap here.
     ///
-    /// Bytes are taken a block at a time, so a 60 MiB string costs one pass and no allocation when nothing
-    /// is kept.
-    fn string(&mut self, cap: usize) -> Result<Option<String>, Stop> {
+    /// Bytes are taken a block at a time, so a 60 MiB string costs one pass and no allocation.
+    fn string_with<S: Sink>(&mut self, sink: &mut S) -> Result<(), Stop> {
         self.bump(); // the opening quote
-        let mut out: Vec<u8> = Vec::new();
-        let mut over = false;
         loop {
             if self.pos == self.end && !self.fill() {
                 return Err(Stop::Early);
             }
-            let (run, len) = {
-                let chunk = &self.buf[self.pos..self.end];
-                (
-                    chunk.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(chunk.len()),
-                    chunk.len(),
-                )
-            };
-            if !over {
-                if out.len() + run > cap {
-                    over = true;
-                    out = Vec::new();
-                } else {
-                    out.extend_from_slice(&self.buf[self.pos..self.pos + run]);
-                }
-            }
+            let chunk = &self.buf[self.pos..self.end];
+            let len = chunk.len();
+            let run = chunk.iter().position(|&b| ENDS_RUN[usize::from(b)]).unwrap_or(len);
+            sink.push(&chunk[..run]);
             self.pos += run;
             if run == len {
                 continue;
@@ -266,30 +290,27 @@ impl<R: Read> Reader<R> {
             match self.buf[self.pos] {
                 b'"' => {
                     self.bump();
-                    break;
+                    return Ok(());
                 }
                 b'\\' => {
                     self.bump();
-                    let mut escaped = Vec::new();
+                    let mut escaped = Esc { b: [0; 8], n: 0 };
                     self.escape(&mut escaped)?;
-                    if !over {
-                        if out.len() + escaped.len() > cap {
-                            over = true;
-                            out = Vec::new();
-                        } else {
-                            out.extend_from_slice(&escaped);
-                        }
-                    }
+                    sink.push(&escaped.b[..escaped.n]);
                 }
                 // A raw control character inside a string is not JSON.
                 _ => return Err(Stop::Syntax),
             }
         }
-        Ok(if over { None } else { Some(go_lossy_utf8(&out)) })
+    }
+
+    /// A string whose text nobody wants.
+    fn skip_string(&mut self) -> Result<(), Stop> {
+        self.string_with(&mut Discard)
     }
 
     /// Reads the escape after a backslash into `out`, as UTF-8.
-    fn escape(&mut self, out: &mut Vec<u8>) -> Result<(), Stop> {
+    fn escape(&mut self, out: &mut Esc) -> Result<(), Stop> {
         let mut c = self.next_byte()?;
         loop {
             let ch = match c {
@@ -352,62 +373,60 @@ impl<R: Read> Reader<R> {
         Ok(v)
     }
 
-    /// Reads a number whose first byte is next, checking Go's scanner grammar, and returns its text up to 64
-    /// bytes (a longer one is not an int64 either way).
+    /// Reads a number whose first byte is next, checking Go's scanner grammar, and returns its value when it
+    /// is an integer that fits an int64: what `str::parse::<i64>` of the number's text would give. A fraction,
+    /// an exponent or an overflow is None, a value that is valid JSON and not an int64.
     ///
     /// A number cut off where it could not yet be complete (`-`, `1.`, `1e`) is `Early`; one that simply ends
     /// the input is complete, which is how Go scans a bare scalar at EOF.
-    fn number(&mut self) -> Result<String, Stop> {
-        let mut text = String::new();
-        let mut push = |c: u8| {
-            if text.len() < 64 {
-                text.push(char::from(c));
-            }
-        };
-        if self.peek() == Some(b'-') {
-            push(b'-');
+    fn number(&mut self) -> Result<Option<i64>, Stop> {
+        let negative = self.peek() == Some(b'-');
+        if negative {
             self.bump();
         }
-        match self.next_byte()? {
-            c @ b'0' => push(c),
-            c @ b'1'..=b'9' => {
-                push(c);
-                while let Some(d @ b'0'..=b'9') = self.peek() {
-                    push(d);
-                    self.bump();
+        // Accumulated towards the sign it will have, so i64::MIN fits.
+        let mut value: Option<i64> = Some(0);
+        let accumulate = |acc: &mut Option<i64>, d: u8| {
+            let d = i64::from(d - b'0');
+            *acc = acc.and_then(|a| a.checked_mul(10)).and_then(|a| {
+                if negative {
+                    a.checked_sub(d)
+                } else {
+                    a.checked_add(d)
                 }
+            });
+        };
+        match self.next_byte()? {
+            c @ b'0' => accumulate(&mut value, c),
+            c @ b'1'..=b'9' => {
+                accumulate(&mut value, c);
+                self.digits(|d| accumulate(&mut value, d));
             }
             _ => return Err(Stop::Syntax),
         }
+        let mut integer = true;
         if self.peek() == Some(b'.') {
-            push(b'.');
+            integer = false;
             self.bump();
             match self.next_byte()? {
-                c @ b'0'..=b'9' => push(c),
+                b'0'..=b'9' => {}
                 _ => return Err(Stop::Syntax),
             }
-            while let Some(d @ b'0'..=b'9') = self.peek() {
-                push(d);
-                self.bump();
-            }
+            self.digits(|_| {});
         }
-        if let Some(e @ (b'e' | b'E')) = self.peek() {
-            push(e);
+        if let Some(b'e' | b'E') = self.peek() {
+            integer = false;
             self.bump();
-            if let Some(s @ (b'+' | b'-')) = self.peek() {
-                push(s);
+            if let Some(b'+' | b'-') = self.peek() {
                 self.bump();
             }
             match self.next_byte()? {
-                c @ b'0'..=b'9' => push(c),
+                b'0'..=b'9' => {}
                 _ => return Err(Stop::Syntax),
             }
-            while let Some(d @ b'0'..=b'9') = self.peek() {
-                push(d);
-                self.bump();
-            }
+            self.digits(|_| {});
         }
-        Ok(text)
+        Ok(if integer { value } else { None })
     }
 
     /// Go `skipValue` walks one JSON value without materialising it, so an unknown field costs no retention.
@@ -416,38 +435,39 @@ impl<R: Read> Reader<R> {
     /// while running out of input is the truncated read that must be retried. Structure is checked as it
     /// goes (commas, colons, string keys), as Go's `Token` does.
     fn skip_value(&mut self, max_depth: usize) -> Result<(), Skip> {
-        // The kind of each open container: true for an object.
-        let mut open: Vec<bool> = Vec::new();
+        // The kind of each open container is `self.open`: true for an object. It is the reader's own, so an
+        // entry's nested fields reuse one allocation instead of making a stack each.
+        self.open.clear();
         loop {
             // A value is next.
             match self.skip_ws().ok_or(Skip::Early)? {
                 b'{' => {
                     self.bump();
-                    if open.len() + 1 > max_depth {
+                    if self.open.len() + 1 > max_depth {
                         return Err(Skip::TooDeep);
                     }
                     if self.skip_ws().ok_or(Skip::Early)? == b'}' {
                         self.bump();
                     } else {
-                        open.push(true);
+                        self.open.push(true);
                         self.skip_key()?;
                         continue;
                     }
                 }
                 b'[' => {
                     self.bump();
-                    if open.len() + 1 > max_depth {
+                    if self.open.len() + 1 > max_depth {
                         return Err(Skip::TooDeep);
                     }
                     if self.skip_ws().ok_or(Skip::Early)? == b']' {
                         self.bump();
                     } else {
-                        open.push(false);
+                        self.open.push(false);
                         continue;
                     }
                 }
                 b'"' => {
-                    self.string(0)?;
+                    self.skip_string()?;
                 }
                 b'-' | b'0'..=b'9' => {
                     self.number()?;
@@ -468,13 +488,13 @@ impl<R: Read> Reader<R> {
             }
             // A value is complete: close what it closes, or move to the next sibling.
             loop {
-                let Some(&is_object) = open.last() else {
+                let Some(&is_object) = self.open.last() else {
                     return Ok(());
                 };
                 match (is_object, self.skip_ws().ok_or(Skip::Early)?) {
                     (true, b'}') | (false, b']') => {
                         self.bump();
-                        open.pop();
+                        self.open.pop();
                     }
                     (true, b',') => {
                         self.bump();
@@ -496,7 +516,7 @@ impl<R: Read> Reader<R> {
         if self.skip_ws().ok_or(Skip::Early)? != b'"' {
             return Err(Skip::Syntax);
         }
-        self.string(0)?;
+        self.skip_string()?;
         self.colon()?;
         Ok(())
     }
@@ -566,9 +586,10 @@ impl<R: Read> Reader<R> {
             if self.skip_ws().ok_or(Stop::Early)? != b'"' {
                 return Err(Stop::Syntax);
             }
-            let key = self.string(16)?;
+            let mut key = Stack::<16>::new();
+            self.string_with(&mut key)?;
             self.colon()?;
-            let field = key.as_deref().and_then(entry_field);
+            let field = key.bytes().and_then(entry_field);
             let c = self.skip_ws().ok_or(Stop::Early)?;
             match field {
                 Some(EntryField::Id) => match c {
@@ -576,9 +597,9 @@ impl<R: Read> Reader<R> {
                         self.bump();
                         self.literal(b"ull")?;
                     }
-                    b'-' | b'0'..=b'9' => match self.number()?.parse::<i64>() {
-                        Ok(id) => e.id = id,
-                        Err(_) => type_error = true,
+                    b'-' | b'0'..=b'9' => match self.number()? {
+                        Some(id) => e.id = id,
+                        None => type_error = true,
                     },
                     _ => {
                         self.skip_value(MAX_NESTING_DEPTH - 1).map_err(skip_to_stop)?;
@@ -594,10 +615,9 @@ impl<R: Read> Reader<R> {
                     // each is the most that can lower into range, so a longer value is unusable whatever it
                     // lowers to, and it is refused here without being copied.
                     b'"' => {
-                        e.hash = match self.string(4 * MAX_INFO_HASH_LEN)? {
-                            Some(h) => Hash::Text(h),
-                            None => Hash::TooLong,
-                        }
+                        let mut text = Stack::<HASH_CAP>::new();
+                        self.string_with(&mut text)?;
+                        e.hash = if text.over { Hash::TooLong } else { Hash::Text(text) };
                     }
                     _ => {
                         self.skip_value(MAX_NESTING_DEPTH - 1).map_err(skip_to_stop)?;
@@ -631,11 +651,71 @@ fn skip_to_stop(s: Skip) -> Stop {
     }
 }
 
+/// The most bytes of a hash value worth keeping: 40 runes of at most 4 bytes each is the most that can lower
+/// into range, so a longer value is unusable whatever it lowers to.
+const HASH_CAP: usize = 4 * MAX_INFO_HASH_LEN;
+
+/// Where a string's bytes go as it is read.
+trait Sink {
+    fn push(&mut self, bytes: &[u8]);
+}
+
+/// Keeps nothing.
+struct Discard;
+
+impl Sink for Discard {
+    #[inline]
+    fn push(&mut self, _: &[u8]) {}
+}
+
+/// Keeps the first `N` bytes on the stack. `over` says the string was longer, in which case nothing is kept.
+struct Stack<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+    over: bool,
+}
+
+impl<const N: usize> Stack<N> {
+    fn new() -> Self {
+        Stack { buf: [0; N], len: 0, over: false }
+    }
+
+    /// The string; None when it did not fit.
+    fn bytes(&self) -> Option<&[u8]> {
+        if self.over {
+            None
+        } else {
+            Some(&self.buf[..self.len])
+        }
+    }
+}
+
+impl<const N: usize> Sink for Stack<N> {
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) {
+        if self.over {
+            return;
+        }
+        if self.len + bytes.len() > N {
+            self.over = true;
+            return;
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+}
+
+/// One escape sequence's UTF-8: at most two replacement characters (a lone surrogate before another one).
+struct Esc {
+    b: [u8; 8],
+    n: usize,
+}
+
 #[derive(Default)]
 enum Hash {
     #[default]
     Unset,
-    Text(String),
+    Text(Stack<HASH_CAP>),
     /// Longer than any hash could lower into range.
     TooLong,
 }
@@ -653,30 +733,62 @@ enum EntryField {
 
 /// Which of the entry's two fields a key names. Go's decoder matches a key to a field case-insensitively, by
 /// simple folding, which adds U+017F (long s) to "s".
-fn entry_field(key: &str) -> Option<EntryField> {
-    let folded: String = key
-        .chars()
-        .map(|c| match c {
-            '\u{017F}' => 's',
-            '\u{212A}' => 'k',
-            c => c.to_ascii_lowercase(),
-        })
-        .collect();
-    match folded.as_str() {
-        "id" => Some(EntryField::Id),
-        "hash" => Some(EntryField::Hash),
+///
+/// Works on the key's UTF-8 bytes: an ASCII letter folds to lower case, U+017F (C5 BF) is "s" and U+212A (E2 84
+/// AA, the Kelvin sign) is "k", and anything else cannot be a letter of either name. The longest name is four
+/// letters, so nothing is built to compare.
+fn entry_field(key: &[u8]) -> Option<EntryField> {
+    let mut folded = [0u8; 4];
+    let mut n = 0;
+    let mut i = 0;
+    while i < key.len() {
+        let (c, width) = match key[i..] {
+            [0xC5, 0xBF, ..] => (b's', 2),
+            [0xE2, 0x84, 0xAA, ..] => (b'k', 3),
+            [b, ..] if b.is_ascii() => (b.to_ascii_lowercase(), 1),
+            _ => return None,
+        };
+        if n == folded.len() {
+            return None;
+        }
+        folded[n] = c;
+        n += 1;
+        i += width;
+    }
+    match &folded[..n] {
+        b"id" => Some(EntryField::Id),
+        b"hash" => Some(EntryField::Hash),
         _ => None,
     }
 }
 
-fn push_char(out: &mut Vec<u8>, c: char) {
+fn push_char(out: &mut Esc, c: char) {
     let mut b = [0u8; 4];
-    out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+    let s = c.encode_utf8(&mut b).as_bytes();
+    out.b[out.n..out.n + s.len()].copy_from_slice(s);
+    out.n += s.len();
 }
 
 /// A UTF-16 code unit as UTF-8; a surrogate on its own is the replacement character.
-fn push_code(out: &mut Vec<u8>, code: u16) {
+fn push_code(out: &mut Esc, code: u16) {
     push_char(out, char::from_u32(u32::from(code)).unwrap_or('\u{FFFD}'));
+}
+
+/// The listing's hash as the map key: Go `strings.ToLower` of the decoded text, None when it is not the length
+/// of an infohash. An ASCII hash is checked by its length before anything is built and is allocated exactly
+/// once, at its final size; a hash with other characters takes the slow road, where the lowered length is what
+/// decides.
+fn lowered_hash(raw: &[u8]) -> Option<String> {
+    if raw.is_ascii() {
+        if !(MIN_INFO_HASH_LEN..=MAX_INFO_HASH_LEN).contains(&raw.len()) {
+            return None;
+        }
+        let mut s = String::with_capacity(raw.len());
+        s.extend(raw.iter().map(|b| char::from(b.to_ascii_lowercase())));
+        return Some(s);
+    }
+    let hash = go_to_lower(&go_lossy_utf8(raw));
+    (MIN_INFO_HASH_LEN..=MAX_INFO_HASH_LEN).contains(&hash.len()).then_some(hash)
 }
 
 /// Go's string decoding of bytes that are not UTF-8: every byte that does not begin a valid sequence becomes
@@ -785,9 +897,10 @@ fn walk<R: Read>(rd: &mut Reader<R>) -> Result<HashMap<String, i64>, ListingFaul
         if rd.skip_ws() != Some(b'"') {
             return Err(Retry);
         }
-        let key = rd.string(16).map_err(|_| Retry)?;
-        match key.as_deref() {
-            Some("success") => {
+        let mut key = Stack::<16>::new();
+        rd.string_with(&mut key).map_err(|_| Retry)?;
+        match key.bytes() {
+            Some(b"success") => {
                 // Same split as the entry decode below: `success` arriving as a string is a schema change,
                 // a body cut off here is a blip.
                 rd.colon().map_err(listing_fault_for)?;
@@ -795,7 +908,7 @@ fn walk<R: Read>(rd: &mut Reader<R>) -> Result<HashMap<String, i64>, ListingFaul
                     success = v;
                 }
             }
-            Some("data") => {
+            Some(b"data") => {
                 // A REPEATED `data` key makes the body unreadable, rather than picking one of them.
                 //
                 // Two rules were tried here and each was unsafe in one direction. "Last wins" lets a trailing
@@ -828,7 +941,7 @@ fn walk<R: Read>(rd: &mut Reader<R>) -> Result<HashMap<String, i64>, ListingFaul
                     // token read above rather than yielding a well-formed one of the wrong kind.
                     b'{' => return Err(BadEnvelope),
                     b'"' => {
-                        rd.string(0).map_err(|_| Retry)?;
+                        rd.skip_string().map_err(|_| Retry)?;
                         return Err(BadEnvelope);
                     }
                     b'-' | b'0'..=b'9' => {
@@ -904,11 +1017,8 @@ fn walk<R: Read>(rd: &mut Reader<R>) -> Result<HashMap<String, i64>, ListingFaul
                     // runes of at most 4 bytes each is the most that can lower into range — so the 60 MiB
                     // case is still refused without allocating. (Here that guard is the `string` cap in
                     // `entry`, which refuses the long value without keeping it.)
-                    let Hash::Text(raw) = e.hash else { continue };
-                    let hash = go_to_lower(&raw);
-                    if hash.len() < MIN_INFO_HASH_LEN || hash.len() > MAX_INFO_HASH_LEN {
-                        continue;
-                    }
+                    let Hash::Text(raw) = &e.hash else { continue };
+                    let Some(hash) = lowered_hash(&raw.buf[..raw.len]) else { continue };
                     map.insert(hash, e.id);
                 }
                 // Entries arrived and NONE of them were usable: that is a listing we could not read, not an
