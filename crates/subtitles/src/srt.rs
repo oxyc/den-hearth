@@ -192,6 +192,12 @@ fn escape_vtt(line: &str) -> String {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes `tag_end` has examined on this thread; lets a test assert on work done, not time.
+    static TAG_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Byte index of the `>` closing a WebVTT tag at the start of `s`, or `None` if this `<` is just a
 /// less-than sign. Covers `<i>`, `</i>`, `<c.loud>`, `<v Fred>`, `<lang en>` and the timestamp form
 /// `<00:00:01.000>`.
@@ -215,7 +221,10 @@ fn tag_end(s: &str) -> Option<usize> {
     if !s.starts_with('<') {
         return None;
     }
-    let end = s.bytes().take(MAX_TAG).position(|b| b == b'>')?;
+    let scan = s.bytes().take(MAX_TAG);
+    #[cfg(test)]
+    let scan = scan.inspect(|_| TAG_BYTES_SCANNED.with(|c| c.set(c.get() + 1)));
+    let end = { scan }.position(|b| b == b'>')?;
     let inner = s.get(1..end)?;
     let name = inner.strip_prefix('/').unwrap_or(inner);
     if !name.chars().next()?.is_ascii_alphanumeric() {
@@ -428,47 +437,40 @@ mod tests {
     /// A cue is arbitrary downloaded text and `to_vtt` re-runs this per request, on the one runtime
     /// thread, caching nothing. Scanning the rest of the line for a `>` at every `<` was quadratic:
     /// 794 ms at 320 KB, and roughly twenty minutes at the body cap — one request stalling the
-    /// process. The bound is loose on purpose; it catches a return to quadratic, not milliseconds.
+    /// process.
     #[test]
     fn escaping_a_hostile_line_stays_linear() {
-        // A RATIO, not a wall-clock bound. The quadratic version did 400 KB of this in about 1.2s in
-        // the test profile, so an absolute bound loose enough to be stable across machines was also
-        // loose enough to pass on the bug — which is what a first attempt at this test did.
-        // Doubling the input doubles linear work and quadruples quadratic work; 8x leaves room for
-        // noise while still failing on n².
-        let time_for = |repeats: usize| {
-            let cues = vec![Cue { index: 1, start: 0, end: 1000, text: "<a".repeat(repeats) }];
-            let started = std::time::Instant::now();
-            let out = serialize_vtt(&cues);
-            // And it really did escape them, rather than finding a shortcut that skips the work.
-            assert!(out.contains("&lt;a"), "the hostile line was not escaped at all");
-            started.elapsed()
+        // Counts the bytes `tag_end` examines, not seconds. A wall-clock ratio flaked on a loaded
+        // machine (8.3x for 4x the input at load average 22) because it measured the scheduler as
+        // much as the algorithm. Work done is deterministic: 4x the input is 4x the bytes scanned
+        // when linear (a hair under, at the line's tail) and about 16x when quadratic.
+        let scanned_for = |text: String, expect: &str| {
+            TAG_BYTES_SCANNED.with(|c| c.set(0));
+            let cues = vec![Cue { index: 1, start: 0, end: 1000, text }];
+            // And it really did escape or pass through the line, rather than finding a shortcut
+            // that skips the work.
+            assert!(serialize_vtt(&cues).contains(expect), "the line was not handled: {expect}");
+            TAG_BYTES_SCANNED.with(|c| c.get())
         };
 
-        // Fastest of three, not one. The suite runs these in parallel, so a single sample can be
-        // scheduled against the rest of it — and a ratio of two noisy samples is twice as noisy.
-        // The minimum is the run that got the least interference, which is the one worth comparing.
-        let best_of_three = |repeats: usize| (0..3).map(|_| time_for(repeats)).min().unwrap();
+        // The last few `<`s have fewer bytes left to scan, so `small` is short of 64 per `<` by a
+        // constant that the 4x multiplication triples. A few KiB of slack covers it; a quadratic
+        // scan overshoots by millions of bytes.
+        const SLACK: usize = 16 * 1024;
 
-        let small = best_of_three(100_000).max(std::time::Duration::from_micros(200));
-        let large = best_of_three(400_000);
-        let ratio = large.as_secs_f64() / small.as_secs_f64();
-        assert!(ratio < 8.0, "4x the input took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
+        // Every `<` is rejected, so each one scans the full bound: the worst case for the scan.
+        let small = scanned_for("<a".repeat(10_000), "&lt;a");
+        let large = scanned_for("<a".repeat(40_000), "&lt;a");
+        assert!(small > 0, "the bounded scan never ran, so this test proves nothing");
+        assert!(large <= 4 * small + SLACK, "4x the input scanned {large} bytes vs {small} — quadratic?");
 
         // The other branch: every `<` DOES close, so each one is accepted as a tag and copied through
         // its own allocation. Linear too, and untested by the case above, which only ever takes the
         // reject path.
-        let tagged = |repeats: usize| {
-            let cues = vec![Cue { index: 1, start: 0, end: 1000, text: "<i>x</i>".repeat(repeats) }];
-            let started = std::time::Instant::now();
-            assert!(serialize_vtt(&cues).contains("<i>x</i>"), "tags were not passed through");
-            started.elapsed()
-        };
-        let best_tagged = |repeats: usize| (0..3).map(|_| tagged(repeats)).min().unwrap();
-        let small = best_tagged(50_000).max(std::time::Duration::from_micros(200));
-        let large = best_tagged(200_000);
-        let ratio = large.as_secs_f64() / small.as_secs_f64();
-        assert!(ratio < 8.0, "4x the tags took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
+        let small = scanned_for("<i>x</i>".repeat(10_000), "<i>x</i>");
+        let large = scanned_for("<i>x</i>".repeat(40_000), "<i>x</i>");
+        assert!(small > 0, "the bounded scan never ran, so this test proves nothing");
+        assert!(large <= 4 * small + SLACK, "4x the tags scanned {large} bytes vs {small} — quadratic?");
     }
 
     #[test]
