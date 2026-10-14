@@ -48,7 +48,12 @@ pub(crate) fn manifest_version() -> &'static str {
 
 /// Go `versionFrom`: DEN_VERSION when set, else DEV_VERSION.
 pub(crate) fn version_from(get: impl Fn(&str) -> String) -> String {
-    todo!("manifest.go versionFrom")
+    let v = get("DEN_VERSION");
+    if v.is_empty() {
+        DEV_VERSION.to_owned()
+    } else {
+        v
+    }
 }
 
 /// Go `buildManifest`: the manifest for a config (`None` = unconfigured).
