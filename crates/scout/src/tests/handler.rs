@@ -433,6 +433,11 @@ pub(crate) fn dead_link(reason: &str) -> StoreError {
     StoreError::DeadLink(DeadLinkError { reason: reason.to_owned() })
 }
 
+/// One request through the handler, its response body read whole.
+pub(crate) async fn send(h: &Handler, req: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
+    h.serve(req).await
+}
+
 /// handler_test.go's `do`: a GET with the given headers.
 pub(crate) async fn get(h: &Handler, path: &str, headers: &[(&str, &str)]) -> http::Response<Vec<u8>> {
     method(h, http::Method::GET, path, headers).await
@@ -446,7 +451,7 @@ pub(crate) async fn post_json(h: &Handler, path: &str, body: &str) -> http::Resp
         .header("content-type", "application/json")
         .body(body.as_bytes().to_vec())
         .expect("a valid request");
-    h.serve(req).await
+    send(h, req).await
 }
 
 /// handler_test.go's `doMethod`.
@@ -460,7 +465,7 @@ pub(crate) async fn method(
     for (k, v) in headers {
         b = b.header(*k, *v);
     }
-    h.serve(b.body(Vec::new()).expect("a valid request")).await
+    send(h, b.body(Vec::new()).expect("a valid request")).await
 }
 
 /// A response header's value, or "" when absent, as Go's `Header().Get` returns it.

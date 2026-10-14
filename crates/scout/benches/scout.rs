@@ -213,6 +213,37 @@ fn ticket_open(bencher: Bencher) {
     bencher.bench(|| keys.open(black_box(&ticket), now).unwrap());
 }
 
+// ---- the handler: a request through routing, the list cache, the conditional GET and the play route ----------
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+/// A warm stream-list hit: the request every Stremio client sends when it opens a title it has opened before.
+#[divan::bench]
+fn handler_list_warm_hit(bencher: Bencher) {
+    let rt = runtime();
+    let hb = rt.block_on(bench_api::handler_bench(releases(500)));
+    bencher.bench_local(|| rt.block_on(bench_api::handler_get(&hb, black_box(&hb.list), None)));
+}
+
+/// The same list revalidated with its ETag: a 304.
+#[divan::bench]
+fn handler_list_revalidate(bencher: Bencher) {
+    let rt = runtime();
+    let hb = rt.block_on(bench_api::handler_bench(releases(500)));
+    assert_eq!(rt.block_on(bench_api::handler_get(&hb, &hb.list, Some(&hb.etag))), 304);
+    bencher.bench_local(|| rt.block_on(bench_api::handler_get(&hb, black_box(&hb.list), Some(&hb.etag))));
+}
+
+/// A play ticket whose link is in the link memo: open the ticket, find the link, redirect.
+#[divan::bench]
+fn handler_ticket_play(bencher: Bencher) {
+    let rt = runtime();
+    let hb = rt.block_on(bench_api::handler_bench(releases(500)));
+    bencher.bench_local(|| rt.block_on(bench_api::handler_get(&hb, black_box(&hb.ticket), None)));
+}
+
 // ---- caches --------------------------------------------------------------------------------------------------
 
 fn keys(n: usize) -> Vec<String> {

@@ -21,6 +21,7 @@ mod deps;
 mod diskcache;
 mod extra;
 mod go_wire_vectors;
+mod golden;
 mod handler;
 mod hostlimit;
 mod indexerconfig;

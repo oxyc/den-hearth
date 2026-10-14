@@ -3,12 +3,23 @@
 //!
 //! These are one-line forwards, so a benchmark measures the production function and not a copy of it.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
+
+use crate::cache::MemoryCache;
+use crate::config::{DebridService, Indexer};
+use crate::deps::Deps;
 use crate::diskcache::TieredCache;
+use crate::handler::{new_handler, Handler};
 use crate::probe::Probe;
 use crate::rank::{self, RankFilters, RawStream};
+use crate::scrape::{DoError, ScrapeQuery, Scraper};
 use crate::season::{self, TorrentFile};
+use crate::stores::{ResolveTarget, Store, StoreError, StoreStatus};
 
 /// A movie request: the filters a configured install sets, a release year and the title's tokens.
 pub fn rank_movie(streams: &[RawStream]) -> Vec<RawStream> {
@@ -92,4 +103,107 @@ pub fn tiered_cache_without_disk_budget(memory_bytes: usize, dir: &Path) -> Tier
     let mut cache = TieredCache::new(memory_bytes, dir);
     cache.max_bytes = 0;
     cache
+}
+
+/// An indexer that answers the same releases every time.
+struct FixedScraper(Vec<RawStream>);
+
+#[async_trait]
+impl Scraper for FixedScraper {
+    fn id(&self) -> Indexer {
+        Indexer("torrentio".to_owned())
+    }
+
+    async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A TorBox account that holds everything and resolves every release to one link.
+struct HeldStore;
+
+#[async_trait]
+impl Store for HeldStore {
+    fn service(&self) -> DebridService {
+        DebridService::TorBox
+    }
+
+    async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        Ok(hashes.iter().map(|h| (h.clone(), true)).collect())
+    }
+
+    async fn resolve(&self, _t: &ResolveTarget) -> Result<String, StoreError> {
+        Ok("https://cdn.example/file.mkv".to_owned())
+    }
+
+    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+        None
+    }
+}
+
+/// The handler's hot paths, warmed: a stream list already in the list cache, its ETag, and a play ticket whose
+/// link is already in the link memo. Built with sealing on, as production runs.
+pub struct HandlerBench {
+    handler: Handler,
+    pub list: String,
+    pub etag: String,
+    pub ticket: String,
+}
+
+/// Builds and warms a `HandlerBench` over `streams`. Call inside a runtime.
+pub async fn handler_bench(streams: Vec<RawStream>) -> HandlerBench {
+    let mut private = [0u8; 32];
+    for (i, b) in private.iter_mut().enumerate() {
+        *b = i as u8 + 1;
+    }
+    let keyring = crate::seal::SealKeyring { keys: vec![den_seal::KeyPair::new(private)] };
+    let plain = br#"{"debrid":[{"service":"torbox","token":"tb-bench"}],"indexers":["torrentio"]}"#;
+    let mut sealed = vec![crate::seal::SEALED_VERSION];
+    sealed.extend(crate::seal::seal(&keyring.keys[0].pub_key, plain).expect("seal"));
+    let blob = crate::util::b64url_encode(&sealed);
+    let streams = Arc::new(streams);
+    let deps = Deps {
+        cache: Arc::new(MemoryCache::new(64 << 20)),
+        probe_client: None,
+        probe_doer: None,
+        meta: None,
+        scrape_timeout: Duration::from_secs(8),
+        list_ttl: Duration::from_secs(3600),
+        public_url: "https://scout.example".to_owned(),
+        make_scrapers: Arc::new(move |_| vec![Box::new(FixedScraper(streams.to_vec())) as Box<dyn Scraper>]),
+        make_stores: Arc::new(|_| vec![Box::new(HeldStore) as Box<dyn Store>]),
+        seal_keyring: Some(Arc::new(keyring)),
+        config_key_invalid: false,
+        metrics_token: String::new(),
+        log_requests: false,
+        revocation: Default::default(),
+        remux_key: String::new(),
+        play_ticket_ttl: crate::ticket::DEFAULT_PLAY_TICKET_TTL,
+        legacy_play_until: None,
+    };
+    let handler = new_handler(deps);
+    let list = format!("/{blob}/stream/movie/tt0111161.json");
+    let (status, etag, body) = request(&handler, &list, None).await;
+    assert_eq!(status, 200, "the list did not build");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON list");
+    let url = body["streams"][0]["url"].as_str().expect("a play URL").to_owned();
+    let ticket = url.trim_start_matches("https://scout.example").to_owned();
+    assert_eq!(request(&handler, &ticket, None).await.0, 302, "the ticket did not play");
+    HandlerBench { handler, list, etag, ticket }
+}
+
+/// One GET through the handler: its status, ETag and body.
+async fn request(h: &Handler, path: &str, if_none_match: Option<&str>) -> (u16, String, Vec<u8>) {
+    let mut req = http::Request::get(path);
+    if let Some(tag) = if_none_match {
+        req = req.header("if-none-match", tag);
+    }
+    let resp = h.serve(req.body(Vec::new()).expect("a valid request")).await;
+    let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+    (resp.status().as_u16(), etag, resp.into_body())
+}
+
+/// A GET of `path` through the warmed handler, revalidating with `if_none_match`; the status it answered.
+pub async fn handler_get(b: &HandlerBench, path: &str, if_none_match: Option<&str>) -> u16 {
+    request(&b.handler, path, if_none_match).await.0
 }
