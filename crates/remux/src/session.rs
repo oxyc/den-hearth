@@ -847,7 +847,7 @@ impl Session {
         // The next session for this release must not be handed the link that just failed.
         st.opened().forget(&self.opened_key);
         let play_url = crate::config::local(&self.play_url, &st.cfg.origin_aliases);
-        match scout::resolve(&st.scout_http, &play_url, &self.source).await {
+        match scout::resolve(&st.scout_http, &play_url, &self.source, st.source_guard).await {
             Ok(r) => {
                 if let Some(door) = &self.door {
                     door.set_upstream(&r.url);
@@ -1548,9 +1548,14 @@ async fn open(
         return Ok(hit);
     }
     // A ticket on scout's public name (d-play) is fetched at its LAN address, like the install it came from.
-    let r = scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src)
-        .await
-        .map_err(OpenFailure::passing)?;
+    let r = scout::resolve(
+        &st.scout_http,
+        &crate::config::local(&s.url, &st.cfg.origin_aliases),
+        src,
+        st.source_guard,
+    )
+    .await
+    .map_err(OpenFailure::passing)?;
     let stable_key = crate::state::probe_key(r.size, &r.head);
     let cached = stable_key.as_deref().and_then(|key| st.probe(key));
     let from_cache = cached.is_some();

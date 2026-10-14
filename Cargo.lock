@@ -438,6 +438,9 @@ dependencies = [
 [[package]]
 name = "den-net"
 version = "0.0.0"
+dependencies = [
+ "base64 0.23.1",
+]
 
 [[package]]
 name = "den-reel"
@@ -448,6 +451,7 @@ dependencies = [
  "blake2",
  "bytes",
  "crypto_box",
+ "den-net",
  "divan",
  "futures-util",
  "http-body-util",
@@ -469,6 +473,7 @@ version = "0.47.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "den-net",
  "divan",
  "dolby_vision",
  "futures-util",

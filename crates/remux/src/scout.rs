@@ -174,6 +174,59 @@ impl ScoutSource {
     }
 }
 
+/// Which hosts a play URL may lead to once it leaves scout. Scout's own origin (`SCOUT_ORIGINS`, after
+/// `ORIGIN_ALIASES`) is always allowed, LAN or loopback as it may be; every other hop of the redirect chain, the
+/// debrid's link that ffmpeg then reads included, must be on the public internet. Without this a scout, or an
+/// indexer behind it, that answers a play URL with `Location: http://169.254.169.254/…` has this service fetch it.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceGuard {
+    allow_private: bool,
+}
+
+impl SourceGuard {
+    /// Refuses every non-public host off scout's origin.
+    pub const fn strict() -> SourceGuard {
+        SourceGuard { allow_private: false }
+    }
+
+    /// What the running service uses. Only this crate's own tests are exempt (their sources are 127.0.0.1
+    /// servers); there is no switch for it in a build that ships.
+    #[cfg(not(test))]
+    pub const fn for_build() -> SourceGuard {
+        SourceGuard::strict()
+    }
+
+    #[cfg(test)]
+    pub const fn for_build() -> SourceGuard {
+        SourceGuard { allow_private: true }
+    }
+
+    /// `Ok` when `url` may be fetched: an IP literal must be public, a name must resolve and every address it
+    /// resolves to must be public.
+    async fn check(&self, url: &reqwest::Url) -> Result<(), String> {
+        const REFUSED: &str = "the play URL led to a host that is not on the public internet";
+        if self.allow_private {
+            return Ok(());
+        }
+        let host = url.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return if den_net::is_public(ip) { Ok(()) } else { Err(REFUSED.into()) };
+        }
+        if host.is_empty() {
+            return Err(REFUSED.into());
+        }
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| "the play URL's host did not resolve".to_string())?
+            .collect();
+        if addrs.is_empty() || addrs.iter().any(|a| !den_net::is_public(a.ip())) {
+            return Err(REFUSED.into());
+        }
+        Ok(())
+    }
+}
+
 /// A scout base URL a browser handed over, accepted only as `<allowed origin>/<config>`: an origin in
 /// `SCOUT_ORIGINS`, exactly one path segment of base64url (den-scout's sealed config alphabet), and no
 /// credentials, query or fragment. This is the SSRF guard — without it a logged-in browser could make
@@ -249,10 +302,16 @@ pub async fn resolve(
     client: &reqwest::Client,
     play_url: &str,
     src: &ScoutSource,
+    guard: SourceGuard,
 ) -> Result<Resolved, String> {
     let mut url = reqwest::Url::parse(play_url).map_err(|_| "the play URL does not parse".to_string())?;
     let mut hops = 0;
     let resp = loop {
+        // Scout itself is reached wherever it lives; any other hop, the last one (which ffmpeg then reads) included,
+        // is checked before a byte is sent to it.
+        if !src.is_scout(&url) {
+            guard.check(&url).await?;
+        }
         let mut req =
             client.get(url.clone()).header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD_BYTES - 1));
         if let Some(k) = src.key.as_deref().filter(|_| src.is_scout(&url)) {
@@ -317,6 +376,69 @@ pub async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scout at 127.0.0.1: `/p/t` redirects to `location` (absolute, or a path on itself), `/final` is a file.
+    async fn scout_redirecting_to(location: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let resp = if buf[..n].starts_with(b"GET /final") {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc".to_string()
+                } else {
+                    format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        base
+    }
+
+    async fn resolve_through(location: &'static str, guard: SourceGuard) -> Result<Resolved, String> {
+        let origin = scout_redirecting_to(location).await;
+        let src = ScoutSource { base: format!("{origin}/cfg"), key: None };
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        resolve(&client, &format!("{origin}/p/t"), &src, guard).await
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_scout_to_a_non_public_host_is_refused() {
+        for location in [
+            "http://127.0.0.1:9/x",
+            "http://169.254.169.254/latest/meta-data",
+            "http://192.168.86.193:8080/x",
+            "http://10.0.0.5/x",
+            "http://100.64.0.1/x",
+            "http://[::1]/x",
+            "http://[fd7a:115c:a1e0::1]/x",
+            "http://[::ffff:10.0.0.1]/x",
+            "http://[64:ff9b::808:808]/x",
+            "http://localhost/x",
+        ] {
+            let err = resolve_through(location, SourceGuard::strict()).await.err().expect(location);
+            assert!(err.contains("not on the public internet"), "{location}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scout_itself_stays_reachable_wherever_it_lives() {
+        // The play URL, the redirect target and the file are all on the scout at 127.0.0.1.
+        let r =
+            resolve_through("/final", SourceGuard::strict()).await.expect("scout's own origin is allowed");
+        assert_eq!(r.head, b"abc");
+    }
+
+    #[tokio::test]
+    async fn a_public_host_passes_the_guard() {
+        let guard = SourceGuard::strict();
+        for url in ["http://93.184.216.34/x", "https://[2606:4700:4700::1111]/x"] {
+            guard.check(&reqwest::Url::parse(url).unwrap()).await.expect(url);
+        }
+    }
 
     fn fixture() -> Vec<Stream> {
         parse(include_bytes!("../testdata/scout-streams.json")).expect("fixture parses")

@@ -436,6 +436,8 @@ pub struct AppState {
     /// For requests to scout: follows no redirect, so the service key cannot be carried off scout's
     /// origin (`scout::resolve` follows them by hand).
     pub scout_http: reqwest::Client,
+    /// Which hosts a play URL may lead to off scout's origin (`scout::resolve`).
+    pub source_guard: crate::scout::SourceGuard,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Ended sessions and the expiry their URLs were signed with.
     tombstones: Mutex<HashMap<String, u64>>,
@@ -569,6 +571,7 @@ impl AppState {
             http: client(reqwest::redirect::Policy::default()),
             source_http: source_client(Duration::from_secs(10), SOURCE_READ_IDLE),
             scout_http: client(reqwest::redirect::Policy::none()),
+            source_guard: crate::scout::SourceGuard::for_build(),
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             creating: Mutex::new(HashMap::new()),
