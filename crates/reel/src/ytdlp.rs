@@ -604,7 +604,7 @@ pub(crate) fn is_group_live(pgid: u32) -> bool {
 }
 
 /// SIGKILL every download still running. Returns how many groups it signalled.
-pub(crate) fn kill_live_groups() -> usize {
+pub fn kill_live_groups() -> usize {
     let taken = {
         let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         g.take().unwrap_or_default()

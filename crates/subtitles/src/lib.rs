@@ -32,7 +32,7 @@ pub mod bench_api;
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
@@ -45,6 +45,13 @@ use tokio::net::TcpListener;
 pub use crate::config::Config;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+
+/// Lock `m`, recovering the data if a panic poisoned it. Every map behind these locks is left
+/// consistent between statements, and a `Drop` that unwrapped a poisoned lock would panic while
+/// unwinding and abort the whole process (hearth hosts four services in it).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The release the image carries (`DEN_VERSION`, set from the repo's `VERSION` file at build time). Keeping it
 /// out of Cargo.toml means a release does not invalidate the cached dependency build merely to change its tag.
@@ -393,20 +400,19 @@ pub fn init(cfg: Config) -> Arc<AppState> {
     state
 }
 
-async fn run(cfg: Config) -> std::io::Result<()> {
-    let port = cfg.port;
-    let state = init(cfg);
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    // Registered before the process says it is up, so a stop that arrives from here on drains.
-    let shutdown = shutdown_signal();
-    // What this process is running with, minus anything secret: the key and the token appear only as
-    // on/off, and the origin is one the addon hands to every client anyway. Same shape as every other
-    // den addon's line.
+/// The line Subtitles logs once it is listening. Hearth prints it too, since its own startup line only
+/// names the services.
+///
+/// What this process is running with, minus anything secret: the key and the token appear only as
+/// on/off, and the origin is one the addon hands to every client anyway. Same shape as every other
+/// den addon's line.
+pub fn startup_line(state: &AppState) -> String {
     let on_off = |on: bool| if on { "on" } else { "off" };
-    eprintln!(
-        "den-subtitles {} listening on :{port} — metrics={} log_requests={} log_identity={} sealed={} \
+    format!(
+        "den-subtitles {} listening on :{} — metrics={} log_requests={} log_identity={} sealed={} \
          revoked={} epoch={} require_iid={} cache_dir={} cache_max_mib={} public_base={} resync={}",
         release_version(),
+        state.cfg.port,
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
         on_off(state.cfg.log_identity),
@@ -422,7 +428,16 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             true => "off".to_string(),
             false => state.cfg.scout_origins.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
         },
-    );
+    )
+}
+
+async fn run(cfg: Config) -> std::io::Result<()> {
+    let port = cfg.port;
+    let state = init(cfg);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    // Registered before the process says it is up, so a stop that arrives from here on drains.
+    let shutdown = shutdown_signal();
+    eprintln!("{}", startup_line(&state));
 
     serve_until(listener, state, shutdown, DRAIN_GRACE).await;
     Ok(())

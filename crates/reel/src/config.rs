@@ -149,9 +149,9 @@ pub struct Config {
     pub cache_epoch: std::sync::atomic::AtomicU64,
 }
 
-fn env_opt(key: &str) -> Option<String> {
+pub(crate) fn env_opt(key: &str) -> Option<String> {
     match env::var(key) {
-        Ok(v) if !v.is_empty() => Some(v),
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
         _ => None,
     }
 }

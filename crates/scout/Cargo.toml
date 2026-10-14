@@ -53,6 +53,9 @@ fastrand = "2"
 # The memory tier (cache.rs `MemoryCache`): a sharded, byte-weighted cache, so a hit does not queue behind a
 # write and the budget is bytes, not entries.
 quick_cache = "0.6"
+# Go `crypto/subtle`: the constant-time compare behind the metrics token and the config key. The same
+# version den-reel, den-remux and den-subtitles carry.
+subtle = "2"
 
 [features]
 # Forwards to the pub(crate) hot paths for benches/scout.rs (src/bench_api.rs). Off in every build that ships.

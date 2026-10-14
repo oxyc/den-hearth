@@ -58,6 +58,7 @@ pub use crate::config::Config;
 use crate::httputil::query_param;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+pub use crate::ytdlp::kill_live_groups;
 use std::sync::{Arc, OnceLock};
 
 /// The release the image carries, from `DEN_VERSION` (set by the Dockerfile from the repo's `VERSION` file).
@@ -1226,10 +1227,32 @@ pub async fn finish(state: &Arc<AppState>) {
     state::save_index_cache(state);
 }
 
+/// The line Reel logs once it is listening: its version, port and the switches an operator checks.
+/// Hearth prints it too, since its own startup line only names the services.
+pub fn startup_line(state: &AppState) -> String {
+    let on = |b: bool| if b { "on" } else { "off" };
+    let cfg = &state.cfg;
+    format!(
+        "den-reel {} listening on :{} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
+         require_iid={} play_signing={} direct_media_max={} env_tmdb_key={} cache={} max_height={}",
+        release_version(),
+        cfg.port,
+        on(cfg.metrics_token.is_some()),
+        on(cfg.log_requests),
+        on(state.config_keyring.is_some()),
+        cfg.revocation.revoked_count(),
+        cfg.revocation.epoch(),
+        on(cfg.revocation.requires_install_id()),
+        play_signing_state(cfg, (state.clock)()),
+        cfg.direct_media_concurrency,
+        on(cfg.tmdb_key.is_some()),
+        cfg.cache_dir.display(),
+        cfg.max_height,
+    )
+}
+
 async fn run(cfg: Config) -> std::io::Result<()> {
     let port = cfg.port;
-    let cache_disp = cfg.cache_dir.display().to_string();
-    let max_h = cfg.max_height.clone();
     let state = init(cfg);
 
     // Built ONCE, before serving — and before the startup line, since until the handlers are
@@ -1245,21 +1268,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let shutdown = shutdown_signal();
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    let on = |b: bool| if b { "on" } else { "off" };
-    eprintln!(
-        "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
-         require_iid={} play_signing={} direct_media_max={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
-        release_version(),
-        on(state.cfg.metrics_token.is_some()),
-        on(state.cfg.log_requests),
-        on(state.config_keyring.is_some()),
-        state.cfg.revocation.revoked_count(),
-        state.cfg.revocation.epoch(),
-        on(state.cfg.revocation.requires_install_id()),
-        play_signing_state(&state.cfg, (state.clock)()),
-        state.cfg.direct_media_concurrency,
-        on(state.cfg.tmdb_key.is_some()),
-    );
+    eprintln!("{}", startup_line(&state));
 
     let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;
 

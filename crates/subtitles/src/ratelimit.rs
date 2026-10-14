@@ -69,7 +69,7 @@ impl Pauses {
     /// bounded: a canceled waiter drops its Arc, and the next acquire sweeps dead entries.
     pub async fn acquire(&self, key: u64) -> OwnedSemaphorePermit {
         let semaphore = {
-            let mut entries = self.admission.lock().unwrap();
+            let mut entries = crate::lock(&self.admission);
             entries.retain(|_, semaphore| semaphore.strong_count() > 0);
             match entries.get(&key).and_then(Weak::upgrade) {
                 Some(semaphore) => semaphore,
@@ -86,12 +86,12 @@ impl Pauses {
     /// Snapshot the pause revision immediately before a request leaves. Its response may clear only
     /// that revision, never a newer refusal received from a concurrent request.
     pub fn begin(&self, key: u64) -> Observation {
-        Observation(self.inner.lock().unwrap().get(&key).map(|p| p.generation).unwrap_or(0))
+        Observation(crate::lock(&self.inner).get(&key).map(|p| p.generation).unwrap_or(0))
     }
 
     /// How much longer this credential must wait, or `None` if it may call now.
     pub fn remaining(&self, key: u64) -> Option<Duration> {
-        let g = self.inner.lock().unwrap();
+        let g = crate::lock(&self.inner);
         let left = g.get(&key)?.until.checked_duration_since(Instant::now())?;
         (!left.is_zero()).then_some(left)
     }
@@ -101,7 +101,7 @@ impl Pauses {
     /// all come back in the same instant. Returns the wait now in force.
     pub fn limited(&self, key: u64, stated: Option<Duration>) -> Duration {
         let now = Instant::now();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = crate::lock(&self.inner);
         make_room(&mut g, key, now);
         let generation = self.sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let p = g.entry(key).or_insert(Pause { until: now, strikes: 0, generation });
@@ -127,7 +127,7 @@ impl Pauses {
     /// Not capped here: a quota's reset is a fact, not a guess, and the caller bounds it.
     pub fn hold(&self, key: u64, wait: Duration) {
         let now = Instant::now();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = crate::lock(&self.inner);
         make_room(&mut g, key, now);
         let generation = self.sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let p = g.entry(key).or_insert(Pause { until: now, strikes: 0, generation });
@@ -137,7 +137,7 @@ impl Pauses {
 
     /// The service answered. That ends the pause and the run of strikes behind it.
     pub fn answered(&self, key: u64, observed: Observation) {
-        let mut pauses = self.inner.lock().unwrap();
+        let mut pauses = crate::lock(&self.inner);
         if pauses.get(&key).is_some_and(|pause| pause.generation == observed.0) {
             pauses.remove(&key);
         }
@@ -433,7 +433,7 @@ mod tests {
         for i in 0..(MAX_KEYS as u64 + 50) {
             p.hold(i, Duration::from_secs(60 + i));
         }
-        let g = p.inner.lock().unwrap();
+        let g = crate::lock(&p.inner);
         assert_eq!(g.len(), MAX_KEYS);
         // The newest survive; the ones closest to lapsing made room.
         assert!(g.contains_key(&(MAX_KEYS as u64 + 49)));

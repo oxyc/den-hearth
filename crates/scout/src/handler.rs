@@ -570,10 +570,8 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A compare that takes as long whatever the inputs share, as `subtle.ConstantTimeCompare`.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 pub(crate) fn split_path(p: &str) -> Vec<String> {
@@ -3455,11 +3453,12 @@ fn is_debug_request(req: &Req) -> bool {
     !req.query.is_empty() && req.query_get("debug") == "1"
 }
 
-fn etag_matches(if_none_match: &str, etag: &str) -> bool {
-    if if_none_match.trim() == "*" {
-        return true;
-    }
-    if_none_match.split(',').any(|tag| tag.trim() == etag)
+/// RFC 9110 §13.1.2: `If-None-Match` compares weakly, so a `W/` prefix on either side is ignored. A
+/// proxy that compresses (Cloudflare) weakens the ETag the client then sends back.
+pub(crate) fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let strong = |tag: &str| tag.trim().trim_start_matches("W/").to_owned();
+    let etag = strong(etag);
+    if_none_match.split(',').any(|tag| tag.trim() == "*" || strong(tag) == etag)
 }
 
 /// beginPlay is what both play routes do first: refuse any verb but GET (see handlePlay for why HEAD is refused

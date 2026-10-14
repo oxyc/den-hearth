@@ -26,6 +26,8 @@ use crate::Body;
 
 /// Go's `ReadTimeout`: the whole request, body included.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Go's MaxHeaderBytes: twice the largest config segment a URL legitimately carries.
+pub const MAX_HEAD: usize = 32 << 10;
 /// The largest request body read. The one route that reads a body (`/validate`) looks at 4 KiB of it.
 const MAX_BODY: usize = 64 << 10;
 
@@ -90,6 +92,11 @@ impl Scout {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let (parts, body) = req.into_parts();
+        // Scout's own listener caps the head at the connection (`max_buf_size`); the shared one cannot,
+        // since the other services' heads are not Scout's, so the same ceiling is applied here.
+        if !own_listener && head_len(&parts) > MAX_HEAD {
+            return error(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "header_too_large");
+        }
         let body = match tokio::time::timeout(READ_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
             Ok(Ok(collected)) => collected.to_bytes().to_vec(),
             Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
@@ -105,6 +112,13 @@ impl Scout {
         let req = Request::get("/health").body(Vec::new()).expect("static request");
         crate::boxed(self.mount.serve(req).await.map(|bytes| Full::new(Bytes::from(bytes))))
     }
+}
+
+/// The size of the request line and headers as they went over the wire, near enough to compare with
+/// `MAX_HEAD`.
+fn head_len(parts: &hyper::http::request::Parts) -> usize {
+    let line = parts.method.as_str().len() + parts.uri.to_string().len() + " HTTP/1.1\r\n".len();
+    parts.headers.iter().fold(line, |sum, (name, value)| sum + name.as_str().len() + value.len() + 4)
 }
 
 fn error(status: StatusCode, name: &str) -> Response<Body> {

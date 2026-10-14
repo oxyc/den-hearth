@@ -297,6 +297,7 @@ fn build_state_full(
         // Never used by a test: nothing here reaches the HLS proxy, and a client builds no
         // connection until something asks it for one.
         http: reqwest::Client::new(),
+        media_http: reqwest::Client::new(),
         prober,
         searcher,
         prewarm,
@@ -1126,6 +1127,23 @@ fn log_identity_is_on_by_default_and_off_only_for_a_falsey_token() {
     for v in ["0", "false", "off", "no", "FALSE", " Off "] {
         assert!(!on(Some(v)), "{v:?} should turn identity logging off");
     }
+}
+
+#[tokio::test]
+async fn startup_line_names_the_port_and_switches() {
+    let state = AppState::new(Config::from_env());
+    let line = crate::startup_line(&state);
+    assert!(line.starts_with("den-reel "), "{line}");
+    assert!(line.contains(&format!("listening on :{}", state.cfg.port)), "{line}");
+    assert!(line.contains("play_signing="), "{line}");
+}
+
+#[test]
+fn env_opt_trims() {
+    std::env::set_var("DEN_REEL_TEST_ENV_OPT_TRIM", "  value \n");
+    assert_eq!(crate::config::env_opt("DEN_REEL_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
+    std::env::set_var("DEN_REEL_TEST_ENV_OPT_TRIM", "   ");
+    assert_eq!(crate::config::env_opt("DEN_REEL_TEST_ENV_OPT_TRIM"), None);
 }
 
 /// yt-dlp's `%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s` print line, parsed for the decision

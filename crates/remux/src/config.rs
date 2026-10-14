@@ -115,11 +115,11 @@ pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
     v.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// `LOG_IDENTITY`: on unless it is exactly `0` or `false` (either case) — the one flag here that
-/// defaults to on, since every decision line already names a release today and turning that off is
-/// the exception, not the rule.
+/// `LOG_IDENTITY`: on unless it is `0`, `false`, `off` or `no` (trimmed, any case) — the one flag here
+/// that defaults to on, since every decision line already names a release today and turning that off is
+/// the exception, not the rule. Every Den addon reads it by this rule.
 pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
-    !matches!(v.map(str::to_ascii_lowercase).as_deref(), Some("0") | Some("false"))
+    !matches!(v.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
 /// `BROWSER_KEY_HASHES`: comma-separated 64-character hex digests. A malformed entry is said once and
@@ -318,6 +318,37 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_identity_is_off_for_the_shared_off_tokens_only() {
+        assert!(log_identity_on(None));
+        assert!(log_identity_on(Some("")));
+        assert!(log_identity_on(Some("1")));
+        for v in ["0", "false", "off", "no", "FALSE", " Off "] {
+            assert!(!log_identity_on(Some(v)), "{v:?} should turn identity logging off");
+        }
+    }
+
+    /// Operators read `transcode=` from this line, so it must say what the state holds.
+    #[tokio::test]
+    async fn startup_line_reports_transcode() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = crate::AppState::new(Config::from_env());
+        state.transcode_ok.store(false, Relaxed);
+        assert!(crate::startup_line(&state).contains(" transcode=off "), "{}", crate::startup_line(&state));
+        state.transcode_ok.store(true, Relaxed);
+        let line = crate::startup_line(&state);
+        assert!(line.contains(&format!("transcode=vaapi(max {})", state.cfg.max_transcodes)), "{line}");
+        assert!(line.starts_with("den-remux "), "{line}");
+    }
+
+    #[test]
+    fn env_opt_trims() {
+        std::env::set_var("DEN_REMUX_TEST_ENV_OPT_TRIM", "  value \n");
+        assert_eq!(env_opt("DEN_REMUX_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
+        std::env::set_var("DEN_REMUX_TEST_ENV_OPT_TRIM", "   ");
+        assert_eq!(env_opt("DEN_REMUX_TEST_ENV_OPT_TRIM"), None);
+    }
 
     #[test]
     fn scout_origins_admit_only_bare_origins() {
