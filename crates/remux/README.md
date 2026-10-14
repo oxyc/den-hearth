@@ -520,11 +520,10 @@ audio and subtitles are unchanged.
 
 ## Run
 
+Remux runs inside den-hearth: see the repository README for building and running the image and the env
+prefixes (`REMUX_*`). Once it runs:
+
 ```bash
-docker build --build-arg DEN_VERSION="$(cat VERSION)" -t den-remux .
-docker run -d --name remux -p 8095:8095 -v remux-scratch:/cache \
-  -e SCOUT_ORIGINS=http://<scout>:8080 -e REMUX_SCOUT_KEY=<secret> \
-  -e BROWSER_KEY_HASHES=<sha256> -e REMUX_URL_KEY=<secret> den-remux
 curl -c jar -H 'content-type: application/json' -d '{"key":"<key>"}' http://localhost:8095/remux/login
 curl -b jar -H 'content-type: application/json' \
   -d '{"imdb":"tt0111161","scout":"http://<scout>:8080/<scoped-config>"}' http://localhost:8095/remux/session
@@ -541,39 +540,9 @@ key. The `#[ignore]`d tests drive the whole path with real ffmpeg: five end-to-e
 Matroska, MP4, and a 5.1 and a 7.1 track converted to AAC 5.1), the session cap, the idle kill (ffmpeg killed and reaped), and `DELETE` → 410. They
 run in the Dockerfile's `test` stage, against the ffmpeg the image ships. Local ffmpeg 8.0 lands a restarted
 H.264 Matroska run one keyframe early; the tests admit only that bounded one-GOP rewind locally while keeping
-the image's segment timing exact. CI's `e2e` job runs the image path:
-
-```bash
-docker build --target test .
-```
+the image's segment timing exact. The root `docker-bake.hcl`'s `e2e` target runs them against the image's
+`ffmpeg-remux`.
 
 ## Deploy
 
-Planned like the other addons: a Podman Quadlet unit from the den repo's `deploy/`, uid 65532, every
-capability dropped, read-only rootfs, scratch bind-mounted from `/var/lib/den/remux-scratch` (owned by
-65532), updated through the health-gated `den-update`.
-
-**Releases.** Run `scripts/release.sh X.Y.Z` on an up-to-date main checkout. It changes only `VERSION`, pushes
-that commit, waits for its exact main CI, and only then tags `vX.Y.Z`. Don't bump `Cargo.toml`: its version stays
-fixed so a release never invalidates the cached dependency layers, and the image supplies `DEN_VERSION` at run
-time (the startup line, `/metrics` and the User-Agent report it).
-
-Main CI is the release gate and the artifact producer: for every main commit it runs the tests and the e2e
-stage, and builds, probes (`scripts/probe-image.sh`: the startup line names the release and `ffmpeg=ok`) and
-scans an immutable `candidate-<sha>` image, recording its digest. The tag's `docker-publish` run only checks
-that record against the registry, probes it once more, signs it and moves the version tags and `:latest`; it
-never rebuilds a subtly different artifact. A failed main run creates no tag and cannot move `:latest`.
-
-Every Monday, and on a manual run, `docker-publish` instead rebuilds the newest tag with the bases re-pulled and
-no cache, so a fix to the Alpine base or the OpenSSL ffmpeg links reaches the box between releases; it is probed,
-scanned (gating on OS packages) and signed the same way. Tags cut before `VERSION` existed cannot be patch-rebuilt;
-the job says to cut one release first. Trivy sees the Alpine packages; the Rust binary and the source-built
-ffmpeg carry no package database, so they are tracked by their pins. Every image carries SLSA provenance and an
-SBOM and is signed keylessly with cosign:
-
-```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/oxyc/den-remux/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/oxyc/den-remux@sha256:<digest>
-```
+Released, signed and deployed as part of den-hearth (the repository README and the den repo's `deploy/`).

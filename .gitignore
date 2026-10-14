@@ -1,1 +1,4 @@
 /target
+.env
+cache/
+/crates/reel/*.mp4

@@ -188,24 +188,15 @@ and hearth gives Scout `https://node.example/scout`, Reel `https://node.example/
 wins; see Listeners for what a service's own listener does). `SCOUT_ORIGINS`, which Subtitles reads, begins with the
 Scout prefix and so also reaches Scout as `ORIGINS`, a name Scout does not read.
 
-## Legacy per-service build files (to delete after cutover)
+## Per-crate tools
 
-Each imported crate still carries the files that built and shipped its own image. They are inert here (GitHub only
-reads the root `.github/`, Docker the root `Dockerfile`) and are superseded by the root files above:
+The image, CI, versioning and releases are the root's alone. What the crates still carry beyond their code:
 
-```
-crates/reel/Dockerfile        crates/reel/docker-bake.hcl        crates/reel/VERSION
-crates/reel/.github/          crates/reel/scripts/release.sh
-crates/subtitles/Dockerfile   crates/subtitles/.dockerignore     crates/subtitles/VERSION
-crates/subtitles/.github/     crates/subtitles/scripts/release.sh
-crates/subtitles/scripts/smoke.sh   crates/subtitles/scripts/tier1-corpus.py
-crates/remux/Dockerfile       crates/remux/docker-bake.hcl       crates/remux/VERSION
-crates/remux/.github/         crates/remux/scripts/release.sh    crates/remux/scripts/probe-image.sh
-```
-
-Keep `crates/reel/worker/resolve.py` (the root `Dockerfile` copies it) and `crates/remux/testdata/` (the e2e tests).
-`tier1-corpus.py` is the Subtitles sync parity gate (its `corpus` Dockerfile stage), which has no equivalent at the
-root yet; carry it over if that gate is still wanted.
+- `crates/reel/worker/resolve.py`: the yt-dlp worker the root `Dockerfile` copies into the image.
+- `crates/remux/testdata/`, `crates/scout/testdata/`: fixtures for the tests and the e2e target.
+- `crates/subtitles/scripts/tier1-corpus.py`: the sync parity and memory gate (alass against ffsubsync); run it
+  anywhere with `alass`, `ffsubsync` and `ffmpeg`. No CI job runs it yet.
+- `crates/subtitles/scripts/smoke.sh`: a live OpenSubtitles smoke test against the standalone `den-subtitles` binary.
 
 ## Develop
 

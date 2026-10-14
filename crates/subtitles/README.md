@@ -278,13 +278,14 @@ only `ServeCtx` (title/file/language identity) and already-redacted text, never 
 
 ## Run
 
+Subtitles runs inside den-hearth: see the repository README for the image and the env prefixes (`SUBS_*`).
+On its own:
+
 ```sh
 cp .env.example .env          # infra only — keys are entered at /configure
-cargo run                     # local (needs alass on PATH for the sync tiers)
-# or
-docker build -t den-subtitles . && docker run -p 8093:8093 --env-file .env den-subtitles
+cargo run -p den-subtitles    # local (needs alass on PATH for the sync tiers)
 
-cargo test --locked           # what CI runs, with cargo fmt --check and clippy -D warnings
+cargo test -p den-subtitles
 ./scripts/tier1-corpus.py     # parity + >=2x runtime/RSS gate (needs legacy ffsubsync too)
 OPENSUBTITLES_KEY=… ./scripts/smoke.sh   # live smoke test against the real OpenSubtitles API
 ```
@@ -295,7 +296,8 @@ its relay (a redirect to an internal address is never followed), the
 router's status codes and headers, and the sync subprocess orchestration (spawn → arg contract →
 read-back → cleanup, against fake binaries).
 
-CI additionally runs the corpus image in the same 512 MiB cgroup as production. With the real
+The standalone repo's CI ran the corpus gate below; den-hearth has no CI job for it yet. It ran in the same
+512 MiB cgroup as production. With the real
 service resident and three real Tier-1 aligners running, it forces 112 MiB resident to model a full
 64 MiB cache with allocator overhead plus every running/prepared tier's capped bodies and buffers. The
 gate requires total cgroup usage to stay below 400 MiB, preserving at least 112 MiB of headroom.
@@ -309,35 +311,4 @@ agree within 250 ms.
 
 ## Deploy
 
-The live deploy is Podman Quadlet on the homelab box, from the den repo's `deploy/` — its
-`deploy/README.md` covers the stack mechanics. The unit, `den-subtitles.container`, publishes LAN host
-port 8093, drops every capability, sets no-new-privileges, caps memory at 512 MiB, runs as uid 65532
-(the image's non-root user), and bind-mounts the cache from `/var/lib/den/subtitles-cache` (owned by
-that uid). Updates go through the health-gated `den-update` script, which proves a new image answers
-`/health` and `/manifest.json` before pinning its digest; the image carries no HEALTHCHECK, so
-nothing probes an idle box.
-
-**Release images.** Every push to `main` builds `ghcr.io/oxyc/den-subtitles:candidate-<sha>` in CI,
-starts it (it must answer `/health` and report the `VERSION` file's version in `/manifest.json`) and scans
-it, then records its digest. Cut a release with `scripts/release.sh X.Y.Z`: it changes only `VERSION`
-(never `Cargo.toml`, so the cached dependency build stays valid; the image carries the version as
-`DEN_VERSION`), pushes that commit, waits for its exact main CI, then tags `vX.Y.Z`. `docker-publish` on
-the tag finds that successful run, checks the candidate tag still names the recorded digest, signs it and
-adds `:X.Y.Z`, `:X.Y`, `:X`, `:sha-<short>` and `:latest`; it neither compiles nor retests anything.
-
-`docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) with
-the base images re-pulled, no build cache and a fresh `apt-get upgrade`, and publishes it as
-`:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Debian security fix — ffmpeg decodes untrusted
-media here — reaches the box between releases, through `den-update`'s probe and rollback like any
-release. It needs a newest tag cut from this pipeline (one with a `VERSION` file). Trivy scans each image
-before it can reach `:latest`: a CRITICAL with a fix available fails the run (on the weekly rebuild only in
-OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL findings go to code scanning. A
-finding that does not apply goes in `.trivyignore` with a reason. Every image carries SLSA provenance and
-an SBOM and is signed keylessly with cosign by `docker-publish` alone; verify a digest with:
-
-```sh
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/oxyc/den-subtitles/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/oxyc/den-subtitles@sha256:<digest>
-```
+Released, signed and deployed as part of den-hearth (the repository README and the den repo's `deploy/`).

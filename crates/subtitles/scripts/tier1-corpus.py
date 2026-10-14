@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tier-1 parity and resource gate for ffsubsync -> alass --no-split, and the Tier-2 memory gate.
 
-Run through the Dockerfile's CI-only ``corpus`` target, or in any Linux environment with
-``alass`` and ``ffsubsync`` (and ``ffmpeg`` for the Tier-2 soundtrack). The fixtures are generated
+Run in any Linux environment with ``alass`` and ``ffsubsync`` (and ``ffmpeg`` for the Tier-2
+soundtrack). It used to run in the standalone image's ``corpus`` target; den-hearth has no CI job for it yet. The fixtures are generated
 deterministically; no copyrighted subtitle text or audio is stored or downloaded.
 """
 
