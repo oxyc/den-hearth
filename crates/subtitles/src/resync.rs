@@ -179,56 +179,8 @@ fn is_ticket(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// An address on the public internet: not loopback, private (RFC 1918), CGNAT (100.64/10, where a
-/// tailnet lives), link-local (the 169.254.169.254 metadata endpoint), IPv6 ULA, multicast,
-/// documentation, benchmarking or reserved space — and not an IPv6 form that carries one of those
-/// IPv4 addresses (mapped, NAT64, 6to4).
-pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_v4(v4);
-            }
-            let s = v6.segments();
-            let embedded = |hi: u16, lo: u16| {
-                let [a, b] = hi.to_be_bytes();
-                let [c, d] = lo.to_be_bytes();
-                Ipv4Addr::new(a, b, c, d)
-            };
-            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) reach the IPv4 address they carry.
-            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                return is_public_v4(embedded(s[6], s[7]));
-            }
-            if s[0] == 0x2002 {
-                return is_public_v4(embedded(s[1], s[2]));
-            }
-            !(s[..6] == [0; 6] // ::/96: unspecified, loopback, the deprecated IPv4-compatible block
-                || v6.is_multicast()
-                || s[0] & 0xfe00 == 0xfc00 // ULA fc00::/7
-                || s[0] & 0xffc0 == 0xfe80 // link-local fe80::/10
-                || s[0] & 0xffc0 == 0xfec0 // site-local fec0::/10
-                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-                || (s[0] == 0x2001 && s[1] == 0)) // Teredo
-        }
-    }
-}
-
-fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        || a == 0
-        || (a == 100 && b & 0xc0 == 64) // CGNAT 100.64/10
-        || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
-        || (a == 198 && b & 0xfe == 18) // benchmarking 198.18/15
-        || a >= 240) // reserved
-}
+/// An address on the public internet; the classifier is shared with Scout and Remux (`den-net`).
+use den_net::is_public as is_public_ip;
 
 /// A client for one hop, pinned to the one address vetted for it.
 ///
@@ -516,7 +468,7 @@ mod tests {
 
     #[test]
     fn only_public_addresses_are_public() {
-        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"];
+        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"];
         for ip in public {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip} counted as internal");
         }
@@ -551,6 +503,8 @@ mod tests {
             "64:ff9b::7f00:1",    // NAT64 of loopback
             "2002:c0a8:5601::1",  // 6to4 of 192.168.86.1
             "64:ff9b::a9fe:a9fe", // NAT64 of the metadata endpoint
+            "64:ff9b:1::1",       // local-use NAT64
+            "64:ff9b::808:808",   // NAT64 of a public address: refused whatever it embeds
         ];
         for ip in internal {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip} counted as public");

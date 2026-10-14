@@ -632,7 +632,20 @@ impl Session {
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
         // Through the session's door where there is one: the head from memory, the rest over warm connections.
-        let input = self.door.as_ref().and_then(|d| st.doors.url(d)).unwrap_or_else(|| i.input.clone());
+        let door_url = self.door.as_ref().and_then(|d| st.doors.url(d));
+        // ffmpeg's own http protocol follows a `Location` without asking, and has no option to stop it, so a link is
+        // never handed to it: only the door (whose reads follow nothing) or a local file.
+        if door_url.is_none() && (i.input.starts_with("http://") || i.input.starts_with("https://")) {
+            crate::log_limited("no_door", || {
+                format!(
+                    "session {}: no loopback door for the release, and ffmpeg is not given a link to read{}",
+                    self.short(),
+                    rid_tail(self.rid.as_deref())
+                )
+            });
+            return Err(());
+        }
+        let input = door_url.unwrap_or_else(|| i.input.clone());
         let spec = Spec {
             input: &input,
             seek,
@@ -847,7 +860,7 @@ impl Session {
         // The next session for this release must not be handed the link that just failed.
         st.opened().forget(&self.opened_key);
         let play_url = crate::config::local(&self.play_url, &st.cfg.origin_aliases);
-        match scout::resolve(&st.scout_http, &play_url, &self.source).await {
+        match scout::resolve(&st.scout_http, &play_url, &self.source, st.source_guard).await {
             Ok(r) => {
                 if let Some(door) = &self.door {
                     door.set_upstream(&r.url);
@@ -1548,9 +1561,14 @@ async fn open(
         return Ok(hit);
     }
     // A ticket on scout's public name (d-play) is fetched at its LAN address, like the install it came from.
-    let r = scout::resolve(&st.scout_http, &crate::config::local(&s.url, &st.cfg.origin_aliases), src)
-        .await
-        .map_err(OpenFailure::passing)?;
+    let r = scout::resolve(
+        &st.scout_http,
+        &crate::config::local(&s.url, &st.cfg.origin_aliases),
+        src,
+        st.source_guard,
+    )
+    .await
+    .map_err(OpenFailure::passing)?;
     let stable_key = crate::state::probe_key(r.size, &r.head);
     let cached = stable_key.as_deref().and_then(|key| st.probe(key));
     let from_cache = cached.is_some();

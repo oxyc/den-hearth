@@ -13,6 +13,8 @@ name = "den-reel"
 path = "src/main.rs"
 
 [dependencies]
+# The config segment's base64url decoder, shared with Scout and Subtitles.
+den-net = { path = "../net" }
 # Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
 # minimal on a homelab box.

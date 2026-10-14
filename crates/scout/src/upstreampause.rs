@@ -83,7 +83,12 @@ impl<D: Doer> PausingDoer<D> {
             paused.insert(key.to_owned(), UpstreamPause { until: UNIX_EPOCH, refusals: 0 });
         }
         let Some(p) = paused.get_mut(key) else { return asked };
-        p.refusals += 1;
+        // A refusal that lands inside a pause already running is the same refusal told again by a request sent before
+        // the first one came back; it does not add a strike, or a burst of N would escalate the next window to 2^N.
+        let running = p.until > now;
+        if !running {
+            p.refusals += 1;
+        }
         let mut pause = asked;
         if !named {
             pause = (REFUSAL_PAUSE * (1u32 << (p.refusals - 1).min(10))).min(MAX_REFUSAL_PAUSE);

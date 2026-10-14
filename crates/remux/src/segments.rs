@@ -765,7 +765,7 @@ async fn open(
     s: &crate::scout::Stream,
 ) -> Result<(crate::scout::Resolved, f64, u64), String> {
     let play = crate::config::local(&s.url, &st.cfg.origin_aliases);
-    let r = crate::scout::resolve(&st.scout_http, &play, src).await?;
+    let r = crate::scout::resolve(&st.scout_http, &play, src, st.source_guard).await?;
     let size = r.size.ok_or("the release has no size")?;
     let key = crate::state::probe_key(r.size, &r.head);
     let info = match key.as_deref().and_then(|k| st.probe(k)) {

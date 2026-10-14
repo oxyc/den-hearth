@@ -1,8 +1,10 @@
 //! ADDON discovery: imdb id → ordered YouTube trailer candidates, via TMDB (primary) and KinoCheck
 //! (fallback). Behind a trait so tests can swap in a fake with no network.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -24,8 +26,8 @@ use crate::config::Config;
 /// anything TMDB actually returns.
 const MAX_UPSTREAM_BODY: usize = 256 * 1024;
 
-/// How long a host is left alone after a 429 or 5xx that did not say how long itself, doubling per
-/// consecutive refusal. The cap also bounds what a `Retry-After` may ask for, so a misconfigured or
+/// How long a credential's upstream is left alone after a 429 or 503 that did not say how long itself,
+/// doubling per consecutive refusal. The cap also bounds what a `Retry-After` may ask for, so a misconfigured or
 /// hostile upstream cannot switch discovery off for a day.
 const PAUSE_BASE_MS: u64 = 30 * 1000;
 pub(crate) const PAUSE_CAP_MS: u64 = 60 * 60 * 1000;
@@ -132,29 +134,72 @@ pub struct HttpUpstream {
     /// Consecutive hard upstream faults (transport / 401 / 403 / 429 / 5xx) — surfaced as `degraded`
     /// on /health (ADDON-02). A 404 "not found" is a miss, not a fault, so it doesn't count.
     fails: AtomicU32,
-    /// One pause per host. A 429 or 5xx is about the host, not the title, so the per-title failure
-    /// cooldown still sent every other title straight back to a host that had just refused.
-    tmdb_pause: Backoff,
-    kinocheck_pause: Backoff,
+    /// One pause per upstream and credential. A 429 (or a 503 that names a Retry-After) is about the
+    /// caller's allowance, not the title, so the per-title failure cooldown still sent every other
+    /// title straight back to an upstream that had just refused. TMDB keys are per install, so one
+    /// install's throttle must not stop another's lookups; the server-side fallback key is a single
+    /// credential and so a single pause. Keyed by (is TMDB, hash of the credential).
+    pauses: Mutex<HashMap<PauseKey, Arc<Backoff>>>,
 }
+
+type PauseKey = (bool, u64);
+
+/// How many pauses are remembered. Keys come from install configs anyone can build.
+const MAX_PAUSES: usize = 1024;
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream {
-            cfg,
-            http,
-            fails: AtomicU32::new(0),
-            tmdb_pause: Backoff::new("tmdb", PAUSE_BASE_MS, PAUSE_CAP_MS),
-            kinocheck_pause: Backoff::new("kinocheck", PAUSE_BASE_MS, PAUSE_CAP_MS),
-        }
+        HttpUpstream { cfg, http, fails: AtomicU32::new(0), pauses: Mutex::new(HashMap::new()) }
     }
 
-    /// The pause for the host a URL belongs to.
-    fn pause(&self, url: &str) -> &Backoff {
-        if self.counts_toward_health(url) {
-            &self.tmdb_pause
-        } else {
-            &self.kinocheck_pause
+    /// The pause a request belongs to: its upstream, and the credential it carries (TMDB's `api_key`
+    /// query parameter, or KinoCheck's `X-Api-Key`; none is its own key).
+    fn pause_key(&self, url: &str, headers: &[(&str, &str)]) -> PauseKey {
+        let from_query = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.query_pairs().find(|(k, _)| k == "api_key").map(|(_, v)| v.into_owned()));
+        let credential = from_query
+            .or_else(|| {
+                headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-api-key")).map(|(_, v)| v.to_string())
+            })
+            .unwrap_or_default();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        credential.hash(&mut h);
+        (self.counts_toward_health(url), h.finish())
+    }
+
+    fn pauses(&self) -> MutexGuard<'_, HashMap<PauseKey, Arc<Backoff>>> {
+        self.pauses.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Is this credential's upstream paused?
+    fn is_paused(&self, key: PauseKey, now: u64) -> bool {
+        self.pauses().get(&key).is_some_and(|b| b.remaining_ms(now).is_some())
+    }
+
+    fn trip(&self, key: PauseKey, now: u64, hint: Option<u64>, why: &str) {
+        let backoff = {
+            let mut pauses = self.pauses();
+            if !pauses.contains_key(&key) && pauses.len() >= MAX_PAUSES {
+                pauses.retain(|_, b| b.remaining_ms(now).is_some());
+                if pauses.len() >= MAX_PAUSES {
+                    pauses.clear();
+                }
+            }
+            let name = if key.0 { "tmdb" } else { "kinocheck" };
+            pauses
+                .entry(key)
+                .or_insert_with(|| Arc::new(Backoff::new(name, PAUSE_BASE_MS, PAUSE_CAP_MS)))
+                .clone()
+        };
+        backoff.trip(now, hint, why);
+    }
+
+    /// The upstream answered this credential: end its pause.
+    fn clear_pause(&self, key: PauseKey) {
+        let removed = self.pauses().remove(&key);
+        if let Some(b) = removed {
+            b.clear();
         }
     }
 
@@ -177,7 +222,8 @@ impl HttpUpstream {
     /// `Ok(Some(v))` parsed; `Ok(None)` the upstream said "not there" (404); `Err(NoAnswer)` we did
     /// not get an answer at all.
     async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Answered<Option<Value>> {
-        if self.pause(url).remaining_ms(crate::state::default_clock()).is_some() {
+        let pause_key = self.pause_key(url, headers);
+        if self.is_paused(pause_key, crate::state::default_clock()) {
             // Not asked: the host told us to back off, and asking anyway is what keeps a throttle
             // from lifting. Still no answer — and counted for /health like the 429 it stands in
             // for, or a throttled TMDB would read as healthy just because we stopped asking.
@@ -210,15 +256,17 @@ impl HttpUpstream {
         };
         let status = res.status();
         let now = crate::state::default_clock();
-        if status == 429 || status.is_server_error() {
-            let hint = retry_after_ms(res.headers(), now);
-            self.pause(url).trip(now, hint, &format!("answered {}", status.as_u16()));
-        } else {
+        let hint = retry_after_ms(res.headers(), now);
+        // Only a 429, or a 503 that says how long, is the upstream telling this credential to wait. Any
+        // other 5xx is that one request failing and says nothing about the next, so it pauses nobody.
+        if status == 429 || (status == 503 && hint.is_some()) {
+            self.trip(pause_key, now, hint, &format!("answered {}", status.as_u16()));
+        } else if !status.is_server_error() {
             // Any other status is the host answering, which ends a pause — a 404 or a bad key's 401
             // included, since those are about the title or the install, not the host's capacity.
-            self.pause(url).clear();
+            self.clear_pause(pause_key);
             if let Some(ms) = rate_limit_spent_ms(res.headers(), now) {
-                self.pause(url).trip(now, Some(ms), "rate limit spent");
+                self.trip(pause_key, now, Some(ms), "rate limit spent");
             }
         }
         if !status.is_success() {

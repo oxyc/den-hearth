@@ -200,6 +200,18 @@ fn b64url_round_trip() {
     assert!(matches!(&dec, Ok(d) if d == input.as_bytes()), "b64url round-trip: {dec:?}");
 }
 
+// Reel and Subtitles read the config segment the same way (their `a_padded_or_wrapped_segment_opens_like_it_does_on_scout`),
+// so a padded or hand-wrapped link opens on all three.
+#[test]
+fn a_padded_or_wrapped_config_segment_opens() {
+    let seg = blob(r#"{"debrid":[{"service":"torbox","token":"t"}]}"#);
+    let wrapped = format!("{}\r\n{}\n", &seg[..10], &seg[10..]);
+    for (what, s) in [("plain", seg.clone()), ("padded", format!("{seg}==")), ("wrapped", wrapped)] {
+        let c = crate::config::decode_config(None, &s);
+        assert!(c.is_some_and(|c| c.debrid.len() == 1), "a {what} segment did not open");
+    }
+}
+
 #[test]
 fn parse_stream_id() {
     let s = crate::id::parse_stream_id("movie", "tt1234567.json");
