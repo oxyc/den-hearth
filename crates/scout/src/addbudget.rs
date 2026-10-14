@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 use crate::config::DebridService;
 use crate::loglimit::log_limited;
 use crate::metrics::metrics;
-use crate::stores::torbox::TORBOX_API;
+use crate::stores::refusal::service_account_identity;
 use crate::stores::{short_hash, StoreError, StoreUnavailableError};
 use crate::util::key_hash;
 
@@ -320,20 +320,6 @@ impl std::fmt::Display for RequestNotSent {
 }
 
 impl std::error::Error for RequestNotSent {}
-
-/// Go `torboxIdentityPrefix`.
-const TORBOX_IDENTITY_PREFIX: &str = "torbox-account:v2:";
-
-/// Go `serviceAccountIdentity` normalises generic account-scoped state too. This keeps callers which pass a raw
-/// TorBox token on the production API compatible while ensuring a store configured for another API never shares
-/// facts with it. Other debrid services have no configurable API identity. (Go: `canonicalTorboxIdentity` for
-/// TorBox, which keeps an identity a store already assembled.)
-fn service_account_identity(svc: DebridService, identity: &str) -> String {
-    if svc == DebridService::TorBox && !identity.starts_with(TORBOX_IDENTITY_PREFIX) {
-        return format!("{TORBOX_IDENTITY_PREFIX}{}:{identity}", key_hash(TORBOX_API));
-    }
-    identity.to_owned()
-}
 
 /// Go `budgetAccount`: the key one account's allowance is kept under.
 pub(crate) fn budget_account(svc: DebridService, token: &str) -> String {

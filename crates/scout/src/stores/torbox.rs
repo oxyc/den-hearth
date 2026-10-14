@@ -52,9 +52,10 @@ use super::{
     unavailable,
 };
 use support::{
-    envelope, first_value, int_or_zero, lock, no_file_list, opt_bool, opt_float, opt_int, opt_string, scoped,
-    string_or_empty, torrent_gone, would_add, DetachedFlight, GaugeGuard,
+    envelope, first_value, int_or_zero, lock, no_file_list, opt_bool, opt_float, opt_int, opt_string,
+    string_or_empty, torrent_gone, would_add, GaugeGuard,
 };
+use crate::util::{scoped, DetachedFlight};
 
 /// Go `torboxAPI`.
 pub const TORBOX_API: &str = "https://api.torbox.app/v1/api";

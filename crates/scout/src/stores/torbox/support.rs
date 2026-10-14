@@ -2,16 +2,12 @@
 //! sentinel errors it raises, the readers for the JSON shapes it decodes the way Go's `encoding/json` does, and the
 //! detached single-flight its shared reads run through.
 
-use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
-use tokio::sync::watch;
 
 use crate::config::DebridService;
-use crate::loglimit::log_limited;
 use crate::stores::{dead_link, unavailable, StoreError, ERR_TORRENT_GONE, ERR_WOULD_ADD};
 use crate::util::{fold_json_keys, Shape};
 
@@ -109,100 +105,6 @@ pub(crate) fn string_or_empty(v: Option<&Value>) -> Result<String, ()> {
 }
 
 // --- concurrency ---
-
-/// A key for work that is shared between callers, scoped to the runtime the caller is on.
-///
-/// Shared work runs in a task on the runtime that started it, and a caller on another runtime could be left
-/// waiting for a task whose runtime has since shut down. The server has one runtime, so this changes nothing
-/// there; it is also what keeps the work of two independent runtimes in one process (each test has its own)
-/// from being mistaken for one account's.
-pub(crate) fn scoped(key: &str) -> String {
-    format!("{}:{key}", tokio::runtime::Handle::current().id())
-}
-
-/// Go `singleflight.Group.DoChan`: concurrent callers of one key share one run of the work and its answer, and the
-/// work is NOT tied to the caller that started it. Dropping the caller that started the work (the request went
-/// away, its budget ran out) leaves the work running for everyone still waiting, which is the property the
-/// account listing and the shared status reads were built to have: "the leader now runs detached from
-/// cancellation".
-///
-/// `indexerconfig::Flight` is not that: when its leader is dropped a waiter starts the work again. That is right
-/// for a mint and wrong here, where the work is a 64 MiB listing a follower is still waiting on.
-///
-/// The work runs in its own task, so a panic in it ends that task and nothing else: every waiter is answered
-/// `None` rather than left waiting, where Go would have died. This is Go's `recoverBackground`: a singleflight
-/// closure that panics re-raises on a bare goroutine nothing can recover, so each of these jobs recovers its own,
-/// counts it, and abandons the work.
-pub(super) struct DetachedFlight<T> {
-    calls: Mutex<BTreeMap<String, watch::Receiver<Option<Option<T>>>>>,
-    /// What the work is, for the log line a panic writes. Always a literal, so it is a fixed vocabulary for the
-    /// limiter's key.
-    what: &'static str,
-}
-
-impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
-    pub(super) const fn new(what: &'static str) -> Self {
-        DetachedFlight { calls: Mutex::new(BTreeMap::new()), what }
-    }
-
-    /// Runs `make()` for the first caller of `key`; a caller that arrives while it is in flight waits for the same
-    /// answer. The key is forgotten before the answer is published, so a caller arriving after it runs the work
-    /// again: nothing is cached here. The answer is `None` for a run that panicked, and the flag says whether
-    /// this caller shared a flight someone else started (Go's `result.Shared`).
-    pub(super) async fn run<F, Fut>(&'static self, key: &str, make: F) -> (Option<T>, bool)
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T> + Send + 'static,
-    {
-        let key = scoped(key);
-        let (mut rx, shared) = {
-            let mut calls = lock(&self.calls);
-            match calls.get(&key) {
-                Some(rx) => (rx.clone(), true),
-                None => {
-                    let (tx, rx) = watch::channel(None);
-                    calls.insert(key.clone(), rx.clone());
-                    let work = make();
-                    tokio::spawn(async move {
-                        let answer = match tokio::spawn(work).await {
-                            Ok(answer) => Some(answer),
-                            Err(e) => {
-                                if e.is_panic() {
-                                    crate::metrics::metrics().background_panic.fetch_add(1, Ordering::Relaxed);
-                                    log_limited(
-                                        &format!("panic:{}", self.what),
-                                        &format!("{} panicked, abandoning it: {}", self.what, panic_text(e.into_panic())),
-                                    );
-                                }
-                                None
-                            }
-                        };
-                        lock(&self.calls).remove(&key);
-                        let _ = tx.send(Some(answer));
-                    });
-                    (rx, false)
-                }
-            }
-        };
-        let Ok(answered) = rx.wait_for(|v| v.is_some()).await else {
-            return (None, shared);
-        };
-        let answer = (*answered).clone().flatten();
-        drop(answered);
-        (answer, shared)
-    }
-}
-
-/// A panic's payload as Go's `%v` of the recovered value would print it.
-fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
-    match payload.downcast::<&str>() {
-        Ok(s) => (*s).to_owned(),
-        Err(payload) => match payload.downcast::<String>() {
-            Ok(s) => *s,
-            Err(_) => "a panic with no message".to_owned(),
-        },
-    }
-}
 
 /// Adds one to a gauge while it lives (Go's `Add(1)` and a deferred `Add(-1)`).
 pub(super) struct GaugeGuard(&'static AtomicI64);

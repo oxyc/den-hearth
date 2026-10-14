@@ -371,6 +371,13 @@ pub(crate) fn as_unavailable(err: &StoreError) -> Option<&StoreUnavailableError>
     }
 }
 
+/// Go `errors.As(err, &unavailable)` as a yes/no. Go's `errAddInFlight` is always built beside a
+/// `StoreUnavailableError` (`fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{...})`), so `errors.As`
+/// finds one in it; the frozen `AddInFlight` variant carries no payload, so that fact is stated here.
+pub(crate) fn wraps_unavailable(err: &StoreError) -> bool {
+    as_unavailable(err).is_some() || matches!(err, StoreError::AddInFlight)
+}
+
 /// Go `scoutBudgetSpent` (stores.go:1218).
 pub(crate) fn scout_budget_spent(svc: DebridService, token: &str) -> bool {
     global_add_budget().remaining(&budget_account(svc, token)) <= 0

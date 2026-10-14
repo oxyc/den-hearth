@@ -113,7 +113,7 @@ pub(crate) fn decide_answer_kind(streams: i64, complete: bool, degraded: &str) -
 /// excusedFromQuorum reports whether a source's failure to answer leaves the list complete: only when it can
 /// never be asked, so waiting on it would make completeness unreachable.
 pub(crate) fn excused_from_quorum(outcome: &str) -> bool {
-    todo!("coverage.go excusedFromQuorum")
+    outcome == OUTCOME_MISCONFIGURED || outcome == OUTCOME_QUARANTINED
 }
 
 /// classifyScrape names what one scrape's error means for coverage. `None` is a scrape that answered.
