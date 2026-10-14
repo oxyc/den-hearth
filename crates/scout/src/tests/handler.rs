@@ -127,6 +127,7 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
             })]
         }),
         seal_keyring: None,
+        config_key_invalid: false,
         metrics_token: String::new(),
         log_requests: false,
         revocation: Revocation::default(),
@@ -569,6 +570,52 @@ async fn routes_sealed_config() {
         200,
         "plaintext with no keyring"
     );
+}
+
+/// CONFIG_KEY set but malformed fails CLOSED: every request carrying an install config is a 503, plaintext or
+/// sealed, and /health says why. Unset and valid are covered by `routes_sealed_config`.
+#[tokio::test]
+async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health() {
+    let (kr, invalid) = crate::deps::build_keyring("not-a-key", "");
+    assert!(kr.is_none() && invalid, "a malformed current key is invalid, not sealing-off");
+    let (kr, invalid) = crate::deps::build_keyring(VEC_PRIV_B64, "not-a-key");
+    assert!(kr.is_some() && !invalid, "a malformed PRIOR key is only skipped");
+    let (kr, invalid) = crate::deps::build_keyring("", "");
+    assert!(kr.is_none() && !invalid, "unset is sealing off");
+
+    let kr = ticket_keyring();
+    let sealed = sealed_config(&kr, &format!("{TICKET_CFG}}}"));
+    let h = new_handler(test_deps(|d| d.config_key_invalid = true));
+    for seg in [valid_blob(), sealed] {
+        for tail in ["manifest.json", "stream/movie/tt1234567.json", "play/x", "availability"] {
+            let r = get(&h, &format!("/{seg}/{tail}"), &[]).await;
+            assert_eq!(r.status(), 503, "{tail}");
+            assert_eq!(r.headers()["retry-after"], "60");
+            assert!(body_str(&r).contains("config_key_invalid"), "{tail}: {}", body_str(&r));
+        }
+    }
+    assert_eq!(get(&h, "/p/ticket", &[]).await.status(), 503, "a play ticket");
+    assert_eq!(get(&h, "/config-key", &[]).await.status(), 503, "no pubkey to hand out");
+    let r = get(&h, "/health", &[]).await;
+    assert!(
+        body_str(&r).contains(r#""reason":"config_key_invalid""#)
+            && body_str(&r).contains(r#""status":"degraded""#),
+        "health: {}",
+        body_str(&r)
+    );
+    // Unconfigured, a healthy handler still says ok.
+    let ok = new_handler(test_deps(|_| {}));
+    assert!(body_str(&get(&ok, "/health", &[]).await).contains(r#""status":"ok""#));
+}
+
+/// A negative epoch is refused, not read as epoch 0 (which every CONFIG_EPOCH admits).
+#[tokio::test]
+async fn a_negative_install_epoch_is_refused() {
+    let h = new_handler(test_deps(|_| {}));
+    let mut config = crate::config::decode_config(None, &valid_blob()).expect("the plaintext blob decodes");
+    assert!(h.admit_install(&config), "epoch 0 is admitted");
+    config.epoch = -1;
+    assert!(!h.admit_install(&config), "a negative epoch must be refused");
 }
 
 /// The configured manifest names its install as REVOKED_INSTALLS spells it; a config without an id, and the

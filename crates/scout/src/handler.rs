@@ -488,6 +488,14 @@ pub(crate) fn err_out(status: u16, msg: &str) -> Out {
     write_json(status, &json!({ "error": msg }), NO_STORE)
 }
 
+/// The 503 an install-config request gets while CONFIG_KEY is malformed. Retry-After is a hint to clients, not a
+/// promise: only an operator fixing the variable and restarting clears it.
+fn config_key_invalid_out() -> Out {
+    let mut out = err_out(503, "config_key_invalid");
+    out.set("retry-after", "60");
+    out
+}
+
 /// Go `json.Marshal`: serde's output, with the characters Go's encoder escapes for HTML safety written as it
 /// writes them (`<`, `>`, `&`, U+2028 and U+2029). Only strings can hold any of them, so the whole text is safe to
 /// rewrite.
@@ -1221,6 +1229,18 @@ impl Inner {
             out.set("access-control-max-age", "86400");
             return out;
         }
+        // CONFIG_KEY is set but malformed: nothing that carries an install config (a config segment, a play
+        // ticket, the availability batch, a cancel) can be trusted, sealed or plaintext, so all of it is a 503
+        // until an operator fixes the variable. That includes /config-key, which has no key to hand out. Only the
+        // static pages, /health, /metrics and /validate (a pasted token, no config) keep their own handling.
+        if self.deps.config_key_invalid
+            && !matches!(
+                req.path.as_str(),
+                "/" | "/configure" | "/configure/" | "/health" | "/metrics" | "/manifest.json" | "/validate"
+            )
+        {
+            return config_key_invalid_out();
+        }
         // DELETE cancels (or, with ?op=reannounce, reannounces) the release a ticket or a legacy play token
         // names — den#204. Matched ahead of the GET/HEAD-only gate below, which otherwise answers every other
         // verb with 405; cancel is the one route besides /validate and /availability that is not a read.
@@ -1256,7 +1276,13 @@ impl Inner {
                 // Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
                 // state so a monitor sees a total-indexer outage instead of just "empty results".
                 let mut status = json!({"status": "ok", "coverage": "complete"});
-                if self.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                if self.deps.config_key_invalid {
+                    status = json!({
+                        "status": "degraded",
+                        "reason": "config_key_invalid",
+                        "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
+                    });
+                } else if self.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                     status =
                         json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
                 } else if self.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
@@ -3407,7 +3433,12 @@ impl Inner {
     /// install that is not revoked is never logged.
     pub(crate) fn admit_install(&self, config: &Config) -> bool {
         let iid = (!config.iid.is_empty()).then_some(config.iid.as_str());
-        let ep = u64::try_from(config.epoch).unwrap_or(0);
+        // A negative epoch is not "epoch 0" (which every CONFIG_EPOCH admits): refuse it. decode already
+        // rejects one today; this keeps that true if the decoder ever stops.
+        let Ok(ep) = u64::try_from(config.epoch) else {
+            log_limited("install-epoch", "config refused: negative install epoch");
+            return false;
+        };
         // A scoped config is minted separately from the install and may carry no id. Tickets den-remux is
         // authorized to mint from it preserve that provenance; epoch and named revocation still apply.
         let verdict = if config.scope.is_empty() {

@@ -275,7 +275,9 @@ fn build_state_full(
     prewarm: PrewarmFn,
     searcher: crate::state::SearchFn,
 ) -> Arc<AppState> {
-    let config_keyring = den_seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
+    let parsed = den_seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev);
+    let config_key_invalid = parsed.is_err();
+    let config_keyring = parsed.unwrap_or(None);
     let media_gate = std::sync::Arc::new(crate::media_gate::MediaGate::new(
         cfg.direct_media_concurrency,
         cfg.direct_media_idle,
@@ -284,6 +286,7 @@ fn build_state_full(
     Arc::new(AppState {
         cfg: Arc::new(cfg),
         config_keyring,
+        config_key_invalid,
         yt_cache: Mutex::new(HashMap::new()),
         ids: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
@@ -1603,6 +1606,58 @@ async fn a_bad_config_segment_fails_closed() {
     assert_eq!(bad.status(), 400);
     let body: Value = bad.json().await.unwrap();
     assert_eq!(body["error"], "bad_config");
+}
+
+/// A state whose `CONFIG_KEY` is set to something that is not a key.
+fn malformed_key_state() -> Arc<AppState> {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.config_key = "not-a-key".into();
+    build_state_cfg(cfg, Box::new(FakeUpstream::new(&["x"], None)), always_playable(), noop_prewarm())
+}
+
+#[tokio::test]
+async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health() {
+    let state = malformed_key_state();
+    assert!(state.config_keyring.is_none() && state.config_key_invalid);
+    assert!(crate::startup_line(&state).contains("sealed=invalid"), "{}", crate::startup_line(&state));
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    // Plaintext and sealed alike, on every config-scoped route: 503, never served.
+    for seg in [plain_segment(r#"{"tmdbKey":"k"}"#), SEALED_SEG.to_string()] {
+        for tail in ["manifest.json", "meta/movie/tt0111161.json", "prepare/movie/tt0111161.json"] {
+            let r = client.get(format!("{base}/{seg}/{tail}")).send().await.unwrap();
+            assert_eq!(r.status(), 503, "{tail}");
+            assert_eq!(r.headers()["retry-after"], "60");
+            assert_eq!(r.json::<Value>().await.unwrap()["error"], "config_key_invalid");
+        }
+    }
+    // No pubkey is handed to /configure, and /health says why.
+    assert_eq!(client.get(format!("{base}/config-key")).send().await.unwrap().status(), 503);
+    let health: Value = client.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["reason"], "config_key_invalid");
+}
+
+#[tokio::test]
+async fn an_unset_config_key_still_accepts_plaintext_and_a_valid_one_still_seals() {
+    let unset =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&["x"], None)), always_playable(), noop_prewarm());
+    assert!(!unset.config_key_invalid);
+    assert!(crate::startup_line(&unset).contains("sealed=off"));
+    let base = spawn_server(unset).await;
+    let seg = plain_segment(r#"{"tmdbKey":"k"}"#);
+    assert_eq!(reqwest::get(format!("{base}/{seg}/manifest.json")).await.unwrap().status(), 200);
+    let health: Value = reqwest::get(format!("{base}/health")).await.unwrap().json().await.unwrap();
+    assert_eq!(health["status"], "ok");
+
+    // A malformed PRIOR key is skipped, not fatal.
+    let mut cfg = test_cfg(temp_dir());
+    cfg.config_key = VEC_PRIV.into();
+    cfg.config_keys_prev = "not-a-key".into();
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&["x"], None)), always_playable(), noop_prewarm());
+    assert!(!state.config_key_invalid && state.config_keyring.is_some());
+    assert!(crate::startup_line(&state).contains("sealed=on"));
 }
 
 // Issue #8 R3: an install id as /configure mints it (bytes 0..16).
