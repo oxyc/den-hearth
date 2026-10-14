@@ -232,7 +232,7 @@ COPY --from=tools /usr/local/lib/yt-dlp.zip /usr/local/lib/yt-dlp.zip
 COPY crates/reel/worker/resolve.py /app/resolve.py
 # The fast resolver, the packages it was locked to, and deno's cache of them (`deno/`, which the worker is
 # pointed at as DENO_DIR and which only it uses: yt-dlp's own deno keeps its cache elsewhere).
-COPY --from=tools /youtubei/main.mjs /youtubei/errors.mjs /youtubei/deno.json /youtubei/deno.lock /app/youtubei/
+COPY --from=tools /youtubei/main.mjs /youtubei/quiet.mjs /youtubei/errors.mjs /youtubei/select.mjs /youtubei/deno.json /youtubei/deno.lock /app/youtubei/
 COPY --from=tools /youtubei/deno /app/youtubei/deno
 # MP4Box + its shared lib (clap writer). ldconfig regenerates the libgpac.so.12 SONAME link.
 COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box

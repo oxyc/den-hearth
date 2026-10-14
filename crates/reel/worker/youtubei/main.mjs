@@ -12,12 +12,14 @@
 // plus the best mp4a audio, else the best muxed avc1+mp4a at or under it; after the last rung, itag 18,
 // else any muxed mp4 avc1+mp4a. `rungs` comes from Reel so the two cannot drift.
 //
-// Bundled with `deno bundle` from deno.lock (see the Dockerfile) and run with network access to
-// YouTube's API hosts only: no filesystem, no environment, no subprocesses.
+// Run from the packages deno.lock pins (see the Dockerfile) with network access to YouTube's API
+// hosts only: no filesystem, no environment, no subprocesses.
+import "./quiet.mjs"; // first: nothing but a reply may reach stdout
 import { Innertube, UniversalCache } from "youtubei.js";
 import readline from "node:readline";
 import process from "node:process";
 import { thrown, unplayable } from "./errors.mjs";
+import { select } from "./select.mjs";
 
 const CLIENT = "VISIONOS";
 // A session carries a visitor identity; a long-lived one is what keeps answers whole (see the
@@ -39,42 +41,6 @@ async function session() {
     builtAt = Date.now();
   }
   return tube;
-}
-
-const has = (f, codec) => (f.mime_type ?? "").includes(codec);
-const best = (list, by) => list.reduce((a, b) => (a && by(a) >= by(b) ? a : b), null);
-
-function chooseVideo(adaptive, limit) {
-  const videos = adaptive.filter((f) => f.has_video && !f.has_audio && has(f, "avc1") && (f.height ?? 0) <= limit);
-  // Tallest, then smoothest, then richest: yt-dlp's own order for `bv*`.
-  return best(videos, (f) => (f.height ?? 0) * 1e9 + (f.fps ?? 0) * 1e6 + (f.bitrate ?? 0));
-}
-
-function chooseAudio(adaptive) {
-  const audios = adaptive.filter((f) => f.has_audio && !f.has_video && has(f, "mp4a"));
-  return best(audios, (f) => f.bitrate ?? 0);
-}
-
-function chooseMuxed(muxed, limit) {
-  const both = muxed.filter((f) => f.has_video && f.has_audio && has(f, "avc1") && has(f, "mp4a"));
-  const within = both.filter((f) => (f.height ?? 0) <= limit);
-  return best(within, (f) => (f.height ?? 0) * 1e9 + (f.bitrate ?? 0));
-}
-
-function select(streaming, rungs) {
-  const adaptive = streaming.adaptive_formats ?? [];
-  const muxed = streaming.formats ?? [];
-  for (const limit of rungs) {
-    const video = chooseVideo(adaptive, limit);
-    const audio = chooseAudio(adaptive);
-    if (video && audio) return [video, audio];
-    const whole = chooseMuxed(muxed, limit);
-    if (whole) return [whole];
-  }
-  const itag18 = muxed.find((f) => f.itag === 18);
-  if (itag18) return [itag18];
-  const any = muxed.find((f) => f.has_video && f.has_audio && has(f, "avc1") && has(f, "mp4a"));
-  return any ? [any] : [];
 }
 
 async function answer(request) {

@@ -72,16 +72,43 @@ def downloader(request):
     return key, ydl
 
 
+def forget(key):
+    """Drop a cached instance so the next request builds a new one."""
+    ydl = _instances.pop(key, None)
+    if ydl is not None:
+        try:
+            ydl.close()
+        except Exception:  # noqa: BLE001 — it is being thrown away because it is not healthy
+            pass
+
+
+# What yt-dlp says when YouTube is refusing the visitor rather than the video: the phrases
+# `ytdlp::is_throttle` in Reel treats as a throttle. "Sign in to confirm you're not a bot" is matched
+# on "not a bot", whichever apostrophe it carries — and not on "sign in to confirm", which an age gate
+# also starts with, and which is about the video.
+_FLAGGED = ("not a bot", "429", "too many requests", "rate-limit", "rate limit")
+
+
+def looks_flagged(message):
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in _FLAGGED)
+
+
 def answer(request):
     """Resolve one id into the same three things `/direct` returns."""
     key, ydl = downloader(request)
     try:
         info = ydl.extract_info("https://www.youtube.com/watch?v=" + request["id"], download=False)
-    except DownloadError:
+    except DownloadError as failure:
+        # A bot check or a throttle is said about the visitor, not the video: the session that was
+        # flagged would be reused for every request until the idle reaper (ten minutes) took it, and
+        # would be refused each time. A fresh instance is a fresh visitor identity.
+        if looks_flagged(str(failure)):
+            forget(key)
         raise
     except Exception:
         # Anything else leaves the instance in an unknown state; the next request builds a new one.
-        _instances.pop(key, None)
+        forget(key)
         raise
 
     # What the CLI's `--print urls` prints: the selected formats, in the order the selector named

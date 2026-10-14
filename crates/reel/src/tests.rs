@@ -6844,6 +6844,35 @@ async fn a_capped_fast_answer_is_resolved_again_by_yt_dlp() {
     assert_eq!((spawn_count(&fast_log), spawn_count(&slow_log)), (1, 1));
 }
 
+/// When youtubei.js had already failed and yt-dlp gave the answer that is then refused, the second
+/// look goes straight to yt-dlp: asking the resolver that just failed would only spend another failure.
+#[tokio::test]
+async fn a_second_look_after_a_fallback_does_not_ask_the_fast_resolver_again() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, fast_log) = fake_worker(
+        &dir,
+        "fast",
+        "echo '{\"ok\": false, \"error\": \"ERROR: [youtube] x: Video unavailable\"}'",
+    );
+    // yt-dlp's first answer is capped, its second whole.
+    let slow_log = dir.join("slow-requests");
+    let reply = format!(
+        "if [ $(wc -l < {}) -le 1 ]; then kind=capped; else kind=whole; fi\n\
+         echo \"{{\\\"ok\\\": true, \\\"width\\\": 1920, \\\"height\\\": 1080, \\\"urls\\\": \
+         [\\\"{base}/$kind?itag=137&clen=100&expire=4000000000\\\"], \\\"hls\\\": null}}\"",
+        slow_log.display()
+    );
+    let (slow, _) = fake_worker(&dir, "slow", &reply);
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.unwrap().video.contains("/whole?"), "the capped answer was kept");
+    assert_eq!(spawn_count(&slow_log), 2, "yt-dlp was not asked for the second look");
+    assert_eq!(spawn_count(&fast_log), 1, "the resolver that had failed was asked again");
+    assert_eq!(counted(&state.resolver.fallback_error), 1);
+}
+
 /// `?height=` reaches the fast resolver as the rungs of the ladder under it, tallest first.
 #[tokio::test]
 async fn the_fast_resolver_is_told_the_rungs_to_walk() {

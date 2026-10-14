@@ -347,20 +347,22 @@ async fn extract_youtubei(st: &AppState, vid: &str, format: &str, rungs: &[u32])
 /// yt-dlp is the resident worker, and the binary whenever that cannot answer either — which is every
 /// way it can fail, including not being configured at all.
 ///
-/// `skip` leaves one resolver out, for the retry after an answer googlevideo refused the end of: a
-/// second look from the same place is the least likely to differ.
+/// `retry` is the second look after an answer googlevideo refused the end of, and it goes straight to
+/// yt-dlp: either youtubei.js gave the refused answer, and a second look from the same place is the
+/// least likely to differ, or it had already failed and yt-dlp gave it, and asking it again would only
+/// spend another failure.
 async fn extract(
     st: &AppState,
     vid: &str,
     format: &str,
     rungs: &[u32],
-    skip: Option<Resolver>,
-) -> (Result<Direct, PlayError>, Resolver) {
+    retry: bool,
+) -> Result<Direct, PlayError> {
     use std::sync::atomic::Ordering::Relaxed;
-    let fast = skip != Some(Resolver::Youtubei) && st.youtubei.configured(&st.cfg);
+    let fast = !retry && st.youtubei.configured(&st.cfg);
     if fast {
         if let Ok(direct) = extract_youtubei(st, vid, format, rungs).await {
-            return (Ok(direct), Resolver::Youtubei);
+            return Ok(direct);
         }
     }
     let started = std::time::Instant::now();
@@ -386,7 +388,7 @@ async fn extract(
             resolver_line(&st.cfg, outcome, Resolver::YtDlp, reason, started.elapsed().as_millis(), vid)
         );
     }
-    (answer, Resolver::YtDlp)
+    answer
 }
 
 /// The rung a request's `?height=` caps the answer at, or `None` for the full `MAX_HEIGHT` ladder.
@@ -542,16 +544,14 @@ pub(crate) async fn answer(
                     let _permit = st.probe_sem.acquire().await;
                     let started = std::time::Instant::now();
                     let rungs = crate::config::ladder_rungs(cap.unwrap_or_else(|| st.cfg.top_rung()));
-                    let (mut answer, first) = extract(&st, &v, &format, &rungs, None).await;
+                    let mut answer = extract(&st, &v, &format, &rungs, false).await;
                     // A capped extraction stays capped for its URLs' whole six hours, and a fresh one
                     // usually is not (`refuses_its_end`), so it is worth one more — once, so a video
                     // that is capped every time still plays its first minute rather than nothing.
-                    // Whoever answered, the check is the same. If youtubei.js was the one capped,
-                    // yt-dlp takes the second look: it reads the video from somewhere else.
+                    // Whoever answered, the check is the same, and the second look is yt-dlp's.
                     if let Ok(d) = &answer {
                         if refuses_its_end(&st.http, &d.video).await {
-                            let skip = (first == Resolver::Youtubei).then_some(first);
-                            let (again, _) = extract(&st, &v, &format, &rungs, skip).await;
+                            let again = extract(&st, &v, &format, &rungs, true).await;
                             let still = match &again {
                                 Ok(d) => refuses_its_end(&st.http, &d.video).await.to_string(),
                                 Err(e) => e.reason.clone(),

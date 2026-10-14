@@ -70,7 +70,11 @@ def run(args):
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     cache = os.path.join(os.environ.get("BENCH_SCRATCH", "/tmp"), "compare-cache")
-    jobs = [(v, 1080) for v in corpus] + [(v, cap) for v in corpus[: args.capped] for cap in (720, 480)]
+    if args.ids:
+        wanted = args.ids.split(",")
+        jobs = [(v, 1080) for v in corpus if v["id"] in wanted]
+    else:
+        jobs = [(v, 1080) for v in corpus] + [(v, cap) for v in corpus[: args.capped] for cap in (720, 480)]
     for video, cap in jobs:
         rungs = [cap] + [s for s in (720, 480) if s < cap]
         rows = {}
@@ -83,6 +87,8 @@ def run(args):
             if reply.get("ok"):
                 row.update(
                     itags=[itag(u) for u in reply["urls"]], height=reply.get("height"), width=reply.get("width"),
+                    # Which audio track: the language/content tags in the stream's own URL.
+                    audio=bench.param(reply["urls"][1], "xtags") if len(reply["urls"]) > 1 else None,
                     hls=bool(reply.get("hls")), variants=master(reply.get("hls")),
                     playable=bench.check(reply, video.get("duration"))["playable"],
                 )
@@ -110,7 +116,7 @@ def summarize(path):
                 notes.append((r["vid"], r["cap"], "ytdlp ok" if a["ok"] else "youtubei ok", (a.get("error") or b.get("error"))))
             continue
         diff["compared"] += 1
-        for key in ("itags", "height", "width", "hls"):
+        for key in ("itags", "height", "width", "hls", "audio"):
             if a[key] != b[key]:
                 diff[f"{key} differ"] += 1
                 notes.append((r["vid"], r["cap"], key, f"ytdlp={a[key]} youtubei={b[key]}"))
@@ -130,6 +136,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", required=True)
     ap.add_argument("--videos", type=int, default=44)
     ap.add_argument("--capped", type=int, default=10, help="videos also asked at the 720 and 480 rungs")
+    ap.add_argument("--ids", help="comma-separated video ids to compare at the full ladder, instead of the corpus")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
     summarize(a.out) if a.summarize else run(a)

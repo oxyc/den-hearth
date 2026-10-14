@@ -1,0 +1,101 @@
+name: youtubei-update
+
+# youtubei.js is Reel's fast resolver (crates/reel/worker/youtubei). Its packages are pinned twice: by
+# deno.lock (an integrity hash per package) and by the lock's own SHA-256 in the Dockerfile
+# (ARG YOUTUBEI_LOCK_SHA256), which makes a changed lockfile impossible to land without that line changing
+# with it. Dependabot cannot keep the two in step (it has no deno ecosystem, and would bump one and not the
+# other), so this does, the way ytdlp-update.yml and deno-update.yml keep their sums.
+#
+# Same supply-chain cooldown as those: a release younger than 2 days is never pulled. The bump rewrites the
+# import in deno.json, regenerates deno.lock, re-pins the lock's SHA-256 in the Dockerfile, and runs the
+# worker's tests against the new packages.
+#
+# Like deno-update this does NOT auto-merge. yt-dlp is the fallback, so a bad bump costs speed, not trailers,
+# but nothing here proves YouTube still answers. Review the deno.lock diff (new or changed packages are the
+# review), then watch `reel_youtubei_fallbacks_total` and the `event=resolver` log lines after the deploy.
+
+on:
+  schedule:
+    - cron: "45 6 * * 1" # weekly; moves slower than yt-dlp
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve latest eligible youtubei.js release
+        id: rel
+        env:
+          COOLDOWN_DAYS: "2"
+        run: |
+          set -euo pipefail
+          meta=$(curl -fsSL https://registry.npmjs.org/youtubei.js)
+          version=$(jq -r '."dist-tags".latest' <<<"$meta")
+          published=$(jq -r --arg v "$version" '.time[$v]' <<<"$meta")
+          current=$(jq -r '.imports["youtubei.js"]' crates/reel/worker/youtubei/deno.json | sed -E 's/.*@//')
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "$published" +%s) ) / 86400 ))
+          echo "current=$current latest=$version age_days=$age_days"
+          if [ "$version" = "$current" ]; then
+            echo "::notice::already on the latest youtubei.js ($version)"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$age_days" -lt "$COOLDOWN_DAYS" ]; then
+            echo "::notice::youtubei.js $version is only ${age_days}d old (<${COOLDOWN_DAYS}d cooldown) — skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "proceed=true"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      # The deno that runs it in production, verified against the Dockerfile's own pin.
+      - name: Install the pinned deno
+        if: steps.rel.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          version=$(grep -oP '^ARG DENO_VERSION=\K\S+' Dockerfile)
+          sha=$(grep -oP '^ARG DENO_SHA256_AMD64=\K\S+' Dockerfile)
+          curl -fsSL "https://github.com/denoland/deno/releases/download/v${version}/deno-x86_64-unknown-linux-gnu.zip" -o deno.zip
+          echo "${sha}  deno.zip" | sha256sum -c -
+          unzip -q -d "$HOME/.local/bin" deno.zip
+          rm deno.zip
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Re-lock and re-pin
+        if: steps.rel.outputs.proceed == 'true'
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd crates/reel/worker/youtubei
+          jq --arg v "npm:youtubei.js@${VERSION}" '.imports["youtubei.js"] = $v' deno.json > deno.json.new
+          mv deno.json.new deno.json
+          rm -f deno.lock
+          export DENO_DIR="$RUNNER_TEMP/deno"
+          deno cache --config=deno.json --lock=deno.lock main.mjs
+          deno test --cached-only --config=deno.json --lock=deno.lock .
+          sum=$(sha256sum deno.lock | cut -d' ' -f1)
+          cd -
+          sed -i -E "s|^ARG YOUTUBEI_LOCK_SHA256=.*|ARG YOUTUBEI_LOCK_SHA256=${sum}|" Dockerfile
+          git diff --stat
+
+      - name: Open PR
+        if: steps.rel.outputs.proceed == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.YTDLP_PR_TOKEN }}
+          branch: youtubei-bump/${{ steps.rel.outputs.version }}
+          title: "youtubei.js → ${{ steps.rel.outputs.version }}"
+          commit-message: "Bump youtubei.js to ${{ steps.rel.outputs.version }} (+ re-locked, lock SHA256 re-pinned)"
+          labels: dependencies
+          body: |
+            Automated bump of the pinned youtubei.js to `${{ steps.rel.outputs.version }}` — release is ≥2 days old (supply-chain cooldown).
+
+            `deno.lock` was regenerated (read the diff: new or changed packages and their integrity hashes are the review), `ARG YOUTUBEI_LOCK_SHA256` re-pinned to match, and the worker's deno tests passed against the new packages.
+
+            **Not auto-merged, on purpose.** CI proves the image builds and the lock verifies. It does not prove YouTube still answers. yt-dlp is the fallback, so a bad bump costs speed rather than trailers; after deploying, watch `reel_youtubei_fallbacks_total` and the `event=resolver` log lines.
