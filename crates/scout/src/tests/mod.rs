@@ -42,6 +42,7 @@ mod redirect;
 mod refusal;
 mod remux;
 mod reqlog;
+mod rust_wire_vectors;
 mod scrape;
 mod seal;
 mod season_bench;
