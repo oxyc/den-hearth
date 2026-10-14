@@ -153,9 +153,12 @@ fn mutate(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
     b
 }
 
+/// `FUZZ_DUMP=path` writes one line per mutated file (fixture, number, and its output), so two builds' passes can be
+/// diffed to the files they disagree on.
 async fn mutated_digest(iters: usize) -> (u64, usize) {
     let mut hasher = DefaultHasher::new();
     let mut probed = 0;
+    let mut dump = String::new();
     for (i, (name, bytes)) in fixtures().iter().enumerate() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
         for n in 0..iters {
@@ -165,7 +168,20 @@ async fn mutated_digest(iters: usize) -> (u64, usize) {
             let out = probe_head(&file, head).await;
             probed += usize::from(!out.starts_with("err"));
             (name, &out).hash(&mut hasher);
+            if std::env::var_os("FUZZ_DUMP").is_some() {
+                dump.push_str(&format!("{name} #{n} {out}\n"));
+            }
+            if std::env::var("FUZZ_SHOW").is_ok_and(|show| show == format!("{name}#{n}")) {
+                let changed: Vec<String> = (0..file.len())
+                    .filter(|&at| bytes.get(at) != Some(&file[at]))
+                    .map(|at| format!("{at}:{:02x}->{:02x}", bytes.get(at).copied().unwrap_or(0), file[at]))
+                    .collect();
+                eprintln!("{name}#{n}: len {} of {}, changed {changed:?}\n  {out}", file.len(), bytes.len());
+            }
         }
+    }
+    if let Some(path) = std::env::var_os("FUZZ_DUMP") {
+        std::fs::write(path, dump).expect("write the dump");
     }
     (hasher.finish(), probed)
 }

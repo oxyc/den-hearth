@@ -17,6 +17,8 @@ pub mod mp4;
 
 use std::fmt;
 
+use den_media::codec;
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VideoCodec {
     H264,
@@ -208,24 +210,15 @@ pub fn av1_track(av1c: &[u8], container: Colour) -> (Option<String>, bool) {
 /// 4:2:0 BT.709: so they're written whenever the stream says anything of its colours, or isn't 4:2:0 in colour. An
 /// HDR stream's string then names its PQ or HLG, which is how a player knows it from SDR.
 pub fn av1_codecs(av1c: &[u8], colour: Colour) -> Option<String> {
-    // marker (1) and version (1); seq_profile (3) and seq_level_idx_0 (5); seq_tier_0, high_bitdepth, twelve_bit,
-    // monochrome, chroma_subsampling_x, chroma_subsampling_y, chroma_sample_position (2).
-    let b = av1c.get(..4)?;
-    if b[0] != 0x81 {
-        return None;
-    }
-    let (profile, level) = (b[1] >> 5, b[1] & 0x1f);
-    let tier = if b[2] & 0x80 != 0 { 'H' } else { 'M' };
-    let depth = match (b[2] & 0x40 != 0, b[2] & 0x20 != 0) {
-        (false, _) => 8,
-        (true, false) => 10,
-        (true, true) => 12,
-    };
+    // A whole record is four bytes, which the codec's reader doesn't require.
+    let av1 = codec::av1(av1c.get(..4)?)?;
+    let tier = if av1.high_tier { 'H' } else { 'M' };
+    let (profile, level, depth) = (av1.profile, av1.level, av1.bit_depth());
     let mut s = format!("av01.{profile}.{level:02}{tier}.{depth:02}");
-    let (mono, x, y) = ((b[2] >> 4) & 1, (b[2] >> 3) & 1, (b[2] >> 2) & 1);
+    let (mono, x, y) = (u8::from(av1.monochrome), av1.subsampling_x, av1.subsampling_y);
     if colour.says() || mono == 1 || (x, y) != (1, 1) {
         // The sample position counts only for 4:2:0.
-        let position = if (x, y) == (1, 1) { b[2] & 3 } else { 0 };
+        let position = if (x, y) == (1, 1) { av1.sample_position } else { 0 };
         let code = |c: u64| if c == 0 { 2 } else { c };
         s.push_str(&format!(
             ".{mono}.{x}{y}{position}.{:02}.{:02}.{:02}.{}",
@@ -767,8 +760,8 @@ impl fmt::Display for DolbyVision {
 /// bytes, the profile in the top 7 bits of the third, the level in its last bit and the top 5 of the fourth, the
 /// compatibility id in the top 4 bits of the fifth.
 pub fn dovi_config(record: &[u8]) -> Option<DolbyVision> {
-    let b = record.get(..5)?;
-    Some(DolbyVision { profile: b[2] >> 1, compat: b[4] >> 4, level: ((b[2] & 1) << 5) | (b[3] >> 3) })
+    let record = codec::dovi(record)?;
+    Some(DolbyVision { profile: record.profile, compat: record.compat?, level: record.level })
 }
 
 /// The largest single structure we will read: a `moov` or `Cues` for a long film is a few MB, and
@@ -855,7 +848,8 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
 
 /// `avc1.PPCCLL` from an `avcC` record: profile, constraint flags, level.
 pub fn avc_codecs(avcc: &[u8]) -> Option<String> {
-    (avcc.len() >= 4 && avcc[0] == 1).then(|| format!("avc1.{:02x}{:02x}{:02x}", avcc[1], avcc[2], avcc[3]))
+    let avc = codec::avc(avcc).filter(|avc| avc.version == 1)?;
+    Some(format!("avc1.{:02x}{:02x}{:02x}", avc.profile, avc.constraints, avc.level))
 }
 
 /// The profile, level and tier an RFC 6381 string names: `avc1.640033` is (100, 51, false), level 5.1 as
@@ -891,15 +885,12 @@ pub fn profile_level(codecs: &str) -> Option<(u8, u16, bool)> {
 /// 14496-15 annex E: the compatibility flags bit-reversed in hex, trailing zero constraint bytes
 /// dropped.
 pub fn hevc_codecs(hvcc: &[u8]) -> Option<String> {
-    if hvcc.len() < 13 {
-        return None;
-    }
-    let space = ["", "A", "B", "C"][(hvcc[1] >> 6) as usize];
-    let tier = if hvcc[1] & 0x20 != 0 { 'H' } else { 'L' };
-    let profile = hvcc[1] & 0x1f;
-    let compat = u32::from_be_bytes([hvcc[2], hvcc[3], hvcc[4], hvcc[5]]).reverse_bits();
-    let level = hvcc[12];
-    let mut constraints = hvcc[6..12].to_vec();
+    let hevc = codec::hevc(hvcc)?;
+    let space = ["", "A", "B", "C"][usize::from(hevc.profile_space)];
+    let tier = if hevc.high_tier { 'H' } else { 'L' };
+    let (profile, level) = (hevc.profile, hevc.level);
+    let compat = hevc.compat_flags.reverse_bits();
+    let mut constraints = hevc.constraints.to_vec();
     while constraints.last() == Some(&0) {
         constraints.pop();
     }

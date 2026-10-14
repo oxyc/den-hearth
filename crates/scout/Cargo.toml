@@ -14,6 +14,8 @@ den-http = { path = "../http" }
 # Client profiles, the dial-time address guard, Retry-After and the per-credential pause, shared with Reel,
 # Subtitles and Remux.
 den-upstream = { path = "../upstream" }
+# The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file's head with, shared with Remux.
+den-media = { path = "../media" }
 # The request and response bodies the handler serves.
 bytes = "1"
 http-body-util = "0.1"

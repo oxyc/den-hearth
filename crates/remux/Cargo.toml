@@ -11,6 +11,8 @@ license = "MIT"
 den-upstream = { path = "../upstream" }
 # Response builders, CORS, the request log line and the metrics bearer check, shared with Reel and Subtitles.
 den-http = { path = "../http" }
+# The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file with, shared with Scout.
+den-media = { path = "../media" }
 # Single-threaded async runtime: the process only routes requests and watches ffmpeg, which does the
 # actual work in its own process. current_thread keeps the resident thread count (and RAM) minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }

@@ -84,7 +84,7 @@ fn parse_matroska_tracks_no_tracks() {
 // wrong answer, so untagged tracks are counted, never named.
 #[test]
 fn parse_track_entry_untagged_is_not_english() {
-    let entry = [crate::probe::ID_TRACK_TYPE, 0x81, crate::probe::TRACK_TYPE_AUDIO];
+    let entry = [den_media::mkv::TRACK_TYPE as u8, 0x81, crate::probe::TRACK_TYPE_AUDIO];
     let (kind, lang) = crate::probe::parse_track_entry(&entry);
     assert!(
         kind == crate::probe::TRACK_TYPE_AUDIO && lang == "und",
@@ -127,7 +127,7 @@ fn clean_lang() {
 // languages anyone chooses between.
 #[test]
 fn parse_track_entry_ignores_video() {
-    let entry = [crate::probe::ID_TRACK_TYPE, 0x81, 0x01];
+    let entry = [den_media::mkv::TRACK_TYPE as u8, 0x81, 0x01];
     let (_, lang) = crate::probe::parse_track_entry(&entry);
     assert!(lang.is_empty(), "video track reported language {lang:?}");
 }
