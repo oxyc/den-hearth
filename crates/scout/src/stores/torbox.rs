@@ -48,7 +48,7 @@ use support::{
     encode_form, envelope, fetch_state, first_value, int_or_zero, is_cancellation, is_torrent_gone, join_all, known_cached,
     live, lock, magnet_for, no_file_list, note_unknown_outcome, opt_bool, opt_float, opt_int, opt_string,
     read_limited, read_store_error, record_refusal_for, redact_token, refusal_is_about_the_account, remember_cached,
-    settle_add_attempt, short_hash, store_error_text, store_refused_us, string_or_empty, torbox_account_identity,
+    scoped, settle_add_attempt, short_hash, store_error_text, store_refused_us, string_or_empty, torbox_account_identity,
     torrent_gone, torrent_miss_key, transport_error, unavailable, unknown_outcome, would_add, DetachedFlight, NoCache,
     TORRENT_MISS_TTL,
 };
@@ -300,7 +300,7 @@ impl TorBoxStore {
     /// Go `torBoxStore.demandCheckCached`: asks for these hashes through the account's batcher, which folds the
     /// demands of every request in a short window into one checkcached call.
     async fn demand_check_cached(&self, hashes: Vec<String>) -> TorboxCheckResult {
-        let key = key_hash(&self.account_identity());
+        let key = scoped(&key_hash(&self.account_identity()));
         let (reply, answer) = oneshot::channel();
         let mut demand = Some(Demand { hashes: hashes.clone(), reply });
         {
@@ -928,6 +928,21 @@ impl TorBoxStore {
             Ok(id) => (id, true),
             Err(_) => (0, false),
         }
+    }
+
+    /// Go `torBoxStore.KnownFileSize` (linkcheck.go:161): TorBox's size comes out of the resolve entry, which
+    /// carries the pack's file list whenever an episode had to be picked from one. A movie resolves without
+    /// listing files, so its size is simply not known. Cache-only: a size is only worth having if finding it
+    /// costs nothing.
+    pub(crate) fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
+        let raw = self.cache.as_ref()?.get(&resolve_key(&self.account_identity(), &t.info_hash))?;
+        let entry = serde_json::from_str::<ResolveEntry>(&raw).ok()?;
+        if entry.files.is_empty() {
+            return None;
+        }
+        let files = entry.files();
+        let id = select_file_id(&files, t).ok()??;
+        size_of(&files, id)
     }
 
     /// Go `torBoxStore.forgetTorrentID` drops both remembered facts about a torrent the account turns out not to
@@ -2249,6 +2264,11 @@ fn parse_torbox_time(raw: Option<&str>) -> Option<Rfc3339> {
 }
 
 // --- file selection ---
+
+/// Go `sizeOf` (linkcheck.go): the listed size of the file with this id, when the listing gave one.
+pub(crate) fn size_of(files: &[TorrentFile], id: i64) -> Option<i64> {
+    files.iter().find(|f| f.index == id && f.size_bytes.is_some_and(|s| s > 0)).and_then(|f| f.size_bytes)
+}
 
 /// Go `selectFileID` picks TorBox's own file id for the requested file. For a series episode it name-matches the
 /// pack first (most reliable); a fileIdx is a POSITION in the torrent's file list, so it's mapped to TorBox's file

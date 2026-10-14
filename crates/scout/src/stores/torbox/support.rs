@@ -641,6 +641,16 @@ pub(crate) fn string_or_empty(v: Option<&Value>) -> Result<String, ()> {
 
 // --- concurrency ---
 
+/// A key for work that is shared between callers, scoped to the runtime the caller is on.
+///
+/// Shared work runs in a task on the runtime that started it, and a caller on another runtime could be left
+/// waiting for a task whose runtime has since shut down. The server has one runtime, so this changes nothing
+/// there; it is also what keeps the work of two independent runtimes in one process (each test has its own)
+/// from being mistaken for one account's.
+pub(crate) fn scoped(key: &str) -> String {
+    format!("{}:{key}", tokio::runtime::Handle::current().id())
+}
+
 /// Go `singleflight.Group.DoChan`: concurrent callers of one key share one run of the work and its answer, and the
 /// work is NOT tied to the caller that started it. Dropping the caller that started the work (the request went
 /// away, its budget ran out) leaves the work running for everyone still waiting, which is the property the
@@ -667,15 +677,15 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T> + Send + 'static,
     {
+        let key = scoped(key);
         let mut rx = {
             let mut calls = lock(&self.0);
-            match calls.get(key) {
+            match calls.get(&key) {
                 Some(rx) => rx.clone(),
                 None => {
                     let (tx, rx) = watch::channel(None);
-                    calls.insert(key.to_owned(), rx.clone());
+                    calls.insert(key.clone(), rx.clone());
                     let work = make();
-                    let key = key.to_owned();
                     tokio::spawn(async move {
                         let answer = tokio::spawn(work).await.ok();
                         lock(&self.0).remove(&key);
