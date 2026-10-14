@@ -28,6 +28,7 @@ use super::{
 use crate::addbudget::{budget_account, global_add_budget, refund_add, spend_add, RequestNotSent};
 use crate::cache::{Cache, CacheClass};
 use crate::config::DebridService;
+use crate::linkcheck::size_of;
 use crate::loglimit::log_limited;
 use crate::metrics::metrics;
 use crate::scrape::{DoError, Doer};
@@ -36,21 +37,23 @@ use crate::season::{
     TorrentFile,
 };
 use crate::stores::refusal::{
-    add_outcome_unknown, backed_off, note_add_attempt, record_refusal, resolve_key, torrent_id_key, transport_kind,
+    account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, backed_off, batches_failed,
+    cache_or_none, canonical_torbox_identity, clear, is_cancellation, is_torrent_gone, known_cached, live, note_add_attempt,
+    note_unknown_outcome, record_refusal, record_refusal_for, refusal_is_about_the_account, remember_cached,
+    resolve_key, settle_add_attempt, torbox_account_identity, torrent_id_key, torrent_miss_key, transport_error,
+    transport_kind, unknown_outcome, TORRENT_MISS_TTL,
 };
 use crate::util::{go_to_lower, key_hash, Shape, LEAF};
 
 pub(crate) use listing::{decode_listing, ListingFault, TruncationDetector};
-pub(crate) use support::canonical_torbox_identity;
+use super::{
+    build_request, dead_link, encode_form, join_all, magnet_for, read_limited,
+    read_store_error, redact_token, short_hash, store_error_text, store_refused_us, torbox_fetch_state as fetch_state,
+    unavailable,
+};
 use support::{
-    account_backed_off, add_in_flight, add_still_believable, batches_failed, build_request, clear, dead_link,
-    encode_form, envelope, fetch_state, first_value, int_or_zero, is_cancellation, is_cancellation_error,
-    is_torrent_gone, join_all, known_cached,
-    live, lock, magnet_for, no_file_list, note_unknown_outcome, opt_bool, opt_float, opt_int, opt_string,
-    read_limited, read_store_error, record_refusal_for, redact_token, refusal_is_about_the_account, remember_cached,
-    scoped, settle_add_attempt, short_hash, store_error_text, store_refused_us, string_or_empty, torbox_account_identity,
-    torrent_gone, torrent_miss_key, transport_error, unavailable, unknown_outcome, would_add, DetachedFlight,
-    GaugeGuard, NoCache, TORRENT_MISS_TTL,
+    envelope, first_value, int_or_zero, lock, no_file_list, opt_bool, opt_float, opt_int, opt_string, scoped,
+    string_or_empty, torrent_gone, would_add, DetachedFlight, GaugeGuard,
 };
 
 /// Go `torboxAPI`.
@@ -176,7 +179,6 @@ static LISTING_FLIGHTS: DetachedFlight<Option<Arc<HashMap<String, i64>>>> =
 static BATCHERS: Mutex<BTreeMap<String, Arc<Batcher>>> = Mutex::new(BTreeMap::new());
 /// Go `listingMemo` with `listingMemoMu`. See `LISTING_MEMO`'s notes on `memo_key`.
 static LISTING_MEMO: Mutex<BTreeMap<(usize, String), ListingMemoEntry>> = Mutex::new(BTreeMap::new());
-static NO_CACHE: NoCache = NoCache;
 
 // --- the store ---
 
@@ -217,10 +219,7 @@ impl Reply {
 impl TorBoxStore {
     /// A store's cache, or the one that holds nothing where Go has a nil `Cache`.
     fn cache(&self) -> &dyn Cache {
-        match &self.cache {
-            Some(c) => c.as_ref(),
-            None => &NO_CACHE,
-        }
+        cache_or_none(&self.cache)
     }
 
     /// Go `torBoxStore.accountIdentity`: the cache identity of this token on this API endpoint.
@@ -228,15 +227,11 @@ impl TorBoxStore {
         torbox_account_identity(&self.api, &self.token)
     }
 
-    /// Go `torBoxStore.budgetAccount`.
-    pub(crate) fn budget_account(&self) -> String {
-        budget_account(DebridService::TorBox, &self.account_identity())
-    }
-
     /// Go `torBoxStore.get`.
     async fn get(&self, u: &str) -> Result<Reply, DoError> {
         let auth = format!("Bearer {}", self.token);
-        let req = build_request(reqwest::Method::GET, u, &[("authorization", &auth), ("accept", "application/json")], None)?;
+        let req = build_request(reqwest::Method::GET, u, &[("authorization", &auth), ("accept", "application/json")], None)
+            .map_err(|e| DoError::from(e.to_string()))?;
         self.send(req).await
     }
 
@@ -258,7 +253,8 @@ impl TorBoxStore {
             &format!("{}{path}", self.api),
             &[("authorization", &auth), ("content-type", "application/x-www-form-urlencoded")],
             Some(encode_form(form)),
-        )?;
+        )
+        .map_err(|e| DoError::from(e.to_string()))?;
         self.send(req).await
     }
 
@@ -435,7 +431,7 @@ impl TorBoxStore {
             Ok(r) => r,
             Err(e) => {
                 refund_add(DebridService::TorBox, &identity, &RequestNotSent);
-                return Err(StoreError::Other(e));
+                return Err(e);
             }
         };
         note_add_attempt(cache, DebridService::TorBox, &identity, info_hash);
@@ -457,10 +453,7 @@ impl TorBoxStore {
             // Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
             // again. The charge stays too — the add was written to the wire. A viewer backing out is the cause
             // that starts no give-up clock.
-            Err(e) => {
-                let cancelled = is_cancellation_error(&e);
-                return Err(unknown_outcome(cache, DebridService::TorBox, &identity, info_hash, cancelled));
-            }
+            Err(e) => return Err(unknown_outcome(cache, DebridService::TorBox, &identity, info_hash, &e)),
         };
         drop(reply);
         settle_add_attempt(cache, DebridService::TorBox, &identity, info_hash);
@@ -942,21 +935,6 @@ impl TorBoxStore {
             Ok(id) => (id, true),
             Err(_) => (0, false),
         }
-    }
-
-    /// Go `torBoxStore.KnownFileSize` (linkcheck.go:161): TorBox's size comes out of the resolve entry, which
-    /// carries the pack's file list whenever an episode had to be picked from one. A movie resolves without
-    /// listing files, so its size is simply not known. Cache-only: a size is only worth having if finding it
-    /// costs nothing.
-    pub(crate) fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
-        let raw = self.cache.as_ref()?.get(&resolve_key(&self.account_identity(), &t.info_hash))?;
-        let entry = serde_json::from_str::<ResolveEntry>(&raw).ok()?;
-        if entry.files.is_empty() {
-            return None;
-        }
-        let files = entry.files();
-        let id = select_file_id(&files, t).ok()??;
-        size_of(&files, id)
     }
 
     /// Go `torBoxStore.forgetTorrentID` drops both remembered facts about a torrent the account turns out not to
@@ -2297,11 +2275,6 @@ fn parse_torbox_time(raw: Option<&str>) -> Option<Rfc3339> {
 
 // --- file selection ---
 
-/// Go `sizeOf` (linkcheck.go): the listed size of the file with this id, when the listing gave one.
-pub(crate) fn size_of(files: &[TorrentFile], id: i64) -> Option<i64> {
-    files.iter().find(|f| f.index == id && f.size_bytes.is_some_and(|s| s > 0)).and_then(|f| f.size_bytes)
-}
-
 /// Go `selectFileID` picks TorBox's own file id for the requested file. For a series episode it name-matches the
 /// pack first (most reliable); a fileIdx is a POSITION in the torrent's file list, so it's mapped to TorBox's file
 /// id via the loaded list. Without a file list (single-file fast path / list failure) the raw fileIdx is passed
@@ -2363,7 +2336,7 @@ impl Store for TorBoxStore {
 
     async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
         let identity = self.account_identity();
-        let (mut result, hashes) = known_cached(self.cache.as_deref(), DebridService::TorBox, &identity, hashes);
+        let (mut result, hashes) = known_cached(self.cache(), DebridService::TorBox, &identity, hashes);
         if hashes.is_empty() {
             return Ok(result);
         }
@@ -2382,7 +2355,7 @@ impl Store for TorBoxStore {
                 result.insert(h.clone(), answer.get(&go_to_lower(h)).copied().unwrap_or(false));
             }
         }
-        remember_cached(self.cache.as_deref(), DebridService::TorBox, &identity, &result);
+        remember_cached(self.cache(), DebridService::TorBox, &identity, &result);
         batches_failed(&batch_ok)?;
         Ok(result)
     }
@@ -2542,7 +2515,7 @@ impl Store for TorBoxStore {
         // If TorBox's earlier answer was stale, add_only_if_cached makes the add refuse rather than silently
         // spend the separate 60-an-hour UNCACHED allowance on a release that turned out not to be cached.
         let (believed_cached, _) =
-            known_cached(self.cache.as_deref(), svc, &identity, std::slice::from_ref(&t.info_hash));
+            known_cached(self.cache(), svc, &identity, std::slice::from_ref(&t.info_hash));
         let only_if_cached = believed_cached.get(&t.info_hash).copied().unwrap_or(false);
         let (torrent_id, queued_id) = match self.add_magnet(&t.info_hash, t.prefetch, only_if_cached).await {
             // Parked, not dead — see errAddQueued. Nothing more to do with this id until a later poll's
@@ -2700,11 +2673,30 @@ impl Store for TorBoxStore {
     }
 
     fn scout_budget_spent(&self) -> Option<bool> {
-        Some(global_add_budget().remaining(&self.budget_account()) <= 0)
+        Some(global_add_budget().remaining(&budget_account(DebridService::TorBox, &self.account_identity())) <= 0)
     }
 
     fn account_refused(&self) -> Option<String> {
         account_backed_off(self.cache(), DebridService::TorBox, &self.account_identity())
+    }
+
+    fn budget_account(&self) -> Option<String> {
+        Some(budget_account(DebridService::TorBox, &self.account_identity()))
+    }
+
+    /// Go `torBoxStore.KnownFileSize` (linkcheck.go:161): TorBox's size comes out of the resolve entry, which
+    /// carries the pack's file list whenever an episode had to be picked from one. A movie resolves without
+    /// listing files, so its size is simply not known. Cache-only: a size is only worth having if finding it
+    /// costs nothing.
+    fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
+        let raw = self.cache.as_ref()?.get(&resolve_key(&self.account_identity(), &t.info_hash))?;
+        let entry = serde_json::from_str::<ResolveEntry>(&raw).ok()?;
+        if entry.files.is_empty() {
+            return None;
+        }
+        let files = entry.files();
+        let id = select_file_id(&files, t).ok()??;
+        size_of(&files, id)
     }
 }
 

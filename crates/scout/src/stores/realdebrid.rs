@@ -8,9 +8,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::addbudget::spend_add;
+use crate::addbudget::{refund_unused_add, spend_add};
 use crate::cache::Cache;
 use crate::config::DebridService;
+use crate::linkcheck::{rd_size_key, size_of};
 use crate::rank::real_debrid_blocked;
 use crate::scrape::Doer;
 use crate::season::{
@@ -19,7 +20,7 @@ use crate::season::{
 use crate::stores::refusal::{
     account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, backed_off,
     cache_or_none, is_cancellation, is_torrent_gone, note_add_attempt, note_unknown_outcome, record_refusal,
-    record_refusal_for, refund_unused_add, scout_budget_spent, settle_add_attempt, store_error_from_do,
+    record_refusal_for, scout_budget_spent, settle_add_attempt, store_error_from_do,
     unknown_outcome, as_unavailable,
 };
 use crate::stores::{
@@ -125,17 +126,6 @@ pub(crate) fn rd_torrent_key(token: &str, info_hash: &str, t: &ResolveTarget) ->
     format!("realdebrid:torrent:{}:{info_hash}{sel}", key_hash(token))
 }
 
-/// Go `rdSizeKey` (linkcheck.go:181): the byte size RD listed for the file a remembered torrent serves.
-/// Same scope as the id.
-fn rd_size_key(token: &str, info_hash: &str, t: &ResolveTarget) -> String {
-    format!("{}:bytes", rd_torrent_key(token, info_hash, t))
-}
-
-/// Go `sizeOf` (linkcheck.go:210): the listed size of the file with this id, when it is known and positive.
-fn size_of(files: &[TorrentFile], id: i64) -> Option<i64> {
-    files.iter().find(|f| f.index == id).and_then(|f| f.size_bytes).filter(|n| *n > 0)
-}
-
 /// Go `rdLinkFor` picks the link belonging to a file id.
 ///
 /// RD's `links` map one-to-one onto the SELECTED files, in file order — not onto every file, and not onto
@@ -169,11 +159,6 @@ fn rd_file_selected(info: &RdInfo, file_id: i64) -> bool {
 impl RealDebridStore {
     fn cache(&self) -> &dyn Cache {
         cache_or_none(&self.cache)
-    }
-
-    /// Go `realDebridStore.budgetAccount`.
-    pub(crate) fn budget_account(&self) -> String {
-        crate::addbudget::budget_account(DebridService::RealDebrid, &self.token)
     }
 
     /// Go `realDebridStore.post`.
@@ -223,13 +208,6 @@ impl RealDebridStore {
         if let Some(n) = size_of(files, file_id) {
             cache.put(&rd_size_key(&self.token, &t.info_hash, t), &n.to_string(), RESOLVE_CACHE_TTL);
         }
-    }
-
-    /// Go `realDebridStore.KnownFileSize` (linkcheck.go:196).
-    pub(crate) fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
-        let cache = self.cache.as_ref()?;
-        let raw = cache.get(&rd_size_key(&self.token, &t.info_hash, t))?;
-        raw.parse::<i64>().ok().filter(|n| *n > 0)
     }
 
     /// Go `realDebridStore.pickFileID` (stores.go:4269): the file id to unrestrict. Name match first, then
@@ -292,7 +270,7 @@ impl RealDebridStore {
             None,
         )
         .map_err(|_| dead_link("realdebrid bad torrent id"))?;
-        let resp = self.client.do_request(req).await.map_err(store_error_from_do)?;
+        let mut resp = self.client.do_request(req).await.map_err(store_error_from_do)?;
         let status = resp.status().as_u16();
         // 404 is RD saying it has no torrent under that id — the one answer that means a remembered id is
         // stale. Anything else, including an empty file list on a torrent whose metadata has not resolved
@@ -310,13 +288,13 @@ impl RealDebridStore {
         if status != 200 {
             return Err(dead_link(format!("realdebrid info http {status}")));
         }
-        let raw = read_limited(resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid bad info"))?;
+        let raw = read_limited(&mut resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid bad info"))?;
         decode_first::<RdInfo>(&raw, &RD_INFO_SHAPE).ok_or_else(|| dead_link("realdebrid bad info"))
     }
 
     /// Go `realDebridStore.unrestrict`.
     async fn unrestrict(&self, link: &str) -> Result<String, StoreError> {
-        let resp = self.post("/unrestrict/link", &[("link", link)]).await?;
+        let mut resp = self.post("/unrestrict/link", &[("link", link)]).await?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             // See selectFiles: the last call of the chain classifies like the first — except for 403, which
@@ -329,7 +307,7 @@ impl RealDebridStore {
             }
             return Err(dead_link(format!("realdebrid unrestrict http {status}")));
         }
-        let raw = read_limited(resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid no download"))?;
+        let raw = read_limited(&mut resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid no download"))?;
         match decode_first::<RdUnrestricted>(&raw, &RD_UNRESTRICTED_SHAPE) {
             Some(body) if !body.download.is_empty() => Ok(body.download),
             _ => Err(dead_link("realdebrid no download")),
@@ -544,7 +522,7 @@ impl Store for RealDebridStore {
         // future before it reaches the charge instead of arriving at it.
         spend_add(svc, &self.token, &t.info_hash, t.prefetch)?;
         note_add_attempt(cache, svc, &self.token, &t.info_hash);
-        let add_resp = match self.post("/torrents/addMagnet", &[("magnet", &magnet_for(&t.info_hash))]).await {
+        let mut add_resp = match self.post("/torrents/addMagnet", &[("magnet", &magnet_for(&t.info_hash))]).await {
             Ok(resp) => resp,
             Err(err) => {
                 // See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
@@ -572,7 +550,7 @@ impl Store for RealDebridStore {
         let add_status = add_resp.status().as_u16();
         // Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
         // decoding straight off the reader left nothing for readStoreError further down.
-        let raw = match read_limited(add_resp, MAX_STORE_BYTES).await {
+        let raw = match read_limited(&mut add_resp, MAX_STORE_BYTES).await {
             Ok(raw) => raw,
             // A body that could not be READ is not an answer that nothing was created. RD had already sent
             // its status line — a 201 means the torrent exists on the account — and a mid-body reset, a TLS
@@ -675,5 +653,16 @@ impl Store for RealDebridStore {
 
     fn account_refused(&self) -> Option<String> {
         account_backed_off(self.cache(), DebridService::RealDebrid, &self.token)
+    }
+
+    fn budget_account(&self) -> Option<String> {
+        Some(crate::addbudget::budget_account(DebridService::RealDebrid, &self.token))
+    }
+
+    /// Go `realDebridStore.KnownFileSize` (linkcheck.go:196).
+    fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
+        let cache = self.cache.as_ref()?;
+        let raw = cache.get(&rd_size_key(&self.token, &t.info_hash, t))?;
+        raw.parse::<i64>().ok().filter(|n| *n > 0)
     }
 }

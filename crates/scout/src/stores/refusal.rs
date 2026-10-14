@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::addbudget::{budget_account, global_add_budget, refund_add, RequestNotSent};
+use crate::addbudget::{budget_account, global_add_budget};
 use crate::cache::{Cache, CacheClass};
 use crate::config::DebridService;
 use crate::loglimit::log_limited;
@@ -15,7 +15,7 @@ use crate::scrape::DoError;
 use crate::stores::pool::StorePool;
 use crate::stores::torbox::TORBOX_API;
 use crate::stores::{
-    dead_link, error_chain_text, is_cancellation_text, ResolveTarget, StoreError, StoreUnavailableError,
+    dead_link, error_chain_text, is_cancellation_error, ResolveTarget, StoreError, StoreUnavailableError,
     ERR_CHECK_FAILED, ERR_TORRENT_GONE, RESOLVE_CACHE_TTL,
 };
 use crate::util::key_hash;
@@ -73,13 +73,13 @@ pub(crate) fn cache_or_none(cache: &Option<Arc<dyn Cache>>) -> &dyn Cache {
 }
 
 /// Go `cachePut(cache, key, "", time.Nanosecond, CacheVolatile)`: drops a key by letting it expire at once.
-fn clear(cache: &dyn Cache, key: &str) {
+pub(crate) fn clear(cache: &dyn Cache, key: &str) {
     cache.put_class(key, "", Duration::from_nanos(1), CacheClass::Volatile);
 }
 
 /// A marker's value when it is live. A cleared key is written as "" and lives for a nanosecond, so a read
 /// inside that tick must not take it for a marker.
-fn live(cache: &dyn Cache, key: &str) -> Option<String> {
+pub(crate) fn live(cache: &dyn Cache, key: &str) -> Option<String> {
     cache.get(key).filter(|v| !v.is_empty())
 }
 
@@ -174,14 +174,14 @@ pub(crate) fn batches_failed(batch_ok: &[bool]) -> Result<(), StoreError> {
 /// Go `resolveKey` (stores.go:782): the cached torrent id and file list for a hash on this account. Scoped
 /// by the canonical TorBox identity, because the value is an account-scoped torrent id.
 pub(crate) fn resolve_key(identity: &str, info_hash: &str) -> String {
-    let identity = crate::stores::torbox::canonical_torbox_identity(identity);
+    let identity = canonical_torbox_identity(identity);
     format!("torbox:resolve:{}:{}", crate::util::key_hash(&identity), info_hash)
 }
 
 /// Go `torrentIDKey` (stores.go:786): the torrent id alone, kept apart from the resolve entry so a queued
 /// torrent with no file list is still addressable by `Status`.
 pub(crate) fn torrent_id_key(identity: &str, info_hash: &str) -> String {
-    let identity = crate::stores::torbox::canonical_torbox_identity(identity);
+    let identity = canonical_torbox_identity(identity);
     format!("torbox:torrent:{}:{}", crate::util::key_hash(&identity), info_hash)
 }
 
@@ -337,11 +337,19 @@ pub(crate) fn is_cancellation(err: &StoreError) -> bool {
 /// A transport failure from the HTTP seam as the error a store call returns. A caller going away or its
 /// deadline running out is `Cancelled`; anything else keeps its text.
 pub(crate) fn store_error_from_do(err: DoError) -> StoreError {
-    let text = error_chain_text(err.as_ref());
-    if is_cancellation_text(&text) {
+    if is_cancellation_error(err.as_ref()) {
         return StoreError::Cancelled;
     }
-    StoreError::Other(text)
+    StoreError::Other(error_chain_text(err.as_ref()))
+}
+
+/// The same for TorBox, whose requests carry the account token in the URL: a transport failure is reported as its
+/// cause and never its URL (Go `transportKind`). A caller going away or its deadline running out is `Cancelled`.
+pub(crate) fn transport_error(err: DoError) -> StoreError {
+    if is_cancellation_error(err.as_ref()) {
+        return StoreError::Cancelled;
+    }
+    StoreError::Other(transport_kind(Some(err.as_ref())))
 }
 
 /// Go's `err.Error()` for the errors a store call returns, for a log line or a remembered reason.
@@ -361,12 +369,6 @@ pub(crate) fn as_unavailable(err: &StoreError) -> Option<&StoreUnavailableError>
         StoreError::Unavailable(u) | StoreError::ScoutSide(u) => Some(u),
         _ => None,
     }
-}
-
-/// Go `refundUnusedAdd` (addbudget.go:279) gives a charge back when the request turned out not to be an
-/// add at all. `refund_add` returns the charge for exactly the not-sent error, which is the same refund.
-pub(crate) fn refund_unused_add(svc: DebridService, token: &str) {
-    refund_add(svc, token, &RequestNotSent);
 }
 
 /// Go `scoutBudgetSpent` (stores.go:1218).
@@ -530,7 +532,7 @@ pub(crate) fn unknown_outcome(
     if unknown_too_long(cache, svc, token, info_hash) {
         return dead_link(format!("{} never reported what its add did", svc.as_str()));
     }
-    if !is_cancellation_text(&error_chain_text(cause)) {
+    if !is_cancellation_error(cause) {
         note_unknown_outcome(cache, svc, token, info_hash);
     }
     StoreError::AddInFlight

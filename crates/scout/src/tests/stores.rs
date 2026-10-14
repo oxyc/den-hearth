@@ -17,7 +17,7 @@ use crate::cache::{Cache, MemoryCache};
 use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
 use crate::stores::refusal::{resolve_key, torrent_id_key};
-use crate::stores::torbox::support::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
+use crate::stores::refusal::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
 use crate::stores::torbox::{
     decode_listing, ListingFault, TorBoxStore, TruncationDetector, CACHE_BATCH, MAX_LISTING_ENTRIES,
     MAX_TORBOX_OUTBOUND, TORBOX_API,
@@ -1312,7 +1312,7 @@ async fn torbox_account_state_is_isolated_by_api_and_token() {
 
     // A positive cache check is scoped the same way.
     cache.put(&cached_key(DebridService::TorBox, &a.account_identity(), H), "1", CACHED_TTL);
-    let (known, ask) = known_cached(Some(&*cache), DebridService::TorBox, &b.account_identity(), &[H.to_owned()]);
+    let (known, ask) = known_cached(&*cache, DebridService::TorBox, &b.account_identity(), &[H.to_owned()]);
     assert!(!held(&known, H) && ask.len() == 1, "endpoint B reused endpoint A's positive");
 
     // Migration is fail-cold: a pre-v2 token-only file is never accepted under either arbitrary API.

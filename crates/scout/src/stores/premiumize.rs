@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::addbudget::spend_add;
+use crate::addbudget::{refund_unused_add, spend_add};
 use crate::cache::Cache;
 use crate::config::DebridService;
 use crate::scrape::Doer;
@@ -17,7 +17,7 @@ use crate::season::{
 use crate::stores::refusal::{
     account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, already_queued, backed_off,
     batches_failed, cache_or_none, forget_held, held_recently, is_cancellation, known_cached, note_add_attempt,
-    note_held, note_queued, note_unknown_outcome, pending_too_long, record_refusal, refund_unused_add,
+    note_held, note_queued, note_unknown_outcome, pending_too_long, record_refusal,
     remember_cached, scout_budget_spent, settle_add_attempt, settle_queued_transfer, store_error_from_do,
     unknown_outcome,
 };
@@ -83,11 +83,6 @@ impl PremiumizeStore {
         cache_or_none(&self.cache)
     }
 
-    /// Go `premiumizeStore.budgetAccount`.
-    pub(crate) fn budget_account(&self) -> String {
-        crate::addbudget::budget_account(DebridService::Premiumize, &self.token)
-    }
-
     /// One `/cache/check` round. `None` is a batch that could not be read, which leaves its hashes unknown.
     async fn check_batch(&self, batch: &[String]) -> Option<Vec<bool>> {
         let mut query = format!("apikey={}", go_query_escape(&self.token));
@@ -96,11 +91,11 @@ impl PremiumizeStore {
             query.push_str(&go_query_escape(h));
         }
         let req = build_request(reqwest::Method::GET, &format!("{}/cache/check?{query}", self.api), &[], None).ok()?;
-        let resp = self.client.do_request(req).await.ok()?;
+        let mut resp = self.client.do_request(req).await.ok()?;
         if resp.status().as_u16() != 200 {
             return None;
         }
-        let raw = read_limited(resp, MAX_STORE_BYTES).await.ok()?;
+        let raw = read_limited(&mut resp, MAX_STORE_BYTES).await.ok()?;
         let body = decode_first::<PmCheck>(&raw, &PM_CHECK_SHAPE)?;
         if body.status != "success" {
             return None;
@@ -268,7 +263,7 @@ impl Store for PremiumizeStore {
         if !t.no_add {
             note_add_attempt(cache, svc, &self.token, &t.info_hash);
         }
-        let resp = match self.client.do_request(req).await.map_err(store_error_from_do) {
+        let mut resp = match self.client.do_request(req).await.map_err(store_error_from_do) {
             Ok(resp) => resp,
             Err(err) => {
                 // The third store gets the same rule. Its ordering already answered 202 from the marker, so
@@ -302,7 +297,7 @@ impl Store for PremiumizeStore {
         // cleared, noteQueued never reached, no refusal recorded — so thirty polls of one release made thirty
         // real directdl calls with the allowance still at fifty. Nothing bounded it, the budget least of all,
         // because the refund kept handing it back. directdl IS the fetch, so each of those queued a transfer.
-        let raw = match read_limited(resp, MAX_STORE_BYTES).await {
+        let raw = match read_limited(&mut resp, MAX_STORE_BYTES).await {
             Ok(raw) => raw,
             // Marker left set and the charge kept: the next poll answers 202 from the marker instead of
             // buying the transfer again.
@@ -542,5 +537,9 @@ impl Store for PremiumizeStore {
 
     fn account_refused(&self) -> Option<String> {
         account_backed_off(self.cache(), DebridService::Premiumize, &self.token)
+    }
+
+    fn budget_account(&self) -> Option<String> {
+        Some(crate::addbudget::budget_account(DebridService::Premiumize, &self.token))
     }
 }
