@@ -201,6 +201,8 @@ def main():
     parser.add_argument("--min-200-bytes", type=int)
     parser.add_argument("--expect-prefix", help="a 200 body must start with this text")
     parser.add_argument("--expect-304-bytes", type=int, default=0)
+    parser.add_argument("--check-retry-after", action="store_true",
+                        help="a 503 without a Retry-After header is counted as the refusal '503:<code>+no-retry-after'")
     parser.add_argument("--procs", type=int, default=1, help="driver processes (one Python process saturates near 10k small requests/s)")
     parser.add_argument("--emit-hist", action="store_true", help="(internal) include the latency histogram for --procs to merge")
     parser.add_argument("--proc-index", type=int, default=0, help="(internal) keeps --path-template ids unique across --procs")
@@ -271,12 +273,16 @@ def main():
                         framing[b"content-length"] = str(size).encode()
                     framed_payload(status, framing, body)
                     code = refusal_code(body) if status >= 400 else None
+                    has_retry_after = response.getheader("retry-after") is not None
                     if response.getheader("connection", "").lower() == "close":
                         connection.close()
                         connection = None
                 else:
-                    status, size, code, _ = raw_request(parsed, path, request_headers, args.mode, args.slow_read_ms, args.cancel_delay_ms)
+                    status, size, code, fields = raw_request(parsed, path, request_headers, args.mode, args.slow_read_ms, args.cancel_delay_ms)
+                    has_retry_after = b"retry-after" in fields
                     body = b""
+                if args.check_retry_after and status == 503 and not has_retry_after:
+                    code = f"{code or 'missing'}+no-retry-after"
                 if status == 200 and args.expect_200_bytes is not None and size != args.expect_200_bytes:
                     raise OSError(f"wrong 200 body size: expected={args.expect_200_bytes} received={size}")
                 if status == 200 and args.min_200_bytes is not None and size < args.min_200_bytes:

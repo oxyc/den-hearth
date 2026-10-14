@@ -61,6 +61,12 @@ class Gate(unittest.TestCase):
         self.assertEqual(row["gate"], "passed")
         self.assertAlmostEqual(row["cpu_cores"], 0.2)
 
+    def test_the_row_reports_the_unreclaimable_and_socket_peaks(self):
+        busy = sample(**{"cgroup.anon": 30 << 20, "cgroup.sock": 9 << 20})
+        row, _ = gate.evaluate_case({"name": "t"}, RESULT, [sample(), busy], sample(), busy, sample(), sample(), True)
+        self.assertEqual(row["cgroup"]["sock_peak_sampled"], 9 << 20)
+        self.assertEqual(row["cgroup"]["unreclaimable_peak_sampled"], (30 + 2 + 9) << 20)
+
     def rejects(self, text, **kw):
         _, failures = case(**kw)
         self.assertTrue(any(text in f for f in failures), failures)

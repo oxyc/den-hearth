@@ -28,7 +28,7 @@ ROOT = harness.ROOT
 BIN = ROOT / "target" / "release" / "den-hearth"
 # Session flow: needs the image's ffmpeg-remux. Cancellation: macOS exhausts its 16k ephemeral ports in seconds at that
 # rate, and the case needs the cgroup to mean anything. Soak: the Docker run's job.
-SKIP = {"remux-session-flow", "cancellation-subs-slow-upstream", "cancellation-remux-speed", "mixed-soak", "remux-health"}
+SKIP = {"remux-session-flow", "cancellation-subs-slow-upstream", "cancellation-remux-speed", "mixed-soak", "overload", "connection-flood", "remux-health"}
 
 
 def free_port():

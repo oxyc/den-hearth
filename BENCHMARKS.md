@@ -237,6 +237,95 @@ Reading it:
   baseline. A cancelled subtitle download is not aborted upstream (the download is a request-independent worker that
   fills the cache for the next viewer): the stub saw those downloads complete.
 
+### HTTP overload: bounded admission
+
+The `overload` case (`bench/http/run.py --only overload`) holds 188 clients on the node for 20 s past what it admits,
+on the main port **and on the four old service ports** (Scout 8080, Reel 8092, Subtitles 8093, Remux 8095): 64 + 32
+Remux media clients and 40 slow readers (against 16 Remux media permits), 32 cold Reel `/meta` and 8 Scout stream
+requests (against 48 bulk positions), and small control clients on every port. The gate requires no client error, only
+the statuses and refusals the case names, every 503 carrying `Retry-After`, no `oom`/`oom_kill`/`max`, and memory,
+descriptors and sockets back to where they started. Two runs of each image back to back, same machine (the VM was shared
+with other benchmark runs, so absolute numbers move between pairs; compare within a pair). Before is `main` (1.2.0),
+after is this PR. Raw rows: `bench/results/http-overload-*.jsonl`.
+
+| | main run 1 | run 2 | this PR run 1 | run 2 |
+|---|---:|---:|---:|---:|
+| `/health` :8090 p50 / p99 ms | 200 / 361 | 204 / 418 | **3.9 / 31.5** | **1.4 / 10.5** |
+| Remux `/remux/health` :8095 p99 ms | 351 | 455 | 31.4 | 10.4 |
+| Scout `/health` :8080 p99 ms | 379 | 462 | 32.0 | 10.9 |
+| Reel `/manifest.json` :8092 p99 ms | 427 | 504 | 26.8 | 10.8 |
+| Subtitles `/manifest.json` :8093 p99 ms | 364 | 454 | 27.5 | 10.9 |
+| Reel cold `/meta` :8092 p99 ms | 1,187 | 1,267 | 84.8 | 34.0 |
+| Scout bulk :8080 p99 ms | 383 | 431 | 27.7 | 12.7 |
+| slow readers p50 | 11.2 s (all served) | 11.1 s | 31 ms (refused) | 26 ms |
+| statuses | 200: 11,719 · 400: 810 | 200: 10,923 · 400: 738 | 200: 72,573 · 400: 29,899 · **503: 206,352** | 200: 181,771 · 400: 64,848 · **503: 396,738** |
+| 503s without `Retry-After` | n/a | n/a | 0 | 0 |
+| media bodies completed (main + :8095 + slow) | 9,582 | 8,944 | 631 | 729 |
+| anon peak MiB | 41.9 | 49.0 | 30.9 | 30.9 |
+| unreclaimable growth after recovery | **+27.8 MiB (gate failed)** | **+36.3 MiB (gate failed)** | passed | passed |
+| `oom` / `oom_kill` / `max` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| CPU cores | 1.55 | 1.55 | 0.70 | 1.05 |
+
+Reading it:
+
+- **Control traffic stays fast.** On main a `/health` probe waits behind the flood like everything else (p50 about 200
+  ms, p99 360 to 505 ms, on every port); with this PR it is 1 to 4 ms at p50 and 10 to 32 ms at p99 on every port,
+  because the 16 control positions are not reachable by bulk and the media flood is refused before it costs a thing.
+- **Excess is refused, not queued**: 200,000 to 400,000 `503 {"error":"media_busy"}` with `Retry-After: 1`, in about 1
+  ms each. The cost is that a client that cannot get a permit gets no body: the 16 Remux permits are held by whoever
+  holds them (here mostly the slow readers, which keep a permit for as long as they keep reading), so the fast clients
+  completed far fewer bodies than before. That is the intended trade (a player retries; a slow reader should not
+  take the node down). The slow readers here are not stalled, they keep moving bytes (4 KiB per 20 ms), so the idle
+  clock never fires on them: they hold a permit for the 10 s it takes to read 2 MiB, which is a fairness limit of 16
+  permits and not a deadline problem. A reader that stops entirely is cut at the idle deadline (Remux 10 s, Reel 30 s;
+  unit test `remux_has_a_shorter_idle_deadline_than_reel`).
+- **Memory is bounded, not dramatic, in this harness.** The 188 clients cannot offer more than they hold, so main
+  also stays inside 512 MiB (`oom` 0). What differs is the anonymous peak (about 25% lower) and that main does
+  not return to its starting unreclaimable memory within the gate's window (the large freed bodies sit
+  in glibc's arenas) where this PR does. `memory.stat`'s `sock` reads 0 on this VM's cgroup, so the socket-buffer
+  ceilings (`sock.rs`) are proven by unit test (`a_writer_to_a_client_that_never_reads_is_stopped_by_the_ceiling`), not by
+  this case.
+- **The send queue and distance.** The numbers above were measured with the first send ceiling (64 KiB) and no
+  harness case has a long round trip, so they say nothing about it. A connection has about its send queue in flight, so
+  throughput is capped near `queue / RTT`: 64 KiB gives ~10 Mbit/s at 50 ms (below a 4K remux), the default 256 KiB
+  ~42 Mbit/s at 50 ms and ~21 Mbit/s at 100 ms. `HEARTH_SNDBUF` (bytes, at least 16 KiB) overrides it, and the kernel
+  clamps the request to `net.core.wmem_max` (208 KiB by default), so a node serving remote 4K clients raises both.
+  Not measured here; the arithmetic is the argument.
+- **Connections** peaked at 250 to 268 established, the 188 clients plus the idle upstream pool, so this case stays
+  under the 256 cap on purpose. The next case exceeds it.
+
+The full suite passes on this PR (`bench/results/http-20261014T125516Z-40620.jsonl`, 18 cases and the idle drain):
+`slow-readers-remux-speed` now sees 503s for the readers past the permits, `remux-speed` may see the kernel reclaim
+Subtitles' page cache (`allow_max`; it moved by 0 to 16 across runs of the same image), `remux_flow.py` retries a refused
+init section as a player does, and every other row is within the noise of the baseline above.
+
+### HTTP connection flood: a full pool must not shut out a new connection
+
+`bench/http/run.py --only connection-flood`: 320 busy keep-alive clients (more than the 256 connections the node accepts)
+hammering a bulk route for 20 s, and two kinds of probe that each open a **fresh connection** every time: 4 clients on the
+driver, and a loop inside the hearth container on `127.0.0.1`, which is what the image's `HEALTHCHECK` and den-update's
+probe do. Three images: `main` (no cap), the first version of this PR (cap of 256, no reserve: a new connection waits in
+the listen backlog), and this PR (the cap plus 64 probation connections: past the cap a peer is accepted, may ask control
+routes only, gets one answer and is closed; anything else is a `503 server_busy`). Two runs of each capped image.
+Raw rows: `bench/results/http-connflood-*.jsonl`.
+
+| | main (no cap) | cap only, run 1 | cap only, run 2 | this PR run 1 | run 2 |
+|---|---:|---:|---:|---:|---:|
+| fresh-connection `/health` from the driver: completed in 20 s | 90,846 | 12,797 | 20,799 | 74,233 | 68,386 |
+| ...of which timed out (10 s) | 0 | **4** | **4** | 0 | 0 |
+| loopback `/health` in the container: completed / timed out (5 s) | 375 / 0 | 91 / **3** | 89 / **3** | 380 / 0 | 381 / 0 |
+| loopback p99 ms | 46.5 | 44.6 | 170.9 | 13.6 | 8.5 |
+| the flood's own statuses | all 200 | all 200 (excess silent in the backlog) | all 200 | 200 and 9,692 `503 server_busy` | 200 and 9,430 `503 server_busy` |
+| gate | passed | **failed** (timeouts) | **failed** | passed | passed |
+
+With the cap alone, a probe that arrives while every position is held waits behind the flood's own reconnects: seven
+probes per run sat for the full timeout and the probe loops completed a fraction of their requests. With probation no
+probe timed out in either run and the probe rates are back to main's. Probation is a bounded, short-lived addition (64
+connections, a 1 s head timeout, no keep-alive, at most 2 MiB of read buffer), and it also turns the flood's overflow into
+the stable 503 instead of silence. The first attempt had 16 slots and a 2 s head timeout and still dropped 4 probes in 20
+s: an overflowing client holds a slot until it has sent its head, so the slots must outnumber a flood that reconnects as
+fast as it is refused.
+
 ### HTTP without the container (native, CPU path)
 
 The release binary directly on the Mac, with the same stubs and driver on loopback, no memory cap (so no gate), no
@@ -277,9 +366,9 @@ the container because Linux's loopback and veth are faster than macOS's loopback
 | den-scout | **FAILED** | 460 | 43 | 162 | 6.81 |
 | den-subtitles | ok | 288 | 0 | 0 | 2.55 |
 
-den-scout's 43 failures are the handler tests: `handler.rs` is still a `todo!()` stub on main (it is being finished on
-another branch), and its 162 ignored tests are the pending ports and the benchmarks. Without `--no-fail-fast`, `cargo
-test --workspace` stops at that crate, and `make`/CI is red on main for the same reason.
+den-scout's 43 failures were the handler tests: when this was measured `handler.rs` was still a `todo!()` stub. Scout's
+handler has since landed and `cargo test --workspace` passes in full (662 den-scout tests), so this table's den-scout row
+is historical; re-measure with `bench/suite-timing.sh`.
 
 The slowest 20 tests (debug build; the scout ones are regex compilation at `opt-level 0`):
 
@@ -443,8 +532,9 @@ reaches the terminal `{"gate":"passed","complete":true}` row is renamed from its
 - **Remux probing and the GPU transcode**: the probes read over HTTP through a private `Source`, and a transcode needs the
   box's VAAPI device. The session flow does cover the real ffmpeg copy/AAC path over the sample.
 - **Subtitles sync and translation** (alass, LLMs): external tools and paid APIs.
-- **den-scout's handler and HTTP surface**: `handler.rs` is not implemented on main yet, and scout is not in the hearth
-  binary. The scout benchmarks are the pure functions behind the handler; its HTTP numbers belong to the PR that wires it.
+- **den-scout's real work over HTTP**: Scout is in the hearth binary and the `overload` case drives its port, but only
+  its cheap answers (`/health`, a refused `/stream`); a real stream list needs indexers and a debrid service, which the
+  harness stubs do not model. The scout microbenchmarks are the pure functions behind the handler.
 - **1 and 10 Gbit shaping** (den-edge's `tc` cases): it needs a dedicated veth and root. The bytes cases above measure the
   unshaped path.
 - **Real network and real debrid.** By design.
