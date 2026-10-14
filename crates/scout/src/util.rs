@@ -87,6 +87,20 @@ pub(crate) static LEAF: Shape = Shape::Leaf;
 pub(crate) fn fold_json_keys(v: &mut serde_json::Value, shape: &Shape) {
     match (v, shape) {
         (serde_json::Value::Object(map), Shape::Object(fields)) => {
+            // Every document an encoder wrote spells its keys exactly. Then nothing is renamed, the map stays as
+            // it is, and only the children the shape looks into are visited.
+            let renames = map.keys().any(|key| {
+                !fields.iter().any(|(name, _)| *name == key.as_str())
+                    && fields.iter().any(|(name, _)| fold_eq(name, key))
+            });
+            if !renames {
+                for (key, child) in map.iter_mut() {
+                    if let Some((_, sub)) = fields.iter().find(|(name, _)| *name == key.as_str()) {
+                        fold_json_keys(child, sub);
+                    }
+                }
+                return;
+            }
             let old = std::mem::take(map);
             for (key, mut child) in old {
                 let field = fields
