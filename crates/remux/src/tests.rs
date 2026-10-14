@@ -3203,8 +3203,9 @@ async fn a_copy_within_thirty_seconds_then_a_transcode_then_the_least_starving_c
     let picked = |j: &serde_json::Value| {
         (j["release"]["filename"].as_str().map(String::from), j["video"]["transcoded"].as_bool())
     };
-    // 8.1 Mbit/s for a minute on 6.6: about 20 s of head start, which the copy is given over a conversion.
-    let j = start(8.14e6, 6_600_000).await;
+    // 8.1 Mbit/s for a minute on a 10 Mbit/s link, 7 of it with headroom: about 16 s of head start, which the copy is
+    // given over a conversion.
+    let j = start(8.14e6, 10_000_000).await;
     assert_eq!(picked(&j), (Some("h264.mkv".into()), Some(false)), "{j}");
     assert!(j["prebuffer"].as_f64().is_some_and(|p| (10.0..=30.0).contains(&p)), "{j}");
     // 12 Mbit/s: no head start carries it, and a 1080p conversion at the link's rate does.
@@ -3214,6 +3215,76 @@ async fn a_copy_within_thirty_seconds_then_a_transcode_then_the_least_starving_c
     let j = start(12e6, 1_500_000).await;
     assert_eq!(picked(&j), (Some("h264.mkv".into()), Some(false)), "{j}");
     assert!(j["prebuffer"].is_null(), "no head start carries it: {j}");
+}
+
+/// A conversion reads its whole source in real time, so the source it is made from is the cheapest to read that
+/// is within `TRANSCODE_SOURCE_MARGIN` of the link — never a release far above it. The case behind it: a 3818 s episode
+/// on a 30 Mbit/s link, whose first-ranked 4K Dolby Vision WEB-DL (105 GB, 220 Mbit/s on average) was converted from
+/// ahead of a 1080p WEB (25 GB, 52 Mbit/s). h264.mkv stands in for the 1080p, hevc.mkv for the 4K release; both are
+/// over the link, a player that takes HEVC copies either.
+#[tokio::test]
+async fn a_conversion_is_not_made_from_a_release_far_above_the_link() {
+    let origin = origin().await;
+    let h264_bytes = fixture("h264.mkv");
+    let hevc_bytes = fixture("hevc.mkv");
+    let h264 = probe_with_head(&h264_bytes, crate::scout::HEAD_BYTES as usize).await;
+    let hevc = probe_with_head(&hevc_bytes, crate::scout::HEAD_BYTES as usize).await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    state.transcode_ok.store(true, Relaxed);
+    let install = crate::auth::install_id(&format!("{origin}/cfg"));
+    // `size` bytes over `duration` seconds at an even rate, a keyframe every 2 s; no index at all where the runtime
+    // is unknown (0).
+    let seed = |name: &str, probed: &probe::MediaInfo, bytes: &[u8], size: u64, duration: f64| {
+        let keyframes: Vec<f64> = (0..(duration / 2.0) as usize).map(|i| i as f64 * 2.0).collect();
+        let byte_index: Vec<(f64, u64)> =
+            keyframes.iter().map(|&t| (t, (size as f64 * t / duration) as u64)).collect();
+        let info = probe::MediaInfo { duration, keyframes, byte_index, video_bytes: None, ..probed.clone() };
+        let resolved = crate::scout::Resolved {
+            url: format!("http://127.0.0.1:9/{name}"),
+            head: bytes.to_vec(),
+            size: Some(size),
+        };
+        state.opened().put(format!("{install}/0/{name}"), &resolved, &info, std::time::Instant::now());
+    };
+    let start_title = |imdb: &'static str, link: Option<u64>| {
+        let (state, origin) = (state.clone(), origin.clone());
+        async move {
+            let link = link.map_or_else(String::new, |l| format!(r#","maxBitrate":{l}"#));
+            let body = format!(
+                r#"{{"imdb":"{imdb}","scout":"{origin}/cfg","playable":{{"h264":51,"hevcMain":153}}{link}}}"#
+            );
+            let r = call(&state, "POST", "/remux/session", None, &body).await;
+            assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+            state.end_all("test").await;
+            let j = r.json();
+            (j["release"]["filename"].as_str().map(String::from), j["video"]["transcoded"].as_bool())
+        }
+    };
+    let start = |link: Option<u64>| start_title("tt0000014", link);
+    let (gb, runtime) = (1_000_000_000u64, 3818.0);
+    seed("h264.mkv", &h264, &h264_bytes, 25 * gb, runtime);
+
+    // 220 Mbit/s against a 30 Mbit/s link: not converted from; the copy that needs least plays.
+    seed("hevc.mkv", &hevc, &hevc_bytes, 105 * gb, runtime);
+    assert_eq!(start(Some(30_000_000)).await, (Some("h264.mkv".into()), Some(false)));
+    // 75 Mbit/s is under four times the link: the conversion is still the way to play it.
+    seed("hevc.mkv", &hevc, &hevc_bytes, 36 * gb, runtime);
+    assert_eq!(start(Some(30_000_000)).await, (Some("hevc.mkv".into()), Some(true)));
+    // No link named: nothing is demoted, and the first ranked plays as it always did.
+    seed("hevc.mkv", &hevc, &hevc_bytes, 105 * gb, runtime);
+    assert_eq!(start(None).await, (Some("h264.mkv".into()), Some(false)));
+    // A runtime nobody knows says nothing of a bitrate: nothing is demoted for it.
+    seed("h264.mkv", &h264, &h264_bytes, 25 * gb, 0.0);
+    seed("hevc.mkv", &hevc, &hevc_bytes, 105 * gb, 0.0);
+    assert_eq!(start(Some(30_000_000)).await, (Some("h264.mkv".into()), Some(false)));
+
+    // The incident: tt0000002's only release, a 12 GB episode (25.3 Mbit/s over 3818 s) on a 30 Mbit/s link. The whole
+    // link would carry it after a 5 s wait; with the headroom it does not, so it is converted where it can be...
+    seed("hevc.mkv", &hevc, &hevc_bytes, 12_081_049_022, runtime);
+    assert_eq!(start_title("tt0000002", Some(30_000_000)).await, (Some("hevc.mkv".into()), Some(true)));
+    // ...and plays as it is where it can't.
+    state.transcode_ok.store(false, Relaxed);
+    assert_eq!(start_title("tt0000002", Some(30_000_000)).await, (Some("hevc.mkv".into()), Some(false)));
 }
 
 /// A transcode is chosen at selection or not at all: a player replacing a session mid-film says `never` and gets a

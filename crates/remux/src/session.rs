@@ -1944,6 +1944,42 @@ fn source_failed() -> Response<Body> {
     )
 }
 
+/// How much bigger than the file opened a listed size has to be to be a pack's, not a rounding difference
+/// (scout's `PACK_SIZE_RATIO`).
+const PACK_SIZE_RATIO: f64 = 1.3;
+
+/// Scout's `size_label`: `18 GB`, `720 MB`, one decimal under 10 GB.
+fn size_label(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= 1024.0 * MIB {
+        let gb = b / (1024.0 * MIB);
+        return if gb >= 10.0 { format!("{} GB", (gb + 0.5) as u64) } else { format!("{gb:.1} GB") };
+    }
+    format!("{} MB", ((b / MIB) + 0.5).max(1.0) as u64)
+}
+
+/// A listed release's label and pack size once the file is open. Scout's list can carry the indexer's season-pack
+/// size as the episode's (a title that names the episode, a pack's bytes); the label then names 105 GB for a 12 GB
+/// file. Where the opened file is much smaller than the listed size, the label names the file and the listed size as
+/// the pack it came from.
+pub(crate) fn opened_label(
+    label: &str,
+    listed: Option<u64>,
+    pack: Option<u64>,
+    opened: Option<u64>,
+) -> (String, Option<u64>) {
+    let (Some(listed), Some(opened)) = (listed, opened) else { return (label.to_string(), pack) };
+    if listed as f64 <= opened as f64 * PACK_SIZE_RATIO || pack.is_some() {
+        return (label.to_string(), pack);
+    }
+    let (was, is) = (size_label(listed), size_label(opened));
+    // A label that doesn't carry the listed size (another rounding, or none) gets the file's appended, so the pack
+    // is never named without the size of what plays.
+    let named = if label.contains(&was) { label.replacen(&was, &is, 1) } else { format!("{label} • {is}") };
+    (format!("{named} · from a {was} pack"), Some(listed))
+}
+
 /// What an opened release is remembered under: the install that listed it, by its hash as a session's owner is,
 /// and the release by its size and name. Not its play URL: scout issues a new ticket with every listing.
 pub(crate) fn opened_key(base: &str, s: &scout::Stream) -> String {
@@ -2549,10 +2585,30 @@ pub(crate) fn prebuffer(info: &MediaInfo, delivery: &Delivery, max_bitrate: Opti
     Some(playlist::startup_delay(&segs, &bytes, from, rate, delivery.buffer)).filter(|w| w.is_finite())
 }
 
-/// Whether a copy of the release needs more than the player's `maxBitrate`. Without one every release fits, and so does
-/// one whose need isn't known: nothing says it doesn't.
+/// The share of the player's `maxBitrate` a copy may need and still count as fitting. A link is a measurement, taken
+/// once, from one moment; it is not a promise. What a player then gets in a session runs below it (a 30 Mbit/s figure,
+/// the box's uplink, against hls.js's own 14-15 Mbit/s estimate), varies by a tenth or more from one minute to the
+/// next, and is shared with whatever else the connection carries. `need` already weighs the heavy stretches, so this
+/// is for the link, not the file: 70% leaves 30% for both. A 12 GB, 3818 s episode (25.3 Mbit/s) does not fit 30
+/// Mbit/s; a 1.5 GB one (3.1) does.
+const LINK_HEADROOM: f64 = 0.7;
+
+/// Whether a copy of the release needs more than `LINK_HEADROOM` of the player's `maxBitrate`. Without one every
+/// release fits, and so does one whose need isn't known: nothing says it doesn't.
 pub(crate) fn over(max_bitrate: Option<u64>, need: Option<Need>) -> bool {
-    max_bitrate.zip(need).is_some_and(|(max, need)| need.bitrate > max)
+    max_bitrate.zip(need).is_some_and(|(max, need)| need.bitrate as f64 > max as f64 * LINK_HEADROOM)
+}
+
+/// How many times the player's link a source may need and still be converted from. A conversion shrinks what the
+/// player downloads, not what the box reads: the whole source comes in at its own rate, in real time, from a debrid
+/// that delivers a fraction of a gigabit (about 13 Mbit/s measured on an uncached TorBox). A 4x margin keeps the
+/// heaviest UHD Blu-ray remuxes (about 120 Mbit/s) convertible for a 30 Mbit/s link, and turns away a 220 Mbit/s WEB-DL.
+const TRANSCODE_SOURCE_MARGIN: u64 = 4;
+
+/// Whether a source needing `bitrate` is worth converting for a player with `max_bitrate` of link. Any source is where
+/// no link is named.
+fn source_within_reach(bitrate: u64, max_bitrate: Option<u64>) -> bool {
+    max_bitrate.is_none_or(|link| bitrate <= link.saturating_mul(TRANSCODE_SOURCE_MARGIN))
 }
 
 /// What this session's picking may treat as the player's link: its own measurement (`own`), narrowed by what
@@ -3162,8 +3218,11 @@ pub async fn create(
     };
     let bitrate =
         |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| need(&t.1 .1, &delivery(t)).map(|n| n.bitrate);
+    // Waited out at the link with its headroom, as fitting is weighed: a copy that only the whole link would carry
+    // is the one that stalls when the link dips, and a wait up front does not make it fit.
+    let usable = max_bitrate.map(|m| (m as f64 * LINK_HEADROOM) as u64);
     let head_start = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        prebuffer(&t.1 .1, &delivery(t), max_bitrate).unwrap_or(f64::INFINITY)
+        prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
     };
     if chosen.is_none() && !want.fits_only {
         let longer = (0..too_big.len())
@@ -3194,9 +3253,13 @@ pub async fn create(
         };
         let convert = fallback.or_else(|| {
             let hevc = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-                t.1 .1.video == VideoCodec::Hevc && bitrate(t).is_some_and(|b| b > preset.bitrate)
+                t.1 .1.video == VideoCodec::Hevc
+                    && bitrate(t).is_some_and(|b| b > preset.bitrate && source_within_reach(b, max_bitrate))
             };
-            let i = too_big.iter().position(hevc)?;
+            // The cheapest to read, not the first ranked: a conversion reads the whole source in real time.
+            let i = (0..too_big.len())
+                .filter(|&i| hevc(&too_big[i]))
+                .min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX))?;
             Some(too_big.remove(i))
         });
         if let Some((c, found)) = convert {
@@ -3381,12 +3444,18 @@ pub async fn create(
             let delivery = Delivery::of(&info, size, want);
             let bytes = playlist::segment_bytes(&segments, &info.byte_index, delivery.bytes);
             (
-                prebuffer(&info, &delivery, max_bitrate),
+                prebuffer(&info, &delivery, usable),
                 need(&info, &delivery),
                 bytes.map(|b| segments.iter().zip(b).map(|(s, b)| (s.start, b.round() as u64)).collect()),
             )
         }
     };
+    let shown_label = opened_label(
+        &c.attributes.label,
+        c.attributes.size_bytes,
+        c.attributes.pack_size_bytes,
+        resolved.size,
+    );
     let session = Arc::new(Session {
         prebuffer,
         need,
@@ -3427,10 +3496,10 @@ pub async fn create(
         imdb: imdb.to_string(),
         dir,
         release: Release {
-            label: c.attributes.label.clone(),
+            label: shown_label.0,
             filename: c.filename().to_string(),
             size,
-            pack_size: c.attributes.pack_size_bytes,
+            pack_size: shown_label.1,
             requested,
         },
         segments,
@@ -4152,7 +4221,11 @@ mod tests {
         assert!(from_start.indexed);
         assert!((5_400_000..5_420_000).contains(&from_start.bitrate), "{from_start:?}");
         assert!(over(Some(4_000_000), Some(from_start)), "4 Mbit/s carries the average, not the film");
-        assert!(!over(Some(6_000_000), Some(from_start)));
+        assert!(
+            over(Some(6_000_000), Some(from_start)),
+            "6 Mbit/s carries it with 10% to spare, short of the 30%"
+        );
+        assert!(!over(Some(8_000_000), Some(from_start)));
         let wait = prebuffer(&info, &deep, Some(6_000_000)).unwrap();
         assert!((0.0..=MAX_PREBUFFER).contains(&wait), "{wait}");
         // At 4 Mbit/s even two minutes ahead can't carry the 1200 Mbit stretch (it needs 5.1): no wait up front would do.
@@ -4255,8 +4328,8 @@ mod tests {
         assert_eq!(n, Need { bitrate: 1_500_000, indexed: false });
         assert!(n.to_string().contains("no byte index"), "the log says it is a guess: {n}");
         assert!(!over(None, Some(n)), "no maxBitrate: every release fits");
-        assert!(!over(Some(1_500_000), Some(n)), "at the limit fits");
-        assert!(over(Some(1_499_999), Some(n)));
+        assert!(!over(Some(2_142_858), Some(n)), "at the limit, which keeps its headroom, fits");
+        assert!(over(Some(2_142_000), Some(n)));
         let unknown = Delivery { bytes: None, ..delivery(0, 0.0, None) };
         assert_eq!(need(&plain, &unknown), None, "an unknown size says nothing");
         assert!(!over(Some(1), None), "and nothing said fits");
@@ -4515,6 +4588,42 @@ mod tests {
             ),
             None,
             "a millisecond short of it is still watched"
+        );
+    }
+
+    /// A copy fits a link only with headroom: the 12 GB, 3818 s episode (25.3 Mbit/s) does not fit 30 Mbit/s, the
+    /// 1.5 GB one (3.1 Mbit/s) does, and a link nobody named or a need nobody knows demotes nothing.
+    #[test]
+    fn a_copy_fits_a_link_only_with_headroom() {
+        let need =
+            |bytes: u64| Some(Need { bitrate: average_bitrate(Some(bytes), 3818.0).unwrap(), indexed: true });
+        assert!(over(Some(30_000_000), need(12_081_049_022)));
+        assert!(!over(Some(30_000_000), need(1_499_990_620)));
+        assert!(!over(Some(30_000_000), need(7_000_000_000)), "14.7 Mbit/s is under 70% of 30");
+        assert!(!over(None, need(12_081_049_022)));
+        assert!(!over(Some(30_000_000), None));
+    }
+
+    /// A season pack's size, listed as the episode's, is moved out of the label once the file is open; a size that
+    /// agrees, or one already named a pack, is left alone.
+    #[test]
+    fn an_opened_files_size_replaces_a_packs_in_the_label() {
+        let (gb105, gb12) = (105 * (1u64 << 30), 12_081_049_022);
+        let label = "4K • WEB-DL • Dolby Vision • Atmos • 105 GB";
+        assert_eq!(
+            opened_label(label, Some(gb105), None, Some(gb12)),
+            ("4K • WEB-DL • Dolby Vision • Atmos • 11 GB · from a 105 GB pack".to_string(), Some(gb105))
+        );
+        assert_eq!(opened_label(label, Some(gb105), None, Some(gb105 + 1000)), (label.to_string(), None));
+        assert_eq!(
+            opened_label(label, Some(gb105), Some(gb105), Some(gb12)),
+            (label.to_string(), Some(gb105))
+        );
+        assert_eq!(opened_label(label, None, None, Some(gb12)), (label.to_string(), None));
+        assert_eq!(
+            opened_label("4K • WEB-DL", Some(gb105), None, Some(gb12)),
+            ("4K • WEB-DL • 11 GB · from a 105 GB pack".to_string(), Some(gb105)),
+            "a label without the listed size gets the file's"
         );
     }
 
