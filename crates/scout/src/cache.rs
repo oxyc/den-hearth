@@ -1,5 +1,8 @@
 //! Port of `internal/scout/cache.go`: the cache seam (stream lists and per-hash truth) and its in-memory
 //! TTL + LRU backend, bounded by bytes. `Cache` and `CacheClass` are FROZEN (see PORTING.md).
+//!
+//! The default backend is an in-memory TTL + LRU cache bounded by BYTES (audit #1: a count cap let a large
+//! resultCap × many titles blow the heap and OOM the container). Thread-safe.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -121,7 +124,10 @@ impl Cache for MemoryCache {
     }
 
     fn put(&self, key: &str, value: &str, ttl: Duration) {
-        let expires = (self.now)() + ttl;
+        let now = (self.now)();
+        // Go's `Add` does not panic on an absurd TTL; neither may this. A TTL past what the clock can hold
+        // never expires in any lifetime of this process.
+        let expires = now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 60 * 60));
         let size = key.len() + value.len();
         let mut guard = self.lock();
         let st = &mut *guard;

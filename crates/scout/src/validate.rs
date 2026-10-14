@@ -3,7 +3,7 @@
 //! Checks a debrid token at the moment it is pasted: one unauthenticated read per service, judged from the right
 //! place for that service. A provider being down is never reported as a wrong token.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION};
@@ -16,6 +16,7 @@ use crate::scrape::Doer;
 use crate::stores::premiumize::PREMIUMIZE_API;
 use crate::stores::realdebrid::REAL_DEBRID_API;
 use crate::stores::torbox::TORBOX_API;
+use crate::util::{fold_json_keys, Shape, LEAF};
 
 /// Go `validateResult`. `throttled` is set when our own pacing refused the check; the route answers 429 for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -32,8 +33,8 @@ pub struct ValidateResult {
 /// Go Premiumize's account reply: only the verdict is read.
 #[derive(Deserialize)]
 struct PremiumizeReply {
-    #[serde(default)]
-    status: String,
+    /// A missing or `null` status reads as "", which is not "success".
+    status: Option<String>,
 }
 
 /// Go `validateBudget`: how long the whole check may take.
@@ -51,14 +52,23 @@ pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: 
     let Some(req) = validate_request(svc, token) else {
         return ValidateResult { reason: "validation unavailable".to_owned(), ..Default::default() };
     };
-    if !allow(limiter, req.url().host_str().unwrap_or_default()) {
+    // Go keys the bucket by `url.Host`, which carries the port when the URL names one.
+    let host = match (req.url().host_str(), req.url().port()) {
+        (Some(h), Some(p)) => format!("{h}:{p}"),
+        (Some(h), None) => h.to_owned(),
+        (None, _) => String::new(),
+    };
+    if !allow(limiter, &host) {
         return ValidateResult {
             reason: "too many checks just now — try again in a moment".to_owned(),
             throttled: true,
             ..Default::default()
         };
     }
-    let resp = match doer.do_request(req).await {
+    let resp = doer.do_request(req).await;
+    // TODO(metrics): Go records `metrics.torboxCall("user", <2xx>)` here for TorBox, success or failure; metrics.rs
+    // is not ported yet.
+    let resp = match resp {
         Ok(resp) => resp,
         // The indexer scrapers log the service name and never the URL, because MediaFusion's carries an
         // encrypted config. Same rule here for a different reason: the URL would be fine, the token would not,
@@ -77,10 +87,19 @@ pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: 
     // answer for every service.
     if svc == DebridService::Premiumize {
         let body = read_prefix(resp).await;
-        return match serde_json::Deserializer::from_slice(&body).into_iter::<PremiumizeReply>().next() {
-            Some(Ok(pm)) if pm.status.eq_ignore_ascii_case("success") => ValidateResult { valid: true, ..Default::default() },
-            Some(Ok(_)) => rejected(),
-            _ => ValidateResult { reason: "could not read the reply".to_owned(), ..Default::default() },
+        // Go decodes the first JSON value and matches `status` case-insensitively, as for every struct field.
+        static SHAPE: Shape = Shape::Object(&[("status", &LEAF)]);
+        let first = serde_json::Deserializer::from_slice(&body).into_iter::<serde_json::Value>().next();
+        let Some(Ok(mut value)) = first else {
+            return ValidateResult { reason: "could not read the reply".to_owned(), ..Default::default() };
+        };
+        fold_json_keys(&mut value, &SHAPE);
+        return match serde_json::from_value::<PremiumizeReply>(value) {
+            Ok(pm) if pm.status.as_deref().unwrap_or_default().eq_ignore_ascii_case("success") => {
+                ValidateResult { valid: true, ..Default::default() }
+            }
+            Ok(_) => rejected(),
+            Err(_) => ValidateResult { reason: "could not read the reply".to_owned(), ..Default::default() },
         };
     }
     ValidateResult { valid: true, ..Default::default() }
@@ -123,21 +142,26 @@ async fn read_prefix(mut resp: reqwest::Response) -> Vec<u8> {
     buf
 }
 
-/// Go `(*hostLimiter).allow`, until `hostlimit.rs` owns it: takes a whole token if one is free right now and never
-/// queues. An empty key is never limited. Kept here, on the limiter's crate-visible fields, so this module does not
-/// wait on that file.
+/// Go `(*hostLimiter).allow`: takes a whole token if one is free right now and never queues. An empty key is never
+/// limited.
+///
+/// TODO(hostlimit): this duplicates `hostLimiter.allow` and `bucket.tryTake`, which belong in `hostlimit.rs` as
+/// `HostLimiter::allow` / `Bucket::try_take`. They are still `todo!()` there, so the logic is kept here, on the
+/// limiter's crate-visible fields, until that file lands; then this function is deleted and the call becomes
+/// `limiter.allow(host)`.
 fn allow(limiter: &HostLimiter, key: &str) -> bool {
     if key.is_empty() {
         return true;
     }
     let bucket = {
-        let mut buckets = limiter.buckets.lock().expect("host limiter lock");
+        // A poisoned lock still holds consistent state: every edit under it finishes before anything can panic.
+        let mut buckets = limiter.buckets.lock().unwrap_or_else(PoisonError::into_inner);
         let burst = limiter.burst as f64;
         Arc::clone(buckets.entry(key.to_owned()).or_insert_with(|| {
             Arc::new(Mutex::new(Bucket { tokens: burst, last: Instant::now() }))
         }))
     };
-    let mut b = bucket.lock().expect("bucket lock");
+    let mut b = bucket.lock().unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     b.tokens += now.duration_since(b.last).as_secs_f64() / limiter.every.as_secs_f64();
     if b.tokens > limiter.burst as f64 {

@@ -1,12 +1,13 @@
 //! Port of `internal/scout/loglimit.go`. Work package 6.
 //!
-//! The log records changes of state, not events. A request-path line fires on every request for as long as its
-//! cause lasts, so each such line goes through `log_limited`, and a condition writes at most one line a minute
-//! however much traffic it sees.
+//! The log records changes of state, not events. A request-path line fires on every request for as long
+//! as its cause lasts — an indexer that is down is down for every scrape, a client waiting on a download
+//! polls every two seconds — so each such line goes through logLimited, and a condition writes at most
+//! one line a minute however much traffic it sees. Per-request detail is what LOG_REQUESTS is for.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Go `logInterval`: a condition writes at most one line per this interval.
@@ -52,16 +53,18 @@ pub(crate) fn capture(f: impl FnOnce()) -> String {
     CAPTURED.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
-/// Go `logLimited`: writes `message` unless the same condition already wrote one inside `LOG_INTERVAL`. The next
-/// line of that condition to get through says how many were held back in between. `key` names the condition and
-/// comes from a fixed vocabulary, never a hash or a title, or the map grows with traffic.
+/// Go `logLimited` writes the line unless the same condition already wrote one inside `LOG_INTERVAL`; the next
+/// line of that condition to get through says how many were held back in between. There is no timer — a
+/// held-back count is reported by the condition's own next line, whenever that comes, or not at all if it
+/// never recurs, which is the state change the silence already told you about.
 ///
-/// There is no timer: a held-back count is reported by the condition's own next line, whenever that comes, or not
-/// at all if it never recurs, which is the state change the silence already told you about.
+/// The key names the CONDITION and must come from a fixed vocabulary: a literal, an indexer id, a debrid
+/// service. Never a hash, a title or anything a caller picks, or the map grows with traffic.
 pub fn log_limited(key: &str, message: &str) {
     let now = Instant::now();
     let held_back = {
-        let mut last = LIMITED_LOG.lock().expect("limited log lock");
+        // Every edit under this lock finishes before anything can panic, so a poisoned guard is still consistent.
+        let mut last = LIMITED_LOG.lock().unwrap_or_else(PoisonError::into_inner);
         match last.get_mut(key) {
             Some(e) if now.duration_since(e.at) < LOG_INTERVAL => {
                 e.suppressed += 1;

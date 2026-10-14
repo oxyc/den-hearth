@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, Once, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -13,6 +13,12 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use crate::cache::{Cache, CacheClass, MemoryCache};
+use crate::loglimit::emit;
+
+/// How often expired entries are swept, and how long a leftover temp file may linger before it counts as
+/// abandoned. Hourly is far more often than space needs and rare enough to be invisible: the sweep is a
+/// small read per file, and the store holds thousands, not millions.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Go `tempFileGrace`: a temp file older than this is a write that died mid-way, and the sweep removes it.
 pub const TEMP_FILE_GRACE: Duration = Duration::from_secs(60 * 60);
@@ -35,7 +41,8 @@ pub struct TieredCache {
     dir: PathBuf,
     /// Go `once`: the first disk failure is logged, not every one after it.
     once: Once,
-    state: Mutex<DiskState>,
+    /// Shared with the thread a write burst starts, which resets `written` when its scan is done.
+    state: Arc<Mutex<DiskState>>,
     /// Go `maxBytes`: the disk budget the sweep trims to. 0 disables the byte budget.
     ///
     /// The memory tier has had a byte budget since audit #1; the disk tier had none, and nothing noticed while it
@@ -65,7 +72,7 @@ impl TieredCache {
         let mut off = dir.as_os_str().is_empty();
         if !off {
             if let Err(e) = fs::create_dir_all(dir) {
-                eprintln!("cache dir {} not writable ({e}) — persistence disabled, memory still serving", dir.display());
+                emit(&format!("cache dir {} not writable ({e}) — persistence disabled, memory still serving", dir.display()));
                 off = true;
             }
         }
@@ -73,7 +80,7 @@ impl TieredCache {
             mem: MemoryCache::new(max_bytes),
             dir: dir.to_path_buf(),
             once: Once::new(),
-            state: Mutex::new(DiskState { off, written: 0 }),
+            state: Arc::new(Mutex::new(DiskState { off, written: 0 })),
             max_bytes: DEFAULT_DISK_BUDGET,
         }
     }
@@ -91,8 +98,7 @@ impl TieredCache {
     /// to turn off BOTH ways an entry is ever reclaimed. The directory may still be readable when it is not
     /// writable, and reaping is exactly what helps if the problem was space.
     pub fn sweep(&self) -> i64 {
-        self.reset_written();
-        sweep_files(&self.dir, self.max_bytes)
+        sweep_files(&self.dir, self.max_bytes, || reset_written(&self.state))
     }
 
     /// Go `SweepEvery`: sweeps once at startup, then on `every`, until dropped. Returns at once when
@@ -105,7 +111,7 @@ impl TieredCache {
         // entries that expired while the process was not running.
         let n = self.sweep();
         if n > 0 {
-            eprintln!("swept {n} expired cache entries at startup");
+            emit(&format!("swept {n} expired cache entries at startup"));
         }
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         // A tick missed during a slow sweep is dropped, as Go's ticker drops it.
@@ -114,7 +120,7 @@ impl TieredCache {
             ticker.tick().await;
             let n = self.sweep();
             if n > 0 {
-                eprintln!("swept {n} expired cache entries");
+                emit(&format!("swept {n} expired cache entries"));
             }
         }
     }
@@ -122,7 +128,7 @@ impl TieredCache {
     /// Go `disable`: turns the disk tier off for the process lifetime after a failure, and logs why.
     pub(crate) fn disable(&self, op: &str, err: &dyn Display) {
         self.lock().off = true;
-        self.once.call_once(|| eprintln!("cache {op} failed ({err}) — persistence disabled, memory still serving"));
+        self.once.call_once(|| emit(&format!("cache {op} failed ({err}) — persistence disabled, memory still serving")));
     }
 
     fn lock(&self) -> MutexGuard<'_, DiskState> {
@@ -149,10 +155,6 @@ impl TieredCache {
         true
     }
 
-    fn reset_written(&self) {
-        self.lock().written = 0;
-    }
-
     /// Go `path`: hashes the key. Cache keys carry config blobs and ids, which are neither filename-safe nor short.
     fn path(&self, key: &str) -> PathBuf {
         let sum = Sha256::digest(key.as_bytes());
@@ -173,13 +175,13 @@ impl Cache for TieredCache {
         // process that reads the file after a restart.
         let nl = raw.iter().position(|&b| b == b'\n').filter(|&nl| nl > 0)?;
         let expires: i64 = std::str::from_utf8(&raw[..nl]).ok()?.parse().ok()?;
-        let now = unix_secs(SystemTime::now());
-        if now >= expires {
+        let now = SystemTime::now();
+        if unix_secs(now) >= expires {
             let _ = fs::remove_file(self.path(key));
             return None;
         }
         let value = String::from_utf8(raw[nl + 1..].to_vec()).ok()?;
-        self.mem.put(key, &value, Duration::from_secs((expires - now) as u64));
+        self.mem.put(key, &value, until(expires, now));
         Some(value)
     }
 
@@ -214,7 +216,7 @@ impl Cache for TieredCache {
         if self.disabled() {
             return;
         }
-        let expires = unix_secs(SystemTime::now() + ttl);
+        let expires = unix_secs_after(SystemTime::now(), ttl);
         let body = format!("{expires}\n{value}");
         if let Err((op, e)) = write_entry(&self.dir, &self.path(key), &body) {
             self.disable(op, &e);
@@ -226,10 +228,11 @@ impl Cache for TieredCache {
         if self.note_written(body.len() as i64) {
             let dir = self.dir.clone();
             let max_bytes = self.max_bytes;
+            let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
-                let n = sweep_files(&dir, max_bytes);
+                let n = sweep_files(&dir, max_bytes, || reset_written(&state));
                 if n > 0 {
-                    eprintln!("swept {n} cache entries after a write burst");
+                    emit(&format!("swept {n} cache entries after a write burst"));
                 }
             });
         }
@@ -240,8 +243,15 @@ impl Cache for TieredCache {
     }
 }
 
-/// The directory half of Go `Sweep`, without the cache's state, so a write burst can run it on a thread.
-fn sweep_files(dir: &Path, max_bytes: i64) -> i64 {
+/// Go `resetWritten`.
+fn reset_written(state: &Mutex<DiskState>) {
+    state.lock().unwrap_or_else(PoisonError::into_inner).written = 0;
+}
+
+/// The directory half of Go `Sweep`, without the cache itself, so a write burst can run it on a thread.
+/// `reset_written` is Go's `c.resetWritten()`: it runs once the directory scan is done, so what was written
+/// while the scan ran is forgotten with the rest, as in Go.
+fn sweep_files(dir: &Path, max_bytes: i64, reset_written: impl FnOnce()) -> i64 {
     if dir.as_os_str().is_empty() {
         return 0;
     }
@@ -292,6 +302,7 @@ fn sweep_files(dir: &Path, max_bytes: i64) -> i64 {
             removed += 1;
         }
     }
+    reset_written();
 
     // Expiry alone is not a ceiling; it is a schedule, and nothing re-reads a stream list, so an entry nobody
     // asks for again occupies the volume until its TTL passes however large the store has grown. Oldest first,
@@ -309,7 +320,7 @@ fn sweep_files(dir: &Path, max_bytes: i64) -> i64 {
             removed += 1;
         }
     }
-    eprintln!("cache volume over its {max_bytes}-byte budget; evicted down to {live_bytes} bytes");
+    emit(&format!("cache volume over its {max_bytes}-byte budget; evicted down to {live_bytes} bytes"));
     removed
 }
 
@@ -356,6 +367,22 @@ fn temp_name() -> String {
 
 fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Go `time.Now().Add(ttl).Unix()`: whole seconds, saturating instead of overflowing on an absurd `ttl`.
+fn unix_secs_after(now: SystemTime, ttl: Duration) -> i64 {
+    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default().saturating_add(ttl);
+    i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX)
+}
+
+/// Go `time.Until(time.Unix(expires, 0))`: the time left, to the nanosecond, not rounded to whole seconds. Go's
+/// `Duration` saturates at about 292 years, which is also where an out-of-range `expires` lands here, so a
+/// timestamp no clock can represent does not panic.
+fn until(expires: i64, now: SystemTime) -> Duration {
+    const GO_MAX_DURATION: Duration = Duration::from_nanos(i64::MAX as u64);
+    let Ok(secs) = u64::try_from(expires) else { return Duration::ZERO };
+    let Some(at) = UNIX_EPOCH.checked_add(Duration::from_secs(secs)) else { return GO_MAX_DURATION };
+    at.duration_since(now).unwrap_or_default().min(GO_MAX_DURATION)
 }
 
 /// Go `writeFile`: writes `body` to `path` with mode 0644. A test seam, kept next to the cache so the

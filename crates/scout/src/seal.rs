@@ -8,6 +8,8 @@ use blake2::Digest;
 use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{Nonce, PublicKey, SalsaBox, SecretKey};
 
+use crate::loglimit::emit;
+
 /// Go `sealedVersion`: the first byte of a DECODED config segment marking a sealed blob. A legacy
 /// plaintext segment starts with `{` (0x7b), so the two never collide.
 pub const SEALED_VERSION: u8 = 0x01;
@@ -31,7 +33,6 @@ pub struct SealKeyring {
     pub keys: Vec<SealKeypair>,
 }
 
-/// Go `newSealKeypair`.
 /// Go `newSealKeypair`.
 pub fn new_seal_keypair(priv_key: [u8; X25519_KEY_SIZE]) -> SealKeypair {
     let pub_key = *SecretKey::from(priv_key).public_key().as_bytes();
@@ -113,7 +114,7 @@ pub fn parse_seal_keyring(current: &str, prev: &str) -> Result<Option<SealKeyrin
         }
         match key_from_b64(p) {
             Ok(k) => keys.push(k),
-            Err(e) => eprintln!("skipping a malformed CONFIG_KEYS_PREV entry: {e}"),
+            Err(e) => emit(&format!("skipping a malformed CONFIG_KEYS_PREV entry: {e}")),
         }
     }
     Ok(Some(SealKeyring { keys }))
@@ -127,11 +128,20 @@ fn key_from_b64(s: &str) -> Result<SealKeypair, String> {
     Ok(new_seal_keypair(priv_key))
 }
 
-/// Go `decodeKeyB64`: std or url base64, with or without padding.
+/// Go `decodeKeyB64` accepts std/url base64 with or without padding.
+///
+/// Lenient the way Go's decoder is: carriage returns and newlines are skipped, and non-zero trailing bits are
+/// accepted (the `base64` crate refuses both by default).
 pub fn decode_key_b64(s: &str) -> Result<Vec<u8>, String> {
-    use base64::engine::general_purpose as gp;
-    [gp::STANDARD, gp::STANDARD_NO_PAD, gp::URL_SAFE, gp::URL_SAFE_NO_PAD]
-        .iter()
-        .find_map(|enc| enc.decode(s).ok())
-        .ok_or_else(|| "bad base64".to_owned())
+    use base64::alphabet::{STANDARD, URL_SAFE};
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    let config = |mode| GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(mode);
+    let engines = [
+        GeneralPurpose::new(&STANDARD, config(DecodePaddingMode::RequireCanonical)),
+        GeneralPurpose::new(&STANDARD, config(DecodePaddingMode::RequireNone)),
+        GeneralPurpose::new(&URL_SAFE, config(DecodePaddingMode::RequireCanonical)),
+        GeneralPurpose::new(&URL_SAFE, config(DecodePaddingMode::RequireNone)),
+    ];
+    let cleaned: String = s.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    engines.iter().find_map(|enc| enc.decode(&cleaned).ok()).ok_or_else(|| "bad base64".to_owned())
 }
