@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::probe::Probe;
 use crate::rank::RawStream;
 
 /// Go `StreamAttributes`: structured, pre-parsed display attributes, emitted on each stream so the client
@@ -56,6 +57,12 @@ pub(crate) struct StreamAttributes {
 
 /// Go `streamAttributes`: the attributes of one stream, read from its title and, when probed, the file.
 pub(crate) fn stream_attributes(_s: RawStream) -> StreamAttributes {
+    todo!()
+}
+
+/// Go `withProbe`: lets the file override the title's guesses wherever the probe read something; an
+/// unprobed release (`None`) comes back unchanged.
+pub(crate) fn with_probe(_attrs: StreamAttributes, _p: Option<&Probe>) -> StreamAttributes {
     todo!()
 }
 
