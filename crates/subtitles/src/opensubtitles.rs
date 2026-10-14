@@ -889,6 +889,92 @@ mod tests {
         assert!(ranking_factors(&subs[0], None).contains(&"hearing_impaired"));
     }
 
+    /// A fixed, varied candidate set: five languages, mixed-case and punctuated release strings, empty
+    /// ones, dubbed and foreign-parts tracks, machine translations and plenty of exact score ties
+    /// (which only the sort's stability orders).
+    fn varied_candidates() -> Vec<Subtitle> {
+        const RELEASES: &[&str] = &[
+            "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264-GRP3",
+            "dune part two 2024 2160p BluRay REMUX HEVC-grp3",
+            "Dune.Part.Two.2024.720p.HDTV.x264-OTHER",
+            "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264-GRP3.mkv",
+            "Dune.Part.Two.2024.DUBBED.1080p.WEB-DL.x265-GRP3",
+            "Dune-Part-Two.2024.480p.DVDRip.XviD",
+            "",
+            "Random.CAM",
+            "DUNE.PART.TWO.2024.1080P.BLURAY.X264-GRP3",
+            "Dune.Part.Two.2024.WEBRip.AVC-Grp3.srt",
+            "Dune.Part.Two.dub.2024.HDRip",
+            "dune_part_two_2024_web_h265-grp9",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..60)
+            .map(|i| {
+                let r = next();
+                Subtitle {
+                    file_id: 1000 + i,
+                    lang: ["en", "sv", "es", "fr", "pt-BR"][(r % 5) as usize].into(),
+                    hash_match: (r >> 8) % 11 == 0,
+                    downloads: [0, 3, 3, 250, 250, 90_000][((r >> 16) % 6) as usize],
+                    release: RELEASES[((r >> 24) % RELEASES.len() as u64) as usize].into(),
+                    hd: false,
+                    fps: 0.0,
+                    from_trusted: (r >> 32) % 4 == 0,
+                    machine_translated: (r >> 36) % 13 == 0,
+                    ai_translated: (r >> 40) % 17 == 0,
+                    foreign_parts_only: (r >> 44) % 15 == 0,
+                    hearing_impaired: false,
+                    ratings: [0.0, 5.0, 5.0, 8.5][((r >> 48) % 4) as usize],
+                }
+            })
+            .collect()
+    }
+
+    /// `rank` is a pure reordering of what the handler serves, so its output is pinned: these orders
+    /// were produced by the implementation that scored each pair inside the comparator, and a faster
+    /// `rank` has to reproduce them byte for byte, ties included.
+    #[test]
+    fn rank_orders_a_fixed_candidate_set_exactly_as_before() {
+        let order = |filename: Option<&str>| {
+            let mut subs = varied_candidates();
+            rank(&mut subs, filename);
+            subs.iter().map(|s| s.file_id).collect::<Vec<_>>()
+        };
+        let with_group = order(Some("Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264-GRP3.mkv"));
+        let no_group = order(Some("dune part two 2024 720p hdtv x264.mkv"));
+        let none = order(None);
+        assert_eq!(with_group, EXPECTED_WITH_GROUP);
+        assert_eq!(no_group, EXPECTED_NO_GROUP);
+        assert_eq!(none, EXPECTED_NONE);
+    }
+    #[rustfmt::skip]
+    const EXPECTED_WITH_GROUP: [i64; 60] = [
+        1033, 1034, 1017, 1002, 1031, 1045, 1046, 1054, 1044, 1004, 1020, 1015, 1037, 1016, 1051, 1008, 1047,
+        1042, 1010, 1024, 1025, 1007, 1005, 1012, 1018, 1011, 1009, 1055, 1053, 1022, 1056, 1039, 1023, 1043,
+        1038, 1026, 1021, 1032, 1013, 1052, 1001, 1014, 1029, 1059, 1019, 1040, 1050, 1058, 1030, 1003, 1048,
+        1036, 1049, 1035, 1006, 1057, 1000, 1027, 1028, 1041,
+    ];
+    #[rustfmt::skip]
+    const EXPECTED_NO_GROUP: [i64; 60] = [
+        1034, 1033, 1015, 1004, 1017, 1020, 1002, 1046, 1054, 1031, 1037, 1045, 1016, 1044, 1051, 1008, 1047,
+        1042, 1005, 1018, 1011, 1025, 1010, 1012, 1024, 1007, 1009, 1055, 1022, 1053, 1026, 1039, 1023, 1043,
+        1021, 1038, 1032, 1056, 1013, 1052, 1001, 1014, 1029, 1019, 1059, 1050, 1058, 1040, 1030, 1003, 1048,
+        1035, 1006, 1049, 1057, 1036, 1000, 1027, 1041, 1028,
+    ];
+    #[rustfmt::skip]
+    const EXPECTED_NONE: [i64; 60] = [
+        1034, 1033, 1004, 1017, 1020, 1015, 1002, 1046, 1031, 1037, 1054, 1045, 1016, 1044, 1051, 1008, 1047,
+        1042, 1005, 1025, 1010, 1018, 1012, 1024, 1007, 1011, 1009, 1055, 1022, 1053, 1026, 1039, 1023, 1043,
+        1021, 1038, 1032, 1056, 1013, 1052, 1001, 1014, 1029, 1019, 1059, 1050, 1058, 1040, 1030, 1003, 1048,
+        1035, 1006, 1049, 1057, 1036, 1000, 1027, 1028, 1041,
+    ];
+
     #[test]
     fn download_error_reason_tag_distinguishes_sparse_from_suspect() {
         assert_eq!(DownloadError::Gone("x".into()).reason_tag(), "gone");
