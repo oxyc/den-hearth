@@ -353,7 +353,14 @@ impl<'a> Client<'a> {
         let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_SUBTITLE_BODY)
             .await
             .map_err(DownloadError::Unavailable)?;
-        let (body, converted) = crate::fetch::subtitle_text(bytes, lang);
+        // Off the runtime thread: guessing a legacy charset reads the whole file at about 30 MB/s
+        // (5 ms for a 220 KB track, ~65 ms at the 2 MiB ceiling), and the serving runtime has only
+        // a few threads. A UTF-8 file costs microseconds either way.
+        let lang = lang.map(str::to_owned);
+        let (body, converted) =
+            tokio::task::spawn_blocking(move || crate::fetch::subtitle_text(bytes, lang.as_deref()))
+                .await
+                .map_err(|e| DownloadError::Unavailable(format!("decode subtitle: {e}")))?;
         // Once per download: the result is cached, so this never repeats per request.
         if let Some(encoding) = converted {
             eprintln!("subtitle: file {file_id} was {}, converted to UTF-8", encoding.name());
