@@ -511,16 +511,19 @@ a counting allocator). Before = `58d32df` (baseline hooks only), after = this br
 | hit rate | 0.376 / 0.493 | 0.376 / 0.493 |
 | heap with the cache full (MB) | 69.5 / 70.8 | 70.7 / 70.7 |
 | hourly sweep (ms, 2.8-3.7 k files) | 14-38 / 34-63 | 0.9 / 3.1-3.4 |
-| restart over the same directory (ms) | 39-121 / 52-65 | 54-139 / 107 |
+| restart over the same directory, 24 h run (ms; fastest / median of 4) | 35.0 / 37.2 | 36.5 / 36.8 |
 
 In this replay the writes it saves are the pin that is written twice in a row (the same value, 180 days): the search
 entries, quota counters and bodies all change, or are new, so there is nothing else to skip. Bytes do not move because
-those files are 5-10 bytes. The restart column is the one thing that got slower: the directory is read twice (an index
-scan, then the boot sweep), once per process start. The first run after a build is a 5-10x outlier on either side
-(cold page cache) and is left in the raw lines.
+those files are 5-10 bytes. Opening the cache walks the directory once: that one pass builds the index and reclaims what
+expired, so the boot sweep is not a second pass (an earlier version of this branch read the directory twice and was
+slower to start). Restart runs were interleaved, before/after, at load average 17-28 on a shared laptop; the first run
+after a build is a 5-10x cold-cache outlier on either side. The sweep time and restart rows for 72 h come from earlier,
+two-pass runs and are in the raw lines only.
 
 Scout, 24 h: writes 256.8 /h and 362 skipped puts, unchanged; bytes 2,162,663 -> 2,163,849 /h (the length in the
-header); hit rate 0.627 unchanged; restart 82-101 ms -> 82-136 ms.
+header); hit rate 0.627 unchanged; restart over 4,352 files (fastest / median of 3) 61.2 / 78.1 ms before, 58.8 / 59.5
+ms after, one directory listing in both.
 
 Divan, `bench/micro.sh subtitles cache_` (median / mean ns, a cache holding about 64 MiB):
 

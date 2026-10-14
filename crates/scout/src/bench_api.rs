@@ -89,7 +89,7 @@ pub fn replay_cache(
     dir: &Path,
     clock: std::sync::Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
 ) -> TieredCache {
-    TieredCache::new(memory_bytes, dir).with_clock(clock)
+    TieredCache::new_with_clock(memory_bytes, dir, clock)
 }
 
 /// What the process does once an hour (hearth's `sweep_every`). Returns entries removed.

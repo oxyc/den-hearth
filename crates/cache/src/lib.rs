@@ -88,6 +88,8 @@ pub struct Options {
     pub cost: fn(&str) -> u8,
     /// Where the tier says what went wrong (an unwritable directory, a failed write, an over-budget volume).
     pub log: fn(&str),
+    /// What expiry reads the time from, from the opening walk of the directory on. `None` is the system clock.
+    pub clock: Option<Clock>,
 }
 
 impl Options {
@@ -102,6 +104,7 @@ impl Options {
             min_shard_bytes: 2 << 20,
             cost: |_| 0,
             log: |line| eprintln!("{line}"),
+            clock: None,
         }
     }
 }
@@ -159,9 +162,13 @@ impl<V: Value> Cache<V> {
             DefaultHashBuilder::default(),
             quick_cache::sync::DefaultLifecycle::default(),
         );
-        let disk =
-            o.dir.as_deref().filter(|d| !d.as_os_str().is_empty()).map(|d| Arc::new(Disk::open(&o, d)));
-        Cache { clock: Arc::new(SystemTime::now), mem, disk }
+        let clock: Clock = o.clock.clone().unwrap_or_else(|| Arc::new(SystemTime::now));
+        let disk = o
+            .dir
+            .as_deref()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(|d| Arc::new(Disk::open(&o, d, clock())));
+        Cache { clock, mem, disk }
     }
 
     /// Reads time from `clock` in both tiers.

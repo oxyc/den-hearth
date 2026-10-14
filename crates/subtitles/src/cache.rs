@@ -171,15 +171,11 @@ impl Cache {
             min_shard_bytes: MIN_SHARD_BYTES,
             cost: evict_rank,
             log: |line| eprintln!("warning: {line}"),
+            clock,
             ..Options::new(max_bytes.min(MAX_MEMORY_BYTES))
         };
-        let mut inner = den_cache::Cache::new(options);
-        if let Some(clock) = clock {
-            inner.set_clock(clock);
-        }
-        let cache = Cache { inner };
-        cache.sweep();
-        cache
+        // Opening the disk tier walks the directory once, building the index and reclaiming what expired.
+        Cache { inner: den_cache::Cache::new(options) }
     }
 
     /// What the disk tier has asked of the filesystem since it was built.

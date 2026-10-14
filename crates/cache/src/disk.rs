@@ -152,7 +152,7 @@ struct Header {
 }
 
 impl Disk {
-    pub(crate) fn open(o: &Options, dir: &Path) -> Disk {
+    pub(crate) fn open(o: &Options, dir: &Path, now: SystemTime) -> Disk {
         let mut unusable = false;
         if let Err(e) = fs::create_dir_all(dir) {
             (o.log)(&format!(
@@ -176,8 +176,12 @@ impl Disk {
             hasher: DefaultHashBuilder::default(),
         };
         if !unusable {
-            let index = disk.scan();
-            *disk.index() = index;
+            // One walk of the directory does both jobs: it builds the index (a file the index does not know is read
+            // once) and reclaims what expired or is torn while the process was down.
+            let n = disk.sweep(now);
+            if n > 0 {
+                (o.log)(&format!("swept {n} cache entries at startup"));
+            }
         }
         disk
     }
@@ -365,24 +369,8 @@ impl Disk {
 
     // ---- scan and sweep ---------------------------------------------------------------------------------------
 
-    /// The index of the directory: one listing, one head read per entry file. A file that cannot be understood is
-    /// indexed as already expired, because a get cannot serve it either way, and the sweep then removes it.
-    fn scan(&self) -> Index {
-        let mut index = Index::new();
-        self.stats.readdirs.fetch_add(1, Ordering::Relaxed);
-        let Ok(entries) = fs::read_dir(&self.dir) else { return index };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if self.naming.is_entry(&name) && entry.file_type().is_ok_and(|t| !t.is_dir()) {
-                if let Some(meta) = self.scan_entry(&name, &entry.path()) {
-                    index.insert(name, meta);
-                }
-            }
-        }
-        index
-    }
-
-    /// The expiry and length are the first line, so a short read reaches them; the file's size says whether the rest
+    /// What one file says about itself: one head read. A file that cannot be understood is described as already
+    /// expired, because a get cannot serve it either way, and the sweep then removes it. The expiry and length are the first line, so a short read reaches them; the file's size says whether the rest
     /// of it is there. `None` only for a file that is gone or cannot be opened (left alone: unreadable is not expired,
     /// and a volume whose uid shifted must not lose its whole store to a sweep).
     fn scan_entry(&self, name: &str, path: &Path) -> Option<Meta> {

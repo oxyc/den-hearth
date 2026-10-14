@@ -43,7 +43,25 @@ pub struct TieredCache {
 impl TieredCache {
     /// Go `NewTieredCache`: `max_bytes` is the memory tier's budget, `dir` the disk tier's directory. An empty
     /// `dir` turns persistence off.
+    ///
+    /// Opening walks the directory once: that builds the index and reclaims what expired while the process was down
+    /// (a redeploy is the likeliest moment for a backlog), so `sweep_every` does not repeat it at startup.
     pub fn new(max_bytes: usize, dir: &Path) -> TieredCache {
+        TieredCache::open(max_bytes, dir, None)
+    }
+
+    /// `new` reading time from `clock` in both tiers from the first walk on, so a replay can run days of traffic in
+    /// seconds.
+    #[cfg(feature = "bench")]
+    pub(crate) fn new_with_clock(
+        max_bytes: usize,
+        dir: &Path,
+        clock: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+    ) -> TieredCache {
+        TieredCache::open(max_bytes, dir, Some(clock))
+    }
+
+    fn open(max_bytes: usize, dir: &Path, clock: Option<den_cache::Clock>) -> TieredCache {
         // Files are `<expiry>\n<value>` from earlier releases and `<expiry> <len>\n<value>` from this one; both are read.
         let options = Options {
             dir: Some(dir.to_path_buf()),
@@ -51,19 +69,10 @@ impl TieredCache {
             min_persist_ttl: PERSIST_MIN_TTL,
             accept_unframed: true,
             log: emit,
+            clock,
             ..Options::new(max_bytes)
         };
         TieredCache { inner: den_cache::Cache::new(options) }
-    }
-
-    /// Reads time from `clock` in both tiers, so a replay can run days of traffic in seconds.
-    #[cfg(feature = "bench")]
-    pub(crate) fn with_clock(
-        mut self,
-        clock: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
-    ) -> TieredCache {
-        self.inner.set_clock(clock);
-        self
     }
 
     /// What the disk tier has asked of the filesystem since it was built.
@@ -82,17 +91,11 @@ impl TieredCache {
         self.inner.sweep()
     }
 
-    /// Go `SweepEvery`: sweeps once at startup, then on `every`, until dropped. Returns at once when
-    /// persistence is off. Cancellation is dropping the future.
+    /// Go `SweepEvery`: sweeps on `every` until dropped (the startup sweep is the walk `new` does). Returns at once
+    /// when persistence is off. Cancellation is dropping the future.
     pub async fn sweep_every(&self, every: Duration) {
         if !self.inner.has_disk() {
             return;
-        }
-        // Once at startup: a redeploy is the most likely moment for the store to be holding a backlog of
-        // entries that expired while the process was not running.
-        let n = self.sweep();
-        if n > 0 {
-            emit(&format!("swept {n} expired cache entries at startup"));
         }
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         // A tick missed during a slow sweep is dropped, as Go's ticker drops it.

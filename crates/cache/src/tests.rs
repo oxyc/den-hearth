@@ -117,9 +117,8 @@ fn a_torn_file_is_never_served() {
     // hazard, so the recorded length is what has to reject it.
     fs::write(&path, &raw[..raw.len() - 6]).unwrap();
 
-    // Found at open: the file's size disagrees with its header, so it is indexed as expired and the sweep takes it.
+    // Found at open: the file's size disagrees with its header, so the opening walk takes it.
     let reopened = open(dir.path());
-    assert_eq!(reopened.sweep(), 1);
     assert!(!path.exists());
     assert_eq!(get(&reopened, "k"), None, "served a truncated entry");
 
@@ -208,6 +207,7 @@ fn the_directory_is_read_once_and_the_index_answers_the_rest() {
     let c = C::new(options(1, dir.path()));
     let opened = c.disk_counts();
     assert_eq!(opened.reads, 10, "the scan should read each file's head once: {opened:?}");
+    assert_eq!(opened.readdirs, 1, "opening should list the directory once: {opened:?}");
     for i in 0..500 {
         assert!(c.get(&format!("never-written-{i}")).is_none());
     }
@@ -255,7 +255,13 @@ fn the_sweep_reclaims_what_nobody_reads_back_and_keeps_the_rest() {
     for i in 0..20 {
         fs::write(c.path_for(&format!("dead-{i}")).unwrap(), "1\nv").unwrap();
     }
+    // The opening walk reclaims what expired while the process was down...
     let c = C::new(options(1, dir.path()));
+    assert_eq!(files(dir.path()), 0);
+    // ...and a later sweep what expires while it runs.
+    for i in 0..20 {
+        fs::write(c.path_for(&format!("dead-{i}")).unwrap(), "1\nv").unwrap();
+    }
     put(&c, "alive", "v", DAY);
     assert_eq!(c.sweep(), 20);
     assert_eq!(files(dir.path()), 1);

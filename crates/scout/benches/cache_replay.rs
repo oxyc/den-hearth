@@ -240,7 +240,7 @@ fn main() {
     offset.store(end, Ordering::Relaxed);
     let started = Instant::now();
     let restarted = bench_api::replay_cache(MEMORY_BYTES, dir.path(), Arc::clone(&clock));
-    bench_api::replay_hourly(&restarted); // hearth sweeps once at startup
+    // Opening walks the directory once and reclaims the expired; hearth's `sweep_every` no longer repeats it.
     let startup_ms = started.elapsed().as_secs_f64() * 1e3;
     let (mut expected, mut restored) = (0u64, 0u64);
     let after_start = restarted.disk_counts();
