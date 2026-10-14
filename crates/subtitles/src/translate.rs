@@ -451,12 +451,12 @@ async fn one_batch<'c>(
     // never rotates out. The lock is released before the call: holding it across the await would
     // serialize the batches straight back into a queue.
     let snapshot: Vec<(String, String)> = {
-        let ctx = context.lock().unwrap();
+        let ctx = crate::lock(context);
         glossary.iter().chain(ctx.iter()).cloned().collect()
     };
     let translated = translate_batch(upstream, &sources, &snapshot, budget, resume).await?;
     {
-        let mut ctx = context.lock().unwrap();
+        let mut ctx = crate::lock(context);
         for (cue, text) in batch.iter().zip(translated.iter()) {
             // Only a pair that actually CHANGED goes into the context. An unchanged one is either a
             // name that legitimately stays put or a cue the model failed on and we fell back to
