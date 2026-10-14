@@ -1,0 +1,15 @@
+[package]
+name = "den-seal"
+version = "0.0.0"
+edition = "2021"
+description = "The sealed config-in-URL keyring and the install-revocation policy Scout, Reel and Subtitles read the same way"
+publish = false
+license = "MIT"
+
+[dependencies]
+# The lenient base64url the config segment is read with (`b64url_decode`).
+den-net = { path = "../net" }
+base64 = "0.23"
+# `seal` = libsodium crypto_box_seal (X25519 + XSalsa20-Poly1305, blake2b nonce): `PublicKey::seal` and
+# `SecretKey::unseal` are the wire format, byte for byte.
+crypto_box = { version = "0.9", features = ["seal"] }

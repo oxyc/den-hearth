@@ -2,19 +2,17 @@
 //! redirect policy every debrid-facing client carries, and `BuildDeps`. `Settings` is FROZEN (see
 //! PORTING.md): the handler, metrics and the startup line all read it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use den_seal::Revocation;
 
 use crate::addbudget::{set_play_reserve, ADD_BUDGET_LIMIT, DEFAULT_PLAY_RESERVE};
 use crate::cache::Cache;
 use crate::cinemeta::{cinemeta_meta, Cinemeta, CINEMETA_BASE};
-use crate::config::{
-    valid_install_id, Config, Indexer, ALL_INDEXERS, DEFAULT_INDEXERS, DISABLED_INDEXERS, INSTALL_ID_LEN,
-    MAX_CONFIG_EPOCH,
-};
+use crate::config::{Config, Indexer, ALL_INDEXERS, DEFAULT_INDEXERS, DISABLED_INDEXERS};
 use crate::coverage::parse_time;
 use crate::decisionlog::{quote_go, set_log_identity};
 use crate::handler::{go_duration, DEFAULT_LIST_TTL, DEFAULT_TIMEOUT};
@@ -53,11 +51,8 @@ pub struct Settings {
     pub mint_indexer_configs: bool,
     pub log_requests: bool,
     pub log_identity: bool,
-    /// REVOKED_INSTALLS: valid install ids.
-    pub revoked_installs: Vec<String>,
-    /// CONFIG_EPOCH.
-    pub config_epoch: i64,
-    pub require_install_id: bool,
+    /// REVOKED_INSTALLS (valid install ids), CONFIG_EPOCH, and REQUIRE_INSTALL_ID.
+    pub revocation: Revocation,
     /// REMUX_KEY: den-remux's service key.
     pub remux_key: String,
     /// PLAY_TICKET_TTL_SECS.
@@ -101,9 +96,9 @@ pub fn startup_summary(s: &Settings, persistent: bool) -> String {
         on_off(s.log_requests),
         on_off(s.log_identity),
         on_off(!s.config_key.is_empty()),
-        s.revoked_installs.len(),
-        s.config_epoch,
-        on_off(s.require_install_id),
+        s.revocation.revoked_count(),
+        s.revocation.epoch(),
+        on_off(s.revocation.requires_install_id()),
         on_off(!s.remux_key.is_empty()),
         names(&DEFAULT_INDEXERS),
         names(&overridden),
@@ -150,9 +145,8 @@ pub fn settings_from_env(get: impl Fn(&str) -> String) -> Settings {
             || get("MINT_INDEXER_CONFIGS") == "1",
         log_requests: flag("LOG_REQUESTS"),
         log_identity: bool_env_or(&get("LOG_IDENTITY"), true),
-        revoked_installs: parse_revoked_installs(&get("REVOKED_INSTALLS")),
-        config_epoch: parse_config_epoch(&get("CONFIG_EPOCH")),
-        require_install_id: flag("REQUIRE_INSTALL_ID"),
+        revocation: Revocation::parse(&get("REVOKED_INSTALLS"), Some(&get("CONFIG_EPOCH")), &emit)
+            .requiring_install_id(flag("REQUIRE_INSTALL_ID")),
         remux_key: get("REMUX_KEY"),
         play_ticket_ttl: dur_env(&get("PLAY_TICKET_TTL_SECS"), DEFAULT_PLAY_TICKET_TTL),
         // Only read with a key set: without one there are no tickets, and the legacy route is the only one.
@@ -178,46 +172,6 @@ pub(crate) fn parse_play_reserve(v: &str) -> i64 {
                 DEFAULT_PLAY_RESERVE
             ));
             DEFAULT_PLAY_RESERVE
-        }
-    }
-}
-
-/// Go `parseRevokedInstalls` reads REVOKED_INSTALLS, a comma-separated list of install ids. A malformed entry is
-/// skipped and said, like a malformed CONFIG_KEYS_PREV entry: it could never match a config, because
-/// validateConfig refuses a config carrying such an id.
-pub(crate) fn parse_revoked_installs(v: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for s in v.split(',') {
-        let s = s.trim();
-        if s.is_empty() {
-            continue;
-        }
-        if !valid_install_id(s) {
-            emit(&format!(
-                "skipping a malformed REVOKED_INSTALLS entry (want a {INSTALL_ID_LEN}-character install id)"
-            ));
-            continue;
-        }
-        out.push(s.to_owned());
-    }
-    out
-}
-
-/// Go `parseConfigEpoch` reads CONFIG_EPOCH. A value that does not parse is said loudly and read as 0, which
-/// refuses nothing: refusing every install over a typo would take the whole addon down.
-pub(crate) fn parse_config_epoch(v: &str) -> i64 {
-    let v = v.trim();
-    if v.is_empty() {
-        return 0;
-    }
-    match v.parse::<i64>() {
-        Ok(n) if (0..=MAX_CONFIG_EPOCH).contains(&n) => n,
-        _ => {
-            emit(&format!(
-                "CONFIG_EPOCH={} is not a non-negative integer — ignoring it, so no config is refused by epoch",
-                quote_go(v.as_bytes())
-            ));
-            0
         }
     }
 }
@@ -389,11 +343,9 @@ pub struct Deps {
     /// One redacted line per response (reqlog.go).
     pub log_requests: bool,
     /// REVOKED_INSTALLS: install ids refused outright. CONFIG_EPOCH refuses every config minted under an older
-    /// epoch. Both reach play tickets too. See admitInstall.
-    pub revoked_installs: HashSet<String>,
-    pub config_epoch: i64,
-    /// Refuse a full config with no install id (REQUIRE_INSTALL_ID); see `Settings::require_install_id`.
-    pub require_install_id: bool,
+    /// epoch. REQUIRE_INSTALL_ID refuses a full config with no install id. All reach play tickets too. See
+    /// admitInstall.
+    pub revocation: Revocation,
     /// den-remux's service key (REMUX_KEY); see `Settings::remux_key` and refuseScoped.
     pub remux_key: String,
     /// How long a /p/ ticket stays good; zero takes the default.
@@ -445,7 +397,6 @@ fn build_deps_with(
     enable_indexer_config_minting(settings.mint_indexer_configs);
     set_play_reserve(settings.play_reserve_adds);
     set_log_identity(settings.log_identity);
-    let revoked: HashSet<String> = settings.revoked_installs.iter().cloned().collect();
     // A client can first use a list's tickets up to 3×LIST_TTL_SECS after the list was built (see
     // defaultPlayTicketTTL), so a TTL at or under that hands out tickets that are dead on arrival.
     if !settings.config_key.is_empty() && settings.play_ticket_ttl <= 3 * settings.list_ttl {
@@ -476,9 +427,7 @@ fn build_deps_with(
         seal_keyring: build_keyring(&settings.config_key, &settings.config_keys_prev).map(Arc::new),
         metrics_token: settings.metrics_token.clone(),
         log_requests: settings.log_requests,
-        revoked_installs: revoked,
-        config_epoch: settings.config_epoch,
-        require_install_id: settings.require_install_id,
+        revocation: settings.revocation.clone(),
         remux_key: settings.remux_key.clone(),
         play_ticket_ttl: settings.play_ticket_ttl,
         legacy_play_until: settings.legacy_play_until,

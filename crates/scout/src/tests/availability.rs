@@ -46,10 +46,8 @@ async fn wait_for_verdict(h: &crate::handler::Handler, config: &str, id: &str, w
 /// Go `sealedConfig`: a JSON config sealed to the test key, as the base64url path segment a client sends.
 /// Takes the keyring for parity with the Go helper; the seal uses the test key's public half.
 pub(crate) fn sealed_config(_kr: &SealKeyring, cfg_json: &str) -> String {
-    let pub_key: [u8; 32] = crate::seal::decode_key_b64(VEC_PUB_B64)
-        .expect("the test public key decodes")
-        .try_into()
-        .expect("32 bytes");
+    let pub_key: [u8; 32] =
+        den_seal::decode_key(VEC_PUB_B64).expect("the test public key decodes").try_into().expect("32 bytes");
     let sealed = seal(&pub_key, cfg_json.as_bytes()).expect("seals");
     let mut framed = vec![SEALED_VERSION];
     framed.extend_from_slice(&sealed);

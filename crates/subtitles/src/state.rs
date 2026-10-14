@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use den_seal::Keyring;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Admission and the 64 MiB memory-cache cap are one 512 MiB cgroup budget. Three concurrent
@@ -26,7 +27,6 @@ use crate::cache::Cache;
 use crate::config::Config;
 use crate::inflight::{InFlight, Progress};
 use crate::logging::LogGate;
-use crate::seal::Keyring;
 use crate::sync::SyncTools;
 use crate::userconfig::{self, Rejected, UserConfig};
 

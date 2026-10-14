@@ -14,9 +14,9 @@ use futures_util::future::Shared;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::seal::Keyring;
 use crate::upstream::{HttpUpstream, Upstream};
 use crate::ytdlp::{self, PlayError};
+use den_seal::Keyring;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<crate::ytdlp::Probe> + Send + Sync>;

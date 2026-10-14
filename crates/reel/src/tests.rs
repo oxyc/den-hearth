@@ -275,7 +275,7 @@ fn build_state_full(
     prewarm: PrewarmFn,
     searcher: crate::state::SearchFn,
 ) -> Arc<AppState> {
-    let config_keyring = crate::seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
+    let config_keyring = den_seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
     let media_gate = std::sync::Arc::new(crate::media_gate::MediaGate::new(
         cfg.direct_media_concurrency,
         cfg.direct_media_idle,

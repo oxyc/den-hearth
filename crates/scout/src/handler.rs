@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use den_seal::Rejected;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1317,14 +1318,14 @@ impl Inner {
                     // The epoch rides along: /configure stamps it into a new config as `ep`, so a link built after
                     // CONFIG_EPOCH is bumped is not refused by it. The page fetches with cache: "no-cache", so
                     // a browser revalidates (a 304 while nothing changed) rather than keeping a pre-bump epoch.
-                    let body = marshal(&json!({"epoch": self.deps.config_epoch, "key": pub_key}));
+                    let body = marshal(&json!({"epoch": self.deps.revocation.epoch(), "key": pub_key}));
                     return self.conditional(req, &body, &etag_for(&body), JSON_TYPE, KEY_CACHE);
                 }
                 // The epoch rides the 404 too: a plaintext link built while CONFIG_EPOCH > 0 must still carry
                 // it, or it would be refused the moment it was made. Matches den-subtitles and den-reel.
                 return write_json(
                     404,
-                    &json!({"epoch": self.deps.config_epoch, "error": "no_key"}),
+                    &json!({"epoch": self.deps.revocation.epoch(), "error": "no_key"}),
                     NO_STORE,
                 );
             }
@@ -3405,33 +3406,32 @@ impl Inner {
     /// or a play ticket. The log line names the reason. A revoked id is cut to six characters, and the id of an
     /// install that is not revoked is never logged.
     pub(crate) fn admit_install(&self, config: &Config) -> bool {
-        if !config.iid.is_empty() && self.deps.revoked_installs.contains(&config.iid) {
-            log_limited(
-                "install-revoked",
-                &format!(
-                    "config refused: install revoked (iid {}…)",
-                    config.iid.chars().take(6).collect::<String>()
-                ),
-            );
-            return false;
-        }
-        if config.epoch < self.deps.config_epoch {
-            log_limited(
-                "install-epoch",
-                &format!(
-                    "config refused: install epoch too old ({} < CONFIG_EPOCH {})",
-                    config.epoch, self.deps.config_epoch
-                ),
-            );
-            return false;
-        }
+        let iid = (!config.iid.is_empty()).then_some(config.iid.as_str());
+        let ep = u64::try_from(config.epoch).unwrap_or(0);
         // A scoped config is minted separately from the install and may carry no id. Tickets den-remux is
-        // authorized to mint from it preserve that provenance; epoch and named revocation still apply above.
-        if self.deps.require_install_id && config.iid.is_empty() && config.scope.is_empty() {
-            log_limited("install-no-iid", "config refused: no install id (REQUIRE_INSTALL_ID is on)");
-            return false;
+        // authorized to mint from it preserve that provenance; epoch and named revocation still apply.
+        let verdict = if config.scope.is_empty() {
+            self.deps.revocation.check(iid, ep)
+        } else {
+            self.deps.revocation.check_scoped(iid, ep)
+        };
+        match verdict {
+            Ok(()) => return true,
+            Err(Rejected::Revoked { iid_prefix }) => log_limited(
+                "install-revoked",
+                &format!("config refused: install revoked (iid {iid_prefix}…)"),
+            ),
+            Err(Rejected::EpochTooOld { ep, epoch }) => log_limited(
+                "install-epoch",
+                &format!("config refused: install epoch too old ({ep} < CONFIG_EPOCH {epoch})"),
+            ),
+            Err(Rejected::NoInstallId) => {
+                log_limited("install-no-iid", "config refused: no install id (REQUIRE_INSTALL_ID is on)")
+            }
+            // `check` yields only the three above.
+            Err(Rejected::Undecodable | Rejected::Plaintext) => {}
         }
-        true
+        false
     }
 }
 

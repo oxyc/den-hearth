@@ -5,7 +5,7 @@
 //! `FakeStore` (stores_test.go's `fakeStore`), and the `blob`/`ticket` helpers that `ticket_test.go` owns.
 //! Package 5 and 6 will port their own copies in their modules; these are the package 4 stand-ins.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use den_seal::Revocation;
 
 use crate::cache::{Cache, MemoryCache};
 use crate::config::{DebridService, Indexer};
@@ -50,6 +51,12 @@ pub(crate) fn other_iid() -> String {
 /// `ticket_test.go`'s `ticketKeyring`.
 pub(crate) fn ticket_keyring() -> SealKeyring {
     parse_seal_keyring(VEC_PRIV_B64, "").expect("the test key parses").expect("the test key is set")
+}
+
+/// The refusals a test deploys with: the install ids in `revoked`, every epoch below `epoch`, and with
+/// `require_iid` every full config that carries no install id.
+pub(crate) fn revocation(revoked: &[&str], epoch: u64, require_iid: bool) -> Revocation {
+    Revocation::parse(&revoked.join(","), Some(&epoch.to_string()), &|_| {}).requiring_install_id(require_iid)
 }
 
 /// `handler_test.go`'s `validBlob`: a TorBox config with one indexer, CAM filtered, cached only.
@@ -122,9 +129,7 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
         seal_keyring: None,
         metrics_token: String::new(),
         log_requests: false,
-        revoked_installs: HashSet::new(),
-        config_epoch: 0,
-        require_install_id: false,
+        revocation: Revocation::default(),
         remux_key: String::new(),
         play_ticket_ttl: crate::ticket::DEFAULT_PLAY_TICKET_TTL,
         legacy_play_until: None,
@@ -517,7 +522,7 @@ async fn routes_pages_and_manifest() {
 #[tokio::test]
 async fn routes_sealed_config() {
     let pub_key: [u8; 32] =
-        crate::seal::decode_key_b64(VEC_PUB_B64).expect("the test key decodes").try_into().expect("32 bytes");
+        den_seal::decode_key(VEC_PUB_B64).expect("the test key decodes").try_into().expect("32 bytes");
     let kr = parse_seal_keyring(VEC_PRIV_B64, "").expect("parses").expect("set");
     // Same config as valid_blob(), but sealed to the addon's key.
     let cfg_json = br#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#;

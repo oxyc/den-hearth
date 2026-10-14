@@ -4,24 +4,25 @@
 //! and must keep opening. The route tests drive the handler; the settings test drives `settings_from_env` and
 //! `build_deps`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use den_seal::InstallId;
 use regex::Regex;
 
 use super::availability::availability_of;
 use super::core::blob;
-use super::handler::{body_str, get, hdr, method, post_json, sealed_config, test_deps};
+use super::handler::{body_str, get, hdr, method, post_json, revocation, sealed_config, test_deps};
 use super::reqlog::{forget_logged, LogCapture};
 use super::seal::{bytes_seq, VEC_PRIV_B64};
 use crate::availability::verdict_prefix;
 use crate::cache::MemoryCache;
 use crate::config::{
-    decode_config, Config, DebridAccount, DebridService, INSTALL_ID_BYTES, MAX_CONFIG_BLOB, MAX_CONFIG_EPOCH,
+    decode_config, Config, DebridAccount, DebridService, MAX_CONFIG_BLOB, MAX_CONFIG_EPOCH,
     MAX_DEBRID_ACCOUNTS, SCOPE_AVAILABILITY,
 };
 use crate::deps::{build_deps, settings_from_env, startup_summary};
@@ -32,11 +33,11 @@ use crate::ticket::{TicketError, TicketKeys, DEFAULT_PLAY_TICKET_TTL};
 use crate::util::{b64url_decode, b64url_encode};
 
 fn test_iid() -> String {
-    b64url_encode(&bytes_seq(0x00, INSTALL_ID_BYTES))
+    b64url_encode(&bytes_seq(0x00, InstallId::BYTES))
 }
 
 fn other_iid() -> String {
-    b64url_encode(&bytes_seq(0x10, INSTALL_ID_BYTES))
+    b64url_encode(&bytes_seq(0x10, InstallId::BYTES))
 }
 
 // Unterminated, so a test can append iid/ep/scope before closing it.
@@ -454,7 +455,7 @@ async fn revoked_install_is_refused_everywhere() {
 
     forget_logged("install-revoked");
     let out = LogCapture::start();
-    let h = with_keyring(|d| d.revoked_installs = HashSet::from([test_iid()]));
+    let h = with_keyring(|d| d.revocation = revocation(&[&test_iid()], 0, false));
     let token =
         encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() });
     let cases: Vec<(String, u16)> = vec![
@@ -487,7 +488,7 @@ async fn revoked_install_is_refused_everywhere() {
 // A config without an install id cannot be revoked by id, and keeps working while CONFIG_EPOCH is 0.
 #[tokio::test]
 async fn revoked_install_a_config_without_an_id_still_works() {
-    let h = new_handler(test_deps(|d| d.revoked_installs = HashSet::from([test_iid()])));
+    let h = new_handler(test_deps(|d| d.revocation = revocation(&[&test_iid()], 0, false)));
     let play = path_of(&stream_urls(&h, &valid_blob()).await[0]);
     let rr = get(&h, &play, &[]).await;
     assert_eq!(rr.status(), 302, "legacy play: {}, want 302", rr.status());
@@ -506,7 +507,7 @@ async fn config_epoch_refuses_what_was_minted_before_it() {
 
     forget_logged("install-epoch");
     let out = LogCapture::start();
-    let h = with_keyring(|d| d.config_epoch = 2);
+    let h = with_keyring(|d| d.revocation = revocation(&[], 2, false));
     let cases: Vec<(String, u16)> = vec![
         (format!("/{old}/manifest.json"), 400),
         (format!("/{old}/stream/movie/tt7654321.json"), 400),
@@ -539,7 +540,7 @@ async fn require_install_id_refuses_only_links_without_one() {
     let kr = ticket_keyring();
     let with_id = sealed_config(&kr, &format!(r#"{TICKET_CFG},"iid":"{}"}}"#, test_iid()));
     let without = sealed_config(&kr, &format!("{TICKET_CFG}}}"));
-    let h = with_keyring(|d| d.require_install_id = true);
+    let h = with_keyring(|d| d.revocation = revocation(&[], 0, true));
     let cases: Vec<(String, u16)> = vec![
         (format!("/{without}/manifest.json"), 400),
         (format!("/{}/manifest.json", valid_blob()), 400),
@@ -550,7 +551,7 @@ async fn require_install_id_refuses_only_links_without_one() {
         let rr = get(&h, &path, &[]).await;
         assert_eq!(rr.status(), want, "{name}: {}, want {want}", rr.status());
     }
-    let strict = new_handler(test_deps(|d| d.require_install_id = true));
+    let strict = new_handler(test_deps(|d| d.revocation = revocation(&[], 0, true)));
     assert!(
         strict.admit_install(&Config { scope: SCOPE_AVAILABILITY.to_owned(), ..Default::default() }),
         "a scoped config was refused for having no install id"
@@ -648,8 +649,10 @@ fn settings_revocation_and_tickets() {
     // 2026-09-17T10:00:00Z
     let legacy = UNIX_EPOCH + Duration::from_secs(1_789_639_200);
     assert!(
-        s.revoked_installs == vec![test_iid(), other_iid()]
-            && s.config_epoch == 3
+        s.revocation.revoked_count() == 2
+            && s.revocation.is_revoked(&test_iid())
+            && s.revocation.is_revoked(&other_iid())
+            && s.revocation.epoch() == 3
             && s.play_ticket_ttl == Duration::from_secs(7200)
             && s.legacy_play_until == Some(legacy),
         "settings: {s:?}"
@@ -663,23 +666,23 @@ fn settings_revocation_and_tickets() {
     assert!(line.contains(" revoked=2 epoch=3 "), "startup line: {line}");
     let d = build_deps(&s, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 10)));
     assert!(
-        d.revoked_installs.contains(&test_iid())
-            && d.revoked_installs.contains(&other_iid())
-            && d.revoked_installs.len() == 2
-            && d.config_epoch == 3
+        d.revocation.is_revoked(&test_iid())
+            && d.revocation.is_revoked(&other_iid())
+            && d.revocation.revoked_count() == 2
+            && d.revocation.epoch() == 3
             && d.play_ticket_ttl == Duration::from_secs(7200)
             && d.legacy_play_until == s.legacy_play_until,
         "deps: revoked={:?} epoch={} ttl={:?} until={:?}",
-        d.revoked_installs,
-        d.config_epoch,
+        d.revocation,
+        d.revocation.epoch(),
         d.play_ticket_ttl,
         d.legacy_play_until
     );
 
     let defaults = settings_from_env(|_| String::new());
     assert!(
-        defaults.revoked_installs.is_empty()
-            && defaults.config_epoch == 0
+        defaults.revocation.revoked_count() == 0
+            && defaults.revocation.epoch() == 0
             && defaults.play_ticket_ttl == DEFAULT_PLAY_TICKET_TTL
             && defaults.legacy_play_until.is_none(),
         "defaults: {defaults:?}"
@@ -691,7 +694,7 @@ fn settings_revocation_and_tickets() {
         ("LEGACY_PLAY_UNTIL", "next tuesday"),
     ]);
     let m = settings_from_env(|k| malformed.get(k).copied().unwrap_or_default().to_owned());
-    assert_eq!(m.config_epoch, 0, "a malformed CONFIG_EPOCH: {}, want 0", m.config_epoch);
+    assert_eq!(m.revocation.epoch(), 0, "a malformed CONFIG_EPOCH: {}, want 0", m.revocation.epoch());
     assert!(
         m.legacy_play_until.is_some_and(|u| u < SystemTime::now()),
         "a malformed LEGACY_PLAY_UNTIL must read as passed: {:?}",

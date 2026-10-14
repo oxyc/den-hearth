@@ -29,7 +29,6 @@ mod media_gate;
 mod play;
 mod prepare;
 mod progressive;
-mod seal;
 mod sign;
 mod sources;
 mod state;
@@ -761,7 +760,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // below it would be refused the moment it was built.
     if path == "/config-key" {
         let epoch = state.cfg.revocation.epoch();
-        return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
+        return match state.config_keyring.as_ref().map(|kr| kr.current_pub_base64()) {
             Some(k) if !k.is_empty() => httputil::json(
                 StatusCode::OK,
                 &serde_json::json!({"key": k, "epoch": epoch}),
@@ -1031,7 +1030,7 @@ fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
 /// line, in the style of the config routes' `bad_config`, is the only place the two differ.
 fn install_admitted(state: &AppState, vid: &str, binding: sign::Binding) -> bool {
     let sign::Binding::Install { iid, ep } = binding else { return true };
-    match state.cfg.revocation.check_install(iid, ep) {
+    match state.cfg.revocation.check(iid, ep) {
         Ok(()) => true,
         Err(why) => {
             log_limited(&format!("play_{}", refusal_condition(&why)), || {
