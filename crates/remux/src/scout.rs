@@ -239,6 +239,46 @@ pub fn validate_scoped(url: &str, origins: &[String]) -> Result<String, &'static
     Ok(format!("{origin}/{config}"))
 }
 
+/// How scout is reached: in process when this service runs inside den-hearth beside the scout the URL names
+/// (`local`, set by hearth), over `http` otherwise. `http` must not follow redirects: one would carry the key off
+/// scout's origin.
+#[derive(Clone, Copy)]
+pub struct Via<'a> {
+    pub http: &'a reqwest::Client,
+    pub local: Option<&'a den_http::Local>,
+}
+
+/// The total time one request to scout may take, in process or over HTTP (`state::scout_profile`).
+pub const SCOUT_TOTAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most of an answer from scout read in process: a stream list is read up to 8 MiB, and nothing else scout
+/// answers is larger.
+const LOCAL_CAP: usize = 8 << 20;
+
+impl Via<'_> {
+    /// A GET of `url`, which is on scout's origin (`ScoutSource::is_scout`), with `headers`: in process when hearth
+    /// serves `url` itself, and over HTTP otherwise. The answer is the same either way, a `reqwest::Response`, so
+    /// what reads it cannot tell which way it came.
+    async fn get_scout(
+        &self,
+        url: &reqwest::Url,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<reqwest::Response, String> {
+        if let Some(call) = self.local.and_then(|local| local.get(url.as_str(), headers.clone(), LOCAL_CAP)) {
+            let resp = tokio::time::timeout(SCOUT_TOTAL, call)
+                .await
+                .map_err(|_| "scout did not answer in time".to_string())??;
+            let (mut parts, body) = resp.into_parts();
+            // The URL the answer is for, as reqwest records it; `Response::url` reads it.
+            use reqwest::ResponseBuilderExt;
+            let tagged = hyper::Response::builder().url(url.clone()).body(()).expect("an empty response");
+            parts.extensions.extend(tagged.into_parts().0.extensions);
+            return Ok(reqwest::Response::from(hyper::Response::from_parts(parts, body)));
+        }
+        self.http.get(url.clone()).headers(headers).send().await.map_err(|e| e.without_url().to_string())
+    }
+}
+
 /// Why a stream list could not be had: scout's status when it answered one, and what happened.
 pub struct ListError {
     pub status: Option<u16>,
@@ -249,23 +289,29 @@ pub struct ListError {
 pub const PLAYABLE_HEADER: &str = "x-den-playable";
 
 /// The stream list for `imdb`, with the service key when the source has one, ranked for the browser whose report
-/// `playable` is. `client` must not follow redirects: one would carry the key off scout's origin.
+/// `playable` is.
 pub async fn list(
-    client: &reqwest::Client,
+    via: Via<'_>,
     src: &ScoutSource,
     imdb: &str,
     playable: Option<&crate::session::Playable>,
 ) -> Result<Vec<Stream>, ListError> {
     let fail = |status: Option<u16>, detail: String| ListError { status, detail };
-    let mut req = client.get(stream_list_url(&src.base, imdb));
+    let url = reqwest::Url::parse(&stream_list_url(&src.base, imdb))
+        .map_err(|_| fail(None, "the scout URL does not parse".into()))?;
+    let mut headers = reqwest::header::HeaderMap::new();
     if let Some(k) = &src.key {
-        req = req.header(KEY_HEADER, k);
+        headers.insert(
+            KEY_HEADER,
+            k.parse().map_err(|_| fail(None, "the service key is not a header value".into()))?,
+        );
     }
     if let Some(p) = playable {
-        // Integers and booleans only: there is nothing in a Playable that fails to serialise.
-        req = req.header(PLAYABLE_HEADER, serde_json::to_string(p).expect("a Playable serialises"));
+        // Integers and booleans only: there is nothing in a Playable that fails to serialise, or that is not ASCII.
+        let report = serde_json::to_string(p).expect("a Playable serialises");
+        headers.insert(PLAYABLE_HEADER, report.parse().expect("a Playable report is a header value"));
     }
-    let resp = req.send().await.map_err(|e| fail(None, e.without_url().to_string()))?;
+    let resp = via.get_scout(&url, headers).await.map_err(|d| fail(None, d))?;
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         return Err(fail(Some(status), format!("scout answered {status}")));
@@ -282,9 +328,12 @@ const MAX_HOPS: usize = 5;
 ///
 /// Redirects are followed here rather than by the client, because the service key must reach scout
 /// and nothing else: an HTTP client forwards custom headers across a cross-origin redirect, which would
-/// hand `X-Den-Remux-Key` to the debrid's CDN. `client` must not follow redirects itself.
+/// hand `X-Den-Remux-Key` to the debrid's CDN.
+///
+/// Only the hops on scout's origin go in process (`Via`); the debrid's are fetched over HTTP behind the guard as
+/// always, even one that names an address hearth itself answers on.
 pub async fn resolve(
-    client: &reqwest::Client,
+    via: Via<'_>,
     play_url: &str,
     src: &ScoutSource,
     guard: SourceGuard,
@@ -292,17 +341,28 @@ pub async fn resolve(
     let mut url = reqwest::Url::parse(play_url).map_err(|_| "the play URL does not parse".to_string())?;
     let mut hops = 0;
     let resp = loop {
-        // Scout itself is reached wherever it lives; any other hop, the last one (which ffmpeg then reads) included,
-        // is checked before a byte is sent to it.
-        if !src.is_scout(&url) {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let range = format!("bytes=0-{}", HEAD_BYTES - 1);
+        headers.insert(reqwest::header::RANGE, range.parse().expect("a range is a header value"));
+        let resp = if src.is_scout(&url) {
+            // Scout itself is reached wherever it lives, and is the only place the key goes.
+            if let Some(k) = src.key.as_deref() {
+                headers.insert(
+                    KEY_HEADER,
+                    k.parse().map_err(|_| "the service key is not a header value".to_string())?,
+                );
+            }
+            via.get_scout(&url, headers).await?
+        } else {
+            // Any other hop, the last one (which ffmpeg then reads) included, is checked before a byte is sent to it.
             guard.check(&url).await?;
-        }
-        let mut req =
-            client.get(url.clone()).header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD_BYTES - 1));
-        if let Some(k) = src.key.as_deref().filter(|_| src.is_scout(&url)) {
-            req = req.header(KEY_HEADER, k);
-        }
-        let resp = req.send().await.map_err(|e| e.without_url().to_string())?;
+            via.http
+                .get(url.clone())
+                .headers(headers)
+                .send()
+                .await
+                .map_err(|e| e.without_url().to_string())?
+        };
         if !resp.status().is_redirection() {
             break resp;
         }
@@ -387,7 +447,7 @@ mod tests {
         let origin = scout_redirecting_to(location).await;
         let src = ScoutSource { base: format!("{origin}/cfg"), key: None };
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
-        resolve(&client, &format!("{origin}/p/t"), &src, guard).await
+        resolve(Via { http: &client, local: None }, &format!("{origin}/p/t"), &src, guard).await
     }
 
     #[tokio::test]

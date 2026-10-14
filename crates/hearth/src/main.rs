@@ -17,6 +17,7 @@ mod admit;
 mod alloc;
 mod den;
 mod env;
+mod inproc;
 mod media;
 mod ports;
 mod route;
@@ -446,6 +447,8 @@ struct Configs {
     scout_mount: den_scout::deps::Settings,
     scout_own: den_scout::deps::Settings,
     den: den::Den,
+    /// Where Remux and Subtitles reach Scout in process (`inproc`).
+    scout_bases: Vec<inproc::Base>,
     metrics_token: Option<String>,
 }
 
@@ -467,6 +470,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
         c.metrics_token,
     );
     hearth.scout.start_sweep();
+    let in_process = inproc::install(&hearth, &c.scout_bases);
     let (stop, shutdown) = watch::channel(false);
     let signal = shutdown_signal();
     tokio::spawn(async move {
@@ -493,6 +497,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
     eprintln!("{}", alloc::startup_line());
     eprintln!("scout: {}", hearth.scout.summary());
     eprintln!("{}", hearth.den.summary());
+    eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
     // Each service's own startup line: operators read `transcode=` and the like from them.
     eprintln!("{}", den_reel::startup_line(&hearth.reel));
     eprintln!("{}", den_remux::startup_line(&hearth.remux));
@@ -586,11 +591,18 @@ fn main() {
     let scout_mount = env::scoped("SCOUT_", Some("scout"), scout_settings);
     let mut scout_own = env::scoped("SCOUT_", None, scout_settings);
     // The startup line names the port Scout answers on.
-    if let Some((_, p)) = own.iter().find(|(s, _)| *s == Service::Scout) {
+    let scout_port = own.iter().find(|(s, _)| *s == Service::Scout).map(|(_, p)| *p);
+    if let Some(p) = scout_port {
         scout_own.port = p.to_string();
     } else {
         scout_own.port = format!("{port}/scout");
     }
+    let scout_bases = inproc::scout_bases(
+        port,
+        scout_port,
+        std::env::var("HEARTH_PUBLIC_BASE_URL").ok().as_deref(),
+        &scout_own.public_url,
+    );
 
     // Scout's key as Scout reads it: the Den addon's ring is derived from it when it has none of its own.
     let den = den::Den::from_env(
@@ -609,7 +621,8 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let configs = Configs { port, own, reel, subs, remux, scout_mount, scout_own, den, metrics_token };
+    let configs =
+        Configs { port, own, reel, subs, remux, scout_mount, scout_own, den, scout_bases, metrics_token };
     if let Err(e) = rt.block_on(run(configs)) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
