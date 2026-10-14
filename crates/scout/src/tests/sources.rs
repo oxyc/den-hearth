@@ -83,9 +83,11 @@ fn public_addr() {
         ("203.0.113.9", false),
         ("2001::1", false),
         ("::127.0.0.1", false),
-        // NAT64 and 6to4 are judged as the IPv4 address they carry
-        ("64:ff9b::808:808", true),
-        ("2002:808:808::1", true),
+        // NAT64, 6to4 and SIIT are refused whatever they embed, as before
+        ("64:ff9b::808:808", false),
+        ("2002:808:808::1", false),
+        ("::ffff:0:8.8.8.8", false),
+        ("192.88.99.1", false),
         ("93.184.216.34", true),
         ("2a00:1450:4001::200e", true),
         ("240.0.0.1", false),

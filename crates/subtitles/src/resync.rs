@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn only_public_addresses_are_public() {
-        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"];
+        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"];
         for ip in public {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip} counted as internal");
         }
@@ -504,6 +504,7 @@ mod tests {
             "2002:c0a8:5601::1",  // 6to4 of 192.168.86.1
             "64:ff9b::a9fe:a9fe", // NAT64 of the metadata endpoint
             "64:ff9b:1::1",       // local-use NAT64
+            "64:ff9b::808:808",   // NAT64 of a public address: refused whatever it embeds
         ];
         for ip in internal {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip} counted as public");

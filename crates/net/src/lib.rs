@@ -10,9 +10,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// documentation prefix, the discard prefix or the `::/96` block (which holds `::` and `::1` and the deprecated
 /// IPv4-compatible form).
 ///
-/// An IPv6 form that carries an IPv4 address (mapped, the well-known NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) is
-/// judged as the IPv4 address it carries, since that is the host a gateway on the path reaches. Local-use NAT64
-/// (`64:ff9b:1::/48`) has no fixed embedding and is never public.
+/// An IPv4-mapped address (`::ffff:a.b.c.d`) is judged as the IPv4 address it carries. The other IPv6 forms that
+/// embed an IPv4 address are refused outright, whatever they embed: NAT64 (`64:ff9b::/96`, and local-use
+/// `64:ff9b:1::/48`), 6to4 (`2002::/16`) and the SIIT IPv4-translated block (`::ffff:0:0:0/96`) all reach
+/// IPv4 through a gateway on the path, which may be one inside the network, and no source or media host is
+/// reached that way.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -25,23 +27,15 @@ fn is_public_v6(v6: Ipv6Addr) -> bool {
         return is_public_v4(v4);
     }
     let s = v6.segments();
-    let embedded = |hi: u16, lo: u16| {
-        let [a, b] = hi.to_be_bytes();
-        let [c, d] = lo.to_be_bytes();
-        Ipv4Addr::new(a, b, c, d)
-    };
-    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        return is_public_v4(embedded(s[6], s[7]));
-    }
-    if s[0] == 0x2002 {
-        return is_public_v4(embedded(s[1], s[2]));
-    }
     !(s[..6] == [0; 6] // ::/96
+        || (s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0) // SIIT ::ffff:0:0:0/96
+        || (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]) // NAT64 64:ff9b::/96
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1) // local-use NAT64 64:ff9b:1::/48
+        || s[0] == 0x2002 // 6to4 2002::/16
         || v6.is_multicast()
         || s[0] & 0xfe00 == 0xfc00 // ULA fc00::/7
         || s[0] & 0xffc0 == 0xfe80 // link-local fe80::/10
         || s[0] & 0xffc0 == 0xfec0 // deprecated site-local fec0::/10
-        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1) // local-use NAT64 64:ff9b:1::/48
         || (s[0] == 0x0100 && s[1..4] == [0, 0, 0]) // discard-only 100::/64
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
         || (s[0] == 0x2001 && s[1] == 0)) // Teredo 2001::/32
@@ -59,6 +53,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || a == 0 // "this network" 0/8
         || (a == 100 && b & 0xc0 == 64) // CGNAT 100.64/10
         || (a == 192 && b == 0 && c == 0) // IETF protocol assignments 192.0.0/24
+        || (a == 192 && b == 88 && c == 99) // deprecated 6to4 relay anycast 192.88.99/24
         || (a == 198 && b & 0xfe == 18) // benchmarking 198.18/15
         || a >= 240) // reserved 240/4 (and the broadcast address)
 }
@@ -90,9 +85,9 @@ mod tests {
             "2001:4860:4860::8888",
             "2001:470::1",
             "2a00:1450:4001::200e",
-            "::ffff:8.8.8.8",   // IPv4-mapped public
-            "64:ff9b::808:808", // NAT64 of 8.8.8.8
-            "2002:808:808::1",  // 6to4 of 8.8.8.8
+            "192.88.98.255", // next to the 6to4 relay block
+            "192.89.0.1",
+            "::ffff:8.8.8.8", // IPv4-mapped public
         ] {
             assert!(is_public(ip.parse().unwrap()), "{ip} counted as non-public");
         }
@@ -142,6 +137,14 @@ mod tests {
             ("::ffff:100.64.0.1", "IPv4-mapped CGNAT"),
             ("::ffff:169.254.169.254", "IPv4-mapped metadata"),
             ("::ffff:192.0.2.1", "IPv4-mapped documentation"),
+            ("192.88.99.1", "deprecated 6to4 relay anycast"),
+            ("192.88.99.255", "deprecated 6to4 relay anycast"),
+            ("::ffff:192.88.99.1", "IPv4-mapped 6to4 relay anycast"),
+            ("::ffff:0:8.8.8.8", "SIIT of a public address"),
+            ("::ffff:0:127.0.0.1", "SIIT of loopback"),
+            ("::ffff:0:a9fe:a9fe", "SIIT of the metadata endpoint"),
+            ("64:ff9b::808:808", "NAT64 of a public address"),
+            ("2002:808:808::1", "6to4 of a public address"),
             ("64:ff9b::7f00:1", "NAT64 of loopback"),
             ("64:ff9b::c0a8:101", "NAT64 of 192.168.1.1"),
             ("64:ff9b::a9fe:a9fe", "NAT64 of the metadata endpoint"),
