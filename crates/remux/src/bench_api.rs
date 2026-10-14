@@ -7,3 +7,9 @@ pub use crate::playlist::{
 };
 pub use crate::segments::longest_shared;
 pub use crate::subs::{for_hls, parse_cues};
+
+/// The probe over a file held in memory, reading only `head` up front as a session does: whether it probed.
+pub async fn probe_file(file: &[u8], head: usize) -> bool {
+    let source = crate::probe::Source::Mem(file);
+    crate::probe::probe(&source, &file[..head.min(file.len())]).await.is_ok()
+}

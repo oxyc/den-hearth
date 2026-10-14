@@ -2,13 +2,15 @@
 
 use crate::attributes::stream_attributes;
 use crate::client::{AUDIO_CONVERTED_COST, NEVER_PLAYS_COST, VIDEO_CONVERTED_COST};
-use crate::probe::{
-    parse_head, parse_matroska_tracks, Probe, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_COLOUR, ID_DEFAULT_DURATION,
-    ID_LANGUAGE, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_SEGMENT, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_TYPE,
-    ID_TRANSFER_CHARACTERISTICS, ID_VIDEO, TRACK_TYPE_AUDIO, TRACK_TYPE_VIDEO,
-};
+use crate::probe::{parse_head, parse_matroska_tracks, Probe, TRACK_TYPE_AUDIO, TRACK_TYPE_VIDEO};
 use crate::probe_mp4::parse_mp4;
 use crate::rank::RawStream;
+use den_media::mkv::{
+    CODEC_ID as ID_CODEC_ID, CODEC_PRIVATE as ID_CODEC_PRIVATE, COLOUR as ID_COLOUR,
+    DEFAULT_DURATION as ID_DEFAULT_DURATION, LANGUAGE as ID_LANGUAGE, PIXEL_HEIGHT as ID_PIXEL_HEIGHT,
+    PIXEL_WIDTH as ID_PIXEL_WIDTH, SEGMENT as ID_SEGMENT, TRACKS as ID_TRACKS, TRACK_ENTRY as ID_TRACK_ENTRY,
+    TRACK_TYPE as ID_TRACK_TYPE, TRANSFER_CHARACTERISTICS as ID_TRANSFER_CHARACTERISTICS, VIDEO as ID_VIDEO,
+};
 
 use super::attributes_web::{ebml, hvc_c};
 use super::client::a_browser;
@@ -161,7 +163,7 @@ fn parse_matroska_video_shape() {
     let entry = ebml(
         ID_TRACK_ENTRY,
         &[
-            ebml(ID_TRACK_TYPE as u32, &[vec![TRACK_TYPE_VIDEO]]),
+            ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_VIDEO]]),
             ebml(ID_CODEC_ID, &[b"V_MPEGH/ISO/HEVC".to_vec()]),
             ebml(ID_CODEC_PRIVATE, &[hvc_c_shape(2, false, 150)]),
             // 41708381 ns: 23.976 fps
@@ -171,7 +173,7 @@ fn parse_matroska_video_shape() {
     );
     let audio = ebml(
         ID_TRACK_ENTRY,
-        &[ebml(ID_TRACK_TYPE as u32, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[b"eng".to_vec()])],
+        &[ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[b"eng".to_vec()])],
     );
     let p = parse_matroska_tracks(&ebml(ID_SEGMENT, &[ebml(ID_TRACKS, &[entry, audio])])).expect("parse");
     assert!(

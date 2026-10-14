@@ -1,0 +1,10 @@
+[package]
+name = "den-media"
+version = "0.0.0"
+edition = "2021"
+description = "The container and codec-record primitives Scout's probe and Remux's probe both read untrusted bytes with: EBML elements, ISO-BMFF boxes, and the avcC, hvcC, av1C and Dolby Vision configuration records"
+publish = false
+license = "MIT"
+
+# No dependencies on purpose: this is the code that reads the bytes of a file a stranger chose, so it carries
+# nothing but std.

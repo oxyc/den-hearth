@@ -4,7 +4,8 @@
 
 use crate::probe::{channel_count, channel_layout};
 use crate::probe_avi::codec_from_four_cc;
-use crate::probe_mp4::{boxes, parse_mp4};
+use crate::probe_mp4::parse_mp4;
+use den_media::mp4::boxes;
 
 use super::probe_containers::testdata;
 
@@ -184,9 +185,9 @@ fn boxes_size_handling() {
         buf.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes());
         buf.extend_from_slice(&payload);
 
-        let got = boxes(&buf);
+        let got: Vec<_> = boxes(&buf).collect();
         assert!(
-            got.len() == 1 && got[0].typ == "wide" && got[0].body.len() == payload.len(),
+            got.len() == 1 && got[0].0 == *b"wide" && got[0].1.len() == payload.len(),
             "64-bit sized box mis-read: {got:?}"
         );
     }
@@ -196,11 +197,8 @@ fn boxes_size_handling() {
         let mut buf = vec![0u8; 8];
         buf[4..8].copy_from_slice(b"last");
         buf.extend_from_slice(&[1, 2, 3, 4]);
-        let got = boxes(&buf);
-        assert!(
-            got.len() == 1 && got[0].body.len() == 4,
-            "size-0 box must extend to the buffer end: {got:?}"
-        );
+        let got: Vec<_> = boxes(&buf).collect();
+        assert!(got.len() == 1 && got[0].1.len() == 4, "size-0 box must extend to the buffer end: {got:?}");
     }
 
     // truncated and impossible sizes stop the walk
@@ -213,7 +211,7 @@ fn boxes_size_handling() {
         vec![0, 0, 0, 1, b'b', b'o', b'x', b'x'],
     ];
     for (i, buf) in bad.iter().enumerate() {
-        let got = boxes(buf);
+        let got: Vec<_> = boxes(buf).collect();
         assert!(got.is_empty(), "case {i}: walked into a bad size: {got:?}");
     }
 }

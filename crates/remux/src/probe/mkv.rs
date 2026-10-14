@@ -5,10 +5,16 @@
 //! (den-scout's probe learned that the hard way). What the walk of the head does not reach — Cues are
 //! usually written at the end — comes through the SeekHead, one ranged read per element.
 
+use den_media::ebml::{child, children, header, uint};
+use den_media::mkv::{
+    is_dovi_block_addition, AUDIO, BLOCK_ADDITION_MAPPING, BLOCK_ADD_ID_EXTRA_DATA, BLOCK_ADD_ID_TYPE,
+    CHANNELS, CODEC_ID, CODEC_PRIVATE, COLOUR, DEFAULT_DURATION, EBML, LANGUAGE, LANGUAGE_BCP47,
+    PIXEL_HEIGHT, PIXEL_WIDTH, SEGMENT, TRACKS, TRACK_ENTRY, TRACK_TYPE, TRACK_TYPE_AUDIO,
+    TRACK_TYPE_SUBTITLE, TRACK_TYPE_VIDEO, TRANSFER_CHARACTERISTICS, VIDEO,
+};
+
 use super::{AudioTrack, MediaInfo, ProbeError, Source, VideoCodec, MAX_ELEMENT};
 
-const EBML: u32 = 0x1A45DFA3;
-const SEGMENT: u32 = 0x18538067;
 const SEEK_HEAD: u32 = 0x114D9B74;
 const SEEK: u32 = 0x4DBB;
 const SEEK_ID: u32 = 0x53AB;
@@ -16,8 +22,6 @@ const SEEK_POSITION: u32 = 0x53AC;
 const INFO: u32 = 0x1549A966;
 const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
 const DURATION: u32 = 0x4489;
-const TRACKS: u32 = 0x1654AE6B;
-const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_NUMBER: u32 = 0xD7;
 const TRACK_UID: u32 = 0x73C5;
 const TAGS: u32 = 0x1254C367;
@@ -27,33 +31,15 @@ const TAG_TRACK_UID: u32 = 0x63C5;
 const SIMPLE_TAG: u32 = 0x67C8;
 const TAG_NAME: u32 = 0x45A3;
 const TAG_STRING: u32 = 0x4487;
-const TRACK_TYPE: u32 = 0x83;
-const CODEC_ID: u32 = 0x86;
-const CODEC_PRIVATE: u32 = 0x63A2;
-const DEFAULT_DURATION: u32 = 0x23E383;
-const LANGUAGE: u32 = 0x22B59C;
-const LANGUAGE_BCP47: u32 = 0x22B59D;
 const NAME: u32 = 0x536E;
 const FLAG_DEFAULT: u32 = 0x88;
 const FLAG_COMMENTARY: u32 = 0x55AF;
 const FLAG_FORCED: u32 = 0x55AA;
 const FLAG_HEARING_IMPAIRED: u32 = 0x55AB;
-const VIDEO: u32 = 0xE0;
-const PIXEL_WIDTH: u32 = 0xB0;
-const PIXEL_HEIGHT: u32 = 0xBA;
-const COLOUR: u32 = 0x55B0;
-const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 const PRIMARIES: u32 = 0x55BB;
 const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 const RANGE: u32 = 0x55B9;
 const BITS_PER_CHANNEL: u32 = 0x55B2;
-const AUDIO: u32 = 0xE1;
-const CHANNELS: u32 = 0x9F;
-const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
-const BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
-const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
-/// The block-addition types that carry a Dolby Vision configuration record.
-const DOVI_TYPES: [&[u8; 4]; 3] = [b"dvcC", b"dvvC", b"dvwC"];
 const CUES: u32 = 0x1C53BB6B;
 const CUE_POINT: u32 = 0xBB;
 const CUE_TIME: u32 = 0xB3;
@@ -66,55 +52,6 @@ const BLOCK_GROUP: u32 = 0xA0;
 const BLOCK: u32 = 0xA1;
 /// A 4K keyframe is ordinarily much smaller. This bounds the one extra range read made only for a contradictory P5.
 const RPU_AUDIT_BYTES: u64 = 16 * 1024 * 1024;
-
-/// An element header: id, payload size (`None` = EBML's "unknown size"), and the header's length.
-pub(crate) fn header(b: &[u8]) -> Option<(u32, Option<u64>, usize)> {
-    let first = *b.first()?;
-    let n = first.leading_zeros() as usize + 1;
-    if n > 4 || b.len() < n {
-        return None;
-    }
-    let id = b[..n].iter().fold(0u32, |acc, &c| acc << 8 | c as u32);
-    let s = *b.get(n)?;
-    let m = s.leading_zeros() as usize + 1;
-    if m > 8 || b.len() < n + m {
-        return None;
-    }
-    // Widened before shifting: an 8-byte size leaves no value bits in the first byte, and a u8
-    // shifted by 8 overflows.
-    let mask = (0xFFu32 >> m) as u8;
-    let mut v = (s & mask) as u64;
-    let mut unknown = s & mask == mask;
-    for &c in &b[n + 1..n + m] {
-        v = v << 8 | c as u64;
-        unknown &= c == 0xFF;
-    }
-    Some((id, (!unknown).then_some(v), n + m))
-}
-
-/// The children of a master element's payload, as `(id, payload)`. Stops at the first malformed or
-/// truncated child rather than guessing past it.
-fn children(b: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
-    let mut pos = 0usize;
-    std::iter::from_fn(move || {
-        let (id, size, hl) = header(b.get(pos..)?)?;
-        let start = pos + hl;
-        let end = start.checked_add(usize::try_from(size?).ok()?)?;
-        if end > b.len() {
-            return None;
-        }
-        pos = end;
-        Some((id, &b[start..end]))
-    })
-}
-
-fn child(b: &[u8], want: u32) -> Option<&[u8]> {
-    children(b).find(|(id, _)| *id == want).map(|(_, body)| body)
-}
-
-fn uint(b: &[u8]) -> u64 {
-    b.iter().take(8).fold(0u64, |acc, &c| acc << 8 | c as u64)
-}
 
 fn float(b: &[u8]) -> Option<f64> {
     match b.len() {
@@ -192,7 +129,7 @@ fn parse_tracks(b: &[u8]) -> Vec<Track> {
                     AUDIO => t.channels = child(v, CHANNELS).map(uint).unwrap_or(1) as u32,
                     BLOCK_ADDITION_MAPPING => {
                         let kind = child(v, BLOCK_ADD_ID_TYPE).map(uint);
-                        if DOVI_TYPES.iter().any(|d| kind == Some(u32::from_be_bytes(**d) as u64)) {
+                        if kind.is_some_and(is_dovi_block_addition) {
                             t.dovi = child(v, BLOCK_ADD_ID_EXTRA_DATA).and_then(super::dovi_config);
                         }
                     }
@@ -523,7 +460,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         .ok_or_else(|| ProbeError::Unsupported("no duration".into()))?;
     let video = tracks
         .iter()
-        .find(|t| t.kind == 1)
+        .find(|t| t.kind == u64::from(TRACK_TYPE_VIDEO))
         .ok_or_else(|| ProbeError::Unsupported("no video track".into()))?;
     let parsed_cues = parse_cues(&cues, video.number);
     let mut keyframes: Vec<f64> = parsed_cues.iter().map(|c| secs(c.time as f64)).collect();
@@ -639,7 +576,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     }
     let audio = tracks
         .iter()
-        .filter(|t| t.kind == 2)
+        .filter(|t| t.kind == u64::from(TRACK_TYPE_AUDIO))
         .map(|t| AudioTrack {
             codec: t.codec_id.clone(),
             language: t.language.clone(),
@@ -654,7 +591,7 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
         .collect();
     let subtitles = tracks
         .iter()
-        .filter(|t| t.kind == SUBTITLE_TRACK)
+        .filter(|t| t.kind == u64::from(TRACK_TYPE_SUBTITLE))
         .map(|t| super::SubtitleTrack {
             codec: t.codec_id.clone(),
             language: t.language.clone(),
@@ -690,9 +627,6 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     })
 }
 
-/// Matroska's TrackType for a subtitle track.
-const SUBTITLE_TRACK: u64 = 17;
-
 /// Text a subtitle codec id carries as characters, which ffmpeg converts to WebVTT: SRT, ASS/SSA (both as `S_TEXT/…`
 /// and as the older `S_ASS`/`S_SSA`) and WebVTT. `S_HDMV/PGS`, `S_VOBSUB` and `S_DVBSUB` are bitmaps.
 fn is_text_subtitle(codec_id: &str) -> bool {
@@ -703,16 +637,6 @@ fn is_text_subtitle(codec_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn element_headers_decode_sizes_and_the_unknown_marker() {
-        assert_eq!(header(&[0x1A, 0x45, 0xDF, 0xA3, 0x9F]), Some((EBML, Some(31), 5)));
-        // A Segment of unknown size: all value bits of an 8-byte size set.
-        let unknown = [0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-        assert_eq!(header(&unknown), Some((SEGMENT, None, 12)));
-        assert_eq!(header(&[0x00]), None, "a zero byte is no valid id");
-        assert_eq!(header(&[0x1A, 0x45]), None, "truncated");
-    }
 
     #[test]
     fn a_seekhead_entry_is_data_not_an_element() {
@@ -885,7 +809,7 @@ mod tests {
         let segment = &file[hl + size.unwrap() as usize..];
         let (_, _, shl) = header(segment).unwrap();
         let tracks = children(&segment[shl..]).find(|(id, _)| *id == TRACKS).unwrap().1;
-        let video = parse_tracks(tracks).into_iter().find(|t| t.kind == 1).unwrap();
+        let video = parse_tracks(tracks).into_iter().find(|t| t.kind == u64::from(TRACK_TYPE_VIDEO)).unwrap();
         assert_eq!(video.codec_id, "V_AV1");
         let (from_container, hdr) = super::super::av1_track(&video.private, colour(&video));
         assert!(hdr);

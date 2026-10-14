@@ -5,50 +5,13 @@
 //! list's `media_time` — the same shift ffmpeg's demuxer applies, so the numbers match the timeline
 //! ffmpeg cuts on.
 
+use den_media::codec::DOVI_CONFIG_TYPES;
+use den_media::mp4::{
+    boxes, child, first_sample_entry, handler_type, header as box_header, media_header, nclx, path, u16_at,
+    u32_at, u64_at, Nclx, VISUAL_ENTRY_HEADER,
+};
+
 use super::{AudioTrack, MediaInfo, ProbeError, Source, VideoCodec, MAX_ELEMENT};
-
-/// Box size, type and header length. A size of 0 ("runs to the end of the file") is reported as 0.
-fn box_header(b: &[u8]) -> Option<(u64, [u8; 4], usize)> {
-    let size = u32::from_be_bytes(b.get(0..4)?.try_into().ok()?) as u64;
-    let typ: [u8; 4] = b.get(4..8)?.try_into().ok()?;
-    if size == 1 {
-        return Some((u64::from_be_bytes(b.get(8..16)?.try_into().ok()?), typ, 16));
-    }
-    Some((size, typ, 8))
-}
-
-fn boxes(b: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
-    let mut pos = 0usize;
-    std::iter::from_fn(move || {
-        let (size, typ, hl) = box_header(b.get(pos..)?)?;
-        let size = if size == 0 { (b.len() - pos) as u64 } else { size };
-        let end = pos.checked_add(usize::try_from(size).ok()?)?;
-        if end > b.len() || (size as usize) < hl {
-            return None;
-        }
-        let body = &b[pos + hl..end];
-        pos = end;
-        Some((typ, body))
-    })
-}
-
-fn child<'a>(b: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
-    boxes(b).find(|(t, _)| t == typ).map(|(_, body)| body)
-}
-
-fn path<'a>(b: &'a [u8], p: &[&[u8; 4]]) -> Option<&'a [u8]> {
-    p.iter().try_fold(b, |cur, typ| child(cur, typ))
-}
-
-fn u16_at(b: &[u8], i: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(b.get(i..i + 2)?.try_into().ok()?))
-}
-fn u32_at(b: &[u8], i: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?))
-}
-fn u64_at(b: &[u8], i: usize) -> Option<u64> {
-    Some(u64::from_be_bytes(b.get(i..i + 8)?.try_into().ok()?))
-}
 
 pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeError> {
     let mut off = 0u64;
@@ -98,19 +61,10 @@ struct Trak<'a> {
 
 fn parse_trak(trak: &[u8]) -> Option<Trak<'_>> {
     let mdia = child(trak, b"mdia")?;
-    let mdhd = child(mdia, b"mdhd")?;
-    let (timescale, lang_at) =
-        if mdhd.first() == Some(&1) { (u32_at(mdhd, 20)?, 32) } else { (u32_at(mdhd, 12)?, 20) };
-    let packed = u16_at(mdhd, lang_at).unwrap_or(0);
-    let language: String = [(packed >> 10) & 31, (packed >> 5) & 31, packed & 31]
-        .iter()
-        .map(|c| char::from(0x60 + *c as u8))
-        .collect();
-    let handler: [u8; 4] = child(mdia, b"hdlr")?.get(8..12)?.try_into().ok()?;
+    let media = media_header(child(mdia, b"mdhd")?)?;
+    let handler = handler_type(mdia)?;
     let stbl = path(mdia, &[b"minf", b"stbl"])?;
-    let stsd = child(stbl, b"stsd")?;
-    // version/flags, entry_count, then the first sample entry as a box.
-    let (etyp, entry) = boxes(stsd.get(8..)?).next()?;
+    let (etyp, entry) = first_sample_entry(stbl)?;
     let (mut empty, mut media_time) = (0u64, 0i64);
     if let Some(elst) = path(trak, &[b"edts", b"elst"]) {
         let v1 = elst.first() == Some(&1);
@@ -133,8 +87,11 @@ fn parse_trak(trak: &[u8]) -> Option<Trak<'_>> {
     }
     Some(Trak {
         handler,
-        timescale,
-        language: (language != "und" && language.bytes().all(|c| c.is_ascii_lowercase())).then_some(language),
+        timescale: media.timescale,
+        language: media
+            .language
+            .filter(|code| code != b"und")
+            .map(|code| String::from_utf8_lossy(&code).into_owned()),
         entry,
         fourcc: etyp,
         empty,
@@ -334,18 +291,18 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
         .find(|t| &t.handler == b"vide")
         .ok_or_else(|| ProbeError::Unsupported("no video track".into()))?;
     // Visual sample entry: 8 bytes of SampleEntry, then 70 of VisualSampleEntry; width/height at 24.
-    let config = |typ: &[u8; 4]| video.entry.get(78..).and_then(|kids| child(kids, typ));
-    // `colr` of type `nclx`: primaries, transfer, matrix as u16s, then the full-range flag in the top bit.
-    let colr = config(b"colr").filter(|c| c.get(0..4) == Some(b"nclx"));
-    let of = |at| colr.and_then(|c| u16_at(c, at)).unwrap_or(0) as u64;
+    let config = |typ: &[u8; 4]| video.entry.get(VISUAL_ENTRY_HEADER..).and_then(|kids| child(kids, typ));
+    // `colr` of type `nclx`: where there is none, or another type, it says nothing.
+    let colr = config(b"colr").and_then(nclx);
+    let code = |of: fn(&Nclx) -> u16| colr.as_ref().map_or(0, |c| u64::from(of(c)));
     let container = super::Colour {
-        primaries: of(4),
-        transfer: of(6),
-        matrix: of(8),
-        full_range: colr.and_then(|c| c.get(10)).map(|b| b & 0x80 != 0),
+        primaries: code(|c| c.primaries),
+        transfer: code(|c| c.transfer),
+        matrix: code(|c| c.matrix),
+        full_range: colr.and_then(|c| c.full_range),
     };
-    let mut hdr = super::is_hdr(of(6), of(4), of(8));
-    let mut hlg = of(6) == 18;
+    let mut hdr = super::is_hdr(container.transfer, container.primaries, container.matrix);
+    let mut hlg = container.transfer == 18;
     let (codec, codecs) = match &video.fourcc {
         b"avc1" | b"avc3" => (VideoCodec::H264, config(b"avcC").and_then(super::avc_codecs)),
         // dvh1/dvhe carry an hvcC base layer; `dolby_vision` below says whether it shows on its own.
@@ -445,7 +402,7 @@ fn parse_moov(moov: &[u8]) -> Result<MediaInfo, ProbeError> {
             })?;
             (ticks > 0).then(|| frames as f64 * video.timescale as f64 / ticks as f64)
         }),
-        dolby_vision: [b"dvcC", b"dvvC", b"dvwC"].into_iter().find_map(config).and_then(super::dovi_config),
+        dolby_vision: DOVI_CONFIG_TYPES.iter().find_map(config).and_then(super::dovi_config),
         dolby_vision_record_mismatch: false,
         dolby_vision_recordless: false,
         audio,
@@ -521,14 +478,5 @@ mod tests {
         b.extend(table(b"stss", &[1, 2, 3, 5], 4));
         assert_eq!(keyframe_ticks(&b, 4), Some(vec![-1, 5, 15, 55]));
         assert!(keyframe_ticks(&b, i64::MIN).is_none(), "timestamp overflow was accepted");
-    }
-
-    #[test]
-    fn a_64_bit_box_size_is_read() {
-        let mut b = vec![0, 0, 0, 1];
-        b.extend_from_slice(b"mdat");
-        b.extend_from_slice(&(5u64 << 32).to_be_bytes());
-        assert_eq!(box_header(&b), Some((5u64 << 32, *b"mdat", 16)));
-        assert_eq!(box_header(&b[..6]), None);
     }
 }
