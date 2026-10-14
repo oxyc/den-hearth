@@ -2817,3 +2817,19 @@ async fn play_multi_store_status_timeout_does_not_add() {
         "a store that ran out of time still led to a resolve"
     );
 }
+
+/// RFC 9110 `If-None-Match` compares weakly: Cloudflare weakens an ETag when it compresses, and the
+/// client sends the weak form back.
+#[test]
+fn if_none_match_compares_weakly_over_a_list() {
+    use crate::handler::etag_matches;
+    assert!(etag_matches("\"x\"", "\"x\""));
+    assert!(etag_matches("W/\"x\"", "\"x\""));
+    assert!(etag_matches("\"x\"", "W/\"x\""));
+    assert!(etag_matches("\"a\" , W/\"x\" ,\"b\"", "\"x\""), "a list with spaces");
+    assert!(etag_matches("*", "\"x\""));
+    assert!(etag_matches(" * ", "\"x\""));
+    assert!(!etag_matches("\"y\"", "\"x\""));
+    assert!(!etag_matches("W/\"y\", \"z\"", "\"x\""));
+    assert!(!etag_matches("", "\"x\""));
+}
