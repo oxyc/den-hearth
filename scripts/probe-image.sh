@@ -6,7 +6,7 @@
 # Unconfigured, den-hearth still starts and answers /health. The startup line must name the expected release for
 # all four services, each service's manifest or health must answer through its prefix on :8090 AND on the port its
 # old container used (Scout 8080, Reel 8092, Subtitles 8093, Remux 8095), and Remux must not report a broken
-# ffmpeg or scratch directory.
+# ffmpeg, scratch directory or transcode. On a host with a GPU it also runs a real rate-controlled VAAPI encode.
 set -euo pipefail
 
 image="${1:?usage: probe-image.sh <image@digest> <version>}"
@@ -58,5 +58,24 @@ curl -fsS http://127.0.0.1:18090/scout/configure | grep -qi '<html' \
 # Remux's ffmpeg and scratch directory are what a broken image loses first.
 reason=$(jq -r '.services.remux.reason // empty' <<<"$body")
 case "$reason" in
-    ffmpeg_unavailable | scratch_unwritable) echo "::error::/health reports remux $reason"; exit 1 ;;
+    ffmpeg_unavailable | scratch_unwritable | transcode_unavailable) echo "::error::/health reports remux $reason"; exit 1 ;;
 esac
+
+# The GPU transcode, for real. ffmpeg listing h264_vaapi proves nothing about the driver under it: Debian's free
+# intel-media-va-driver lists it and then refuses every bitrate-controlled encode, and has no scale_vaapi kernels.
+# So with a render node on this host, run Remux's own flags (job.rs) on a six-frame clip. A runner without one
+# (CI) skips it; the image is not proven for transcoding there, only for everything else.
+node=/dev/dri/renderD128
+if [ -e "$node" ]; then
+    clip="$(dirname "$0")/../crates/remux/testdata/gpu-probe.mkv"
+    gid=$(stat -c %g "$node")
+    docker run --rm -i --device "$node" --group-add "$gid" --entrypoint ffmpeg-remux "$image" \
+        -hide_banner -loglevel error -hwaccel vaapi -hwaccel_device "$node" -hwaccel_output_format vaapi \
+        -f matroska -i pipe:0 -map 0:V:0 -vf scale_vaapi=w=256:h=144:format=nv12 \
+        -c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 4000000 -maxrate 6000000 -bufsize 8000000 \
+        -frames:v 6 -f mp4 -movflags frag_keyframe+empty_moov pipe:1 <"$clip" >/dev/null \
+        || { echo "::error::the rate-controlled h264_vaapi encode failed on $node (see above)"; exit 1; }
+    echo "gpu: rate-controlled h264_vaapi encode ok on $node"
+else
+    echo "gpu: skipped, no $node on this host (the transcode path is not proven here)"
+fi

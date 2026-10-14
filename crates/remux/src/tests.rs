@@ -3123,6 +3123,68 @@ async fn session_routes_refuse_without_the_right_credentials() {
     assert_eq!(call(&state, "GET", "/health", None, "").await.json()["status"], "ok");
 }
 
+/// An executable that stands in for ffmpeg: it runs `body` as a shell script.
+fn fake_ffmpeg(body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = temp_dir().join("ffmpeg");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The start-up encode check passes what ffmpeg accepts and says why when ffmpeg refuses, and it hands the
+/// encoder a session's own flags.
+#[tokio::test]
+async fn the_start_up_test_encode_reports_what_ffmpeg_says() {
+    let device = Path::new("/dev/dri/renderD128");
+    let args = crate::state::probe_args_for_test();
+    let joined = args.join(" ");
+    assert!(
+        joined.contains("-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi")
+    );
+    assert!(joined.contains("-vf scale_vaapi=w=256:h=144:format=nv12 -c:v h264_vaapi -profile:v high"));
+    assert!(joined.contains("-b:v 4000000 -maxrate 6000000 -bufsize 8000000"), "{joined}");
+
+    let ok = fake_ffmpeg("cat >/dev/null");
+    assert_eq!(crate::state::probe_encode(&ok, device).await, Ok(()));
+
+    let cqp = fake_ffmpeg(
+        "cat >/dev/null\necho 'Driver does not support any RC mode compatible with selected options (supported modes: CQP).' >&2\necho 'Error while opening encoder' >&2\nexit 234",
+    );
+    let err = crate::state::probe_encode(&cqp, device).await.unwrap_err();
+    assert!(err.contains("supported modes: CQP") && err.contains("Error while opening encoder"), "{err}");
+
+    // ffmpeg that dies without reading its input (a device that will not open) is that failure, not a broken pipe.
+    let dead = fake_ffmpeg("echo 'cannot open the device' >&2\nexit 1");
+    assert!(crate::state::probe_encode(&dead, device).await.unwrap_err().contains("cannot open the device"));
+
+    assert!(crate::state::probe_encode("/nonexistent/ffmpeg", device)
+        .await
+        .unwrap_err()
+        .contains("cannot start"));
+}
+
+/// A GPU whose test encode failed degrades /health with its own reason; transcoding being merely off does not.
+#[tokio::test]
+async fn a_failed_test_encode_degrades_health() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    assert_eq!(call(&state, "GET", "/health", None, "").await.json()["status"], "ok");
+    state.transcode_broken.store(true, Relaxed);
+    let body = call(&state, "GET", "/health", None, "").await.json();
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["reason"], "transcode_unavailable");
+}
+
+/// The real thing, on a box with a GPU: `VAAPI_DEVICE` (default renderD128) and `FFMPEG_PATH` (an ffmpeg with
+/// VAAPI) must pass the same test encode a session's start-up runs.
+#[tokio::test]
+#[ignore = "needs ffmpeg with VAAPI and a GPU"]
+async fn the_gpu_passes_the_start_up_test_encode() {
+    let device = tool("VAAPI_DEVICE", "/dev/dri/renderD128");
+    let result = crate::state::probe_encode(&tool("FFMPEG_PATH", "ffmpeg"), Path::new(&device)).await;
+    assert_eq!(result, Ok(()));
+}
+
 /// How long a job takes to its `init.mp4` and first GOP reading the release directly and through its door, against
 /// a Matroska file at `DOOR_BENCH_URL` (a server that answers ranges, as far away as the case in hand) from the
 /// keyframe at `DOOR_BENCH_SEEK` seconds. The door is opened the way a session opens it: after reading the head and

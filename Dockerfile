@@ -189,7 +189,10 @@ FROM debian:trixie-slim AS runtime
 # ffmpeg (Reel and Subtitles) + ca-certificates (TLS roots) + python3 (Reel's resident resolver:
 # spawning the standalone yt-dlp costs ~840ms of interpreter start for every trailer). The libraries
 # Remux's ffmpeg links are named here rather than left to ffmpeg's own dependencies. On amd64 — the box,
-# with its UHD 630 — Intel's VAAPI driver (iHD) comes too. `upgrade` first: the slim base is refreshed
+# with its UHD 630 — Intel's VAAPI driver (iHD) comes too, the non-free build (non-free component enabled for
+# that install only): the free `intel-media-va-driver` exposes only the low-power encode entrypoint, which
+# offers CQP alone ("Driver does not support any RC mode compatible with selected options"), and has no
+# VPP kernels, so scale_vaapi fails too. Remux's bitrate-controlled encode needs the full one. `upgrade` first: the slim base is refreshed
 # only every few weeks, and ffmpeg parses untrusted media, so a build takes the Debian security fixes
 # current when this layer was last built. CI reuses the layer while the base digest is unchanged; the
 # weekly patch rebuild runs without cache and so always takes the current ones.
@@ -197,7 +200,10 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
          ffmpeg ca-certificates python3 libssl3t64 zlib1g libva2 libva-drm2 \
     && if [ "$(dpkg --print-architecture)" = amd64 ]; then \
-         apt-get install -y --no-install-recommends intel-media-va-driver; \
+         sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+         && apt-get update \
+         && apt-get install -y --no-install-recommends intel-media-va-driver-non-free \
+         && sed -i 's/^Components: main non-free$/Components: main/' /etc/apt/sources.list.d/debian.sources; \
        fi \
     && rm -rf /var/lib/apt/lists/*
 

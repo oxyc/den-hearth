@@ -462,6 +462,8 @@ pub struct AppState {
     pub scratch_ok: AtomicBool,
     /// Can this ffmpeg transcode on the GPU (`check_transcode`), with `MAX_TRANSCODES` above 0?
     pub transcode_ok: AtomicBool,
+    /// The GPU is here and ffmpeg lists the encoder, but a real test encode failed (`probe_encode`).
+    pub transcode_broken: AtomicBool,
     producer_slots: Arc<tokio::sync::Semaphore>,
     transcode_slots: Arc<tokio::sync::Semaphore>,
     /// Producers holding an active-remux slot now.
@@ -584,6 +586,7 @@ impl AppState {
             ffmpeg_ok: AtomicBool::new(false),
             scratch_ok: AtomicBool::new(false),
             transcode_ok: AtomicBool::new(false),
+            transcode_broken: AtomicBool::new(false),
             producer_slots,
             transcode_slots,
             active_producers: Arc::new(AtomicUsize::new(0)),
@@ -1015,6 +1018,63 @@ pub async fn check_transcode(ffmpeg: &str, device: &Path) -> bool {
         ],
     )
     .await
+}
+
+/// Six frames of 320x180 H.264 (Matroska, 6 KB), fed to `probe_encode` on stdin.
+const ENCODE_PROBE_CLIP: &[u8] = include_bytes!("../testdata/gpu-probe.mkv");
+
+/// The arguments of a session's GPU encode (`job::args`) on `ENCODE_PROBE_CLIP`: the same decode, scale,
+/// profile and rate control, for a few frames, written as fragmented MP4 to stdout.
+fn encode_probe_args(device: &str) -> Vec<String> {
+    let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let mut a = s(&["-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1"]);
+    a.extend(s(&["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]));
+    a.extend(s(&["-f", "matroska", "-i", "pipe:0", "-map", "0:V:0"]));
+    a.extend(s(&["-vf", "scale_vaapi=w=256:h=144:format=nv12"]));
+    a.extend(s(&["-c:v", "h264_vaapi", "-profile:v", "high", "-level:v", "4.1"]));
+    a.extend(s(&["-b:v", "4000000", "-maxrate", "6000000", "-bufsize", "8000000"]));
+    a.extend(s(&["-frames:v", "6", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]));
+    a
+}
+
+#[cfg(test)]
+pub fn probe_args_for_test() -> Vec<String> {
+    encode_probe_args("/dev/dri/renderD128")
+}
+
+/// Can this GPU actually run a session's encode? `check_transcode` only reads ffmpeg's help, which says
+/// nothing about the driver: Debian's free `intel-media-va-driver` lists `h264_vaapi` and then refuses every
+/// bitrate-controlled encode ("Driver does not support any RC mode"). This runs the real thing, once, on a
+/// few frames. `Err` is ffmpeg's own last words.
+pub async fn probe_encode(ffmpeg: &str, device: &Path) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new(ffmpeg)
+        .args(encode_probe_args(&device.to_string_lossy()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot start {ffmpeg}: {e}"))?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    // ffmpeg may exit before it has read the clip (a device that will not open), so a broken pipe is not
+    // this check's failure: the exit status and stderr below say why.
+    let feed = tokio::spawn(async move {
+        let _ = stdin.write_all(ENCODE_PROBE_CLIP).await;
+    });
+    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await;
+    feed.abort();
+    match out {
+        Err(_) => Err("the test encode did not finish in 20 s".to_string()),
+        Ok(Err(e)) => Err(format!("the test encode could not be awaited: {e}")),
+        Ok(Ok(o)) if o.status.success() => Ok(()),
+        Ok(Ok(o)) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let said = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" | ");
+            let said: String = said.chars().take(400).collect();
+            Err(format!("{} — {}", o.status, if said.is_empty() { "no output" } else { &said }))
+        }
+    }
 }
 
 /// Does `ffmpeg <args>` print `want`, for every pair? Says the first that does not.

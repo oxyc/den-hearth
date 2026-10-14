@@ -127,6 +127,12 @@ fn health_verdict(state: &AppState) -> Option<(&'static str, &'static str)> {
         ))
     } else if !state.scratch_ok.load(Relaxed) {
         Some(("scratch_unwritable", "SCRATCH_DIR cannot be written — check the volume and its owner (65532)"))
+    } else if state.transcode_broken.load(Relaxed) {
+        Some((
+            "transcode_unavailable",
+            "the GPU is present but a test encode with a session's flags failed (see the startup log) — \
+             check the VAAPI driver (Debian's intel-media-va-driver-non-free) and VAAPI_DEVICE",
+        ))
     } else if state.cfg.scout_install_url.is_none() && state.cfg.scout_origins.is_empty() {
         Some((
             "scout_unconfigured",
@@ -1089,8 +1095,16 @@ pub async fn init(cfg: Config) -> Arc<AppState> {
     state.load_unplayable();
     state.load_probe_cache();
     state.ffmpeg_ok.store(state::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
-    let transcode = state.cfg.max_transcodes > 0
+    let mut transcode = state.cfg.max_transcodes > 0
         && state::check_transcode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await;
+    if transcode {
+        // ffmpeg listing the encoder proves nothing about the driver under it: run one for a few frames.
+        if let Err(why) = state::probe_encode(&state.cfg.ffmpeg, &state.cfg.vaapi_device).await {
+            eprintln!("transcode: the GPU's test encode failed, transcoding is off — {why}");
+            state.transcode_broken.store(true, Relaxed);
+            transcode = false;
+        }
+    }
     state.transcode_ok.store(transcode, Relaxed);
     state.segments_ffmpeg.store(segments::check_ffmpeg(&state.cfg.ffmpeg).await, Relaxed);
     if state.segments_ok() {
