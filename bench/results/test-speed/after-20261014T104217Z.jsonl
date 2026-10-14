@@ -1,0 +1,26 @@
+{"kind": "meta", "commit": "ae0fc1d", "load": [25.8818359375, 31.81201171875, 34.77099609375], "runs": 3, "cargo_args": [], "label": "after"}
+{"kind": "build", "case": "clean", "run": 0, "wall": 65.38, "cpu": 254.06, "rc": 0, "label": "after"}
+{"kind": "build", "case": "clean", "run": 1, "wall": 81.38, "cpu": 263.08, "rc": 0, "label": "after"}
+{"kind": "build", "case": "clean", "run": 2, "wall": 105.95, "cpu": 281.97, "rc": 0, "label": "after"}
+{"kind": "run", "case": "cargo test (warm)", "run": 0, "wall": 20.63, "cpu": 13.42, "rc": 0, "label": "after"}
+{"kind": "run", "case": "cargo test (warm)", "run": 1, "wall": 17.78, "cpu": 14.51, "rc": 0, "label": "after"}
+{"kind": "run", "case": "cargo test (warm)", "run": 2, "wall": 15.53, "cpu": 12.61, "rc": 0, "label": "after"}
+{"kind": "run", "case": "nextest (warm)", "run": 0, "wall": 21.15, "cpu": 39.0, "rc": 0, "label": "after"}
+{"kind": "run", "case": "nextest (warm)", "run": 1, "wall": 46.63, "cpu": 38.98, "rc": 0, "label": "after"}
+{"kind": "run", "case": "nextest (warm)", "run": 2, "wall": 42.31, "cpu": 38.37, "rc": 0, "label": "after"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 0, "wall": 7.85, "cpu": 7.15, "rc": 0, "label": "after"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 1, "wall": 7.73, "cpu": 6.72, "rc": 0, "label": "after"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 2, "wall": 9.44, "cpu": 7.0, "rc": 0, "label": "after"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 0, "wall": 5.72, "cpu": 4.99, "rc": 0, "label": "after"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 1, "wall": 4.69, "cpu": 5.45, "rc": 0, "label": "after"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 2, "wall": 3.1, "cpu": 4.91, "rc": 0, "label": "after"}
+{"seconds": 5.173, "binary": "den-reel", "test": "tests::a_lingering_descendant_does_not_pin_a_finished_download", "kind": "slowest", "label": "after"}
+{"seconds": 4.272, "binary": "den-scout", "test": "tests::rank::lookaround_patterns_answer_for_a_title_of_any_length", "kind": "slowest", "label": "after"}
+{"seconds": 3.162, "binary": "den-subtitles", "test": "srt::tests::escaping_a_hostile_line_stays_linear", "kind": "slowest", "label": "after"}
+{"seconds": 2.657, "binary": "den-remux", "test": "source::tests::growing_ranges_need_far_fewer_round_trips_on_a_controlled_high_bdp_path", "kind": "slowest", "label": "after"}
+{"seconds": 2.104, "binary": "den-remux", "test": "source::tests::a_read_paused_longer_than_any_total_timeout_carries_on", "kind": "slowest", "label": "after"}
+{"seconds": 1.239, "binary": "den-reel", "test": "tests::concurrent_asks_for_one_id_share_a_single_resolve", "kind": "slowest", "label": "after"}
+{"seconds": 1.149, "binary": "den-scout", "test": "tests::scrape::scraper_url", "kind": "slowest", "label": "after"}
+{"seconds": 1.107, "binary": "den-subtitles", "test": "cache::tests::the_sweep_spends_the_cheap_entries_first", "kind": "slowest", "label": "after"}
+{"seconds": 1.104, "binary": "den-subtitles", "test": "opensubtitles::download_tests::a_rate_limit_on_one_title_holds_every_title_until_an_answer", "kind": "slowest", "label": "after"}
+{"seconds": 1.104, "binary": "den-subtitles", "test": "cache::tests::the_sweep_bounds_the_disk_tier", "kind": "slowest", "label": "after"}

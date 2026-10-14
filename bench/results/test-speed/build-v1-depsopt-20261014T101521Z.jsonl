@@ -1,0 +1,7 @@
+{"kind": "meta", "commit": "ae0fc1d", "load": [30.89013671875, 39.947265625, 41.58154296875], "runs": 2, "cargo_args": [], "label": "build-v1-depsopt"}
+{"kind": "build", "case": "clean", "run": 0, "wall": 196.57, "cpu": 453.23, "rc": 0, "label": "build-v1-depsopt"}
+{"kind": "build", "case": "clean", "run": 1, "wall": 109.46, "cpu": 393.84, "rc": 0, "label": "build-v1-depsopt"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 0, "wall": 9.02, "cpu": 6.95, "rc": 0, "label": "build-v1-depsopt"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 1, "wall": 11.28, "cpu": 6.95, "rc": 0, "label": "build-v1-depsopt"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 0, "wall": 8.15, "cpu": 5.53, "rc": 0, "label": "build-v1-depsopt"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 1, "wall": 4.5, "cpu": 5.62, "rc": 0, "label": "build-v1-depsopt"}

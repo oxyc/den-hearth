@@ -1,0 +1,1 @@
+{"kind": "meta", "commit": "ae0fc1d", "load": [19.05517578125, 25.18505859375, 32.951171875], "runs": 2, "cargo_args": ["--config=target.aarch64-apple-darwin.rustflags=['-C','link-arg=-fuse-ld=lld']"], "label": "build-v3-lld"}

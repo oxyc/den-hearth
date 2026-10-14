@@ -1,0 +1,5 @@
+{"kind": "meta", "commit": "ae0fc1d", "load": [17.93115234375, 24.74853515625, 32.70556640625], "runs": 2, "cargo_args": ["--config=target.aarch64-apple-darwin.rustflags=['-C','link-arg=-fuse-ld=lld']"], "label": "build-v3-lld"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 0, "wall": 5.92, "cpu": 6.55, "rc": 0, "label": "build-v3-lld"}
+{"kind": "build", "case": "incremental: touch crates/scout/src/util.rs", "run": 1, "wall": 4.69, "cpu": 5.97, "rc": 0, "label": "build-v3-lld"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 0, "wall": 4.8, "cpu": 5.13, "rc": 0, "label": "build-v3-lld"}
+{"kind": "build", "case": "incremental: touch crates/remux/src/redact.rs", "run": 1, "wall": 4.53, "cpu": 5.13, "rc": 0, "label": "build-v3-lld"}

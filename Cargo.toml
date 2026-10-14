@@ -2,6 +2,29 @@
 resolver = "2"
 members = ["crates/*"]
 
+# Line tables are all a panic backtrace needs; dropping variable-level DWARF cuts the clean build's CPU time by
+# about a fifth (BENCHMARKS.md, "Test-suite speed"). Attach a debugger with `--config profile.dev.debug=2`.
+[profile.dev]
+debug = "line-tables-only"
+
+# The regex engines and serde_json run the multi-megabyte-title tests (scout's lookaround and episode patterns,
+# the account-listing decoders); unoptimised they dominate the suite. Dependencies only, so the crates under test
+# keep debug assertions and overflow checks, and a dependency is built once, not on every incremental rebuild.
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
+
 # Self-contained binaries for a resource-constrained homelab. opt-level 3 (speed): the serve/stream
 # path wants the fast codegen (time-to-first-frame). Fat LTO + one codegen unit + strip keep it small.
 # panic=unwind (the default): a panic in one request task unwinds just that connection (tokio catches

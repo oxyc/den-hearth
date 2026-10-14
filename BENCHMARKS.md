@@ -310,6 +310,61 @@ is as long as its slowest test, so the 21 s is roughly the sum of the five. Elev
 nine of those are the episode-matching tests; going by what they call, their time is regex construction at `opt-level 0`
 (not profiled), so an optimisation of episode matching would speed them up too.
 
+### Test-suite speed
+
+`bench/test_speed.py` measures a checkout three times per case and reports wall AND CPU seconds (user+sys of the whole
+process tree). The machine here was shared (load average 25-30 throughout), so wall time is mostly the neighbours; CPU
+seconds are what to compare. Before = `ae0fc1d`, after = this branch. Raw lines: `bench/results/test-speed/`.
+
+| case (min of 3) | before wall / CPU s | after wall / CPU s |
+|---|---:|---:|
+| clean build of every test binary | 100.4 / 313.3 | 65.4 / 254.1 |
+| `cargo test --workspace`, warm | 26.7 / 25.1 | 15.5 / 12.6 |
+| `cargo nextest run --workspace`, warm | 13.3 / 45.1 | 21.2 / 38.4 |
+| incremental: touch `crates/scout/src/util.rs` | 2.1 / 4.7 | 7.7 / 6.7 |
+| incremental: touch `crates/remux/src/redact.rs` | 1.5 / 4.2 | 3.1 / 4.9 |
+
+What moved: warm `cargo test` CPU halves and the clean build loses a fifth of its CPU. The incremental rebuild costs
+about 2 s more CPU for scout (0.7 s for remux): the optimised dependencies make the test binary slower to link. nextest
+is for isolation and per-test timeouts, not speed: one process per test costs about three times the CPU of `cargo
+test`, so its wall time depends on idle cores (13 s on a quiet minute, 21-46 s under load).
+
+Slowest tests, one run each, wall seconds (concurrent with the rest of the suite, so inflated):
+
+| test | before | after |
+|---|---:|---:|
+| den-scout `rank::lookaround_patterns_answer_for_a_title_of_any_length` | 13.45 | 4.27 |
+| den-subtitles `srt::tests::escaping_a_hostile_line_stays_linear` | 5.43 | 3.16 |
+| den-reel `a_lingering_descendant_does_not_pin_a_finished_download` | 5.16 | 5.17 |
+| den-scout `stores_pick::cached_episode_patterns_answers_for_the_episode_asked_about` | 4.03 | below 1.1 |
+| den-remux `growing_ranges_need_far_fewer_round_trips_…` | 2.53 | 2.66 |
+| den-remux `a_read_paused_longer_than_any_total_timeout_carries_on` | 2.51 | 2.10 |
+
+The scout regex tests are the clean measurement: run alone, the lookaround and cached-episode tests retired 107.6 G
+instructions before and 34.6 G after (`/usr/bin/time -l`); the whole scout test binary went from 166.5 G to 86.6 G.
+
+Rejected, with numbers:
+
+- `[profile.dev.package.den-scout] opt-level = 1`: the two regex tests fall from 34.6 G to 15.1 G instructions, but the
+  crate takes about 2 minutes to build instead of 20-30 s, on every edit.
+- lld (`-C link-arg=-fuse-ld=lld`, nixpkgs lld 21): incremental CPU 6.0/5.1 s against 6.5/5.4 s, inside the noise, and
+  it needs a tool nobody has installed.
+- `split-debuginfo`: `unpacked` is already the macOS default for the dev profile.
+- Paused time for the real-socket tests in remux and reel: reqwest's timeouts would fire on virtual time while bytes are
+  still in flight, which changes what the test proves. Only the two in-process `Flight` tests in scout took
+  `start_paused`; the other scout sleeps (5-100 ms each, mock `Doer`, no sockets) are already paused or too short to
+  matter.
+- `escaping_a_hostile_line_stays_linear` runs den-subtitles' own code, not a dependency's, so the dependency settings do
+  not touch it (41.6 G instructions either way). It stays as it is.
+
+Run it in CI (and locally):
+
+```sh
+cargo test --workspace --locked --no-fail-fast                                   # includes doctests
+nix run nixpkgs#cargo-nextest -- nextest run --workspace --locked --profile ci   # isolated, per-test timeouts (.config/nextest.toml)
+python3 bench/test_speed.py --label after --root . --target /tmp/target --runs 3 # the table above
+```
+
 ## How to run
 
 ```sh
