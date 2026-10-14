@@ -173,7 +173,7 @@ fn play_a_link_that_fails_its_check_is_a_dead_link() {
     fn pending() {
         use super::pending_handler::*;
         use crate::deps::Deps;
-        use crate::tests::stores::tally_store::TallyStore;
+        use crate::tests::linkmemo::TallyStore;
         let cdn = sized_cdn(&[]);
         let store = TallyStore::new(crate::config::DebridService::TorBox, move |_| Ok(format!("{cdn}/f.mkv")));
         let deps = Deps::for_test(|d| {
@@ -199,7 +199,7 @@ fn play_a_check_that_cannot_answer_passes_the_link_through() {
     fn pending() {
         use super::pending_handler::*;
         use crate::deps::Deps;
-        use crate::tests::stores::tally_store::TallyStore;
+        use crate::tests::linkmemo::TallyStore;
         let link = "http://127.0.0.1:1/f.mkv".to_owned(); // a port nothing listens on: the check cannot answer
         let store = TallyStore::new(crate::config::DebridService::TorBox, move |_| Ok(link.clone()));
         let deps = Deps::for_test(|d| {
@@ -227,7 +227,7 @@ fn play_a_checked_link_is_not_checked_again() {
     fn pending() {
         use super::pending_handler::*;
         use crate::deps::Deps;
-        use crate::tests::stores::tally_store::TallyStore;
+        use crate::tests::linkmemo::TallyStore;
         use std::sync::atomic::{AtomicI32, Ordering};
         let checks = std::sync::Arc::new(AtomicI32::new(0));
         let cdn = sized_cdn(&[("/f.mkv", 1000)]);

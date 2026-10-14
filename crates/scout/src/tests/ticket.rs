@@ -44,6 +44,11 @@ pub(crate) fn ticket_keys(kr: &SealKeyring) -> TicketKeys {
     TicketKeys::new(Some(kr)).expect("a keyring turns tickets on")
 }
 
+/// Go `validBlob` (handler_test.go:18): the config every handler test starts from.
+pub(crate) fn valid_blob() -> String {
+    blob(r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#)
+}
+
 fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH).expect("after the epoch").as_secs() as i64
 }
@@ -271,11 +276,6 @@ mod pending_handler {
     use super::*;
     use crate::deps::Deps;
     use crate::handler::serve;
-
-    /// Go `validBlob` (handler_test.go:18).
-    pub(super) fn valid_blob() -> String {
-        blob(r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#)
-    }
 
     /// Go `sealedConfig` (availability_test.go:42).
     pub(super) fn sealed_config(kr: &SealKeyring, cfg_json: &str) -> String {
