@@ -11,6 +11,8 @@ async-trait = "0.1"
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
 # `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.
 base64 = "0.22"
+# Go `crypto/sha256`: the 128-bit cache-key digest `key_hash` returns (util.go).
+sha2 = "0.10"
 # Go's `encoding/json`: `json.Marshal` for string literals in config fixtures (`jsonString`), the JSON
 # text `validate_config` takes, the streamed TorBox account listing (`decodeListing`), and the response
 # bodies the handler tests decode.
