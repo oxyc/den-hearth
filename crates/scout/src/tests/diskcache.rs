@@ -75,12 +75,9 @@ fn tiered_cache_volatile_overwrite_retires_durable_value() {
                 c
             }
             "memory eviction" => {
-                c.put_class(
-                    "large-enough-to-evict",
-                    &"x".repeat(128),
-                    Duration::from_secs(3600),
-                    CacheClass::Volatile,
-                );
+                for i in 0..20 {
+                    c.put_class(&format!("filler{i}"), &"x".repeat(30), Duration::from_secs(3600), CacheClass::Volatile);
+                }
                 c
             }
             _ => TieredCache::new(64, dir.path()),

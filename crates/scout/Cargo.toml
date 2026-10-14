@@ -50,6 +50,9 @@ url = "2"
 httpdate = "1"
 # Go `math/rand` for the jitter on an unnamed pause (upstreampause.go).
 fastrand = "2"
+# The memory tier (cache.rs `MemoryCache`): a sharded, byte-weighted cache, so a hit does not queue behind a
+# write and the budget is bytes, not entries.
+quick_cache = "0.6"
 
 [features]
 # Forwards to the pub(crate) hot paths for benches/scout.rs (src/bench_api.rs). Off in every build that ships.
@@ -57,6 +60,11 @@ bench = []
 
 [[bench]]
 name = "scout"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "cache_mem"
 harness = false
 required-features = ["bench"]
 
