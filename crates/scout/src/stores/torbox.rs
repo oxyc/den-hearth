@@ -44,7 +44,8 @@ pub(crate) use listing::{decode_listing, ListingFault, TruncationDetector};
 pub(crate) use support::canonical_torbox_identity;
 use support::{
     account_backed_off, add_in_flight, add_still_believable, batches_failed, build_request, clear, dead_link,
-    encode_form, envelope, fetch_state, first_value, int_or_zero, is_cancellation, is_torrent_gone, join_all, known_cached,
+    encode_form, envelope, fetch_state, first_value, int_or_zero, is_cancellation, is_cancellation_error,
+    is_torrent_gone, join_all, known_cached,
     live, lock, magnet_for, no_file_list, note_unknown_outcome, opt_bool, opt_float, opt_int, opt_string,
     read_limited, read_store_error, record_refusal_for, redact_token, refusal_is_about_the_account, remember_cached,
     scoped, settle_add_attempt, short_hash, store_error_text, store_refused_us, string_or_empty, torbox_account_identity,
@@ -338,10 +339,13 @@ impl TorBoxStore {
 
     /// Go `torBoxStore.requestDownload`: asks TorBox for the playable link of one file of a torrent.
     pub(crate) async fn request_download(&self, torrent_id: i64, file_id: Option<i64>) -> Result<String, StoreError> {
-        let mut u = format!("{}/torrents/requestdl?token={}&torrent_id={torrent_id}", self.api, query_escape(&self.token));
-        if let Some(f) = file_id {
-            u.push_str(&format!("&file_id={f}"));
+        let id = torrent_id.to_string();
+        let file = file_id.map(|f| f.to_string());
+        let mut q = vec![("token", self.token.as_str()), ("torrent_id", id.as_str())];
+        if let Some(file) = &file {
+            q.push(("file_id", file.as_str()));
         }
+        let u = format!("{}/torrents/requestdl?{}", self.api, encode_form(&q));
         let mut reply = match self.get(&u).await {
             Ok(r) => r,
             // Never the raw error. TorBox wants the token as a QUERY PARAMETER, and a transport failure yields
@@ -451,8 +455,12 @@ impl TorBoxStore {
         let raw = match reply.read(MAX_STORE_BYTES).await {
             Ok(raw) => raw,
             // Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
-            // again. The charge stays too — the add was written to the wire.
-            Err(_) => return Err(unknown_outcome(cache, DebridService::TorBox, &identity, info_hash, false)),
+            // again. The charge stays too — the add was written to the wire. A viewer backing out is the cause
+            // that starts no give-up clock.
+            Err(e) => {
+                let cancelled = is_cancellation_error(&e);
+                return Err(unknown_outcome(cache, DebridService::TorBox, &identity, info_hash, cancelled));
+            }
         };
         drop(reply);
         settle_add_attempt(cache, DebridService::TorBox, &identity, info_hash);
@@ -1581,19 +1589,6 @@ fn torbox_endpoint(u: &reqwest::Url) -> &'static str {
 /// Go `strings.ToUpper` for a hash: simple per-character upper-casing.
 fn go_to_upper(s: &str) -> String {
     s.chars().map(|c| c.to_uppercase().next().unwrap_or(c)).collect()
-}
-
-/// Go `url.QueryEscape`.
-fn query_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(char::from(b)),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Feeds the blocking listing decode from the async body reader.

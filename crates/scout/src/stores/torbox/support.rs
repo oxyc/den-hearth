@@ -377,23 +377,31 @@ pub(crate) fn unavailable(service: DebridService, reason: impl Into<String>, sta
 /// can be concluded about the store or the release from it. Anything else is the transport failing, and says
 /// only what failed.
 pub(crate) fn transport_error(err: DoError) -> StoreError {
-    let mut chain = Vec::new();
-    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
-    while let Some(e) = link {
-        chain.push(e.to_string());
-        link = e.source();
-    }
-    let cancelled = err.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
-        || chain.iter().any(|m| {
-            m.contains("context canceled")
-                || m.contains("context deadline exceeded")
-                || m.contains("operation cancelled")
-                || m.contains("operation was canceled")
-        });
-    if cancelled {
+    if is_cancellation_error(err.as_ref()) {
         return StoreError::Cancelled;
     }
     StoreError::Other(transport_kind(Some(err.as_ref())))
+}
+
+/// Go `isCancellation` for an error that arrived as a chain of causes: the caller went away or its deadline
+/// ran out, which reads as these words wherever in the chain they are, and as a timeout for a client with its own.
+pub(crate) fn is_cancellation_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut link = Some(err);
+    while let Some(e) = link {
+        if e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) {
+            return true;
+        }
+        let m = e.to_string();
+        if m.contains("context canceled")
+            || m.contains("context deadline exceeded")
+            || m.contains("operation cancelled")
+            || m.contains("operation was canceled")
+        {
+            return true;
+        }
+        link = e.source();
+    }
+    false
 }
 
 // --- store helpers from the shared head (stores.go:323-442) ---

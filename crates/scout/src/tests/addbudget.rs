@@ -364,6 +364,27 @@ impl Store for StubStore {
     }
 }
 
+/// A response that arrives with its status line and then fails while its body is read, the way a mid-body reset,
+/// a TLS truncation or a client's context expiring after the headers does.
+fn failing_body_response(status: u16, message: &str) -> reqwest::Response {
+    let body = futures_util::stream::iter(vec![
+        Ok::<Vec<u8>, io::Error>(Vec::new()),
+        Err(io::Error::other(message.to_owned())),
+    ]);
+    let r = http::Response::builder().status(status).body(reqwest::Body::wrap_stream(body)).expect("valid status");
+    reqwest::Response::from(r)
+}
+
+/// Go `brokenBodyResponse`: the body dies with a transport fault (an unexpected EOF).
+fn broken_body_response(status: u16, message: &str) -> reqwest::Response {
+    failing_body_response(status, message)
+}
+
+/// Go `cancelledBodyResponse`: the body dies because the caller went away (`context canceled`).
+fn cancelled_body_response(status: u16, message: &str) -> reqwest::Response {
+    failing_body_response(status, message)
+}
+
 /// Go `resolveCacheTTL`.
 fn resolve_cache_ttl() -> Duration {
     RESOLVE_CACHE_TTL
@@ -2564,11 +2585,7 @@ async fn tor_box_a_rejected_key_on_mylist_reaches_the_account_backoff() {
 /// created nothing" refunded the charge for a torrent that does exist, and with no backoff on that branch
 /// the budget was the only bound: sixty polls created sixty torrents with the allowance untouched.
 #[tokio::test]
-#[ignore = "needs package 2: the Real-Debrid Store impl, and a streamed body that errors mid-read (futures-util)"]
 async fn real_debrid_an_unreadable_answer_is_not_proof_nothing_was_created() {
-    // Enable when the owning package lands: move the body up and delete this wrapper.
-    #[cfg(any())]
-    async fn pending() {
         let _budget = install_budget(HOUR, 50);
 
         let created = Arc::new(AtomicUsize::new(0));
@@ -2591,8 +2608,6 @@ async fn real_debrid_an_unreadable_answer_is_not_proof_nothing_was_created() {
         // the expensive assumption.
         let left = global_add_budget().remaining(&budget_account(RealDebrid, "tok"));
         assert_eq!(left, 49, "allowance {left} — an add whose outcome is unknown was treated as one that never happened");
-    }
-    todo!("needs package 2: the Real-Debrid Store impl, and a streamed body that errors mid-read (futures-util)");
 }
 
 /// The rejected-key return must not drop the torrent id it was just handed: Status needs it to report a
@@ -2659,11 +2674,7 @@ async fn premiumize_an_answered_failure_is_asked_only_once() {
 /// refusal). A caller that builds its own error satisfies the helper test and breaks the property, which
 /// is exactly how it shipped.
 #[tokio::test]
-#[ignore = "needs packages 1 and 2: the three Store impls, and a body that is cancelled mid-read (futures-util)"]
 async fn stores_a_cancelled_add_body_is_not_a_refusal() {
-    // Enable when the owning package lands: move the body up and delete this wrapper.
-    #[cfg(any())]
-    async fn pending() {
         // (name, service, add path, body that the store then reads)
         let cases: [(&str, DebridService, &'static str, &'static str); 3] = [
             ("realdebrid", RealDebrid, "addMagnet", r#"{"id":"t1"}"#),
@@ -2701,19 +2712,13 @@ async fn stores_a_cancelled_add_body_is_not_a_refusal() {
             let left = global_add_budget().remaining(&budget_account(svc, "tok"));
             assert_eq!(left, 49, "{name}: allowance {left}, want 49");
         }
-    }
-    todo!("needs packages 1 and 2: the three Store impls, and a body that is cancelled mid-read (futures-util)");
 }
 
 /// An add whose answer never arrived is what the in-flight marker is for. It must survive, so the next
 /// poll says "downloading" — honest for an add that went out and whose result we never saw — rather than
 /// buying the torrent again or blaming the store.
 #[tokio::test]
-#[ignore = "needs package 2: the Real-Debrid Store impl, and a body that errors mid-read (futures-util)"]
 async fn real_debrid_an_unread_answer_leaves_the_add_in_flight() {
-    // Enable when the owning package lands: move the body up and delete this wrapper.
-    #[cfg(any())]
-    async fn pending() {
         let _budget = install_budget(HOUR, 50);
 
         let created = Arc::new(AtomicUsize::new(0));
@@ -2740,8 +2745,6 @@ async fn real_debrid_an_unread_answer_leaves_the_add_in_flight() {
         assert_eq!(left, 49, "allowance {left} — an add that went out was treated as one that never happened");
         // And it is not a refusal, so no store gets blamed for a body scout could not read.
         assert!(backed_off(&*cache, RealDebrid, "tok", H).is_none(), "filed as RD refusing");
-    }
-    todo!("needs package 2: the Real-Debrid Store impl, and a body that errors mid-read (futures-util)");
 }
 
 /// TorBox's createtorrent detail is persisted into the refusal cache, which writes through to disk — so
@@ -3099,11 +3102,7 @@ async fn stores_a_cancelled_add_does_not_start_the_give_up_clock() {
 /// only by whether the response headers arrived first. Guarding the transport branch alone left the same
 /// release condemned by the same viewer action.
 #[tokio::test]
-#[ignore = "needs packages 1 and 2: the three Store impls, and a body that is cancelled mid-read (futures-util)"]
 async fn stores_a_cancelled_body_read_does_not_start_the_give_up_clock() {
-    // Enable when the owning package lands: move the body up and delete this wrapper.
-    #[cfg(any())]
-    async fn pending() {
         // (name, svc, add path)
         let cases: [(&str, DebridService, &'static str); 3] = [
             ("torbox", TorBox, "createtorrent"),
@@ -3145,8 +3144,6 @@ async fn stores_a_cancelled_body_read_does_not_start_the_give_up_clock() {
             let _ = store.resolve(&tgt(H)).await;
             assert!(cache.get(&unknown_outcome_key(svc, "tok", H)).is_some_and(|s| !s.is_empty()), "{name}: a truncated answer left no give-up clock, so nothing bounds the retries");
         }
-    }
-    todo!("needs packages 1 and 2: the three Store impls, and a body that is cancelled mid-read (futures-util)");
 }
 
 /// TorBox reports plenty of errors as HTTP 200 with no torrent id, and a proxy page served as 200 lands

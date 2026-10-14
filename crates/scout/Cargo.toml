@@ -52,4 +52,6 @@ fastrand = "2"
 [dev-dependencies]
 # Go's `t.TempDir()`.
 tempfile = "3"
+# A response whose body fails mid-read (`brokenBodyResponse`, `cancelledBodyResponse`): a stream that yields an error.
+futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }
