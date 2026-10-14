@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use den_upstream::{AddressGuard, ClientProfile, Guard, GuardError, Redirect, Vetted};
 use futures_util::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, StreamBody};
@@ -186,8 +187,17 @@ fn is_ticket(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// An address on the public internet; the classifier is shared with Scout and Remux (`den-net`).
+#[cfg(test)]
 use den_net::is_public as is_public_ip;
+
+/// The settings of the client for one hop. No redirects, because each one is a new hop that has to be vetted the
+/// same way; the guard (no proxy, and the vetted address pinned) is added per hop.
+fn hop_profile() -> ClientProfile {
+    ClientProfile::new()
+        .user_agent(format!("den-subtitles/{}", crate::release_version()))
+        .redirect(Redirect::Never)
+        .connect(CONNECT_TIMEOUT)
+}
 
 /// A client for one hop, pinned to the one address vetted for it.
 ///
@@ -197,32 +207,21 @@ use den_net::is_public as is_public_ip;
 /// instead of the address pinned here.
 async fn pinned_client(url: &Url, origins: &[Origin]) -> Result<reqwest::Client, String> {
     let origin = origin_of(url).ok_or("resync hop is not a plain http(s) URL")?;
-    let listed = origins.contains(&origin);
     // `host_str` brackets an IPv6 literal.
     let bare = origin.host.trim_start_matches('[').trim_end_matches(']');
-    let builder = reqwest::Client::builder()
-        .user_agent(format!("den-subtitles/{}", crate::release_version()))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .connect_timeout(CONNECT_TIMEOUT);
-    let builder = match bare.parse::<IpAddr>() {
-        Ok(ip) if listed || is_public_ip(ip) => builder,
-        Ok(_) => return Err("resync hop is not a public address".into()),
-        Err(_) => {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((bare, origin.port))
-                .await
-                .map_err(|e| format!("resolve resync hop: {e}"))?
-                .collect();
-            // Every address, not just the one pinned: a name that also answers with an internal
-            // address is not one to be trusted with the rest.
-            if !listed && addrs.iter().any(|a| !is_public_ip(a.ip())) {
-                return Err("resync hop resolves to a non-public address".into());
-            }
-            let first = *addrs.first().ok_or("resync hop resolves to nothing")?;
-            builder.resolve(bare, first)
-        }
+    // A listed origin is the operator's own scout: reached wherever it lives, but still resolved once and pinned.
+    let guard = if origins.contains(&origin) { AddressGuard::permissive() } else { AddressGuard::strict() };
+    let literal = bare.parse::<IpAddr>().is_ok();
+    let profile = match guard.vet(bare, origin.port).await {
+        Ok(Vetted::Literal(_)) => hop_profile().guard(Guard::NoProxy),
+        // Every address a name resolves to was judged, not just the one pinned.
+        Ok(Vetted::Resolved(addr)) => hop_profile().guard(Guard::Pinned { host: bare.to_owned(), addr }),
+        Err(GuardError::NotPublic) if literal => return Err("resync hop is not a public address".into()),
+        Err(GuardError::NotPublic) => return Err("resync hop resolves to a non-public address".into()),
+        Err(GuardError::Unresolved(e)) => return Err(format!("resolve resync hop: {e}")),
+        Err(GuardError::Nothing) => return Err("resync hop resolves to nothing".into()),
     };
-    builder.build().map_err(|e| format!("resync client: {e}"))
+    profile.build().map_err(|e| format!("resync client: {e}"))
 }
 
 /// Follow `start`'s redirects to the URL that serves the bytes, vetting each hop, and return it with
@@ -370,6 +369,36 @@ mod tests {
 
     fn origins(list: &str) -> Vec<Origin> {
         parse_origins(list)
+    }
+
+    /// A resync hop follows no redirect (each is a new hop to vet), gives up on a connection after ten seconds, has
+    /// no total timeout (the relay's own budgets bound it), and is named.
+    #[test]
+    fn the_hop_profile_keeps_its_timeouts_redirects_and_agent() {
+        let profile = hop_profile();
+        assert_eq!(profile.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(profile.total_timeout(), None);
+        assert_eq!(profile.read_idle_timeout(), None);
+        assert!(matches!(profile.redirect_policy(), Redirect::Never));
+        assert_eq!(profile.address_guard(), &Guard::None);
+        assert_eq!(
+            profile.user_agent_str(),
+            Some(format!("den-subtitles/{}", crate::release_version()).as_str())
+        );
+    }
+
+    /// The hop's guard follows what was judged: a literal connects as it is, a name to the one address vetted.
+    #[tokio::test]
+    async fn a_hop_is_pinned_to_the_address_that_was_vetted() {
+        let listed = origins("http://localhost:8080");
+        assert!(pinned_client(&Url::parse("http://localhost:8080/p/x").unwrap(), &listed).await.is_ok());
+        let err = pinned_client(&Url::parse("http://localhost:8080/p/x").unwrap(), &[]).await.unwrap_err();
+        assert_eq!(err, "resync hop resolves to a non-public address");
+        let err = pinned_client(&Url::parse("http://10.0.0.5/p/x").unwrap(), &[]).await.unwrap_err();
+        assert_eq!(err, "resync hop is not a public address");
+        assert!(pinned_client(&Url::parse("http://10.0.0.5/p/x").unwrap(), &origins("http://10.0.0.5"))
+            .await
+            .is_ok());
     }
 
     #[test]

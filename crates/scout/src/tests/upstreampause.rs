@@ -12,8 +12,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::scrape::{DoError, Doer};
 use crate::upstreampause::{
-    exhausted_for, pause_on_refusal, retry_after, MAX_REFUSAL_PAUSE, MAX_RETRY_AFTER, REFUSAL_PAUSE,
+    pause_on_refusal, retry_after, MAX_REFUSAL_PAUSE, MAX_RETRY_AFTER, REFUSAL_PAUSE,
 };
+use den_upstream::exhausted_for;
 
 type Answer = Box<dyn Fn(&reqwest::Request) -> reqwest::Response + Send + Sync>;
 
@@ -232,14 +233,14 @@ async fn pause_on_refusal_waits_out_an_allowance_an_answer_says_is_spent() {
         ("legacy", headers(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", legacy_reset.as_str())])),
     ];
     for (name, header) in spent {
-        assert_eq!(exhausted_for(&header, now), (Duration::from_secs(90), true), "{name}");
+        assert_eq!(exhausted_for(&header, now), Some(Duration::from_secs(90)), "{name}");
     }
     let not_spent: [(&str, HeaderMap); 2] = [
         ("requests left", headers(&[("ratelimit", r#""hourly";r=4;t=90"#), ("x-ratelimit-remaining", "4")])),
         ("nothing said", HeaderMap::new()),
     ];
     for (name, header) in not_spent {
-        assert!(!exhausted_for(&header, now).1, "{name} read as spent");
+        assert!(exhausted_for(&header, now).is_none(), "{name} read as spent");
     }
 
     let next = Arc::new(CountingDoer::new(answering(

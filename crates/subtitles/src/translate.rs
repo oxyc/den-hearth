@@ -667,7 +667,7 @@ fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap
     // well inside the window it had just asked for. Failing to read either falls back to our own
     // schedule, which is the safe direction. A provider naming an hour is naming a wait longer than
     // the whole run is allowed; the deadline check turns that into a clean failure, not a long doze.
-    Some(ratelimit::retry_after(headers, std::time::SystemTime::now()).unwrap_or(Duration::ZERO))
+    Some(den_upstream::retry_after(headers, std::time::SystemTime::now()).unwrap_or(Duration::ZERO))
 }
 
 /// Record what a call's outcome says about the key's shared pause. Any answer ends it — a reply the

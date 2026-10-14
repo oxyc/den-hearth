@@ -34,6 +34,7 @@ mod playwarm;
 mod probe;
 mod probe_containers;
 mod probe_fanout;
+mod probe_golden;
 mod probe_mp4;
 mod queued;
 mod rank;

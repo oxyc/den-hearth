@@ -1,0 +1,64 @@
+scout/hevc10.mp4 @1048576: {"container":"mp4","videoCodec":"hevc","audioChannels":"1.0","bitDepth":10,"videoProfile":2,"videoLevel":30,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/hevc10.mp4 @4096: err: no track information in the file head
+scout/hevc10.mp4 @1000: err: no track information in the file head
+scout/hi10p.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":10,"videoProfile":110,"videoLevel":10,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["ja"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/hi10p.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":10,"videoProfile":110,"videoLevel":10,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["ja"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/hi10p.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":10,"videoProfile":110,"videoLevel":10,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["ja"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/moov-at-end.mp4 @1048576: {"container":"mp4","videoCodec":"h264","audioChannels":"1.0","videoProfile":244,"videoLevel":10,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["fr"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/moov-at-end.mp4 @4096: err: no track information in the file head
+scout/moov-at-end.mp4 @1000: err: no track information in the file head
+scout/multi-audio.mp4 @1048576: {"container":"mp4","videoCodec":"h264","audioChannels":"5.1","videoProfile":244,"videoLevel":10,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["sv","it"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/multi-audio.mp4 @4096: {"container":"mp4","videoCodec":"h264","audioChannels":"5.1","videoProfile":244,"videoLevel":10,"width":64,"height":64,"frameRate":5.0,"audioLanguages":["sv","it"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/multi-audio.mp4 @1000: err: no track information in the file head
+scout/sample.mp4 @1048576: {"container":"mp4","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":66,"videoLevel":12,"width":320,"height":240,"frameRate":15.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+scout/sample.mp4 @4096: err: no track information in the file head
+scout/sample.mp4 @1000: err: no track information in the file head
+scout/tracks.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":40,"width":1920,"height":1080,"frameRate":25.0,"audioLanguages":["it"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/tracks.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":40,"width":1920,"height":1080,"frameRate":25.0,"audioLanguages":["it"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/tracks.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":40,"width":1920,"height":1080,"frameRate":25.0,"audioLanguages":["it"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/xvid.avi @1048576: {"container":"avi","videoCodec":"mpeg4","audioChannels":"2.0","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+scout/xvid.avi @4096: {"container":"avi","videoCodec":"mpeg4","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+scout/xvid.avi @1000: {"container":"avi","videoCodec":"mpeg4","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/av1.mkv @1048576: {"container":"matroska","videoCodec":"av1","audioChannels":"2.0","hdrFormat":"HDR10","bitDepth":10,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/av1.mkv @4096: {"container":"matroska","videoCodec":"av1","audioChannels":"2.0","hdrFormat":"HDR10","bitDepth":10,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/av1.mkv @1000: {"container":"matroska","videoCodec":"av1","audioChannels":"2.0","hdrFormat":"HDR10","bitDepth":10,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/av1.mp4 @1048576: {"container":"mp4","videoCodec":"av1","hdrFormat":"HDR10","bitDepth":10,"width":320,"height":180,"frameRate":24.001,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/av1.mp4 @4096: err: no track information in the file head
+remux/av1.mp4 @1000: err: no track information in the file head
+remux/gpu-probe.mkv @1048576: err: no track information in the file head
+remux/gpu-probe.mkv @4096: err: no track information in the file head
+remux/gpu-probe.mkv @1000: err: no track information in the file head
+remux/h264.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/h264.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/h264.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/h264.mp4 @1048576: {"container":"mp4","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["fr"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/h264.mp4 @4096: err: no track information in the file head
+remux/h264.mp4 @1000: err: no track information in the file head
+remux/hdr10.mkv @1048576: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":10,"videoProfile":2,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/hdr10.mkv @4096: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":10,"videoProfile":2,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/hdr10.mkv @1000: err: no track information in the file head
+remux/hevc.mkv @1048576: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/hevc.mkv @4096: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/hevc.mkv @1000: err: no track information in the file head
+remux/moov-at-end.mp4 @1048576: {"container":"mp4","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":160,"height":90,"frameRate":24.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/moov-at-end.mp4 @4096: err: no track information in the file head
+remux/moov-at-end.mp4 @1000: err: no track information in the file head
+remux/open-gop.mkv @1048576: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/open-gop.mkv @4096: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/open-gop.mkv @1000: err: no track information in the file head
+remux/open-gop.mp4 @1048576: {"container":"mp4","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.002,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/open-gop.mp4 @4096: err: no track information in the file head
+remux/open-gop.mp4 @1000: err: no track information in the file head
+remux/segments-a.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":64,"height":36,"frameRate":2.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/segments-a.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":64,"height":36,"frameRate":2.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/segments-a.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":64,"height":36,"frameRate":2.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/segments-b.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":64,"height":36,"frameRate":2.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/segments-b.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":64,"height":36,"frameRate":2.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/segments-b.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"1.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":64,"height":36,"frameRate":2.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/subs.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":["en","fi","sv"],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/subs.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":["en","fi","sv"],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/subs.mkv @1000: err: no track information in the file head
+remux/surround.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"7.1","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/surround.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"7.1","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/surround.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"7.1","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+codec records: 90f5e2434b1db5a3

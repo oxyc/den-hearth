@@ -1,0 +1,21 @@
+[package]
+name = "den-upstream"
+version = "0.0.0"
+edition = "2021"
+description = "Outbound HTTP and upstream backoff every addon shares: named client profiles, the address guard, Retry-After and rate-limit headers, and the per-credential pause"
+publish = false
+license = "MIT"
+
+[dependencies]
+# The shared public-address classifier the guard judges every address with.
+den-net = { path = "../net" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# `lookup_host`, for the guard's name checks and the dial-time resolver.
+tokio = { version = "1", features = ["net"] }
+# Retry-After's HTTP-date form; hyper already builds the same dates for the Date header.
+httpdate = "1"
+# The jitter on an unstated pause.
+fastrand = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "test-util"] }

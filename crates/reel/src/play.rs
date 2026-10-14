@@ -700,7 +700,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
             // Also systemic, but not the extractor's fault: a throttle pauses every new extraction
             // instead of moving the counter whose advice is to bump yt-dlp.
             if e.reason == "throttled" {
-                state.youtube.trip((state.clock)(), None, "YouTube is throttling extractions");
+                state.youtube.trip((state.clock)(), "YouTube is throttling extractions");
             }
             // A local failure is not the extractor's fault, but it is still a total outage from the
             // viewer's side, and it used to move nothing at all.

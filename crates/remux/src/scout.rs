@@ -7,6 +7,7 @@
 //! report passed on in `X-Den-Playable`, and the first release that is cached on the debrid, probes cleanly and
 //! plays in the browser as it is wins; one it can only have converted is the last resort.
 
+use den_upstream::{AddressGuard, GuardError};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -179,14 +180,12 @@ impl ScoutSource {
 /// debrid's link that ffmpeg then reads included, must be on the public internet. Without this a scout, or an
 /// indexer behind it, that answers a play URL with `Location: http://169.254.169.254/…` has this service fetch it.
 #[derive(Clone, Copy, Debug)]
-pub struct SourceGuard {
-    allow_private: bool,
-}
+pub struct SourceGuard(AddressGuard);
 
 impl SourceGuard {
     /// Refuses every non-public host off scout's origin.
     pub const fn strict() -> SourceGuard {
-        SourceGuard { allow_private: false }
+        SourceGuard(AddressGuard::strict())
     }
 
     /// What the running service uses. Only this crate's own tests are exempt (their sources are 127.0.0.1
@@ -198,32 +197,18 @@ impl SourceGuard {
 
     #[cfg(test)]
     pub const fn for_build() -> SourceGuard {
-        SourceGuard { allow_private: true }
+        SourceGuard(AddressGuard::permissive())
     }
 
     /// `Ok` when `url` may be fetched: an IP literal must be public, a name must resolve and every address it
     /// resolves to must be public.
     async fn check(&self, url: &reqwest::Url) -> Result<(), String> {
-        const REFUSED: &str = "the play URL led to a host that is not on the public internet";
-        if self.allow_private {
-            return Ok(());
-        }
-        let host = url.host_str().unwrap_or_default().trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            return if den_net::is_public(ip) { Ok(()) } else { Err(REFUSED.into()) };
-        }
-        if host.is_empty() {
-            return Err(REFUSED.into());
-        }
-        let port = url.port_or_known_default().unwrap_or(443);
-        let addrs: Vec<_> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| "the play URL's host did not resolve".to_string())?
-            .collect();
-        if addrs.is_empty() || addrs.iter().any(|a| !den_net::is_public(a.ip())) {
-            return Err(REFUSED.into());
-        }
-        Ok(())
+        self.0.check(url).await.map_err(|refused| match refused {
+            GuardError::Unresolved(_) => "the play URL's host did not resolve".to_string(),
+            GuardError::NotPublic | GuardError::Nothing => {
+                "the play URL led to a host that is not on the public internet".to_string()
+            }
+        })
     }
 }
 

@@ -458,6 +458,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "den-media"
+version = "0.0.0"
+
+[[package]]
 name = "den-net"
 version = "0.0.0"
 dependencies = [
@@ -474,6 +478,7 @@ dependencies = [
  "bytes",
  "den-http",
  "den-seal",
+ "den-upstream",
  "divan",
  "futures-util",
  "http-body-util",
@@ -496,7 +501,8 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "den-http",
- "den-net",
+ "den-media",
+ "den-upstream",
  "divan",
  "dolby_vision",
  "futures-util",
@@ -525,16 +531,16 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "den-http",
+ "den-media",
  "den-net",
  "den-seal",
+ "den-upstream",
  "divan",
  "fancy-regex",
- "fastrand",
  "futures-util",
  "hkdf",
  "http",
  "http-body-util",
- "httpdate",
  "quick_cache",
  "regex",
  "reqwest",
@@ -569,6 +575,7 @@ dependencies = [
  "den-http",
  "den-net",
  "den-seal",
+ "den-upstream",
  "divan",
  "encoding_rs",
  "futures-util",
@@ -581,6 +588,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "den-upstream"
+version = "0.0.0"
+dependencies = [
+ "den-net",
+ "fastrand",
+ "httpdate",
+ "reqwest",
+ "tokio",
 ]
 
 [[package]]

@@ -4,14 +4,16 @@
 //! file holds them for `shape_test.go`.
 
 use crate::attributes::{detect_audio_codec, stream_attributes};
-use crate::probe::{
-    avc_bit_depth, bit_depth_from_config, hevc_bit_depth, parse_matroska_tracks, Probe,
-    ID_BLOCK_ADDITION_MAPPING, ID_BLOCK_ADD_ID_EXTRA_DATA, ID_BLOCK_ADD_ID_TYPE, ID_CODEC_ID,
-    ID_CODEC_PRIVATE, ID_LANGUAGE, ID_SEGMENT, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_TYPE, TRACK_TYPE_AUDIO,
-    TRACK_TYPE_VIDEO,
-};
+use crate::probe::{bit_depth_from_config, parse_matroska_tracks, Probe, TRACK_TYPE_AUDIO, TRACK_TYPE_VIDEO};
 use crate::probe_mp4::parse_mp4;
 use crate::rank::RawStream;
+use den_media::codec::{avc_bit_depth, hevc_bit_depth};
+use den_media::mkv::{
+    BLOCK_ADDITION_MAPPING as ID_BLOCK_ADDITION_MAPPING,
+    BLOCK_ADD_ID_EXTRA_DATA as ID_BLOCK_ADD_ID_EXTRA_DATA, BLOCK_ADD_ID_TYPE as ID_BLOCK_ADD_ID_TYPE,
+    CODEC_ID as ID_CODEC_ID, CODEC_PRIVATE as ID_CODEC_PRIVATE, LANGUAGE as ID_LANGUAGE,
+    SEGMENT as ID_SEGMENT, TRACKS as ID_TRACKS, TRACK_ENTRY as ID_TRACK_ENTRY, TRACK_TYPE as ID_TRACK_TYPE,
+};
 
 use super::probe_containers::testdata;
 use super::probe_mp4::{mp4_file, mp4box, trak, video_entry};
@@ -351,7 +353,7 @@ pub(crate) fn ebml(id: u32, body: &[Vec<u8>]) -> Vec<u8> {
 // reports no tracks). `mapping` is the video's BlockAdditionMapping, or None.
 fn mkv_with_video(private: &[u8], mapping: Option<Vec<u8>>) -> Vec<u8> {
     let mut video = vec![
-        ebml(ID_TRACK_TYPE as u32, &[vec![TRACK_TYPE_VIDEO]]),
+        ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_VIDEO]]),
         ebml(ID_CODEC_ID, &[b"V_MPEGH/ISO/HEVC".to_vec()]),
         ebml(ID_CODEC_PRIVATE, &[private.to_vec()]),
     ];
@@ -360,7 +362,7 @@ fn mkv_with_video(private: &[u8], mapping: Option<Vec<u8>>) -> Vec<u8> {
     }
     let audio = ebml(
         ID_TRACK_ENTRY,
-        &[ebml(ID_TRACK_TYPE as u32, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[b"eng".to_vec()])],
+        &[ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[b"eng".to_vec()])],
     );
     ebml(ID_SEGMENT, &[ebml(ID_TRACKS, &[ebml(ID_TRACK_ENTRY, &video), audio])])
 }

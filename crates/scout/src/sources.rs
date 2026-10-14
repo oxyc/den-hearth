@@ -12,13 +12,14 @@
 //! address a connection is about to reach must be public. A hostname that resolves to the LAN, loopback or
 //! the tailnet is refused however it got there — by DNS, a rebinding answer or a redirect.
 
-use std::error::Error;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, LazyLock};
+use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use den_upstream::guard::{bare_host as host_str, is_refusal, literal_refused};
+use den_upstream::{ClientProfile, Guard, Redirect};
 
 use crate::hostlimit::{new_bounded_host_limiter, HostLimiter};
 use crate::scrape::{DoError, Doer};
@@ -32,7 +33,7 @@ pub(crate) const MAX_SOURCES: usize = 3;
 /// Go `maxSourceURL`: the longest source URL kept.
 pub(crate) const MAX_SOURCE_URL: usize = 2048;
 /// Go `errNotPublic`: the refusal a source connection gets for a non-public address. A reason constant.
-pub(crate) const ERR_NOT_PUBLIC: &str = "household source: refusing a non-public address";
+pub(crate) use den_upstream::NOT_PUBLIC as ERR_NOT_PUBLIC;
 
 /// Go `normalizeSources` keeps the sources a config may name, as base URLs, in order, without repeats.
 pub(crate) fn normalize_sources(raw: &[String]) -> Vec<String> {
@@ -111,11 +112,6 @@ pub(crate) fn source_host(base: &str) -> String {
 pub(crate) static SOURCE_LIMITER: LazyLock<HostLimiter> =
     LazyLock::new(|| new_bounded_host_limiter(Duration::from_secs(1), 30, 4096));
 
-/// The host of a URL without the brackets an IPv6 literal carries (Go's `url.URL.Hostname`).
-fn host_str(u: &url::Url) -> Option<&str> {
-    u.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']'))
-}
-
 /// Go `publicAddr`: whether an address is one a source may be fetched from. The classifier is shared with
 /// Subtitles and Remux (`den-net`), so every service refuses the same ranges.
 pub(crate) use den_net::is_public as public_addr;
@@ -128,7 +124,7 @@ pub(crate) use den_net::is_public as public_addr;
 /// about to be made. reqwest has no such hook, so the same guarantee is built from three pieces that together
 /// cover every way a connection gets its address:
 ///
-///  - a host NAME is resolved by [`PublicOnly`], which drops every non-public answer before anything connects
+///  - a host NAME is resolved by `den_upstream::PublicOnly`, which drops every non-public answer before anything connects
 ///    (and connects to exactly the addresses it returned, so a rebinding answer cannot be swapped in later);
 ///  - a host that is an IP LITERAL never reaches a resolver, so [`SourceClient::do_request`] judges it before the
 ///    first request goes out;
@@ -139,18 +135,20 @@ pub(crate) struct SourceClient {
     client: reqwest::Client,
 }
 
+/// The household sources' profile: thirty seconds in all and ten to connect, a small pool, the redirect verdict
+/// below, and the dial-time public-address guard (which is also what keeps the proxy out).
+pub(crate) fn source_profile() -> ClientProfile {
+    ClientProfile::new()
+        .total(Duration::from_secs(30))
+        .connect(Duration::from_secs(10))
+        .pool(4, Duration::from_secs(90))
+        .redirect(Redirect::Custom(follow_source_redirect))
+        .guard(Guard::PublicDial)
+}
+
 pub(crate) fn new_source_client() -> SourceClient {
     // An error here can only come from the static configuration above, never from the network.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .no_proxy()
-        .dns_resolver(Arc::new(PublicOnly))
-        .redirect(reqwest::redirect::Policy::custom(follow_source_redirect))
-        .build()
-        .expect("the household source client's static configuration builds");
+    let client = source_profile().build().expect("the household source client's static configuration builds");
     SourceClient { client }
 }
 
@@ -174,24 +172,6 @@ impl Doer for SourceClient {
 /// Go `errNotPublic`, as the error a refused connection returns.
 fn refused() -> DoError {
     Box::new(io::Error::other(ERR_NOT_PUBLIC))
-}
-
-/// Whether the guard is what stopped a request, anywhere along its error chain (the resolver's refusal and a
-/// refused redirect both surface as the source of a reqwest error).
-fn is_refusal(e: &reqwest::Error) -> bool {
-    let mut cause: Option<&(dyn Error + 'static)> = Some(e);
-    while let Some(c) = cause {
-        if c.to_string() == ERR_NOT_PUBLIC {
-            return true;
-        }
-        cause = c.source();
-    }
-    false
-}
-
-/// Whether a URL names a non-public address directly. A name is not judged here: that is the resolver's job.
-fn literal_refused(u: &url::Url) -> bool {
-    host_str(u).and_then(|h| h.parse::<IpAddr>().ok()).is_some_and(|ip| !public_addr(ip))
 }
 
 /// What the source client does with a redirect.
@@ -223,26 +203,5 @@ fn follow_source_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redir
         RedirectVerdict::Follow => attempt.follow(),
         RedirectVerdict::Stop => attempt.stop(),
         RedirectVerdict::Refuse => attempt.error(io::Error::other(ERR_NOT_PUBLIC)),
-    }
-}
-
-/// Go `refusePrivateDial`, run on the name lookup rather than the connect: the names a source resolves to
-/// are filtered down to the public ones before any connection is made, so no answer to the lookup can reach
-/// a private address. A host that is only an IP literal never reaches this resolver; those are refused where
-/// they are named and where they are redirected to.
-struct PublicOnly;
-
-impl reqwest::dns::Resolve for PublicOnly {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        Box::pin(async move {
-            let found = tokio::net::lookup_host((name.as_str(), 0)).await?;
-            let public: Vec<SocketAddr> = found.filter(|a| public_addr(a.ip())).collect();
-            if public.is_empty() {
-                let refused: Box<dyn Error + Send + Sync> = Box::new(io::Error::other(ERR_NOT_PUBLIC));
-                return Err(refused);
-            }
-            let addrs: reqwest::dns::Addrs = Box::new(public.into_iter());
-            Ok(addrs)
-        })
     }
 }

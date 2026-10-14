@@ -18,7 +18,9 @@ use http_body_util::{BodyExt, Limited};
 use hyper::{Request, Response, StatusCode};
 
 use den_scout::cache::Cache;
-use den_scout::deps::{build_deps_shared, shared_http, startup_summary, GuardedClient, Settings};
+use den_scout::deps::{
+    build_deps_shared, shared_http, shared_profile, startup_summary, GuardedClient, Settings,
+};
 use den_scout::diskcache::{TieredCache, SWEEP_INTERVAL};
 use den_scout::handler::{new_handler, Handler};
 use den_scout::scrape::Doer;
@@ -46,13 +48,7 @@ pub struct Scout {
 /// which upstreams asked to be left alone. A redirect is refused where it would replay a body or hand a credential
 /// to another host (see `GuardedClient`).
 fn client() -> Arc<dyn Doer> {
-    let guarded = GuardedClient::new(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(32)
-            .pool_idle_timeout(Duration::from_secs(90))
-    })
-    .expect("scout http client");
+    let guarded = GuardedClient::from_profile(&shared_profile()).expect("scout http client");
     shared_http(guarded)
 }
 
