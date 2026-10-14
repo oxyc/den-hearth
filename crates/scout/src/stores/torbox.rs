@@ -172,6 +172,10 @@ static OUTBOUND: Semaphore = Semaphore::const_new(MAX_TORBOX_OUTBOUND);
 /// Go `torboxStatusSlots`.
 static STATUS_SLOT_POOL: Semaphore = Semaphore::const_new(STATUS_SLOTS);
 /// Go `torboxCheckFlights`, `torboxStatusFlights`, `listingFlight`.
+///
+/// listingFlight collapses concurrent fetches of one account's listing into a single round trip. The cache
+/// alone only helps SEQUENTIAL callers, and the case this exists for — a poster grid probing eight releases at
+/// once — is anything but sequential.
 static CHECK_FLIGHTS: DetachedFlight<TorboxCheckResult> = DetachedFlight::new("torbox check-cached round");
 static STATUS_FLIGHTS: DetachedFlight<CachedStatus> = DetachedFlight::new("torbox status read");
 static LISTING_FLIGHTS: DetachedFlight<Option<Arc<HashMap<String, i64>>>> =
@@ -519,8 +523,33 @@ impl TorBoxStore {
         let cache = self.cache();
         // An add we already sent and never heard back about must not be sent again — see addAttemptKey.
         add_in_flight(cache, DebridService::TorBox, &identity, info_hash)?;
-        // Go refuses to CHARGE an add the caller's deadline can no longer carry (`addWouldMissTheClock`). Here a
-        // spent deadline drops this future, so there is no spent clock to find.
+        // Go's `addWouldMissTheClock` refuses to CHARGE an add the caller's deadline can no longer carry. Here a
+        // spent deadline drops this future, so there is no spent clock to find; its comment is kept for whoever
+        // adds a deadline seam:
+        //
+        // The charge and the in-flight marker are both written before the request is built, and a dead context
+        // fails at client.Do, which returns without refunding — deliberately, since a request that may have
+        // reached the wire must not be re-sent. So an add attempted on a spent clock costs one of the fifty per
+        // hour, sends nothing at all, and leaves a 90-second marker that has the next poll report a download
+        // nobody queued. Measured on an expired context: zero upstream requests, one add spent per service.
+        //
+        // It guards the CHARGE rather than the store, and that distinction is the whole point. An earlier
+        // version skipped the whole store from ResolvePreferring when the clock was gone, which also discarded
+        // the free cache reads ahead of the charge — addInFlight and the two backoff gates — and so turned a
+        // 202 "downloading" into a 503 naming the viewer's debrid as refusing, for a release scout had queued
+        // moments earlier. Placed here, the free answers still surface and only the pointless purchase stops.
+        // Wrapped in errScoutSide, and that wrap is load-bearing rather than cosmetic. recordRefusal excludes
+        // errScoutSide by name, and without it this error was filed as a REFUSAL BY THE STORE: it wraps neither
+        // a cancellation nor errScoutSide, and it returns before noteAddAttempt, so both of recordRefusal's
+        // guards missed it and TorBox's add-error handler wrote a one-minute refusedKey naming TorBox for a
+        // release TorBox had never been asked about. One spent clock then made a healthy release answer 503 on
+        // /play AND on ?probe=1 for the next sixty seconds, on a fresh clock, with the store skipped as
+        // "backing off". Measured: control 302, treatment 503 twice over.
+        //
+        // That is the laundering this file warns about twice — at recordRefusal itself and at the RD site that
+        // once built a StoreUnavailableError here and hid the cause from isCancellation. It came back because
+        // the guard was placed one line ABOVE noteAddAttempt, and it was the marker that used to route this
+        // error away from recordRefusal.
         spend_add(DebridService::TorBox, &identity, info_hash, prefetch)?;
         let magnet = magnet_for(info_hash);
         let mut form = vec![("magnet", magnet.as_str()), ("seed", "3"), ("allow_zip", "false")];
@@ -1196,7 +1225,27 @@ impl TorBoxStore {
         // concurrent request against the same API+token account in the window between the two reads.
         //
         // A panic in the fetch is abandoned rather than fatal, and every waiter is answered "could not find
-        // out" (Go's `recoverBackground`).
+        // out" (Go's `recoverBackground`). Go's own words for it: this closure is a BACKGROUND goroutine now, and
+        // DoChan makes a panic in it fatal to the process: singleflight re-raises it with `go panic(e)` on a
+        // fresh goroutine whenever anyone is waiting on a channel, where nothing can recover it. Under the
+        // blocking Do it unwound into the caller's stack and the handler's own recover turned it into a 500.
+        // Moving to DoChan quietly converted a recoverable panic into a dead container, which is the rule
+        // probe_fanout.go's recoverBackground was written for; abandoning the fetch is already a first-class
+        // outcome here, so a panic joins it.
+        //
+        // Go builds the fetch's context INSIDE the closure, so its cancel is tied to the lifetime of the fetch
+        // rather than to the leader's own call: constructing it outside and deferring the cancel there undid the
+        // detachment completely, since the deferred cancel fires when the leader's caller returns, which on the
+        // abandonment path is exactly when the fetch still needs to be running for everyone else — measured as
+        // the joiner inheriting "context canceled", the very failure this is here to prevent. Go's fetch also
+        // keeps the LEADER'S DEADLINE (`context.WithDeadline`); the port has no context to read one from, so
+        // the fetch runs on the same fifteen seconds as the other shared reads.
+        //
+        // Go also looks once more at the flight's answer when the caller's own budget runs out in the same
+        // instant the answer lands, because select picks at random when both are ready and the answer is a fact
+        // about the account that does not go stale because the asker ran out of clock. Measured 50.1% lost over
+        // 20,000 trials, and recovered only for the case ready at the moment the select is evaluated. Here the
+        // caller's budget is a timeout around this whole call, which polls the answer before the clock.
         let store = self.clone();
         let memo_key = key.clone();
         let (answer, _) = LISTING_FLIGHTS
@@ -1816,7 +1865,14 @@ struct ListingMemoEntry {
 /// endpoint and token together identify the account, and the answer does not depend on who asked — and it is
 /// only the memo that is cache-scoped, so it is worth saying rather than implying otherwise.
 ///
-/// (Go checks that a `Cache` can be a map key at all, `memoisable`. An `Arc`'s address always can.)
+/// Go's `memoisable` reports whether a Cache can be a map key at all. Comparable() is a STATIC property of the
+/// type and is not sufficient on its own: a struct holding an interface field is comparable as a type and panics
+/// as a value when that field holds a slice or a map. Since the whole point is to avoid a panic in a request
+/// handler, such a value is actually tried. A POINTER never needs that. It hashes by address whatever it points
+/// at, so it cannot panic, and every Cache in this repo is one — the probe therefore costs nothing on any real
+/// path (measured: 1.3 ns for a pointer against 27.6 ns for the probe, next to 25.8 ns for the whole memo
+/// lookup it guards). An `Arc`'s address always can be a key, so the port has no such check and no memo-less
+/// cache.
 fn memo_key(cache: &Arc<dyn Cache>, key: &str) -> (usize, String) {
     (Arc::as_ptr(cache) as *const () as usize, key.to_owned())
 }
