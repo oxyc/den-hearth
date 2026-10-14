@@ -2555,6 +2555,18 @@ pub(crate) fn over(max_bitrate: Option<u64>, need: Option<Need>) -> bool {
     max_bitrate.zip(need).is_some_and(|(max, need)| need.bitrate > max)
 }
 
+/// How many times the player's link a source may need and still be converted from. A conversion shrinks what the
+/// player downloads, not what the box reads: the whole source comes in at its own rate, in real time, from a debrid
+/// that delivers a fraction of a gigabit (about 13 Mbit/s measured on an uncached TorBox). A 4x margin keeps the
+/// heaviest UHD Blu-ray remuxes (about 120 Mbit/s) convertible for a 30 Mbit/s link, and turns away a 220 Mbit/s WEB-DL.
+const TRANSCODE_SOURCE_MARGIN: u64 = 4;
+
+/// Whether a source needing `bitrate` is worth converting for a player with `max_bitrate` of link. Any source is where
+/// no link is named.
+fn source_within_reach(bitrate: u64, max_bitrate: Option<u64>) -> bool {
+    max_bitrate.is_none_or(|link| bitrate <= link.saturating_mul(TRANSCODE_SOURCE_MARGIN))
+}
+
 /// What this session's picking may treat as the player's link: its own measurement (`own`), narrowed by what
 /// is left of the box's configured upload (`uplink_bps`, `UPLINK_MBPS`) once `other_bps` — every other
 /// currently open remote session's own `need` — is taken out. A release that still doesn't fit in what's left
@@ -3194,9 +3206,13 @@ pub async fn create(
         };
         let convert = fallback.or_else(|| {
             let hevc = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-                t.1 .1.video == VideoCodec::Hevc && bitrate(t).is_some_and(|b| b > preset.bitrate)
+                t.1 .1.video == VideoCodec::Hevc
+                    && bitrate(t).is_some_and(|b| b > preset.bitrate && source_within_reach(b, max_bitrate))
             };
-            let i = too_big.iter().position(hevc)?;
+            // The cheapest to read, not the first ranked: a conversion reads the whole source in real time.
+            let i = (0..too_big.len())
+                .filter(|&i| hevc(&too_big[i]))
+                .min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX))?;
             Some(too_big.remove(i))
         });
         if let Some((c, found)) = convert {
