@@ -62,11 +62,11 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 pub use crate::config::Config;
-pub use crate::job::kill_live_groups;
 pub use crate::httputil::Body;
+pub use crate::job::kill_live_groups;
 use crate::session::SubFile;
-pub use crate::state::AppState;
 use crate::state::unix_now;
+pub use crate::state::AppState;
 
 /// The release the runtime image carries (`DEN_VERSION`, from the repository's `VERSION`). Keeping it out of
 /// Cargo.toml means a release does not invalidate the cached dependency and compile layers merely to change its

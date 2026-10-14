@@ -320,6 +320,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "den-hearth"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "den-reel",
+ "den-remux",
+ "den-subtitles",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "den-reel"
 version = "0.56.0"
 dependencies = [

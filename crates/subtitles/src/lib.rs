@@ -46,7 +46,7 @@ pub use crate::state::AppState;
 /// The release the image carries (`DEN_VERSION`, set from the repo's `VERSION` file at build time). Keeping it
 /// out of Cargo.toml means a release does not invalidate the cached dependency build merely to change its tag.
 /// Developer builds and tests have no image metadata, so they fall back to the package version.
-pub(crate) fn release_version() -> &'static str {
+pub fn release_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION
         .get_or_init(|| {

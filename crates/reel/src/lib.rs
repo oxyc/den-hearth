@@ -52,16 +52,16 @@ use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
 pub use crate::config::Config;
+use crate::httputil::query_param;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
-use crate::httputil::query_param;
 use std::sync::{Arc, OnceLock};
 
 /// The release the image carries, from `DEN_VERSION` (set by the Dockerfile from the repo's `VERSION` file).
 /// Keeping it out of Cargo.toml means a release does not change the manifest the dependency layer is keyed on,
 /// so a version bump recompiles nothing. A developer build or a test has no image metadata and falls back to
 /// the package version.
-pub(crate) fn release_version() -> &'static str {
+pub fn release_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION
         .get_or_init(|| {
