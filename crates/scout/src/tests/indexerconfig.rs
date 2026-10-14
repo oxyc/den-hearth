@@ -252,19 +252,14 @@ async fn unaskable_scraper_transient_still_counts_in_the_quorum() {
 
 // Off unless the operator says otherwise: this decides whether the debrid token leaves the homelab.
 #[test]
-#[ignore = "needs settings_from_env (deps.rs, package 4) to read MINT_INDEXER_CONFIGS"]
 fn minting_is_opt_in() {
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::settings_from_env;
-        assert!(
-            !settings_from_env(|_| String::new()).mint_indexer_configs,
-            "minting must default to off — it sends the debrid token to a third party"
-        );
-        let on = settings_from_env(|k| if k == "MINT_INDEXER_CONFIGS" { "true".into() } else { String::new() });
-        assert!(on.mint_indexer_configs, "MINT_INDEXER_CONFIGS=true should enable it");
-    }
-    todo!("pending: indexerconfig_test.go TestMintingIsOptIn")
+    use crate::deps::settings_from_env;
+    assert!(
+        !settings_from_env(|_| String::new()).mint_indexer_configs,
+        "minting must default to off — it sends the debrid token to a third party"
+    );
+    let on = settings_from_env(|k| if k == "MINT_INDEXER_CONFIGS" { "true".into() } else { String::new() });
+    assert!(on.mint_indexer_configs, "MINT_INDEXER_CONFIGS=true should enable it");
 }
 
 // Expired mint entries are reclaimed on write.

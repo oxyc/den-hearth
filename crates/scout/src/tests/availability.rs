@@ -21,7 +21,7 @@ use crate::tests::handler::{
 use crate::util::b64url_encode;
 
 /// Go `availabilityOf`: asks the availability route for one id and returns its verdict.
-async fn availability_of(h: &crate::handler::Handler, config: &str, id: &str) -> String {
+pub(crate) async fn availability_of(h: &crate::handler::Handler, config: &str, id: &str) -> String {
     let r = post_json(h, &format!("/{config}/availability"), &format!(r#"{{"ids":["{id}"]}}"#)).await;
     assert_eq!(r.status(), 200, "availability: {} {}", r.status(), body_str(&r));
     let body: serde_json::Value = serde_json::from_slice(r.body()).expect("availability is JSON");

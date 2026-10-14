@@ -112,46 +112,74 @@ fn public_addr() {
 
 // The guard sits on the connection, not on the name: a host that resolves to the box's own network is
 // refused at dial time, whatever the config said.
-#[test]
-#[ignore = "needs a TLS test server (httptest.NewTLSServer) and the stremioScraper/Doer seam"]
-fn source_client_refuses_a_non_public_address() {
-    #[cfg(any())]
-    async fn pending() {
-        use crate::scrape::StremioScraper;
-        use crate::sources::{new_source_client, ERR_NOT_PUBLIC};
+//
+// Go stands a TLS server up on the loopback and fails the test if it is reached. No TLS server is available to
+// this crate's tests, so a plain loopback listener plays it: the source client must refuse the address without ever
+// connecting, which the listener never accepting proves.
+#[tokio::test]
+async fn source_client_refuses_a_non_public_address() {
+    use crate::scrape::{Doer, Scraper};
+    use crate::sources::{new_source_client, ERR_NOT_PUBLIC};
 
-        // Go: srv := httptest.NewTLSServer(...) — a source on a loopback address must never be reached.
-        let url = "https://127.0.0.1:1/manifest.json";
-        let err = new_source_client().get(url).send().await.expect_err("refused");
-        assert!(err.to_string().contains(ERR_NOT_PUBLIC), "err = {err}, want the non-public refusal");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+    let url = format!("https://{}", listener.local_addr().expect("a local address"));
+    let err = new_source_client().do_request(get(&format!("{url}/manifest.json"))).await.expect_err("the non-public refusal");
+    assert!(err.to_string().contains(ERR_NOT_PUBLIC), "err = {err}, want the non-public refusal");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await.is_err(),
+        "a source on a loopback address was reached"
+    );
 
-        // And a scraper asking it reports the refusal once, without spending the budget on retries.
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        let sc = StremioScraper::for_test(url, &calls);
-        assert!(sc.scrape(&crate::scrape::ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() }).await.is_err()
-            && calls.load(std::sync::atomic::Ordering::SeqCst) == 1, "want one refused request");
-    }
-    todo!("pending: sources_test.go TestSourceClient_refusesANonPublicAddress")
+    // And a scraper asking it reports the refusal once, without spending the budget on retries.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    let client: std::sync::Arc<dyn Doer> = std::sync::Arc::new(super::mock::MockDoer(move |_r: reqwest::Request| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ERR_NOT_PUBLIC.into())
+    }));
+    let sc = crate::scrape::SourceScraper::new(&url, client);
+    let q = crate::scrape::ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() };
+    let result = sc.scrape(&q).await;
+    let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(result.is_err() && n == 1, "err = {:?} after {n} request(s), want one refused request", result.as_ref().err());
 }
 
-#[test]
-#[ignore = "needs makeScrapers and Config.sources through the Doer seam (scrape.rs, package 5 port pending)"]
-fn make_scrapers_asks_household_sources_through_the_guarded_client() {
-    #[cfg(any())]
-    fn pending() {
-        use crate::config::{Config, Indexer};
-        use crate::scrape::make_scrapers;
+// Go reads the scraper's fields off a `*stremioScraper`; here the scraper is a trait object, so what is checked is
+// what it does: its id, the host that labels it, and which client it was asked through.
+#[tokio::test]
+async fn make_scrapers_asks_household_sources_through_the_guarded_client() {
+    use crate::config::{Config, Indexer};
+    use crate::scrape::{make_scrapers, Doer, SourceScraper};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
-        // Go: plain, guarded := mockDoer{}, mockDoer{fn: ...200 "{}"}
-        let cfg = Config { indexers: vec![Indexer::Torrentio], sources: vec!["https://mf.example/cfg".into()], ..Default::default() };
-        let got = make_scrapers(&cfg, &plain_doer(), &guarded_doer(), None);
-        assert_eq!(got.len(), 2, "scrapers = {}", got.len());
-        let own = &got[0];
-        assert!(own.id() == Indexer::OwnSources && own.base_url() == "https://mf.example/cfg", "household source scraper");
-        assert!(own.uses_guarded_client(), "a household source must be fetched with the guarded client");
-        assert_eq!(own.name(), "own source mf.example");
-    }
-    todo!("pending: sources_test.go TestMakeScrapers_asksHouseholdSourcesThroughTheGuardedClient")
+    let asked: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let doer = |which: &'static str| -> Arc<dyn Doer> {
+        let log = Arc::clone(&asked);
+        Arc::new(super::mock::MockDoer(move |r: reqwest::Request| {
+            log.lock().expect("lock").push((which, r.url().to_string()));
+            Ok(super::mock::resp(200, "{}"))
+        }))
+    };
+    let (plain, guarded) = (doer("plain"), doer("guarded"));
+    let cfg = Config { indexers: vec![Indexer("torrentio".into())], sources: vec!["https://mf.example/cfg".into()], ..Default::default() };
+    let got = make_scrapers(&cfg, plain, Arc::clone(&guarded), &HashMap::new());
+    assert_eq!(got.len(), 2, "scrapers = {}", got.len());
+    let q = crate::scrape::ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() };
+    assert!(
+        got[0].id() == Indexer("own".into()) && got[0].label() == "mf.example",
+        "household source scraper = {} {:?}",
+        got[0].id().0,
+        got[0].label()
+    );
+    got[0].scrape(&q).await.expect("an answer");
+    assert_eq!(
+        asked.lock().expect("lock").as_slice(),
+        [("guarded", "https://mf.example/cfg/stream/movie/tt1.json".to_owned())],
+        "a household source must be fetched with the guarded client"
+    );
+    let name = SourceScraper::new("https://mf.example/cfg", guarded).stremio.name("mf.example");
+    assert_eq!(name, "own source mf.example", "name = {name:?}");
 }
 
 // An addon configured with a debrid account links to its own resolver rather than naming the torrent; the

@@ -20,7 +20,7 @@ use crate::tests::mock::{resp, MockDoer};
 /// `reply`. `prime` runs against the cache before any request is made, so a test can mark a hash as
 /// scout's own add (or leave it unmarked, for the "not ours" case) and seed the torrent id the way Resolve
 /// or Status would have.
-fn cancel_torbox_handler(
+pub(crate) fn cancel_torbox_handler(
     reply: impl Fn(&reqwest::Request) -> reqwest::Response + Send + Sync + 'static,
     prime: Option<Box<dyn FnOnce(&dyn Cache)>>,
 ) -> (Handler, Arc<Mutex<Vec<String>>>) {

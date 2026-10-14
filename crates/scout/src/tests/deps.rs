@@ -110,16 +110,12 @@ fn settings_from_env() {
 }
 
 #[tokio::test]
-#[ignore = "needs scrape::make_scrapers, stores::build_stores and the unaskable scraper from packages 1, 2 and 5"]
 async fn build_deps() {
-    // Enable when packages 1, 2 and 5 land: move `pending` up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
     use std::sync::Arc;
 
     use crate::cache::MemoryCache;
     use crate::config::{Config, DebridAccount, DebridService, Filters};
-    use crate::scrape::ScrapeQuery;
+    use crate::scrape::{ScrapeQuery, UnaskableError};
 
     let settings = deps::settings_from_env(|_| String::new());
     let built = deps::build_deps(&settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
@@ -132,18 +128,32 @@ async fn build_deps() {
     // comet needs a per-install config URL and this environment supplies none, so it is never requested —
     // asked bare it can only 403. But it stays in the list as a source that CANNOT answer, rather than
     // disappearing from it: dropping it would take it out of the quorum too, and "an empty result is
-    // authoritative only when every indexer answered" would quietly become "…every indexer we still bother
-    // asking", which is how one 200-empty becomes a confident "this release does not exist".
+    // authoritative only when every indexer answered" would quietly become "…every indexer we still
+    // bother asking", which is how one 200-empty becomes a confident "this release does not exist".
     let sc = (built.make_scrapers)(&cfg);
-    assert!(sc.len() == 2 && sc[0].id() == indexer("torrentio") && sc[1].id() == indexer("comet"), "makeScrapers");
+    assert!(sc.len() == 2 && sc[0].id() == indexer("torrentio") && sc[1].id() == indexer("comet"), "makeScrapers: {} scrapers", sc.len());
+    let err = sc[1].scrape(&ScrapeQuery::default()).await.expect_err("an unaskable indexer must fail, so it counts as a source that did not answer");
+    // Go asserts `sc[1].(unaskableScraper)`; here the scraper's failure says what it is.
+    let Some(un) = err.downcast_ref::<UnaskableError>() else {
+        panic!("comet should be unaskable without a config URL, got {err}");
+    };
+    // NOT transient. The distinction decides whether the operator is told to configure something or
+    // told an upstream is down, and it is read one level up to decide whether an empty list is an
+    // outage. Inverting it on this, the shipped default, reported every genuinely empty title as an
+    // indexer outage: X-Den-Degraded on every response, no-store so negative caching never runs, and
+    // three in a row flipping /health to degraded on a service that is perfectly healthy.
+    //
+    // Only the CONSUMPTION of this flag was covered, never its production, so the inversion was green.
     assert!(
-        sc[1].scrape(&ScrapeQuery::default()).await.is_err(),
-        "an unaskable indexer must fail, so it counts as a source that did not answer"
+        !un.transient,
+        "an indexer with no config URL and no minting is a misconfiguration, not an outage — marking it transient \
+         suppresses the operator's log line and reports healthy empty lists as a degraded scrape"
     );
-    // The Go test then asserts `sc[1]` is `unaskableScraper` with `transient == false`. That type is
-    // package 5's (scrape.go:433) and is not in this crate yet, so that assertion waits for its port.
-    // NOT transient: the distinction decides whether the operator is told to configure something or told an
-    // upstream is down, and it is read one level up to decide whether an empty list is an outage.
-    }
-    todo!("pending: go deps_test.go:TestBuildDeps")
+    // Given the URL, it is asked.
+    let with_comet_settings = deps::settings_from_env(|k| if k == "COMET_URL" { "https://comet.example/CONFIG".to_owned() } else { String::new() });
+    let with_comet = deps::build_deps(&with_comet_settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
+    let sc = (with_comet.make_scrapers)(&cfg);
+    assert!(sc.len() == 2 && sc[1].id() == indexer("comet"), "makeScrapers with comet URL: {} scrapers", sc.len());
+    let st = (built.make_stores)(&cfg);
+    assert!(st.len() == 1 && st[0].service() == DebridService::TorBox, "makeStores: {} stores", st.len());
 }

@@ -462,7 +462,7 @@ fn limiter_host(base: &str) -> Option<String> {
 
 impl StremioScraper {
     /// Go `stremioScraper.name`: how the scraper reads in a log line. `label` names a household source's host.
-    fn name(&self, label: &str) -> String {
+    pub(crate) fn name(&self, label: &str) -> String {
         if label.is_empty() {
             self.indexer.0.clone()
         } else {
@@ -606,7 +606,7 @@ pub(crate) struct SourceScraper {
 }
 
 impl SourceScraper {
-    fn new(base: &str, client: Arc<dyn Doer>) -> SourceScraper {
+    pub(crate) fn new(base: &str, client: Arc<dyn Doer>) -> SourceScraper {
         SourceScraper {
             stremio: StremioScraper { indexer: Indexer(OWN_SOURCES.to_owned()), base_url: base.to_owned(), client },
             label: source_host(base),

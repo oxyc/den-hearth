@@ -1,10 +1,21 @@
 //! Go: `internal/scout/coverage_test.go` (219 lines). Work package 4.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::coverage::{AnswerEnvelope, ANSWER_EMPTY, ANSWER_LIVE, ANSWER_PARTIAL, ANSWER_UNKNOWN, OUTCOME_QUARANTINED};
+use crate::cache::{Cache, MemoryCache};
+use crate::config::Indexer;
+use crate::coverage::{
+    classify_scrape as classify, decide_answer_kind as decide_kind, AnswerEnvelope, ANSWER_EMPTY, ANSWER_LIVE, ANSWER_PARTIAL, ANSWER_UNKNOWN,
+    OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_QUARANTINED, OUTCOME_REFUSED, OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE,
+};
 use crate::handler::new_handler;
+use crate::indexerconfig::UnaskableScraper;
+use crate::rank::RawStream;
+use crate::scrape::{keep_answer, scrape_covered as cover, DeadlineExceeded, DoError, HttpStatusError, ScrapeQuery, Scraper, StremioScraper, UnaskableError};
+use crate::sources::ERR_NOT_PUBLIC;
 use crate::tests::handler::{blob, body_str, fake_scraper, get, test_deps, test_seeds, valid_blob, FakeFuture};
+use crate::tests::mock::MockDoer;
 
 /// Go `envelopeOf`: splits a stream-list body into its `streams` array and its `den` envelope.
 pub(crate) fn envelope_of(body: &str) -> (serde_json::Value, AnswerEnvelope) {
@@ -31,89 +42,116 @@ fn decide_answer_kind() {
     }
 }
 
-/// Go `TestClassifyScrape`: every scrape error maps to one outcome. The cases that need the scraper error taxonomy
-/// (`unaskableScraper`, `*httpStatusError`, `errNotPublic`) belong to package 5's scrape.go.
-#[test]
-#[ignore = "needs scrape::UnaskableScraper, scrape::HttpStatusError and sources::ERR_NOT_PUBLIC from package 5"]
-fn classify_scrape() {
-    // Enable when package 5 lands: move `pending` up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::coverage::{classify_scrape, OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_REFUSED, OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE};
-        let asked = FakeScraper::named("torrentio");
-        let cases: Vec<(&str, Box<dyn Scraper>, Option<DoError>, &str)> = vec![
-            ("answered", asked.clone(), None, OUTCOME_ANSWERED),
-            ("deadline", asked.clone(), Some(err("wrapped: context deadline exceeded")), OUTCOME_TIMEOUT),
-            ("queued past the budget", asked.clone(), Some(err("torrentio: queued past the scrape budget: deadline")), OUTCOME_TIMEOUT),
-            ("http 408", asked.clone(), Some(http_status_error("torrentio", 408)), OUTCOME_TIMEOUT),
-            ("http 429 (or a paused upstream)", asked.clone(), Some(http_status_error("torrentio", 429)), OUTCOME_REFUSED),
-            ("http 403", asked.clone(), Some(http_status_error("torrentio", 403)), OUTCOME_REFUSED),
-            ("http 502", asked.clone(), Some(http_status_error("torrentio", 502)), OUTCOME_UNREACHABLE),
-            ("non-public household source", asked.clone(), Some(err("dial: refusing a non-public address")), OUTCOME_REFUSED),
-            ("network failure", asked.clone(), Some(err("connection reset")), OUTCOME_UNREACHABLE),
-            ("no config URL", unaskable("mediafusion", false), Some(err("not asked")), OUTCOME_MISCONFIGURED),
-            ("config mint failed", unaskable("mediafusion", true), Some(err("not asked")), OUTCOME_UNREACHABLE),
-        ];
-        for (name, sc, e, want) in cases {
-            assert_eq!(classify_scrape(sc.as_ref(), e.as_ref()), want, "{name}");
-        }
+/// Go `fmt.Errorf("<prefix>: %w", context.DeadlineExceeded)`.
+#[derive(Debug)]
+struct WrappedDeadline(&'static str);
+
+impl std::fmt::Display for WrappedDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0, DeadlineExceeded)
     }
-    todo!("pending: coverage_test.go:TestClassifyScrape")
+}
+
+impl std::error::Error for WrappedDeadline {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&DeadlineExceeded)
+    }
+}
+
+/// Go `TestClassifyScrape`: every scrape error maps to one outcome. Go tells an unaskable scraper apart by its type;
+/// here the scraper's failure says what it is (`UnaskableError`), so the case is the scraper's error.
+#[test]
+fn classify_scrape() {
+    let asked = || fake_scraper("torrentio", || Box::pin(async { Ok(Vec::new()) }) as FakeFuture);
+    let err = |text: &str| -> Option<DoError> { Some(Box::new(std::io::Error::other(text.to_owned()))) };
+    let deadline = |prefix: &'static str| -> Option<DoError> { Some(Box::new(WrappedDeadline(prefix))) };
+    let http = |code: u16| -> Option<DoError> { Some(Box::new(HttpStatusError { name: "torrentio".to_owned(), code })) };
+    let unaskable = |transient: bool| -> Option<DoError> {
+        Some(Box::new(UnaskableError { indexer: "mediafusion".to_owned(), transient }))
+    };
+    let cases: Vec<(&str, Option<DoError>, &str)> = vec![
+        ("answered", None, OUTCOME_ANSWERED),
+        ("deadline", deadline("wrapped"), OUTCOME_TIMEOUT),
+        ("queued past the budget", deadline("torrentio: queued past the scrape budget"), OUTCOME_TIMEOUT),
+        ("http 408", http(408), OUTCOME_TIMEOUT),
+        ("http 429 (or a paused upstream)", http(429), OUTCOME_REFUSED),
+        ("http 403", http(403), OUTCOME_REFUSED),
+        ("http 502", http(502), OUTCOME_UNREACHABLE),
+        ("non-public household source", err(&format!("dial: {ERR_NOT_PUBLIC}")), OUTCOME_REFUSED),
+        ("network failure", err("connection reset"), OUTCOME_UNREACHABLE),
+        ("no config URL", unaskable(false), OUTCOME_MISCONFIGURED),
+        ("config mint failed", unaskable(true), OUTCOME_UNREACHABLE),
+    ];
+    for (name, e, want) in cases {
+        let got = classify(asked().as_ref(), e.as_ref());
+        assert_eq!(got, want, "{name}: {got:?}, want {want:?}");
+    }
 }
 
 /// Go `TestScrapeCovered`: every scraper appears in the coverage with what it did, and completeness follows from
-/// those outcomes. Needs `scrapeCovered` (scrape.go, package 5).
-#[test]
-#[ignore = "needs scrape::scrape_covered from package 5"]
-fn scrape_covered() {
-    // Enable when package 5 lands: move `pending` up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        let release = test_seeds()[..1].to_vec();
-        let found = FakeScraper::answering("torrentio", release);
-        let none = FakeScraper::answering("comet", Vec::new());
-        let hang = FakeScraper::hanging("mediafusion");
-        let unconfigured = unaskable("mediafusion", false);
-        let cases = [
-            ("all answered, none found", vec![none.clone(), unconfigured.clone()], true, vec![OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED], ANSWER_EMPTY),
-            ("one timed out, none found", vec![none.clone(), hang.clone()], false, vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT], ANSWER_UNKNOWN),
-            ("one timed out, releases found", vec![found.clone(), hang.clone()], false, vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT], ANSWER_PARTIAL),
-            ("all answered, releases found", vec![found.clone(), none.clone()], true, vec![OUTCOME_ANSWERED, OUTCOME_ANSWERED], ANSWER_LIVE),
-        ];
-        for (name, scrapers, complete, outcomes, kind) in cases {
-            let res = scrape_covered(&scrapers, &ScrapeQuery::default(), Duration::from_millis(30), None, Duration::ZERO).await;
-            assert_eq!(res.complete, complete, "{name}: complete");
-            assert_eq!(res.sources.len(), scrapers.len(), "{name}: every source in coverage");
-            for (i, want) in outcomes.iter().enumerate() {
-                let s = &res.sources[i];
-                assert!(s.id == scrapers[i].id().0 && s.outcome == *want, "{name}: source {i} = {} {}", s.id, s.outcome);
-                if *want == OUTCOME_ANSWERED {
-                    assert!(s.observed_at.is_some(), "{name}: source {i} answered with no time");
-                }
+/// those outcomes.
+#[tokio::test]
+async fn scrape_covered() {
+    let found = || -> Arc<dyn Scraper> {
+        Arc::from(fake_scraper("torrentio", || {
+            Box::pin(async { Ok(vec![RawStream { info_hash: "a".repeat(40), title: "Movie 1080p".to_owned(), ..Default::default() }]) })
+                as FakeFuture
+        }))
+    };
+    let none = || -> Arc<dyn Scraper> { Arc::from(fake_scraper("comet", || Box::pin(async { Ok(Vec::new()) }) as FakeFuture)) };
+    // Go's `<-ctx.Done()`: never answers, so only the scrape's own budget ends it.
+    let hang = || -> Arc<dyn Scraper> {
+        Arc::from(fake_scraper("mediafusion", || {
+            Box::pin(std::future::pending::<Result<Vec<RawStream>, DoError>>()) as FakeFuture
+        }))
+    };
+    let unconfigured = || -> Arc<dyn Scraper> { Arc::new(UnaskableScraper { indexer: Indexer("mediafusion".to_owned()), transient: false }) };
+
+    let cases: Vec<(&str, Vec<Arc<dyn Scraper>>, bool, Vec<&str>, &str)> = vec![
+        ("all answered, none found", vec![none(), unconfigured()], true, vec![OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED], ANSWER_EMPTY),
+        ("one timed out, none found", vec![none(), hang()], false, vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT], ANSWER_UNKNOWN),
+        ("one timed out, releases found", vec![found(), hang()], false, vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT], ANSWER_PARTIAL),
+        ("all answered, releases found", vec![found(), none()], true, vec![OUTCOME_ANSWERED, OUTCOME_ANSWERED], ANSWER_LIVE),
+    ];
+    for (name, scrapers, complete, outcomes, kind) in cases {
+        let res = cover(&scrapers, &ScrapeQuery::default(), Duration::from_millis(30), None, Duration::ZERO).await;
+        assert_eq!(res.complete, complete, "{name}: complete = {}, want {complete}", res.complete);
+        assert_eq!(res.sources.len(), scrapers.len(), "{name}: {} sources in coverage, want every one of {}", res.sources.len(), scrapers.len());
+        for (i, want) in outcomes.iter().enumerate() {
+            let s = &res.sources[i];
+            assert!(
+                s.id == scrapers[i].id().0 && s.outcome == *want,
+                "{name}: source {i} = {} {}, want {} {want}",
+                s.id,
+                s.outcome,
+                scrapers[i].id().0
+            );
+            if *want == OUTCOME_ANSWERED {
+                assert!(s.observed_at.is_some(), "{name}: source {i} answered with no time");
             }
-            let degraded = if res.any_ok { "" } else { "indexers" };
-            assert_eq!(decide_answer_kind(res.seeds.len() as i64, res.complete, degraded), kind, "{name}: answerKind");
         }
+        let degraded = if res.any_ok { "" } else { "indexers" };
+        let got = decide_kind(res.seeds.len() as i64, res.complete, degraded);
+        assert_eq!(got, kind, "{name}: answerKind = {got:?}, want {kind:?}");
     }
-    todo!("pending: coverage_test.go:TestScrapeCovered")
 }
 
 /// Go `TestScrapeCovered_reusedAnswerIsMarked`: an answer reused from the indexer answer cache is an answer,
-/// marked as reused. Needs `keepAnswer` and `stremioScraper` (scrape.go, package 5).
-#[test]
-#[ignore = "needs scrape::keep_answer and scrape::StremioScraper from package 5"]
-fn scrape_covered_reused_answer_is_marked() {
-    // Enable when package 5 lands: move `pending` up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        let cache = MemoryCache::new(1 << 20);
-        let sc = StremioScraper::new("torrentio", "https://torrentio.example");
-        keep_answer(&cache, Duration::from_secs(60), &sc, &ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() }, test_seeds());
-        let res = scrape_covered(&[Box::new(sc)], &ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() }, Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
-        let s = &res.sources[0];
-        assert!(s.outcome == OUTCOME_ANSWERED && s.cached && s.items == 3 && res.complete, "reused answer: {s:?}, complete {}", res.complete);
-    }
-    todo!("pending: coverage_test.go:TestScrapeCovered_reusedAnswerIsMarked")
+/// marked as reused.
+#[tokio::test]
+async fn scrape_covered_reused_answer_is_marked() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let sc = StremioScraper {
+        indexer: Indexer("torrentio".to_owned()),
+        base_url: "https://torrentio.example".to_owned(),
+        client: Arc::new(MockDoer(|_| -> Result<reqwest::Response, DoError> { panic!("a reused answer must not ask the indexer") })),
+    };
+    let q = ScrapeQuery { kind: "movie".to_owned(), imdb: "tt1".to_owned(), ..Default::default() };
+    keep_answer(Some(&*cache), Duration::from_secs(60), &sc, &q, &test_seeds());
+    let scrapers: Vec<Arc<dyn Scraper>> = vec![Arc::new(sc)];
+    let res = cover(&scrapers, &q, Duration::from_secs(1), Some(cache), Duration::from_secs(60)).await;
+    let s = &res.sources[0];
+    assert!(s.outcome == OUTCOME_ANSWERED && s.cached && s.items == 3 && res.complete, "reused answer: {s:?}, complete {}", res.complete);
 }
 
 /// Go `TestStream_envelopeReportsCoverage`: the body carries the envelope, the header and the envelope agree, and

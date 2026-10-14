@@ -165,44 +165,53 @@ async fn scrape_retries_a_shed_request_but_not_a_refusal() {
 // answers from `stale-if-error` only for a URL it already holds, and a private options path is warm
 // essentially never. Scout collected 502s for an episode whose bare path served 50 releases to a curl on
 // the same machine. Nothing is lost — rankStreams drops cam/scr itself and applies its own ordering.
-#[test]
-#[ignore = "needs makeScrapers (scrape.rs, not yet stubbed) and Config/Filters from config.rs"]
-fn make_scrapers_torrentio_uses_bare_path() {
-    #[cfg(any())]
-    fn pending() {
-        use crate::config::{Config, Filters, Indexer};
-        use crate::scrape::make_scrapers;
-        use std::collections::HashMap;
+//
+// Go reads `baseURL` off each `*stremioScraper`; the scraper is a trait object here, so each one is asked and the
+// URL it asked is the base it was built with.
+#[tokio::test]
+async fn make_scrapers_torrentio_uses_bare_path() {
+    use crate::config::{Config, Filters};
+    use crate::scrape::make_scrapers;
+    use std::collections::HashMap;
 
-        let cfg = Config {
-            indexers: vec![Indexer("torrentio".into()), Indexer("mediafusion".into())],
-            filters: Filters { exclude_cam: true, ..Default::default() },
-            ..Default::default()
-        };
-        let overrides = HashMap::from([(Indexer("mediafusion".into()), "https://mf.self/CONFIG".to_owned())]);
-        let got = make_scrapers(&cfg, plain_doer(), guarded_doer(), &overrides);
-        assert_eq!(got[0].base_url(), "https://torrentio.strem.fun", "torrentio base");
-        assert_eq!(got[1].base_url(), "https://mf.self/CONFIG", "mediafusion override");
-
-        // The filter setting must not change the URL at all — that coupling was the whole defect.
-        let off = make_scrapers(
-            &Config { indexers: vec![Indexer("torrentio".into())], filters: Filters { exclude_cam: false, ..Default::default() }, ..Default::default() },
-            plain_doer(),
-            guarded_doer(),
-            &HashMap::new(),
-        );
-        assert_eq!(off[0].base_url(), "https://torrentio.strem.fun", "excludeCam off");
-
-        // An operator override still wins, so a self-hosted torrentio can be pointed at.
-        let custom = make_scrapers(
-            &cfg,
-            plain_doer(),
-            guarded_doer(),
-            &HashMap::from([(Indexer("torrentio".into()), "https://tor.self/opts".to_owned())]),
-        );
-        assert_eq!(custom[0].base_url(), "https://tor.self/opts", "override");
+    /// The URL each scraper asked, in scraper order.
+    async fn asked_urls(cfg: &Config, overrides: &HashMap<Indexer, String>) -> Vec<String> {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let doer: Arc<dyn Doer> = Arc::new(MockDoer(move |r: reqwest::Request| {
+            log.lock().expect("lock").push(r.url().to_string());
+            Ok(resp(200, r#"{"streams":[]}"#))
+        }));
+        let got = make_scrapers(cfg, Arc::clone(&doer), doer, overrides);
+        // An indexer with no config URL is never asked, so it leaves no entry.
+        for sc in &got {
+            let _ = sc.scrape(&movie("tt1")).await;
+        }
+        let urls = seen.lock().expect("lock").clone();
+        urls
     }
-    todo!("pending: scrape_test.go TestMakeScrapersTorrentioUsesBarePath")
+
+    let cfg = Config {
+        indexers: vec![Indexer("torrentio".into()), Indexer("mediafusion".into())],
+        filters: Filters { exclude_cam: true, ..Default::default() },
+        ..Default::default()
+    };
+    let overrides = HashMap::from([(Indexer("mediafusion".into()), "https://mf.self/CONFIG".to_owned())]);
+    let got = asked_urls(&cfg, &overrides).await;
+    assert_eq!(got[0], "https://torrentio.strem.fun/stream/movie/tt1.json", "torrentio base: {}", got[0]);
+    assert_eq!(got[1], "https://mf.self/CONFIG/stream/movie/tt1.json", "mediafusion override: {}", got[1]);
+
+    // The filter setting must not change the URL at all — that coupling was the whole defect.
+    let off = asked_urls(
+        &Config { indexers: vec![Indexer("torrentio".into())], filters: Filters { exclude_cam: false, ..Default::default() }, ..Default::default() },
+        &HashMap::new(),
+    )
+    .await;
+    assert_eq!(off[0], "https://torrentio.strem.fun/stream/movie/tt1.json", "excludeCam off: {}", off[0]);
+
+    // An operator override still wins, so a self-hosted torrentio can be pointed at.
+    let custom = asked_urls(&cfg, &HashMap::from([(Indexer("torrentio".into()), "https://tor.self/opts".to_owned())])).await;
+    assert_eq!(custom[0], "https://tor.self/opts/stream/movie/tt1.json", "override: {}", custom[0]);
 }
 
 // A canned answer for `FakeScraper`.
@@ -305,38 +314,33 @@ async fn scrape_all() {
 // "indexer unreachable", so scout's own queue was logged and counted as the upstream's outage. That is
 // the difference between "we could not get to it in time" and "it is down", and only the second is a
 // reason to go looking at the indexer.
-#[test]
-#[ignore = "needs indexerLimiter (scrape.go, package-5 static not stubbed yet) and a deadline-aware scrape"]
-fn scrape_a_budget_spent_queueing_is_not_an_indexer_outage() {
-    #[cfg(any())]
-    async fn pending() {
-        use crate::scrape::indexer_limiter;
-        use std::time::Duration;
+#[tokio::test]
+async fn scrape_a_budget_spent_queueing_is_not_an_indexer_outage() {
+    use crate::scrape::indexer_limiter;
 
-        const HOST: &str = "queued-past-budget.example";
-        // Drain the burst so the next caller genuinely has to wait for a token. These are free by
-        // definition — the burst exists so a household's normal use never queues.
-        for _ in 0..30 {
-            indexer_limiter().wait(HOST).await;
-        }
-
-        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let asked_in_client = Arc::clone(&asked);
-        let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| {
-            asked_in_client.store(true, Ordering::SeqCst);
-            Ok(resp(200, r#"{"streams":[]}"#))
-        }));
-        let sc = StremioScraper { indexer: Indexer("torrentio".into()), base_url: format!("https://{HOST}"), client };
-
-        // Shorter than the ~1s the drained bucket now makes a caller wait.
-        let result = tokio::time::timeout(Duration::from_millis(20), sc.scrape(&movie("tt0111161"))).await;
-
-        assert!(!asked.load(Ordering::SeqCst), "asked the indexer with a context that had already expired");
-        // The caller still learns nothing came back — that is what keeps an empty result non-authoritative.
-        // What it must be able to tell is WHY, so a deadline is not filed against the indexer's health.
-        assert!(result.is_err(), "a scrape that never happened must report an error");
+    const HOST: &str = "queued-past-budget.example";
+    // Drain the burst so the next caller genuinely has to wait for a token. These are free by
+    // definition — the burst exists so a household's normal use never queues.
+    for _ in 0..30 {
+        crate::hostlimit::wait(Some(indexer_limiter()), HOST).await;
     }
-    todo!("pending: scrape_test.go TestScrape_aBudgetSpentQueueingIsNotAnIndexerOutage")
+
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked_in_client = Arc::clone(&asked);
+    let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| {
+        asked_in_client.store(true, Ordering::SeqCst);
+        Ok(resp(200, r#"{"streams":[]}"#))
+    }));
+    let sc = StremioScraper { indexer: Indexer("torrentio".into()), base_url: format!("https://{HOST}"), client };
+
+    // Shorter than the ~1s the drained bucket now makes a caller wait. Go gives the scrape a 20 ms context; the
+    // caller's deadline here is a timeout around the future, which drops it while it is still queued.
+    let result = tokio::time::timeout(Duration::from_millis(20), sc.scrape(&movie("tt0111161"))).await;
+
+    assert!(!asked.load(Ordering::SeqCst), "asked the indexer with a context that had already expired");
+    // The caller still learns nothing came back — that is what keeps an empty result non-authoritative.
+    // What it must be able to tell is WHY, so a deadline is not filed against the indexer's health.
+    assert!(result.is_err(), "a scrape that never happened must report an error");
 }
 
 // Not in the Go suite: what the Rust port adds around the same behaviour. Go tells an unaskable scraper and an

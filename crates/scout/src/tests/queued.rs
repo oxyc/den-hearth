@@ -1,13 +1,12 @@
 //! Go: `internal/scout/queued_test.go` (280 lines). Work package 1.
 //!
-//! Some tests go through the handler (`TestPlay_queuedAddAnswers202`, `TestProbe_queuedReleaseAnswers202NotNotQueued`)
-//! and stay red until work package 4 lands; `TestAddMagnet_queuedChargeIsNotRefunded` needs the add budget
-//! (package 3). Those three are cfg-gated until their owners land.
+//! Two tests go through the handler (`TestPlay_queuedAddAnswers202`, `TestProbe_queuedReleaseAnswers202NotNotQueued`).
 
 use std::sync::Arc;
 
 use crate::cache::{Cache, MemoryCache};
 use crate::config::DebridService;
+use crate::tests::handler::{get, valid_blob};
 use crate::stores::torbox::{was_added_by_us, TorBoxStore, TORBOX_API};
 use crate::stores::{ResolveTarget, Store, StoreError, FETCH_QUEUED};
 use crate::tests::mock::{resp, MockDoer};
@@ -211,15 +210,8 @@ async fn add_magnet_already_queued_but_hash_missing_from_listing_stays_a_dead_li
 }
 
 // /play answers 202 for a release TorBox queued, never 404 — den#204.
-//
-// Gated until package 4 lands the handler (`NewHandler`, `do`, `cancelTorBoxHandler`).
-#[test]
-#[ignore = "needs handler from package 4"]
-fn play_queued_add_answers_202() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-    use crate::tests::handler::{do_req, valid_blob};
+#[tokio::test]
+async fn play_queued_add_answers_202() {
     let hash = "b".repeat(40);
     let (h, _) = crate::tests::cancel::cancel_torbox_handler(
         |req| match base(req).as_str() {
@@ -229,14 +221,12 @@ fn play_queued_add_answers_202() {
         },
         None,
     );
-    let rr = do_req(&h, &format!("/{}/play/{}", valid_blob(), crate::play::encode_play_token(&crate::play::PlayTarget {
+    let rr = get(&h, &format!("/{}/play/{}", valid_blob(), crate::play::encode_play_token(&crate::play::PlayTarget {
         info_hash: hash,
         file_idx: Some(0),
         ..Default::default()
-    })), None);
+    })), &[]).await;
     assert_eq!(rr.status(), 202, "play on a queued add: {:?}", rr.body());
-    }
-    todo!("pending: queued_test.go:202 TestPlay_queuedAddAnswers202")
 }
 
 // StatusAnswer only ever asked mylist (the torrent listing), never TorBox's own queue — so a release
@@ -269,15 +259,8 @@ async fn status_answer_queued_release_with_no_marker_is_found_via_getqueued() {
 // The probe route (?probe=1) is what Home's progress bar polls, and must answer the same "coming" state
 // as /play for a release parked in TorBox's queue — never 404 not_queued, which the client reads as the
 // release being gone.
-//
-// Gated until package 4 lands the handler (`NewHandler`, `do`, `cancelTorBoxHandler`).
-#[test]
-#[ignore = "needs handler from package 4"]
-fn probe_queued_release_answers_202_not_not_queued() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-    use crate::tests::handler::{do_req, valid_blob};
+#[tokio::test]
+async fn probe_queued_release_answers_202_not_not_queued() {
     let hash = "e".repeat(40);
     let queued_hash = hash.clone();
     let (h, _) = crate::tests::cancel::cancel_torbox_handler(
@@ -288,15 +271,13 @@ fn probe_queued_release_answers_202_not_not_queued() {
         },
         None,
     );
-    let rr = do_req(&h, &format!("/{}/play/{}?probe=1", valid_blob(), crate::play::encode_play_token(&crate::play::PlayTarget {
+    let rr = get(&h, &format!("/{}/play/{}?probe=1", valid_blob(), crate::play::encode_play_token(&crate::play::PlayTarget {
         info_hash: hash,
         file_idx: Some(0),
         ..Default::default()
-    })), None);
+    })), &[]).await;
     assert_eq!(rr.status(), 202, "probe on a queued release: {:?}", rr.body());
     let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("probe body did not decode");
     assert_eq!(body["state"], "queued", "probe state");
     assert_eq!(body["service"], "torbox", "probe service");
-    }
-    todo!("pending: queued_test.go:255 TestProbe_queuedReleaseAnswers202NotNotQueued")
 }

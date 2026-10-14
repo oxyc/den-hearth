@@ -220,19 +220,13 @@ async fn host_limiter_degrades_to_no_op() {
 // back as a degraded empty list from a perfectly healthy indexer. The sustained rate is what protects
 // the indexer; the burst only decides whether normal use waits at all.
 #[test]
-#[ignore = "needs indexer_limiter from scrape.rs (package 5)"]
 fn indexer_limiter_burst_covers_a_season_open() {
-    // Enable when package 5 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::scrape::indexer_limiter;
-        const SEASON: i64 = 24;
-        let lim = indexer_limiter();
-        let mut b = Bucket { tokens: lim.burst as f64, last: Instant::now() };
-        for i in 0..SEASON {
-            let delay = b.take(lim.every, lim.burst);
-            assert!(delay == Duration::ZERO, "episode {} of a season open waited {delay:?}; the tail is never asked within the budget", i + 1);
-        }
+    use crate::scrape::indexer_limiter;
+    const SEASON: i64 = 24;
+    let lim = indexer_limiter();
+    let mut b = Bucket { tokens: lim.burst as f64, last: Instant::now() };
+    for i in 0..SEASON {
+        let delay = b.take(lim.every, lim.burst);
+        assert!(delay == Duration::ZERO, "episode {} of a season open waited {delay:?}; the tail is never asked within the budget", i + 1);
     }
-    todo!("pending: hostlimit_test.go:~251 TestIndexerLimiter_burstCoversASeasonOpen")
 }

@@ -10,7 +10,12 @@ use std::sync::Arc;
 use reqwest::{Method, Url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::deps::refuse_redirect_replay;
+use crate::addbudget::{budget_account, global_add_budget};
+use crate::cache::MemoryCache;
+use crate::config::DebridService;
+use crate::deps::{refuse_redirect_replay, ReqwestDoer};
+use crate::stores::torbox::TorBoxStore;
+use crate::stores::{ResolveTarget, Store};
 
 /// What a loopback test server answers with: status, optional `Location`, body.
 type Reply = (u16, Option<String>, &'static str);
@@ -67,48 +72,51 @@ async fn spawn_server(respond: impl Fn(&str, &str) -> Reply + Send + Sync + 'sta
 // The redirect target is a SEPARATE path, so what is asserted is the number of add requests that actually
 // reach a second location — the thing that costs the account.
 #[tokio::test]
-#[ignore = "needs stores::torbox::TorBoxStore and addbudget's global budget from packages 1 and 3"]
 async fn an_add_is_not_replayed_to_the_redirect_target() {
-    // Enable when packages 1 and 3 land: move `pending` up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        for (status, name) in [(307u16, "307 temporary"), (308, "308 permanent"), (302, "302 found")] {
-            let first_hop = Arc::new(AtomicI32::new(0));
-            let replayed = Arc::new(AtomicI32::new(0));
-            let (fh, rp) = (first_hop.clone(), replayed.clone());
-            let base = spawn_server(move |method, path| match path {
-                "/torrents/createtorrent" => {
-                    fh.fetch_add(1, Ordering::SeqCst);
-                    (status, Some("/moved".to_owned()), "")
+    for (status, name) in [(307u16, "307 temporary"), (308, "308 permanent"), (302, "302 found")] {
+        let first_hop = Arc::new(AtomicI32::new(0));
+        let replayed = Arc::new(AtomicI32::new(0));
+        let (fh, rp) = (first_hop.clone(), replayed.clone());
+        let base = spawn_server(move |method, path| match path {
+            "/torrents/createtorrent" => {
+                fh.fetch_add(1, Ordering::SeqCst);
+                (status, Some("/moved".to_owned()), "")
+            }
+            "/moved" => {
+                if method == "POST" {
+                    rp.fetch_add(1, Ordering::SeqCst);
                 }
-                "/moved" => {
-                    if method == "POST" {
-                        rp.fetch_add(1, Ordering::SeqCst);
-                    }
-                    (200, None, r#"{"data":{"torrent_id":9}}"#)
-                }
-                _ => (200, None, r#"{"success":true,"data":[]}"#),
-            })
-            .await;
-            let token = format!("redirect-{name}");
-            let hash = "a".repeat(40);
-            let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::custom(|a| {
-                    let via = a.previous().iter().map(|u| (Method::POST, u.clone())).collect::<Vec<_>>();
-                    if refuse_redirect_replay(&Method::POST, a.url(), &via) { a.stop() } else { a.follow() }
-                }))
-                .build()
-                .expect("a client");
-            let s = TorBoxStore { token: token.clone(), cache: Arc::new(MemoryCache::new(1 << 20)), api: base, client };
-            let _ = s.resolve(&ResolveTarget { info_hash: hash, ..ResolveTarget::default() }).await;
-            assert_eq!(replayed.load(Ordering::SeqCst), 0, "{name}: the add was re-sent to the redirect target");
-            assert_eq!(first_hop.load(Ordering::SeqCst), 1, "{name}: the add reached the original endpoint");
-            let after = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
-            assert!(before - after <= 1, "{name}: the hourly allowance moved by {}", before - after);
-        }
+                (200, None, r#"{"data":{"torrent_id":9}}"#)
+            }
+            _ => (200, None, r#"{"success":true,"data":[]}"#),
+        })
+        .await;
+        let token = format!("redirect-{name}");
+        let hash = "a".repeat(40);
+        let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+        // Go's CheckRedirect is handed the redirected request, whose method a 301/302/303 has already turned into
+        // a GET; reqwest's policy sees only the status, so the method is worked out from it. The earlier hops are
+        // the add itself.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|a| {
+                let method = if matches!(a.status().as_u16(), 301..=303) { Method::GET } else { Method::POST };
+                let via = a.previous().iter().map(|u| (Method::POST, u.clone())).collect::<Vec<_>>();
+                if refuse_redirect_replay(&method, a.url(), &via) { a.stop() } else { a.follow() }
+            }))
+            .build()
+            .expect("a client");
+        let s = TorBoxStore {
+            token: token.clone(),
+            cache: Some(Arc::new(MemoryCache::new(1 << 20))),
+            api: base,
+            client: Arc::new(ReqwestDoer(client)),
+        };
+        let _ = s.resolve(&ResolveTarget { info_hash: hash, ..ResolveTarget::default() }).await;
+        assert_eq!(replayed.load(Ordering::SeqCst), 0, "{name}: the add was re-sent to the redirect target");
+        assert_eq!(first_hop.load(Ordering::SeqCst), 1, "{name}: the add reached the original endpoint");
+        let after = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+        assert!(before - after <= 1, "{name}: the hourly allowance moved by {}", before - after);
     }
-    todo!("pending: go redirect_test.go:TestRefuseRedirectReplay_anAddIsNotReplayedToTheRedirectTarget")
 }
 
 // A credential in the query string must not follow a redirect off the debrid's API host — Go strips the
