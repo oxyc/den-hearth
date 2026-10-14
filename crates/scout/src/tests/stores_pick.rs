@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::scrape::{DoError, Doer};
 use crate::season::{
     bare_episode_patterns, base_name, cached_episode_patterns, matches_episode, names_episode, pick_episode_file,
-    season_only_pattern, EPISODE_PATTERN_CAP, TorrentFile,
+    err_episode_not_in_torrent, season_only_pattern, EPISODE_PATTERN_CAP, TorrentFile,
 };
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
@@ -42,6 +42,15 @@ fn want_pick(got: Result<Option<i64>, StoreError>, want: i64, what: &str) {
     }
 }
 
+/// Go `wantNotInTorrent` asserts a picker REFUSED, rather than substituting some other file.
+fn want_not_in_torrent(got: Result<Option<i64>, StoreError>, what: &str) {
+    match got {
+        Err(e) if e == err_episode_not_in_torrent() => {}
+        Ok(Some(v)) => panic!("{what}: served file {v} instead of refusing (err <nil>)"),
+        other => panic!("{what}: got err {other:?}, want errEpisodeNotInTorrent"),
+    }
+}
+
 /// A Real-Debrid store that is never asked anything, for the tests that call a picker directly.
 fn idle_real_debrid() -> RealDebridStore {
     let client: Arc<dyn Doer> =
@@ -58,10 +67,7 @@ fn idle_premiumize() -> PremiumizeStore {
 // The pack is the common case: name-matching must beat the positional index, because the indexer's
 // fileIdx and the debrid's own file order are not guaranteed to agree.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_name_match_beats_order() {
-    #[cfg(any())]
-    fn pending() {
         let files = [
             file(0, "Show.S01E01.1080p.mkv", 900),
             file(1, "Show.S01E02.1080p.mkv", 950),
@@ -74,8 +80,6 @@ fn pick_episode_file_name_match_beats_order() {
         // hold what was asked for. Falling back to the largest video served S01E03 as though it were S02E01:
         // the stream plays, it is simply the wrong episode, and nothing upstream can tell.
         want_not_in_torrent(pick_episode_file(&files, 2, 1), "an episode-labelled pack that lacks the episode");
-    }
-    todo!("pending: stores_pick_test.go:51")
 }
 
 // The fallback survives where it is actually needed: a release whose filename names no episode at all is
@@ -409,10 +413,7 @@ fn pick_episode_file_modern_pack_names_are_not_all_episode_one() {
 // two, then breaking the tie by file size, let that noise outrank the file that really did name the
 // episode. Where the names carry no label it is the only evidence there is, and must still work.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_a_bare_number_never_outranks_a_label() {
-    #[cfg(any())]
-    fn pending() {
         // The precedence between the two kinds of evidence, which a union got wrong.
         //
         // A bare number carries no season and cannot say which show it belongs to. Where the filenames DO name
@@ -443,8 +444,6 @@ fn pick_episode_file_a_bare_number_never_outranks_a_label() {
             file(1, "[Grp] Show - 02 [1080p].mkv", 900),
         ];
         want_pick(pick_episode_file(&bare, 1, 2), 1, "with nothing else to go on, the bare number decides");
-    }
-    todo!("pending: stores_pick_test.go:391")
 }
 
 // Real-Debrid's in-range fileIdx branch maps a POSITION to RD's own file id. Nothing verified it: every
@@ -571,10 +570,7 @@ fn pick_episode_file_a_title_number_is_not_an_episode() {
 // carries a single labelled special beside bare-numbered episodes; treating the pool as labelled turned
 // a hit into a hard refusal, and the client records a release that plays as dead.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_one_labelled_file_does_not_condemn_the_rest() {
-    #[cfg(any())]
-    fn pending() {
         // One labelled file must not switch the weak tier off for the rest of the pack. An anime batch commonly
         // carries a single labelled special beside bare-numbered episodes; treating the pool as labelled turned
         // a hit into a hard refusal, and the client records a release that plays as dead.
@@ -593,18 +589,13 @@ fn pick_episode_file_one_labelled_file_does_not_condemn_the_rest() {
         // And a pack where EVERY file names its episode still refuses when none of them is yours.
         let all_labelled = [file(0, "Show.S01E01.mkv", 900), file(1, "Show.S01E02.mkv", 950)];
         want_not_in_torrent(pick_episode_file(&all_labelled, 1, 9), "a fully labelled pack that lacks the episode holds nothing to play");
-    }
-    todo!("pending: stores_pick_test.go:530")
 }
 
 // One stray file cannot unmake a pack, and cannot rescue a number that decides nothing. Both guards used
 // to be phrased as set-size comparisons over the pool, so a single extra video — a sample, a featurette,
 // a bonus rip, all of them ordinary in a season pack and all of them videos — was enough to disarm each.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_one_stray_file_disarms_nothing() {
-    #[cfg(any())]
-    fn pending() {
         // One stray file cannot unmake a pack, and cannot rescue a number that decides nothing. Both guards used
         // to be phrased as set-size comparisons over the pool, so a single extra video — a sample, a featurette,
         // a bonus rip, all of them ordinary in a season pack and all of them videos — was enough to disarm each.
@@ -647,8 +638,6 @@ fn pick_episode_file_one_stray_file_disarms_nothing() {
         // A single labelled episode is not a pack: it cannot condemn anything.
         let one = [file(0, "Show.S01E01.1080p.mkv", 900)];
         assert!(matches!(pick_episode_file(&one, 2, 1), Ok(Some(_))), "a lone episode file is not a pack that lacks your episode");
-    }
-    todo!("pending: stores_pick_test.go:558")
 }
 
 // A backslash is legal in a POSIX filename, and these names come from the torrent. Splitting on it
@@ -845,10 +834,7 @@ fn pick_episode_file_the_bare_tier_ignores_labelled_files() {
 // The majority rule's boundary. Equal counts must NOT condemn: the unlabelled files may be absolutely
 // numbered, and a refusal short-circuits every store's picker before the indexer's position is read.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_equal_counts_defer_rather_than_condemn() {
-    #[cfg(any())]
-    fn pending() {
         // The majority rule's boundary. Equal counts must NOT condemn: the unlabelled files may be absolutely
         // numbered, and a refusal short-circuits every store's picker before the indexer's position is read.
         let files = [
@@ -863,8 +849,6 @@ fn pick_episode_file_equal_counts_defer_rather_than_condemn() {
         majority.push(file(4, "Show.S01E03.1080p.mkv", 960));
         majority.push(file(5, "Extras/featurette.mkv", 10));
         want_not_in_torrent(pick_episode_file(&majority, 2, 1), "three labelled episodes against one extra is a labelled pack");
-    }
-    todo!("pending: stores_pick_test.go:776")
 }
 
 // A double episode names TWO, and only the first was ever matched. Asked for the second, nothing matched
@@ -984,10 +968,7 @@ fn episode_patterns_the_range_second_element_must_be_an_episode() {
 // number safe; it is not, because every digit-initial tag joined to the label wears one. What identifies
 // the form is that the number before the dash is the one just below the number after it.
 #[test]
-#[ignore = "needs season.rs namesEpisode (package 5)"]
 fn episode_patterns_a_tight_dash_is_not_enough_to_make_a_range() {
-    #[cfg(any())]
-    fn pending() {
         // A range is arithmetic, not punctuation. A tight dash was tried as the thing that made a bare second
         // number safe; it is not, because every digit-initial tag joined to the label wears one. What identifies
         // the form is that the number before the dash is the one just below the number after it.
@@ -1021,8 +1002,6 @@ fn episode_patterns_a_tight_dash_is_not_enough_to_make_a_range() {
             .map(|i| file(i, &format!("Show.S01E{i:02}-60fps.mkv"), 1000 + i))
             .collect();
         want_not_in_torrent(pick_episode_file(&fps, 1, 60), "a pack of E01-E06 does not hold episode 60");
-    }
-    todo!("pending: stores_pick_test.go:939")
 }
 
 // A bare range wider than a double episode is an ordinary release, and refusing it condemns a pack that
@@ -1030,10 +1009,7 @@ fn episode_patterns_a_tight_dash_is_not_enough_to_make_a_range() {
 // answers 404 for a file sitting right there. What excludes the tags is not how WIDE the span is but
 // that both ends are written the same way and the far end stops at a separator.
 #[test]
-#[ignore = "needs season.rs namesEpisode (package 5)"]
 fn episode_patterns_bare_ranges_span_a_whole_season() {
-    #[cfg(any())]
-    fn pending() {
         // A bare range wider than a double episode is an ordinary release, and refusing it condemns a pack that
         // plays: the refusal short-circuits every store's picker before the indexer's fileIdx is read, so /play
         // answers 404 for a file sitting right there. What excludes the tags is not how WIDE the span is but
@@ -1074,18 +1050,13 @@ fn episode_patterns_bare_ranges_span_a_whole_season() {
             want_pick(pick_episode_file(&pack, 1, ep_n), (ep_n - 1) / 6, &format!("episode {ep_n} lives in file {}", (ep_n - 1) / 6));
         }
         want_not_in_torrent(pick_episode_file(&pack, 1, 20), "episode 20 is not in a pack of E01-E12");
-    }
-    todo!("pending: stores_pick_test.go:987")
 }
 
 // A range is MEMBERSHIP, not two endpoints. Anchoring only the far end matched episodes 1 and 6 of
 // `S01E01-06.mkv` and none of the four between, so a pack of such files was condemned for two thirds of
 // its episodes — and that refusal short-circuits every picker before the indexer's fileIdx is read.
 #[test]
-#[ignore = "needs season.rs namesEpisode (package 5)"]
 fn names_episode_a_range_holds_every_episode_in_it() {
-    #[cfg(any())]
-    fn pending() {
         // A range is MEMBERSHIP, not two endpoints. Anchoring only the far end matched episodes 1 and 6 of
         // `S01E01-06.mkv` and none of the four between, so a pack of such files was condemned for two thirds of
         // its episodes — and that refusal short-circuits every picker before the indexer's fileIdx is read.
@@ -1111,8 +1082,6 @@ fn names_episode_a_range_holds_every_episode_in_it() {
             want_pick(pick_episode_file(&pack, 1, ep_n), (ep_n - 1) / 6, &format!("episode {ep_n} lives in file {}", (ep_n - 1) / 6));
         }
         want_not_in_torrent(pick_episode_file(&pack, 1, 20), "episode 20 is not in a pack of E01-E12");
-    }
-    todo!("pending: stores_pick_test.go:1040")
 }
 
 // Sonarr writes six multi-episode styles and three of them chain past two numbers. Capturing exactly one
