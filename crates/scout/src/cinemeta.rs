@@ -87,7 +87,7 @@ impl Cinemeta {
         }
         let key = cinemeta_key(&self.base, typ, imdb);
         if let Some(v) = self.cache.get(&key) {
-            if v != CINEMETA_MISS_VALUE {
+            if &*v != CINEMETA_MISS_VALUE {
                 if let Ok(m) = serde_json::from_str::<CineMeta>(&v) {
                     return (m, true);
                 }

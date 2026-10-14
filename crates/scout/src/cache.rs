@@ -5,6 +5,7 @@
 //! resultCap × many titles blow the heap and OOM the container). Thread-safe, and sharded: a hit on one shard
 //! never waits for a write on another.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use quick_cache::sync::Cache as Sharded;
@@ -12,7 +13,9 @@ use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 
 /// FROZEN. Go `Cache`. Thread-safe. `get` returns `None` for a missing or expired key.
 pub trait Cache: Send + Sync {
-    fn get(&self, key: &str) -> Option<String>;
+    /// The value is shared with the cache, not copied out of it: a hit costs a reference count, and a caller that
+    /// needs an owned `String` makes that copy itself.
+    fn get(&self, key: &str) -> Option<Arc<str>>;
     fn put(&self, key: &str, value: &str, ttl: Duration);
 
     /// Go's `classifiedCache` optional interface (`PutClass`), folded in as a defaulted method: a cache
@@ -52,7 +55,7 @@ pub struct MemoryCache {
 
 #[derive(Clone)]
 struct CacheEntry {
-    value: String,
+    value: Arc<str>,
     expires: SystemTime,
 }
 
@@ -93,7 +96,7 @@ impl MemoryCache {
 }
 
 impl Cache for MemoryCache {
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Option<Arc<str>> {
         let entry = self.entries.get(key)?;
         if (self.now)() > entry.expires {
             self.entries.remove(key);
@@ -103,11 +106,18 @@ impl Cache for MemoryCache {
     }
 
     fn put(&self, key: &str, value: &str, ttl: Duration) {
+        self.put_shared(key, Arc::from(value), ttl);
+    }
+}
+
+impl MemoryCache {
+    /// `put` for a value the caller already holds shared, so it is stored without another copy.
+    pub(crate) fn put_shared(&self, key: &str, value: Arc<str>, ttl: Duration) {
         let now = (self.now)();
         // Go's `Add` does not panic on an absurd TTL; neither may this. A TTL past what the clock can hold
         // never expires in any lifetime of this process.
         let expires =
             now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 60 * 60));
-        self.entries.insert(key.to_owned(), CacheEntry { value: value.to_owned(), expires });
+        self.entries.insert(key.to_owned(), CacheEntry { value, expires });
     }
 }

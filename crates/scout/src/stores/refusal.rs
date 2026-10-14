@@ -57,7 +57,7 @@ pub(crate) const TORBOX_IDENTITY_PREFIX: &str = "torbox-account:v2:";
 pub(crate) struct NoCache;
 
 impl Cache for NoCache {
-    fn get(&self, _key: &str) -> Option<String> {
+    fn get(&self, _key: &str) -> Option<Arc<str>> {
         None
     }
 
@@ -80,7 +80,7 @@ pub(crate) fn clear(cache: &dyn Cache, key: &str) {
 
 /// A marker's value when it is live. A cleared key is written as "" and lives for a nanosecond, so a read
 /// inside that tick must not take it for a marker.
-pub(crate) fn live(cache: &dyn Cache, key: &str) -> Option<String> {
+pub(crate) fn live(cache: &dyn Cache, key: &str) -> Option<Arc<str>> {
     cache.get(key).filter(|v| !v.is_empty())
 }
 
@@ -600,10 +600,11 @@ pub(crate) fn backed_off(
     token: &str,
     info_hash: &str,
 ) -> Option<String> {
+    // The reason is handed on as an owned String (an error path, not the hit path): the copy `get` used to make.
     if let Some(reason) = cache.get(&account_refused_key(svc, token)) {
-        return Some(reason);
+        return Some(reason.to_string());
     }
-    cache.get(&refused_key(svc, token, info_hash))
+    cache.get(&refused_key(svc, token, info_hash)).map(|reason| reason.to_string())
 }
 
 /// Go `accountBackedOff` (stores.go:1496): the service rejected this ACCOUNT a moment ago, so nothing it
@@ -613,7 +614,7 @@ pub(crate) fn backed_off(
 /// rejected key makes every request pointless, including one for a release the account holds — and
 /// without this the read path recorded the refusal and then asked again on the very next poll.
 pub(crate) fn account_backed_off(cache: &dyn Cache, svc: DebridService, token: &str) -> Option<String> {
-    cache.get(&account_refused_key(svc, token))
+    cache.get(&account_refused_key(svc, token)).map(|reason| reason.to_string())
 }
 
 /// Go `refusalIsAboutTheAccount` (stores.go:1505): a status the service returns about WHO is asking, not

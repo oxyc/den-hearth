@@ -358,7 +358,7 @@ impl TieredCache {
 }
 
 impl Cache for TieredCache {
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Option<Arc<str>> {
         if let Some(v) = self.mem.get(key) {
             return Some(v);
         }
@@ -385,12 +385,13 @@ impl Cache for TieredCache {
             self.retire(&name);
             return None;
         }
-        let value = String::from_utf8(raw[nl + 1..].to_vec()).ok()?;
+        // The one copy of the file's value: shared with the memory tier and the caller from here on.
+        let value: Arc<str> = Arc::from(std::str::from_utf8(&raw[nl + 1..]).ok()?);
         let fingerprint = self.fingerprint(&value);
         if let Some(m) = self.index().get_mut(&name) {
             m.value = Some(fingerprint);
         }
-        self.mem.put(key, &value, until(expires, now));
+        self.mem.put_shared(key, Arc::clone(&value), until(expires, now));
         Some(value)
     }
 

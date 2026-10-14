@@ -1012,7 +1012,7 @@ pub(crate) struct RecordingCache {
 }
 
 impl Cache for RecordingCache {
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Option<Arc<str>> {
         self.inner.get(key)
     }
 
