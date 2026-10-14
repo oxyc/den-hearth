@@ -1211,228 +1211,907 @@ async fn stream_a_partial_list_is_still_served_and_cached() {
 #[test]
 #[ignore = "needs hostlimit::HostLimiter from package 6 (debugLimiter) and handler build internals"]
 fn stream_debug_reports_where_the_list_went() {
-    // Go TestStreamDebug_reportsWhereTheListWent: ?debug=1 names deduped=3, ranked=2, the CAM drop under
-    // droppedBy.cam, and scores in served order.
-    todo!("port with debugLimiter once hostlimit lands")
+    // Enable when package 6 lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamDebug_reportsWhereTheListWent: ?debug=1 names deduped=3, ranked=2, the CAM drop under
+        // droppedBy.cam, and scores in served order.
+        unthrottle_debug();
+        let h = new_handler(test_deps(|_| {}));
+        let rr = get(&h, &format!("/{}/stream/movie/tt1234567.json?debug=1", valid_blob()), &[]).await;
+        assert_eq!(rr.status(), 200, "debug");
+        let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("JSON");
+        let debug = &body["debug"];
+        assert!(!debug.is_null(), "?debug=1 returned no debug block");
+        assert!(debug["deduped"] == 3 && debug["ranked"] == 2, "counts: {debug}");
+        assert_eq!(debug["droppedBy"]["cam"], 1, "the CAM drop was not attributed");
+        let kept = debug["kept"].as_array().expect("kept");
+        let streams = body["streams"].as_array().expect("streams");
+        assert_eq!(kept.len(), streams.len(), "kept scores for served streams");
+        for (i, s) in streams.iter().enumerate() {
+            assert_eq!(kept[i]["title"], s["title"], "kept[{i}] order");
+        }
+        assert!(kept[0]["score"].as_i64() > kept[1]["score"].as_i64(), "scores do not explain the order");
+    }
+    todo!("pending: handler_test.go:TestStreamDebug_reportsWhereTheListWent")
 }
 
 #[test]
 #[ignore = "needs hostlimit::HostLimiter from package 6 (debugLimiter)"]
 fn stream_debug_is_never_cached() {
-    // Go TestStreamDebug_isNeverCached: a ?debug=1 build is never written under the list cache key, and a
-    // normal response carries no debug block.
-    todo!("port with debugLimiter once hostlimit lands")
+    // Enable when package 6 lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamDebug_isNeverCached: a ?debug=1 build is never written under the list cache key, and a
+        // normal response carries no debug block.
+        unthrottle_debug();
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let h = new_handler(test_deps(|d| d.cache = cache.clone()));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        assert_eq!(get(&h, &format!("{path}?debug=1"), &[]).await.status(), 200, "debug");
+        let key = cache.last_key();
+        if !key.is_empty() {
+            if let Some(v) = cache.get(&key) {
+                assert!(!v.contains("droppedBy"), "a debug build was cached and would be served to everyone else");
+            }
+        }
+        let plain = get(&h, &path, &[]).await;
+        assert!(!body_str(&plain).contains("\"debug\""), "a normal response carries a debug block");
+    }
+    todo!("pending: handler_test.go:TestStreamDebug_isNeverCached")
 }
 
 #[test]
 #[ignore = "needs hostlimit::HostLimiter from package 6 (debugLimiter)"]
 fn stream_debug_accounting_reconciles() {
-    // Go TestStreamDebug_accountingReconciles: deduped minus every attributed drop equals ranked, with the
-    // seed cap and the RD filename filter both attributed.
-    todo!("port with debugLimiter once hostlimit lands")
+    // Enable when package 6 lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamDebug_accountingReconciles: deduped minus every attributed drop equals ranked, with the
+        // seed cap and the RD filename filter both attributed.
+        unthrottle_debug();
+        let rd_blob = blob(r#"{"debrid":[{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}"#);
+        let mut seeds: Vec<RawStream> = (0..crate::handler::MAX_SEEDS + 20)
+            .map(|i| RawStream { info_hash: format!("{i:040x}"), title: format!("Film.2024.1080p.WEB-DL.x264-G{i}.mkv"), ..RawStream::default() })
+            .collect();
+        seeds.extend((0..20).map(|i| RawStream {
+            info_hash: format!("{:040x}", 100000 + i),
+            title: format!("Film.2024.1080p.BluRay.REMUX-G{i}.mkv"),
+            ..RawStream::default()
+        }));
+        let s = seeds.clone();
+        let h = new_handler(test_deps(move |d| {
+            let s = s.clone();
+            d.make_scrapers = Arc::new(move |_| {
+                let s = s.clone();
+                vec![fake_scraper("torrentio", move || {
+                    let s = s.clone();
+                    Box::pin(async move { Ok(s) })
+                })]
+            });
+            d.make_stores = Arc::new(|_| vec![Box::new(FakeStore::empty(DebridService::RealDebrid))]);
+        }));
+        let rr = get(&h, &format!("/{rd_blob}/stream/movie/tt1234567.json?debug=1"), &[]).await;
+        assert_eq!(rr.status(), 200, "debug");
+        let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("JSON");
+        let debug = &body["debug"];
+        assert_eq!(debug["deduped"], seeds.len(), "deduped = the indexer's count before trimming");
+        assert_eq!(debug["droppedBy"]["seedCap"], seeds.len() - crate::handler::MAX_SEEDS, "seedCap drops");
+        assert!(debug["droppedBy"]["realDebridBlocked"].as_i64().unwrap_or(0) > 0, "the RD filename filter dropped nothing");
+        let dropped: i64 = debug["droppedBy"].as_object().map_or(0, |m| m.values().filter_map(|v| v.as_i64()).sum());
+        assert_eq!(debug["deduped"].as_i64().unwrap_or(0) - dropped, debug["ranked"].as_i64().unwrap_or(-1), "accounting does not reconcile");
+    }
+    todo!("pending: handler_test.go:TestStreamDebug_accountingReconciles")
 }
 
 #[test]
 #[ignore = "needs hostlimit::HostLimiter from package 6 (debugLimiter)"]
 fn stream_debug_is_rate_limited() {
-    // Go TestStreamDebug_isRateLimited: the third ?debug=1 in the window answers 429 with Retry-After, and a
-    // plain request is unaffected.
-    todo!("port with debugLimiter once hostlimit lands")
+    // Enable when package 6 lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamDebug_isRateLimited: the third ?debug=1 in the window answers 429 with Retry-After, and a
+        // plain request is unaffected.
+        set_debug_limiter(std::time::Duration::from_secs(3600), 2);
+        let scrapes = Arc::new(AtomicI32::new(0));
+        let count = scrapes.clone();
+        let h = new_handler(test_deps(move |d| {
+            let count = count.clone();
+            d.make_scrapers = Arc::new(move |_| {
+                let count = count.clone();
+                vec![fake_scraper("torrentio", move || {
+                    let count = count.clone();
+                    Box::pin(async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        }));
+        let path = format!("/{}/stream/movie/tt1234567.json?debug=1", valid_blob());
+        for i in 0..2 {
+            assert_eq!(get(&h, &path, &[]).await.status(), 200, "debug {i}");
+        }
+        let third = get(&h, &path, &[]).await;
+        assert_eq!(third.status(), 429, "third debug");
+        assert!(!hdr(&third, "retry-after").is_empty(), "429 without a Retry-After");
+        assert_eq!(scrapes.load(Ordering::SeqCst), 2, "a refused debug must not reach the indexers or the debrid");
+        assert_eq!(get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(), 200, "normal request after debug throttling");
+    }
+    todo!("pending: handler_test.go:TestStreamDebug_isRateLimited")
 }
 
 #[test]
 #[ignore = "needs hostlimit::HostLimiter from package 6 (debugLimiter)"]
 fn stream_debug_leaks_no_upstream_urls_or_tokens() {
-    // Go TestStreamDebug_leaksNoUpstreamURLsOrTokens: the debug body names no token and no upstream address.
-    todo!("port with debugLimiter once hostlimit lands")
+    // Enable when package 6 lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamDebug_leaksNoUpstreamURLsOrTokens: the debug body names no token and no upstream address.
+        unthrottle_debug();
+        let h = new_handler(test_deps(|_| {}));
+        let body = body_str(&get(&h, &format!("/{}/stream/movie/tt1234567.json?debug=1", valid_blob()), &[]).await);
+        for forbidden in ["tb-secret", "mediafusion.elfhosted", "torrentio.strem.fun", "https://comet"] {
+            assert!(!body.contains(forbidden), "?debug=1 disclosed {forbidden:?}");
+        }
+    }
+    todo!("pending: handler_test.go:TestStreamDebug_leaksNoUpstreamURLsOrTokens")
 }
 
 #[test]
 #[ignore = "needs the handler's stale-list build internals (splitCached, joinCached, staleWindowFor)"]
 fn stream_list_serves_stale_while_rebuilding() {
-    // Go TestStreamList_servesStaleWhileRebuilding: a complete list one second past freshness is served at
-    // once with den.answerKind stale and no degraded reason, and a rebuild runs behind it.
-    todo!("port once splitCached and joinCached are ported")
+    // Enable when splitCached/joinCached land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_servesStaleWhileRebuilding: a complete list one second past freshness is served at
+        // once with den.answerKind stale and no degraded reason, and a rebuild runs behind it.
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let scraped = Arc::new(tokio::sync::Notify::new());
+        let s = scraped.clone();
+        let h = new_handler(test_deps(|d| {
+            d.cache = cache.clone();
+            d.make_scrapers = Arc::new(move |_| {
+                let s = s.clone();
+                vec![fake_scraper("torrentio", move || {
+                    let s = s.clone();
+                    Box::pin(async move {
+                        s.notify_one();
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        }));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        assert_eq!(get(&h, &path, &[]).await.status(), 200, "cold build");
+        scraped.notified().await;
+        // Age the entry past its freshness without touching its physical expiry.
+        let key = cache.last_key();
+        let held = cache.get(&key).expect("the cold build cached nothing");
+        let (complete, _, etag, body) = crate::handler::split_cached(&held);
+        cache.put(&key, &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body), Duration::from_secs(60));
+        let stale = get(&h, &path, &[]).await;
+        assert_eq!(stale.status(), 200, "stale hit");
+        let cached: serde_json::Value = serde_json::from_str(&body).expect("cached body");
+        let served: serde_json::Value = serde_json::from_slice(stale.body()).expect("served body");
+        assert_eq!(served["streams"], cached["streams"], "the stale hit did not serve the cached streams");
+        assert!(served["den"]["answerKind"] == "stale" && served["den"]["degraded"].is_null(), "stale hit den = {}", served["den"]);
+        assert_eq!(served["den"]["generatedAt"], cached["den"]["generatedAt"], "the stale hit lost the list's build time");
+        assert_ne!(hdr(&stale, "etag"), etag, "the relabelled body kept the fresh list's ETag");
+        assert_eq!(hdr(&stale, "cache-control"), "private, max-age=60", "stale cache-control");
+        tokio::time::timeout(Duration::from_secs(5), scraped.notified()).await.expect("no rebuild ran behind the stale answer");
+    }
+    todo!("pending: handler_test.go:TestStreamList_servesStaleWhileRebuilding")
 }
 
 #[test]
 #[ignore = "needs the handler's stale-list build internals (splitCached, joinCached)"]
 fn stream_list_a_disconnect_does_not_kill_the_stale_rebuild() {
-    // Go TestStreamList_aDisconnectDoesNotKillTheStaleRebuild: the rebuild behind a stale answer runs to its
-    // end after the client that triggered it has gone.
-    todo!("port once splitCached and joinCached are ported")
+    // Enable when splitCached/joinCached land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_aDisconnectDoesNotKillTheStaleRebuild: the rebuild behind a stale answer runs to its
+        // end after the client that triggered it has gone. The rebuild waits so the cancel has happened first.
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let scraped = Arc::new(tokio::sync::Mutex::new(Vec::<bool>::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicI32::new(0));
+        let (sc, rel, cl) = (scraped.clone(), release.clone(), calls.clone());
+        let h = Arc::new(new_handler(test_deps(|d| {
+            d.cache = cache.clone();
+            d.make_scrapers = Arc::new(move |_| {
+                let (sc, rel, cl) = (sc.clone(), rel.clone(), cl.clone());
+                vec![fake_scraper("torrentio", move || {
+                    let (sc, rel, cl) = (sc.clone(), rel.clone(), cl.clone());
+                    Box::pin(async move {
+                        if cl.fetch_add(1, Ordering::SeqCst) > 0 {
+                            rel.notified().await;
+                        }
+                        sc.lock().await.push(true);
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        })));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        assert_eq!(get(&h, &path, &[]).await.status(), 200, "cold build");
+        let key = cache.last_key();
+        let held = cache.get(&key).expect("the cold build cached nothing");
+        let (complete, _, etag, body) = crate::handler::split_cached(&held);
+        cache.put(&key, &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body), Duration::from_secs(60));
+        let serving = tokio::spawn({
+            let h = h.clone();
+            let path = path.clone();
+            async move { get(&h, &path, &[]).await }
+        });
+        serving.abort(); // a stale hit from a client that goes away the instant it has its answer
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!scraped.lock().await.is_empty(), "the rebuild died with the request context: it never refreshed the entry");
+    }
+    todo!("pending: handler_test.go:TestStreamList_aDisconnectDoesNotKillTheStaleRebuild")
 }
 
 #[test]
 #[ignore = "needs the handler's stale-list build internals (staleWindowFor, splitCached, joinCached)"]
 fn stream_list_stale_window_scales_with_the_ttl() {
-    // Go TestStreamList_staleWindowScalesWithTheTTL: a 30s list's stale reply is capped at max-age=30.
-    todo!("port once splitCached and joinCached are ported")
+    // Enable when splitCached/joinCached land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_staleWindowScalesWithTheTTL: the stale window is capped by the configured TTL, and the
+        // stale reply never claims a longer freshness than the operator configured.
+        assert_eq!(crate::handler::stale_window_for(Duration::from_secs(30)), Duration::from_secs(30), "short TTL");
+        assert_eq!(crate::handler::stale_window_for(Duration::from_secs(300)), crate::handler::MAX_STALE_SERVE_WINDOW, "long TTL");
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let c = cache.clone();
+        let h = new_handler(test_deps(move |d| {
+            d.cache = c.clone();
+            d.list_ttl = Duration::from_secs(30);
+        }));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        get(&h, &path, &[]).await;
+        let key = cache.last_key();
+        let held = cache.get(&key).unwrap_or_default();
+        let (complete, _, etag, body) = crate::handler::split_cached(&held);
+        cache.put(&key, &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body), Duration::from_secs(60));
+        assert_eq!(hdr(&get(&h, &path, &[]).await, "cache-control"), "private, max-age=30", "stale cache-control");
+    }
+    todo!("pending: handler_test.go:TestStreamList_staleWindowScalesWithTheTTL")
 }
 
 #[test]
 #[ignore = "needs the handler's stale-if-error and outage-hold arithmetic (staleIfErrorFor, outageHoldFor)"]
 fn stream_list_stale_if_error_stays_inside_ticket_life() {
-    // Go TestStreamList_staleIfErrorStaysInsideTicketLife: stale-if-error is min(ceiling, ticket-3*list).
-    todo!("port the stale-if-error arithmetic")
+    // Enable when stale_if_error_for lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestStreamList_staleIfErrorStaysInsideTicketLife: a complete list's stale-if-error never outlives the
+        // tickets in it.
+        for (list, ticket, want) in [
+            (Duration::from_secs(300), Duration::from_secs(24 * 3600), Duration::from_secs(3600)),
+            (Duration::from_secs(300), Duration::from_secs(3600), Duration::from_secs(45 * 60)),
+            (Duration::from_secs(300), Duration::from_secs(600), Duration::ZERO),
+        ] {
+            assert_eq!(crate::handler::stale_if_error_for(list, ticket), want, "list {list:?}, ticket {ticket:?}");
+        }
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        let h = new_handler(test_deps(|_| {}));
+        assert_eq!(hdr(&futures_block(get(&h, &path, &[])), "cache-control"), "private, max-age=300, stale-while-revalidate=300, stale-if-error=3600");
+        let short = new_handler(test_deps(|d| d.play_ticket_ttl = Duration::from_secs(600)));
+        assert_eq!(hdr(&futures_block(get(&short, &path, &[])), "cache-control"), "private, max-age=300, stale-while-revalidate=300", "with ten-minute tickets");
+    }
+    todo!("pending: handler_test.go:TestStreamList_staleIfErrorStaysInsideTicketLife")
 }
 
 #[test]
 #[ignore = "needs the handler's outage-hold arithmetic (outageHoldFor)"]
 fn stream_list_outage_hold_leaves_tickets_a_viewing() {
-    // Go TestStreamList_outageHoldLeavesTicketsAViewing: the outage hold is the ticket life less the list
-    // TTL and outageViewingRoom, and never less than the stale window.
-    todo!("port the outage-hold arithmetic")
+    // Enable when outage_hold_for lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestStreamList_outageHoldLeavesTicketsAViewing: the server holds a complete list for an outage far
+        // longer than a device may keep its own copy, but always leaves the list's tickets a viewing's worth of life.
+        for (list, ticket, want) in [
+            (Duration::from_secs(300), Duration::from_secs(24 * 3600), Duration::from_secs(24 * 3600) - Duration::from_secs(15 * 60) - crate::handler::OUTAGE_VIEWING_ROOM),
+            (Duration::from_secs(300), Duration::from_secs(4 * 3600), Duration::from_secs(3600)),
+            (Duration::from_secs(300), Duration::from_secs(600), Duration::ZERO),
+        ] {
+            assert_eq!(crate::handler::outage_hold_for(list, ticket), want, "list {list:?}, ticket {ticket:?}");
+        }
+    }
+    todo!("pending: handler_test.go:TestStreamList_outageHoldLeavesTicketsAViewing")
 }
 
 #[test]
 #[ignore = "needs the handler's stale-list build internals (splitCached, joinCached, outageHoldFor)"]
 fn stream_list_serves_the_last_complete_list_when_no_indexer_answers() {
-    // Go TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers: stale_list during the outage, the
-    // cool-off suppresses re-scrapes, and past the outage hold the answer is unknown.
-    todo!("port once splitCached and joinCached are ported")
+    // Enable when splitCached/joinCached land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers: when no indexer answers, a title whose
+        // last complete list is past its stale window gets that list back, marked stale_list. Within the cool-off
+        // it is served without scraping again. Past the outage hold the answer is the build's own (unknown).
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scrapes = Arc::new(AtomicI32::new(0));
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let (dn, sc, c) = (down.clone(), scrapes.clone(), cache.clone());
+        let h = new_handler(test_deps(move |d| {
+            d.cache = c.clone();
+            let (dn, sc) = (dn.clone(), sc.clone());
+            d.make_scrapers = Arc::new(move |_| {
+                let (dn, sc) = (dn.clone(), sc.clone());
+                vec![fake_scraper("torrentio", move || {
+                    let (dn, sc) = (dn.clone(), sc.clone());
+                    Box::pin(async move {
+                        sc.fetch_add(1, Ordering::SeqCst);
+                        if dn.load(Ordering::SeqCst) {
+                            return Err(Box::new(std::io::Error::other("indexer down")) as DoError);
+                        }
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        }));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        assert_eq!(get(&h, &path, &[]).await.status(), 200, "cold build");
+        let key = cache.last_key();
+        let held = cache.get(&key).unwrap_or_default();
+        let (complete, _, etag, body) = crate::handler::split_cached(&held);
+        let age = |past: Duration| cache.put(&key, &crate::handler::join_cached(complete, now_unix() - past.as_secs() as i64, &etag, &body), Duration::from_secs(24 * 3600));
+        age(Duration::from_secs(5 * 60));
+        assert_eq!(hdr(&get(&h, &path, &[]).await, "x-den-degraded"), "stale_list", "healthy background rebuild");
+        down.store(true, Ordering::SeqCst);
+        age(Duration::from_secs(5 * 60));
+        let before = scrapes.load(Ordering::SeqCst);
+        let stale = get(&h, &path, &[]).await;
+        assert_eq!(stale.status(), 200, "outage");
+        assert_eq!(hdr(&stale, "x-den-degraded"), "stale_list", "X-Den-Degraded");
+        assert_eq!(hdr(&stale, "cache-control"), "private, max-age=60", "stale cache-control");
+        assert_eq!(scrapes.load(Ordering::SeqCst), before + 1, "scraped once for the outage answer");
+        let again = get(&h, &path, &[]).await;
+        assert_eq!(hdr(&again, "x-den-degraded"), "stale_list", "inside the cool-off");
+        assert_eq!(scrapes.load(Ordering::SeqCst), before + 1, "a request inside the cool-off scraped again");
+        age(Duration::from_secs(3 * 3600));
+        assert_eq!(hdr(&get(&h, &path, &[]).await, "x-den-degraded"), "stale_list", "three hours into an outage");
+        age(crate::handler::outage_hold_for(crate::handler::DEFAULT_LIST_TTL, crate::ticket::DEFAULT_PLAY_TICKET_TTL) + Duration::from_secs(120));
+        let late = get(&h, &path, &[]).await;
+        assert_eq!(hdr(&late, "x-den-degraded"), "indexers", "past the outage hold");
+        let v: serde_json::Value = serde_json::from_slice(late.body()).unwrap_or_default();
+        assert_eq!(v["den"]["answerKind"], "unknown", "past the outage hold the answer is unknown");
+    }
+    todo!("pending: handler_test.go:TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers")
 }
 
 #[test]
 #[ignore = "needs the handler's rebuild gate (bookRebuild, releaseRebuild) and its counters"]
 fn stream_list_stale_rebuild_spawns_one_goroutine_per_key() {
-    // Go TestStreamList_staleRebuildSpawnsOneGoroutinePerKey: 300 stale hits start one rebuild, not 300.
-    todo!("port with the rebuild gate")
+    // Enable when the rebuild gate lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_staleRebuildSpawnsOneGoroutinePerKey: one goroutine per stale KEY, not per stale REQUEST.
+        // 300 stale hits while one rebuild is in flight must start nothing else.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let builds = Arc::new(AtomicI32::new(0));
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let (rel, bd, c) = (release.clone(), builds.clone(), cache.clone());
+        let h = new_handler(test_deps(move |d| {
+            d.cache = c.clone();
+            let (rel, bd) = (rel.clone(), bd.clone());
+            d.make_scrapers = Arc::new(move |_| {
+                let (rel, bd) = (rel.clone(), bd.clone());
+                vec![fake_scraper("torrentio", move || {
+                    let (rel, bd) = (rel.clone(), bd.clone());
+                    Box::pin(async move {
+                        if bd.fetch_add(1, Ordering::SeqCst) > 0 {
+                            rel.notified().await; // hold the rebuild open so the flood lands while it is in flight
+                        }
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        }));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        get(&h, &path, &[]).await; // seed
+        let key = cache.last_key();
+        let held = cache.get(&key).unwrap_or_default();
+        let (complete, _, etag, body) = crate::handler::split_cached(&held);
+        cache.put(&key, &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body), Duration::from_secs(60));
+        let before = crate::handler::live_goroutines();
+        for i in 0..300 {
+            assert_eq!(get(&h, &path, &[]).await.status(), 200, "stale hit {i}");
+        }
+        let grew = crate::handler::live_goroutines() - before;
+        release.notify_waiters();
+        assert!(grew <= 5, "300 stale hits grew the goroutine count by {grew}, want ~1");
+    }
+    todo!("pending: handler_test.go:TestStreamList_staleRebuildSpawnsOneGoroutinePerKey")
 }
 
 #[test]
 #[ignore = "needs the handler's rebuild gate (bookRebuild, releaseRebuild)"]
 fn rebuild_gate() {
-    // Go TestRebuildGate: booking, the cool-off after a degraded rebuild, and its expiry.
-    todo!("port with the rebuild gate")
+    // Enable when the rebuild gate lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestRebuildGate: booking, the cool-off after a degraded rebuild, and its expiry, against injected times.
+        let mut h = crate::handler::RebuildGate::default();
+        let t0 = std::time::Instant::now();
+        let budget = Duration::from_secs(28);
+        let (gen, ok) = h.book_rebuild("k", t0, t0 + budget);
+        assert!(ok, "first booking refused");
+        assert!(!h.book_rebuild("k", t0 + Duration::from_secs(1), t0 + budget).1, "a second booking was granted while the first was live");
+        // A healthy rebuild clears the key immediately, so the next expiry rebuilds at once.
+        h.release_rebuild("k", gen, None);
+        let (gen2, ok) = h.book_rebuild("k", t0 + Duration::from_secs(2), t0 + budget);
+        assert!(ok, "a released key refused the next booking");
+        // A DEGRADED rebuild installs a cool-off, which outlives the booking window it replaces.
+        h.release_rebuild("k", gen2, Some(t0 + crate::handler::REBUILD_COOLOFF));
+        assert!(!h.book_rebuild("k", t0 + budget + Duration::from_secs(1), t0 + budget).1, "the cool-off did not outlive the booking window");
+        assert!(h.book_rebuild("k", t0 + crate::handler::REBUILD_COOLOFF + Duration::from_secs(1), t0 + budget).1, "the cool-off never expired");
+    }
+    todo!("pending: handler_test.go:TestRebuildGate")
 }
 
 #[test]
 #[ignore = "needs the handler's rebuild gate (bookRebuild, releaseRebuild, maxConcurrentRebuilds)"]
 fn rebuild_gate_bounds_concurrent_rebuilds() {
-    // Go TestRebuildGate_boundsConcurrentRebuilds: a global ceiling on concurrent rebuilds.
-    todo!("port with the rebuild gate")
+    // Enable when the rebuild gate lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestRebuildGate_boundsConcurrentRebuilds: a global ceiling on concurrent rebuilds, in addition to the
+        // per-key one. Finishing one frees exactly one slot.
+        let mut h = crate::handler::RebuildGate::default();
+        let t0 = std::time::Instant::now();
+        let mut gens = std::collections::HashMap::new();
+        for i in 0..crate::handler::MAX_CONCURRENT_REBUILDS {
+            let key = format!("k{i}");
+            let (gen, ok) = h.book_rebuild(&key, t0, t0 + Duration::from_secs(60));
+            assert!(ok, "booking {i} refused below the ceiling");
+            gens.insert(key, gen);
+        }
+        assert!(!h.book_rebuild("one-too-many", t0, t0 + Duration::from_secs(60)).1, "booked more than the ceiling");
+        h.release_rebuild("k0", gens["k0"], None);
+        assert!(h.book_rebuild("after-release", t0, t0 + Duration::from_secs(60)).1, "a freed slot was not reusable");
+    }
+    todo!("pending: handler_test.go:TestRebuildGate_boundsConcurrentRebuilds")
 }
 
 #[test]
 #[ignore = "needs the handler's rebuild gate lease sweep (rebuilds, releaseRebuild)"]
 fn rebuild_gate_swept_lease_still_returns_its_slot() {
-    // Go TestRebuildGate_sweptLeaseStillReturnsItsSlot: a swept lease gives its slot back.
-    todo!("port with the rebuild gate")
+    // Enable when the rebuild gate lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestRebuildGate_sweptLeaseStillReturnsItsSlot: a lease swept by a later booking still returns its slot.
+        let mut h = crate::handler::RebuildGate::default();
+        let t0 = std::time::Instant::now();
+        let (gen, _) = h.book_rebuild("overrun", t0, t0 + Duration::from_secs(1));
+        let later = t0 + Duration::from_secs(10);
+        let (sweeper, _) = h.book_rebuild("sweeper", later, later + Duration::from_secs(60));
+        assert!(!h.holds("overrun"), "the expired lease was not swept");
+        h.release_rebuild("overrun", gen, None);
+        h.release_rebuild("sweeper", sweeper, None);
+        for i in 0..crate::handler::MAX_CONCURRENT_REBUILDS {
+            assert!(h.book_rebuild(&format!("fresh{i}"), later, later + Duration::from_secs(60)).1, "only {i} slots came back");
+        }
+    }
+    todo!("pending: handler_test.go:TestRebuildGate_sweptLeaseStillReturnsItsSlot")
 }
 
 #[test]
 #[ignore = "needs the handler's rebuild gate fencing token (releaseRebuild)"]
 fn rebuild_gate_stale_lease_releases_nothing() {
-    // Go TestRebuildGate_staleLeaseReleasesNothing: a superseded lease neither deletes a live booking nor a
-    // cool-off.
-    todo!("port with the rebuild gate")
+    // Enable when the rebuild gate lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestRebuildGate_staleLeaseReleasesNothing: a superseded lease neither deletes a live booking nor a
+        // cool-off. The fencing token (the generation) is what tells them apart.
+        let mut h = crate::handler::RebuildGate::default();
+        let t0 = std::time::Instant::now();
+        let (old, _) = h.book_rebuild("k", t0, t0 + Duration::from_secs(1));
+        let (fresh, ok) = h.book_rebuild("k", t0 + Duration::from_secs(2), t0 + Duration::from_secs(30));
+        assert!(ok && fresh != old, "second booking");
+        h.release_rebuild("k", old, None);
+        assert!(!h.book_rebuild("k", t0 + Duration::from_secs(3), t0 + Duration::from_secs(30)).1, "a superseded lease deleted the live booking");
+        h.release_rebuild("k", fresh, Some(t0 + Duration::from_secs(3600)));
+        let (late, ok) = h.book_rebuild("other", t0 + Duration::from_secs(4), t0 + Duration::from_secs(30));
+        assert!(ok, "could not book a second key");
+        h.release_rebuild("k", late, None); // right gen, wrong key: must not touch k's cool-off
+        assert!(!h.book_rebuild("k", t0 + Duration::from_secs(5), t0 + Duration::from_secs(30)).1, "a superseded lease wiped the cool-off");
+        h.release_rebuild("other", late, None);
+    }
+    todo!("pending: handler_test.go:TestRebuildGate_staleLeaseReleasesNothing")
 }
 
 #[test]
 #[ignore = "needs the handler's rebuild gate counter (rebuildsLive)"]
 fn rebuild_gate_slot_accounting_balances() {
-    // Go TestRebuildGate_slotAccountingBalances: every granted booking returns its slot exactly once.
-    todo!("port with the rebuild gate")
+    // Enable when the rebuild gate lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestRebuildGate_slotAccountingBalances: every granted booking returns its slot exactly once, so the
+        // ceiling neither seizes up nor loosens.
+        let mut h = crate::handler::RebuildGate::default();
+        let t0 = std::time::Instant::now();
+        for round in 0..5 {
+            let mut gens = Vec::new();
+            for i in 0..crate::handler::MAX_CONCURRENT_REBUILDS {
+                let (gen, ok) = h.book_rebuild(&format!("r{round}-k{i}"), t0, t0 + Duration::from_secs(60));
+                assert!(ok, "round {round}: booking {i} refused — slots did not come back");
+                gens.push(gen);
+            }
+            for (i, gen) in gens.into_iter().enumerate() {
+                h.release_rebuild(&format!("r{round}-k{i}"), gen, None);
+            }
+        }
+        assert_eq!(h.live(), 0, "after balanced book/release pairs the live count is not 0");
+    }
+    todo!("pending: handler_test.go:TestRebuildGate_slotAccountingBalances")
 }
 
 #[tokio::test]
 #[ignore = "needs the handler's stale-list build internals (splitCached, joinCached)"]
 async fn stream_list_outage_does_not_scrape_per_request() {
-    // Go TestStreamList_outageDoesNotScrapePerRequest: 20 stale hits during an outage produce at most 3 scrapes.
-    todo!("port once splitCached and joinCached are ported")
+    // Enable when splitCached/joinCached land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_outageDoesNotScrapePerRequest: 20 stale hits during an outage produce at most 3 scrapes.
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scrapes = Arc::new(AtomicI32::new(0));
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let (hl, sc, c) = (healthy.clone(), scrapes.clone(), cache.clone());
+        let h = new_handler(test_deps(move |d| {
+            d.cache = c.clone();
+            let (hl, sc) = (hl.clone(), sc.clone());
+            d.make_scrapers = Arc::new(move |_| {
+                let (hl, sc) = (hl.clone(), sc.clone());
+                vec![fake_scraper("torrentio", move || {
+                    let (hl, sc) = (hl.clone(), sc.clone());
+                    Box::pin(async move {
+                        sc.fetch_add(1, Ordering::SeqCst);
+                        if !hl.load(Ordering::SeqCst) {
+                            return Err(Box::new(std::io::Error::other("canceled")) as DoError);
+                        }
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        }));
+        let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+        get(&h, &path, &[]).await;
+        let key = cache.last_key();
+        let held = cache.get(&key).unwrap_or_default();
+        let (complete, _, etag, body) = crate::handler::split_cached(&held);
+        healthy.store(false, Ordering::SeqCst);
+        for _ in 0..20 {
+            // Re-stale the entry before each request, as a real expired entry would be.
+            cache.put(&key, &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body), Duration::from_secs(60));
+            get(&h, &path, &[]).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(scrapes.load(Ordering::SeqCst) <= 3, "scrapes for 20 stale hits during an outage — the cool-off is not holding");
+    }
+    todo!("pending: handler_test.go:TestStreamList_outageDoesNotScrapePerRequest")
 }
 
 #[tokio::test]
 #[ignore = "needs the handler's stale-list build internals (splitCached)"]
 async fn stream_list_partial_list_gets_no_stale_window() {
-    // Go TestStreamList_partialListGetsNoStaleWindow: a partial list carries no freshness stamp.
-    todo!("port once splitCached is ported")
+    // Enable when splitCached lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestStreamList_partialListGetsNoStaleWindow: a partial list must never be served stale, and carries no
+        // freshness stamp.
+        let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+        let c = cache.clone();
+        let h = new_handler(test_deps(move |d| {
+            d.cache = c.clone();
+            d.make_scrapers = Arc::new(|_| {
+                vec![
+                    fake_scraper("torrentio", || Box::pin(async { Ok(test_seeds()) })),
+                    fake_scraper("comet", || Box::pin(async { Err(Box::new(std::io::Error::other("canceled")) as DoError) })),
+                ]
+            });
+        }));
+        assert_eq!(get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(), 200, "partial build");
+        let held = cache.get(&cache.last_key()).expect("the partial build cached nothing");
+        let (complete, fresh_until, _, _) = crate::handler::split_cached(&held);
+        assert!(!complete, "a scrape with a failed indexer was recorded as complete");
+        assert_eq!(fresh_until, 0, "a partial list carries a freshness stamp");
+    }
+    todo!("pending: handler_test.go:TestStreamList_partialListGetsNoStaleWindow")
 }
 
 #[test]
 #[ignore = "needs the handler's cached-entry format (splitCached, joinCached)"]
 fn split_cached_reads_an_older_entry_conservatively() {
-    // Go TestSplitCached_readsAnOlderEntryConservatively: an entry with no completeness recorded is read as
-    // incomplete, and the three-field format round-trips.
-    todo!("port the cached-entry format")
+    // Enable when splitCached lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestSplitCached_readsAnOlderEntryConservatively: an entry with no completeness recorded is read as
+        // incomplete, and the current format round-trips, a body with a separator is not truncated, and the
+        // freshness stamp round-trips beside completeness.
+        let (complete, _, etag, body) = crate::handler::split_cached("W/\"abc\"\x00{\"streams\":[]}");
+        assert!(!complete, "an entry with no completeness recorded must not be assumed complete");
+        assert_eq!((etag.as_str(), body.as_str()), ("W/\"abc\"", "{\"streams\":[]}"), "legacy entry mis-split");
+        for want in [true, false] {
+            let (got, _, e, b) = crate::handler::split_cached(&crate::handler::join_cached(want, 0, "E", "B"));
+            assert!(got == want && e == "E" && b == "B", "round trip complete={want}");
+        }
+        let (_, _, _, weird) = crate::handler::split_cached(&crate::handler::join_cached(true, 0, "E", "a\x00b"));
+        assert_eq!(weird, "a\x00b", "body with a separator was truncated");
+        let (c, f, e, b) = crate::handler::split_cached(&crate::handler::join_cached(true, 1757000000, "E", "B"));
+        assert!(c && f == 1757000000 && e == "E" && b == "B", "stamped round trip");
+        // A three-field entry from a build that predates the stamp reports freshUntil 0: no stamp.
+        let (c, f, _, _) = crate::handler::split_cached("1\x00E\x00B");
+        assert!(c && f == 0, "pre-stamp entry: complete={c} freshUntil={f}, want complete with no stamp");
+    }
+    todo!("pending: handler_test.go:TestSplitCached_readsAnOlderEntryConservatively")
 }
 
 #[test]
 #[ignore = "needs the handler's cached-entry format (splitCached)"]
 fn split_cached_treats_every_unknown_form_the_same_way() {
-    // Go TestSplitCached_treatsEveryUnknownFormTheSameWay: a value with no separator is read the same as the
-    // legacy one-separator form.
-    todo!("port the cached-entry format")
+    // Enable when splitCached lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        // Go TestSplitCached_treatsEveryUnknownFormTheSameWay: a value with no separator is read the same way as the
+        // legacy one-separator form, and a separator-less value is served whole.
+        let (bare_complete, _, _, bare_body) = crate::handler::split_cached("just-a-body");
+        let (sep_complete, _, _, _) = crate::handler::split_cached("etag\x00body");
+        assert_eq!(bare_complete, sep_complete, "unknown completeness answered differently with and without a separator");
+        assert!(!bare_complete, "completeness that was never recorded must not be assumed");
+        assert_eq!(bare_body, "just-a-body", "a separator-less value must be served whole");
+    }
+    todo!("pending: handler_test.go:TestSplitCached_treatsEveryUnknownFormTheSameWay")
 }
 
 #[tokio::test]
 #[ignore = "needs package 1's torBoxStore and package 2's StorePool (the play path's resolve and status budgets)"]
 async fn handle_play_poll_reads_use_the_status_budget() {
-    // Go TestHandlePlay_pollReadsUseTheStatusBudget: a poll-route status read never takes the resolve budget,
-    // and only the escalation may take double the status budget.
-    todo!("needs the play path")
+    // Enable when package 1's TorBox store and package 2's StorePool land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestHandlePlay_pollReadsUseTheStatusBudget: a poll-route status read never takes the resolve budget,
+        // and only the escalation may take double the status budget.
+        for route in ["", "?probe=1"] {
+            for unknown in [false, true] {
+                let store = DeadlineStore::new(DebridService::TorBox, unknown);
+                let seen = store.status_at.clone();
+                let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+                let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "a".repeat(40), ..Default::default() });
+                get(&h, &format!("/{}/play/{tok}{route}", valid_blob()), &[]).await;
+                let reads = seen.lock().expect("the lock").clone();
+                assert!(!reads.is_empty(), "the status read never happened");
+                let ceiling = 2 * crate::handler::STATUS_BUDGET;
+                let doubled = reads.iter().filter(|l| **l > crate::handler::STATUS_BUDGET).count();
+                assert!(reads.iter().all(|l| *l <= ceiling), "a status read exceeded the 2x ceiling: {reads:?}");
+                let want = usize::from(unknown && route.is_empty());
+                assert_eq!(doubled, want, "reads exceeding the ordinary status budget: {reads:?}");
+            }
+        }
+    }
+    todo!("pending: handler_test.go:TestHandlePlay_pollReadsUseTheStatusBudget")
 }
 
 #[tokio::test]
 #[ignore = "needs package 2's StorePool (escalation)"]
 async fn handle_play_the_escalation_re_asks_only_the_store_that_could_not_answer() {
-    // Go TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer.
-    todo!("needs StorePool")
+    // Enable when package 2's StorePool lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer: the escalation re-asks only the store
+        // that could not answer. Three reads happen: poll, escalation, post-failure. Only the escalation is narrowed.
+        let stores = vec![
+            AnsweringStore::new(DebridService::RealDebrid, StatusAnswer::No),
+            AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown),
+            AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No),
+        ];
+        let handles = stores.iter().map(|s| s.asked.clone()).collect::<Vec<_>>();
+        let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| stores.clone().into_iter().map(|s| Box::new(s) as Box<dyn Store>).collect())));
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "a".repeat(40), ..Default::default() });
+        get(&h, &format!("/{}/play/{tok}", valid_blob()), &[]).await;
+        assert_eq!(handles[1].load(Ordering::SeqCst), 3, "the store that could not answer was read the wrong number of times");
+        assert!(handles[0].load(Ordering::SeqCst) == 2 && handles[2].load(Ordering::SeqCst) == 2, "definitive stores were re-asked");
+    }
+    todo!("pending: handler_test.go:TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer")
 }
 
 #[test]
 #[ignore = "needs the handler's escalated status context (escalatedStatusCtx, escalatedStatusBudget)"]
 fn escalated_status_ctx_cannot_outlive_the_resolve_budget() {
-    // Go TestEscalatedStatusCtx_cannotOutliveTheResolveBudget.
-    todo!("port escalatedStatusCtx")
+    // Enable when escalatedStatusCtx lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestEscalatedStatusCtx_cannotOutliveTheResolveBudget: the escalated status read is bounded by its own
+        // ceiling and can never outlive the resolve budget it is gating.
+        let parent_budget = crate::handler::RESOLVE_BUDGET;
+        let parent = tokio::time::timeout(parent_budget, std::future::pending::<()>());
+        let (ctx, _cancel, ok) = crate::handler::escalated_status_ctx(parent_budget);
+        assert!(ok, "a full resolve budget refused the escalation");
+        let left = ctx.remaining();
+        assert!(left <= 2 * crate::handler::STATUS_BUDGET, "escalated read got {left:?}");
+        assert_eq!(crate::handler::escalated_status_budget(), 2 * crate::handler::STATUS_BUDGET, "the escalation is not twice the status budget");
+        assert!(ctx.remaining() <= parent_budget, "the escalated read outlives the resolve budget");
+        // Too little left to do the add afterwards: declined.
+        let (_, _, tight_ok) = crate::handler::escalated_status_ctx(crate::handler::escalated_status_budget());
+        assert!(!tight_ok, "escalated with too little budget left to add afterwards");
+        let (_, _, none_ok) = crate::handler::escalated_status_ctx(Duration::ZERO);
+        assert!(!none_ok, "escalated from a context with no deadline");
+        drop(parent);
+    }
+    todo!("pending: handler_test.go:TestEscalatedStatusCtx_cannotOutliveTheResolveBudget")
 }
 
 #[tokio::test]
 #[ignore = "needs package 1's torBoxStore (the probe's refusal path)"]
 async fn handle_probe_reports_a_refusal_it_discovers_itself() {
-    // Go TestHandleProbe_reportsARefusalItDiscoversItself: a refusal seen by the probe is not reported as 404.
-    todo!("needs the TorBox store")
+    // Enable when package 1's TorBox store lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestHandleProbe_reportsARefusalItDiscoversItself: a refusal the probe discovers itself is reported as
+        // a refusal, not as an absence (404 "not_queued").
+        let held = "a".repeat(40);
+        for warm in [false, true] {
+            let cache = Arc::new(MemoryCache::new(1 << 20));
+            cache.put(&torrent_id_key("tb-secret", &held), "42", crate::handler::RESOLVE_CACHE_TTL);
+            if warm {
+                cache.put(&resolve_key("tb-secret", &held), r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#, crate::handler::RESOLVE_CACHE_TTL);
+            }
+            let store = TorBoxStore::with_client(
+                "tb-secret",
+                cache.clone(),
+                MockDoer::new(move |r: &http::Request<String>| {
+                    if warm && r.uri().path().contains("requestdl") {
+                        return resp(429, "{}");
+                    }
+                    if r.uri().path().contains("mylist") {
+                        return resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#);
+                    }
+                    resp(200, &format!(r#"{{"data":{{"{held}":{{"name":"x"}}}}}}"#))
+                }),
+            );
+            let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+            let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: held.clone(), season: Some(1), episode: Some(2), ..Default::default() });
+            let rec = get(&h, &format!("/{}/play/{tok}?probe=1", valid_blob()), &[]).await;
+            assert_ne!(rec.status(), 404, "probe answered 404 for a refusal it saw itself (warm={warm})");
+        }
+    }
+    todo!("pending: handler_test.go:TestHandleProbe_reportsARefusalItDiscoversItself")
 }
 
 #[tokio::test]
 #[ignore = "needs the status budget as a mutable value (statusBudget) and package 2's StorePool"]
 async fn play_the_preference_cache_check_is_budgeted() {
-    // Go TestPlay_thePreferenceCacheCheckIsBudgeted: the preference check gets a slice of the resolve clock.
-    todo!("needs the status budget and StorePool")
+    // Enable when the status budget and StorePool land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestPlay_thePreferenceCacheCheckIsBudgeted: /play's preference cache check gets a slice of the resolve
+        // clock, never the whole thing. Asserted on the deadline the store is handed.
+        let _budget = crate::handler::set_status_budget(Duration::from_millis(150));
+        let store = RecordingCheckStore::new(DebridService::TorBox);
+        let budgets = store.budgets.clone();
+        let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+        // TWO accounts: the preference check is gated on more than one being configured.
+        let two = blob(r#"{"debrid":[{"service":"torbox","token":"tb"},{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}"#);
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "c".repeat(40), ..Default::default() });
+        assert_eq!(get(&h, &format!("/{two}/play/{tok}"), &[]).await.status(), 302, "play");
+        let got = budgets.recv_timeout(Duration::from_secs(1)).expect("no cache check was made");
+        assert!(got <= crate::handler::STATUS_BUDGET, "the preference cache check was given {got:?} of budget, want about the status budget");
+    }
+    todo!("pending: handler_test.go:TestPlay_thePreferenceCacheCheckIsBudgeted")
 }
 
 #[tokio::test]
 #[ignore = "needs package 1's torBoxStore and package 3's global add budget"]
 async fn resolve_a_spent_clock_does_not_buy_an_add() {
-    // Go TestResolve_aSpentClockDoesNotBuyAnAdd.
-    todo!("needs the TorBox store and the add budget")
+    // Enable when package 1's TorBox store and package 3's add budget land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestResolve_aSpentClockDoesNotBuyAnAdd: a resolve on a spent clock must not charge an add, and issues
+        // no upstream request.
+        let token = "spent-clock-resolve".to_owned();
+        let hash = "d".repeat(40);
+        let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+        let upstream = Arc::new(AtomicI32::new(0));
+        let u = upstream.clone();
+        let s = TorBoxStore::with_client(&token, Arc::new(MemoryCache::new(1 << 20)), MockDoer::new(move |_| {
+            u.fetch_add(1, Ordering::SeqCst);
+            resp(200, r#"{"data":{}}"#)
+        }));
+        let ctx = CancelledCtx::new();
+        assert!(s.resolve_in(&ctx, &ResolveTarget { info_hash: hash, ..Default::default() }).await.is_err(), "a resolve on a spent clock should not succeed");
+        assert_eq!(global_add_budget().remaining(&budget_account(DebridService::TorBox, &token)), before, "the hourly add budget moved on a spent clock");
+        assert_eq!(upstream.load(Ordering::SeqCst), 0, "upstream requests were issued on an expired context");
+    }
+    todo!("pending: handler_test.go:TestResolve_aSpentClockDoesNotBuyAnAdd")
 }
 
 #[tokio::test]
 #[ignore = "needs package 2's StorePool (ResolvePreferring) and package 1's torBoxStore"]
 async fn resolve_preferring_a_spent_clock_still_surfaces_an_in_flight_add() {
-    // Go TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd.
-    todo!("needs StorePool")
+    // Enable when package 2's StorePool lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd: a spent clock still reports an add scout
+        // already has out, which is a pure cache read ahead of the charge, so it costs nothing.
+        let token = "inflight-resolve-preferring".to_owned();
+        let hash = "e".repeat(40);
+        let cache = Arc::new(MemoryCache::new(1 << 20));
+        note_add_attempt(&cache, DebridService::RealDebrid, &token, &hash);
+        let quiet = MockDoer::new(|_| resp(200, r#"{"data":{}}"#));
+        let pool = StorePool::new(vec![
+            Box::new(TorBoxStore::with_client(&token, cache.clone(), quiet.clone())),
+            Box::new(RealDebridStore::with_client(&token, cache.clone(), quiet)),
+        ]);
+        let ctx = CancelledCtx::new();
+        let err = pool.resolve_preferring(&ctx, &ResolveTarget { info_hash: hash, ..Default::default() }, None).await;
+        assert!(matches!(err, Err(StoreError::AddInFlight)), "a spent clock reported {err:?}, want AddInFlight");
+    }
+    todo!("pending: handler_test.go:TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd")
 }
 
 #[tokio::test]
 #[ignore = "needs the status budget as a mutable value (statusBudget)"]
 async fn play_status_timeout_does_not_add() {
-    // Go TestPlay_statusTimeoutDoesNotAdd: a timed-out status read leads to no resolve.
-    todo!("needs the mutable status budget")
+    // Enable when the mutable status budget lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestPlay_statusTimeoutDoesNotAdd: a timed-out status read is not "nobody is fetching it", so it leads to
+        // no add. The second, longer read is what answers.
+        let _budget = crate::handler::set_status_budget(Duration::from_millis(150));
+        let store = SlowStatusStore::new(DebridService::TorBox, 1, false); // slow once, then answers
+        let resolves = store.resolves.clone();
+        let hits = store.status_hits.clone();
+        let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "a".repeat(40), ..Default::default() });
+        assert_eq!(get(&h, &format!("/{}/play/{tok}", valid_blob()), &[]).await.status(), 202, "the release is downloading");
+        assert_eq!(resolves.load(Ordering::SeqCst), 0, "a timed-out status read still queued the torrent");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "status calls: the short read, then the definitive one");
+    }
+    todo!("pending: handler_test.go:TestPlay_statusTimeoutDoesNotAdd")
 }
 
 #[tokio::test]
 #[ignore = "needs the status budget as a mutable value (statusBudget)"]
 async fn play_prompt_not_downloading_still_adds() {
-    // Go TestPlay_promptNotDownloadingStillAdds: a prompt "not downloading" answer still adds.
-    todo!("needs the mutable status budget")
+    // Enable when the mutable status budget lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestPlay_promptNotDownloadingStillAdds: a prompt "not downloading" answer is a real answer, and the add
+        // proceeds.
+        let _budget = crate::handler::set_status_budget(Duration::from_millis(150));
+        let store = SlowStatusStore::new(DebridService::TorBox, 0, true); // answers at once, and says no
+        let resolves = store.resolves.clone();
+        let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "b".repeat(40), ..Default::default() });
+        assert_eq!(get(&h, &format!("/{}/play/{tok}", valid_blob()), &[]).await.status(), 302, "play");
+        assert_eq!(resolves.load(Ordering::SeqCst), 1, "a prompt 'not downloading' must still add");
+    }
+    todo!("pending: handler_test.go:TestPlay_promptNotDownloadingStillAdds")
 }
 
 #[tokio::test]
 #[ignore = "needs the status budget as a mutable value (statusBudget)"]
 async fn play_multi_store_status_timeout_does_not_add() {
-    // Go TestPlay_multiStoreStatusTimeoutDoesNotAdd: with several accounts, a timed-out store adds nothing.
-    todo!("needs the mutable status budget")
+    // Enable when the mutable status budget lands: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        // Go TestPlay_multiStoreStatusTimeoutDoesNotAdd: with several accounts, a store that ran out of time adds
+        // nothing, and the other stores' prompt "no" does not end the pool early.
+        let _budget = crate::handler::set_status_budget(Duration::from_millis(150));
+        let slow = SlowStatusStore::new(DebridService::TorBox, 1, false); // TorBox is slow once, then reports the download
+        let slow_resolves = slow.resolves.clone();
+        let quick_resolves = Arc::new(AtomicI32::new(0));
+        let quick = |svc: DebridService| CountingResolveStore::new(SlowStatusStore::new(svc, 0, true), quick_resolves.clone());
+        let stores: Vec<Box<dyn Store>> = vec![Box::new(slow), Box::new(quick(DebridService::RealDebrid)), Box::new(quick(DebridService::Premiumize))];
+        let h = new_handler(test_deps(move |d| {
+            let stores = std::sync::Mutex::new(Some(stores));
+            d.make_stores = Arc::new(move |_| stores.lock().expect("the lock").take().unwrap_or_default());
+        }));
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "a".repeat(40), ..Default::default() });
+        assert_eq!(get(&h, &format!("/{}/play/{tok}", valid_blob()), &[]).await.status(), 202, "TorBox is downloading it");
+        assert_eq!(slow_resolves.load(Ordering::SeqCst) + quick_resolves.load(Ordering::SeqCst), 0, "a store that ran out of time still led to a resolve");
+    }
+    todo!("pending: handler_test.go:TestPlay_multiStoreStatusTimeoutDoesNotAdd")
 }
