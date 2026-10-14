@@ -632,7 +632,20 @@ impl Session {
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
         // Through the session's door where there is one: the head from memory, the rest over warm connections.
-        let input = self.door.as_ref().and_then(|d| st.doors.url(d)).unwrap_or_else(|| i.input.clone());
+        let door_url = self.door.as_ref().and_then(|d| st.doors.url(d));
+        // ffmpeg's own http protocol follows a `Location` without asking, and has no option to stop it, so a link is
+        // never handed to it: only the door (whose reads follow nothing) or a local file.
+        if door_url.is_none() && (i.input.starts_with("http://") || i.input.starts_with("https://")) {
+            crate::log_limited("no_door", || {
+                format!(
+                    "session {}: no loopback door for the release, and ffmpeg is not given a link to read{}",
+                    self.short(),
+                    rid_tail(self.rid.as_deref())
+                )
+            });
+            return Err(());
+        }
+        let input = door_url.unwrap_or_else(|| i.input.clone());
         let spec = Spec {
             input: &input,
             seek,

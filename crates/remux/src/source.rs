@@ -605,6 +605,50 @@ mod tests {
         assert_eq!(client.get(&url).send().await.unwrap().status().as_u16(), 404, "closed with its session");
     }
 
+    /// A server that answers every request with a 302 to `location`.
+    async fn redirector(location: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        base
+    }
+
+    /// `resolve` checks every hop up to the link, so a redirect a LATER read gets (a CDN sending the link somewhere
+    /// new) is never followed: not by a probe's range read, and not by a door's upstream read.
+    #[tokio::test]
+    async fn a_redirect_on_a_later_source_read_is_not_followed() {
+        let (target, _, hits) = upstream(1024).await;
+        for location in [format!("{target}/b"), "http://169.254.169.254/latest/meta-data".to_string()] {
+            let link = redirector(location.clone()).await;
+            let client = crate::state::source_client(Duration::from_secs(1), Duration::from_secs(1));
+
+            let err =
+                crate::probe::read_range(&client, &link, 100, 50).await.expect_err("a redirect is no read");
+            assert!(err.contains("302"), "{location}: followed, or failed some other way: {err}");
+
+            let doors = Doors::default();
+            let door = doors.open(client.clone(), &link, &[], 1024);
+            let url = doors.url(&door).expect("a loopback listener");
+            let resp =
+                reqwest::Client::new().get(&url).header("range", "bytes=100-149").send().await.unwrap();
+            let body = resp.bytes().await;
+            assert!(body.map_or(true, |b| b.is_empty()), "{location}: the door served bytes from a redirect");
+            assert_eq!(doors.stats().consumed.load(Relaxed), 0, "{location}");
+        }
+        assert_eq!(hits[1].load(Relaxed), 0, "a redirect target was requested");
+    }
+
     /// ffmpeg paused while the player is far ahead reads nothing for minutes, mid-request. A client with a total timeout
     /// cuts that request off once the pause outlasts it; the source client times only reads being made, and carries on.
     #[tokio::test]

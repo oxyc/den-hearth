@@ -419,8 +419,13 @@ const SOURCE_READ_IDLE: Duration = Duration::from_secs(30);
 /// one pool, so ffmpeg's reads go over the connection the probe opened. No total timeout: a read of the film runs as
 /// long as ffmpeg takes it, paused whenever the player is far enough ahead, so only a connection that won't open and
 /// a read that stops arriving — timed only while it is being read — end one.
+///
+/// It follows no redirect. `scout::resolve` walks the play URL's redirects itself and checks every hop (`SourceGuard`);
+/// the URL it ends on answers ranges directly. A redirect on a later read is an upstream sending the link somewhere
+/// new, which nothing has checked, so it is a failed read like an expired link, never a hop followed.
 pub fn source_client(connect: Duration, read_idle: Duration) -> reqwest::Client {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect)
         .read_timeout(read_idle)
         .user_agent(crate::user_agent())
