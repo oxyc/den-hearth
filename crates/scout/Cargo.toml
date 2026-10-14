@@ -26,6 +26,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http = "1"
+# Go `crypto/sha256`: the disk tier names an entry's file by the SHA-256 of its key.
+sha2 = "0.10"
+# Go `time.NewTicker`: `TieredCache::sweep_every` runs on a tokio interval and cancels by dropping the future.
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 # Go's `t.TempDir()`.
