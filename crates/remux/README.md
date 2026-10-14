@@ -379,8 +379,9 @@ Low resource use comes first, and the design follows from it:
   libva has to load Intel's driver at run time, which a fully static binary cannot, and that driver is
   most of the image now. Disk only: nothing loads it until a transcode starts. den-reel's image on the box is 693 MB
   (Debian ffmpeg, yt-dlp, deno, MP4Box).
-- **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start and a
-  session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
+- **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start — keeping the
+  sessions a shutdown suspended, to resume (`ARCHITECTURE.md`), and removing those not resumed within
+  `SESSION_IDLE_SECS` — and a session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
   while its ffmpeg is actually running and otherwise sleeps until a request or its idle deadline.
 - **One ffmpeg per session**, `-threads 1` (the video is copied; AAC needs one thread — a 7.1 track decoded and
   encoded to 5.1 took 0.90 CPU-s for 30 s against stereo's 0.60, 34× real time on one Apple Silicon core), paused with

@@ -70,7 +70,7 @@ pub enum Video {
 }
 
 /// What a copy does with the video's Dolby Vision.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Dovi {
     /// The video carries none.
     Absent,
@@ -88,7 +88,7 @@ pub const TRANSCODE_CODECS: &str = "avc1.640029";
 
 /// A transcode's size and rate: the picture fitted inside `width` × `height`, `bitrate` on average, `peak` at most —
 /// as the master playlist's BANDWIDTH counts it and as ffmpeg is told it — over a `buffer` of rate control.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Preset {
     pub width: u32,
     pub height: u32,
@@ -141,7 +141,7 @@ impl Preset {
 }
 
 /// What happens to the audio track.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AudioOut {
     /// Copied as it is — E-AC-3, AC-3 or FLAC, for a player that plays them in fMP4 HLS.
     Copy,

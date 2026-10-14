@@ -122,8 +122,9 @@ const PROBE_KEYFRAMES_MAX: usize = 65_536;
 const PROBE_TRACKS_MAX: usize = 128;
 const PROBE_STRING_MAX: usize = 256;
 
+/// Also what a session's restart record carries of its release (`resume`).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct StoredMediaInfo {
+pub(crate) struct StoredMediaInfo {
     container: String,
     duration: f64,
     video: crate::probe::VideoCodec,
@@ -170,7 +171,7 @@ impl From<&MediaInfo> for StoredMediaInfo {
 }
 
 impl StoredMediaInfo {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let short = |s: &str| s.len() <= PROBE_STRING_MAX;
         let finite_time = |n: f64| n.is_finite() && n >= 0.0 && n <= self.duration + 1.0;
         let ordered_times =
@@ -209,7 +210,7 @@ impl StoredMediaInfo {
             && byte_index
     }
 
-    fn into_media(self) -> Option<MediaInfo> {
+    pub(crate) fn into_media(self) -> Option<MediaInfo> {
         let container = match self.container.as_str() {
             "matroska" => "matroska",
             "mp4" => "mp4",
@@ -512,6 +513,8 @@ pub struct AppState {
     pub segments: crate::segments::Segments,
     /// Can this ffmpeg write PCM to a pipe (`segments::check_ffmpeg`)? Scanning is off without it.
     pub segments_ffmpeg: AtomicBool,
+    /// One rebuild of a session from its restart record at a time (`session::revive`).
+    pub(crate) revive_lock: tokio::sync::Mutex<()>,
 }
 
 /// A session replacing another of the same owner mid-film, which plays on until this one has started.
@@ -620,6 +623,7 @@ impl AppState {
             doors: Default::default(),
             segments: Default::default(),
             segments_ffmpeg: AtomicBool::new(false),
+            revive_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -939,6 +943,55 @@ impl AppState {
         self.sessions().insert(s.sid.clone(), s);
     }
 
+    /// Publish a session rebuilt after a restart, if its owner's share and `MAX_SESSIONS` have room for it — counting
+    /// what is being set up as `reserve` does. A rebuild never evicts: the owner may have started another session
+    /// since, which is the one it wants now.
+    pub fn insert_revived(&self, s: Arc<Session>) -> bool {
+        let share = match s.owner.as_str() {
+            o if crate::auth::is_grant_owner(o) => self.cfg.guest_max_sessions,
+            o if o.starts_with("install:") => self.cfg.max_sessions_per_install,
+            _ => 1,
+        };
+        let mut map = self.sessions();
+        let creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = map.values().filter(|o| o.owner == s.owner).count()
+            + creating.get(&s.owner).copied().unwrap_or(0);
+        if mine >= share || map.len() + creating.values().sum::<usize>() >= self.cfg.max_sessions {
+            return false;
+        }
+        map.insert(s.sid.clone(), s);
+        true
+    }
+
+    /// For a shutdown: stop every session's ffmpeg and keep its scratch, so the next process resumes it
+    /// (`session::revive`). Nothing is ended and no tombstone is written.
+    pub async fn suspend_all(&self) {
+        let all: Vec<Arc<Session>> = self.sessions().drain().map(|(_, s)| s).collect();
+        for s in &all {
+            s.suspend(self).await;
+        }
+        if !all.is_empty() {
+            eprintln!("shutdown: suspended {} session(s); their scratch is kept to resume them", all.len());
+        }
+    }
+
+    /// The scratch of sessions an earlier process left (`resume::sweep`) that no player has come back for within
+    /// `SESSION_IDLE_SECS` of the start: idle that long, they would have ended anyway.
+    pub async fn forget_unresumed(&self, sids: Vec<String>) {
+        let _one = self.revive_lock.lock().await;
+        let gone: Vec<_> = sids
+            .into_iter()
+            .filter(|sid| self.session(sid).is_none())
+            .map(|sid| self.cfg.scratch_dir.join(format!("s-{sid}")))
+            .filter(|dir| dir.exists())
+            .collect();
+        let n = gone.len();
+        let _ = tokio::task::spawn_blocking(move || gone.iter().for_each(|d| crate::resume::remove(d))).await;
+        if n > 0 {
+            eprintln!("scratch: removed {n} session dir(s) no player came back for after the restart");
+        }
+    }
+
     /// The expiry an ended session's URLs were signed with.
     pub fn tombstone(&self, sid: &str) -> Option<u64> {
         self.tombstones.lock().unwrap_or_else(|e| e.into_inner()).get(sid).copied()
@@ -981,26 +1034,12 @@ impl AppState {
         ended
     }
 
+    #[cfg(test)]
     pub async fn end_all(&self, why: &str) {
         let sids: Vec<String> = self.sessions().keys().cloned().collect();
         for sid in sids {
             self.end_session(&sid, why).await;
         }
-    }
-}
-
-/// Remove what a previous process left in scratch. Sessions live in memory only, so every `s-*`
-/// directory found at boot belongs to one that no longer exists.
-pub fn sweep_scratch(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut removed = 0;
-    for e in rd.flatten() {
-        if e.file_name().to_string_lossy().starts_with("s-") && std::fs::remove_dir_all(e.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        eprintln!("scratch: removed {removed} session dir(s) left by the previous process");
     }
 }
 

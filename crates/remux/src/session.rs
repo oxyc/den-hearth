@@ -49,6 +49,12 @@ const SNAP: f64 = 0.05;
 /// player may ask for the segment before when the point is near a boundary (hls.js allows a quarter second),
 /// and a job already behind that request is kept, where one ahead of it would be restarted.
 const START_SLACK: f64 = 1.0;
+/// A session rebuilt after a restart fetches its release again once a request comes within this many segments of
+/// the first one scratch doesn't hold. A player asks for segments as far ahead as it buffers — 30 s to two minutes —
+/// so that fetch and the run's start happen while it still plays what it has.
+const RESUME_LEAD: usize = 2;
+/// How soon fetching a rebuilt session's release is tried again after it failed.
+const RESOLVE_RETRY: Duration = Duration::from_secs(5);
 /// ffmpeg runs in a row that produced nothing before the session gives up on its source.
 const MAX_FAILURES: u32 = 3;
 /// How many releases to resolve and probe before giving up on a title. Past the first few, each is one debrid
@@ -168,6 +174,14 @@ pub struct Inner {
     /// The debrid link ffmpeg reads — scout's play URL, resolved — and whether it has been re-fetched.
     input: String,
     reresolved: bool,
+    /// Scout's play URL for the release, a secret: what a fresh debrid link is fetched through when the one ffmpeg
+    /// reads stops working, or when a session rebuilt after a restart needs one (`ensure_resolved`). A rebuild that had
+    /// to list the title again holds the new ticket here.
+    play_url: String,
+    /// A rebuilt session's fetch of its release is under way in the background (`serve_segment`).
+    warming: bool,
+    /// When fetching the release again last failed, so a player's retries don't each ask scout again at once.
+    resolve_failed: Option<Instant>,
     /// Segments actually sent to a player (never a HEAD), for the end-of-session summary line.
     segments_served: u64,
     /// The sum of those segments' own durations: seconds of the film actually delivered, as against
@@ -257,16 +271,19 @@ pub struct Session {
     pub media: String,
     reports: AtomicU8,
     speed_probes: AtomicU8,
-    /// Scout's play URL for the release and the scout it came from, for fetching a fresh debrid link
-    /// when the one ffmpeg reads stops working mid-session. Both are secrets.
-    play_url: String,
-    /// The loopback door its ffmpeg reads the release through (`source`); `None` for a release of unknown size, which
-    /// ffmpeg reads directly.
-    door: Option<crate::source::Door>,
+    /// The loopback door its ffmpeg reads the release through (`source`); `None` inside for a release of unknown size,
+    /// which ffmpeg reads directly. Unset while a session rebuilt after a restart has not fetched its release again
+    /// (`ensure_resolved`): until then it serves only what scratch holds.
+    door: std::sync::OnceLock<Option<crate::source::Door>>,
+    /// The scout the release came from, a secret, for fetching a fresh debrid link.
     source: scout::ScoutSource,
     /// What the release's link and probe are remembered under (`opened_key`), so a link that stops working is
     /// forgotten there too.
     opened_key: String,
+    /// The release's file as `file_key` names it: a link fetched again must lead to the same file.
+    file_key: Option<String>,
+    /// One fetch of the release at a time (`ensure_resolved`).
+    resolve_gate: tokio::sync::Mutex<()>,
     inner: Mutex<Inner>,
     /// One request at a time may queue for and start this session's producer.
     producer_gate: tokio::sync::Mutex<()>,
@@ -285,7 +302,7 @@ fn api(status: StatusCode, code: &'static str, detail: impl Into<String>) -> Api
 
 /// The nearest keyframe to `t` when there is one within `SNAP`, else `t`. Keeps a job's running sum of
 /// GOP durations pinned to the real keyframes, so rounding cannot drift across a long film.
-fn snap(keyframes: &[f64], t: f64) -> f64 {
+pub(crate) fn snap(keyframes: &[f64], t: f64) -> f64 {
     let i = keyframes.partition_point(|k| *k < t);
     [i.checked_sub(1), Some(i)]
         .into_iter()
@@ -436,7 +453,7 @@ impl Session {
 
     /// Take what the job has finished since the last look: its exit, and the GOPs in its playlist.
     fn refresh(&self, i: &mut Inner, st: &AppState) {
-        let Inner { job, gops, finished, init, bytes, failures, input, .. } = i;
+        let Inner { job, gops, finished, init, bytes, failures, input, play_url, .. } = i;
         let Some(job) = job.as_mut() else { return };
         let newly_exited = job.exit.is_none() && job.poll_exit().is_some();
         // After the exit check, so everything written before the exit is read.
@@ -485,7 +502,7 @@ impl Session {
                 if let Some(tail) = job.take_stderr() {
                     let (sid, start, rid) =
                         (self.short().to_string(), job.start, rid_tail(self.rid.as_deref()));
-                    let secrets = [input.clone(), self.play_url.clone(), self.source.base.clone()];
+                    let secrets = [input.clone(), play_url.clone(), self.source.base.clone()];
                     tokio::spawn(async move {
                         let tail = tail.await.unwrap_or_default();
                         let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
@@ -627,12 +644,14 @@ impl Session {
             }
             return Ok(());
         }
+        // A rebuilt session that has not fetched its release again has nothing to give ffmpeg yet.
+        let Some(door) = self.door.get() else { return Err(()) };
         let (start, seek) = self.restart_point(n);
         let id = i.next_job;
         i.next_job += 1;
         let dir = self.dir.join(format!("j{id}"));
         // Through the session's door where there is one: the head from memory, the rest over warm connections.
-        let door_url = self.door.as_ref().and_then(|d| st.doors.url(d));
+        let door_url = door.as_ref().and_then(|d| st.doors.url(d));
         // ffmpeg's own http protocol follows a `Location` without asking, and has no option to stop it, so a link is
         // never handed to it: only the door (whose reads follow nothing) or a local file.
         if door_url.is_none() && (i.input.starts_with("http://") || i.input.starts_with("https://")) {
@@ -657,6 +676,8 @@ impl Session {
         };
         match Job::spawn(&st.cfg.ffmpeg, id, start, &spec, permit) {
             Ok(new) => {
+                // So a process after this one can place the run's GOPs (`resume::adopt`).
+                crate::resume::note_job_start(&dir, start);
                 if let Some(old) = i.job.replace(new) {
                     // A run that already exited said so when it did.
                     if old.exit.is_none() {
@@ -746,6 +767,7 @@ impl Session {
 
     async fn start_producer(&self, st: &Arc<AppState>, n: usize, deadline: Instant) -> Result<(), ()> {
         let started = Instant::now();
+        tokio::time::timeout_at(deadline.into(), self.ensure_resolved(st)).await.map_err(|_| ())??;
         let gate =
             tokio::time::timeout_at(deadline.into(), self.producer_gate.lock()).await.map_err(|_| ())?;
         let old = {
@@ -859,10 +881,10 @@ impl Session {
         }
         // The next session for this release must not be handed the link that just failed.
         st.opened().forget(&self.opened_key);
-        let play_url = crate::config::local(&self.play_url, &st.cfg.origin_aliases);
+        let play_url = crate::config::local(&self.lock().play_url, &st.cfg.origin_aliases);
         match scout::resolve(&st.scout_http, &play_url, &self.source, st.source_guard).await {
             Ok(r) => {
-                if let Some(door) = &self.door {
+                if let Some(door) = self.door.get().and_then(Option::as_ref) {
                     door.set_upstream(&r.url);
                 }
                 self.lock().input = r.url;
@@ -876,8 +898,105 @@ impl Session {
         }
     }
 
-    pub async fn serve_segment(
+    /// A session rebuilt after a restart (`revive`) serves what scratch holds without its release; this fetches a
+    /// link to the release again and opens its door, once, before the first ffmpeg run needs it. Through the play URL
+    /// it was opened with, and — where that ticket no longer plays — through the title's listing again, for the same
+    /// release. The link must lead to the very file the session was made from (`file_key`), or the segments made from
+    /// it would not be the ones the player's playlist promises: such a session ends. Any other failure is passing, and
+    /// is tried again no sooner than `RESOLVE_RETRY` later.
+    async fn ensure_resolved(&self, st: &AppState) -> Result<(), ()> {
+        if self.door.get().is_some() {
+            return Ok(());
+        }
+        let _gate = self.resolve_gate.lock().await;
+        if self.door.get().is_some() {
+            return Ok(());
+        }
+        let play_url = {
+            let i = self.lock();
+            if i.ended || i.resolve_failed.is_some_and(|at| at.elapsed() < RESOLVE_RETRY) {
+                return Err(());
+            }
+            i.play_url.clone()
+        };
+        let started = Instant::now();
+        let secrets = [self.source.base.as_str(), play_url.as_str()];
+        let fetched = match self.fetch_release(st, &play_url).await {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                crate::log_limited("resume_resolve", || {
+                    format!(
+                        "session {}: fetching the release again failed: {}{}",
+                        self.short(),
+                        crate::redact::scrub(&e, &secrets),
+                        rid_tail(self.rid.as_deref())
+                    )
+                });
+                self.lock().resolve_failed = Some(Instant::now());
+                return Err(());
+            }
+        };
+        let (r, relisted) = fetched;
+        if self.file_key.is_some() && file_key(&r) != self.file_key {
+            eprintln!(
+                "session {}: the release's link now leads to another file; ending it{}",
+                self.short(),
+                rid_tail(self.rid.as_deref())
+            );
+            st.end_session(&self.sid, "release changed").await;
+            return Err(());
+        }
+        let door = r.size.map(|size| st.doors.open(st.source_http.clone(), &r.url, &r.head, size));
+        let _ = self.door.set(door);
+        {
+            let mut i = self.lock();
+            i.input = r.url;
+            i.resolve_failed = None;
+            if let Some(url) = relisted {
+                i.play_url = url;
+            }
+        }
+        eprintln!(
+            "session {}: release fetched again after a restart in {} ms{}",
+            self.short(),
+            started.elapsed().as_millis(),
+            rid_tail(self.rid.as_deref())
+        );
+        Ok(())
+    }
+
+    /// The release behind `play_url`, or — where scout no longer plays that ticket — behind the play URL a fresh
+    /// listing of the title gives the same release (`opened_key`), with that play URL.
+    async fn fetch_release(
         &self,
+        st: &AppState,
+        play_url: &str,
+    ) -> Result<(scout::Resolved, Option<String>), String> {
+        let local = |url: &str| crate::config::local(url, &st.cfg.origin_aliases);
+        let first =
+            match scout::resolve(&st.scout_http, &local(play_url), &self.source, st.source_guard).await {
+                Ok(r) => return Ok((r, None)),
+                Err(e) => e,
+            };
+        let list = scout::list(&st.scout_http, &self.source, &self.imdb, None)
+            .await
+            .map_err(|e| format!("{first}; listing the title again: {}", e.detail))?;
+        let again = list
+            .iter()
+            .find(|s| opened_key(&self.source.base, s) == self.opened_key)
+            .ok_or_else(|| format!("{first}; the title's listing no longer has the release"))?;
+        let r = scout::resolve(&st.scout_http, &local(&again.url), &self.source, st.source_guard).await?;
+        Ok((r, Some(again.url.clone())))
+    }
+
+    /// Whether this session has its release: only one rebuilt after a restart may not yet (`ensure_resolved`).
+    #[cfg(test)]
+    pub fn resolved(&self) -> bool {
+        self.door.get().is_some()
+    }
+
+    pub async fn serve_segment(
+        self: &Arc<Self>,
         st: &Arc<AppState>,
         n: usize,
         head: bool,
@@ -900,6 +1019,24 @@ impl Session {
                     Ok(None) => false,
                     Err(()) => return source_failed(),
                 };
+                // A rebuilt session serving from scratch: once what scratch holds runs out within `RESUME_LEAD`
+                // segments of this one, its release is fetched and a run started there, while the player still
+                // plays what it has.
+                if ready.is_some() && self.door.get().is_none() && !i.warming {
+                    let last = self.segments.len() - 1;
+                    if let Some(m) =
+                        (n + 1..=(n + RESUME_LEAD).min(last)).find(|&m| self.ready(&i, m).is_none())
+                    {
+                        i.warming = true;
+                        let (s, st) = (self.clone(), st.clone());
+                        tokio::spawn(async move {
+                            if s.ensure_resolved(&st).await.is_ok() {
+                                let _ = s.start_producer(&st, m, Instant::now() + SEGMENT_WAIT).await;
+                            }
+                            s.lock().warming = false;
+                        });
+                    }
+                }
                 self.gate(&mut i, st);
                 (ready, start)
             };
@@ -1163,6 +1300,8 @@ impl Session {
     /// could not be had.
     async fn list_subtitles(&self, st: &AppState, sb: &crate::subs::Subs) -> Option<Vec<crate::subs::Entry>> {
         use crate::subs;
+        // The list is asked with the release's hash, which reads the file's tail through its link.
+        self.ensure_resolved(st).await.ok()?;
         let input = self.lock().input.clone();
         let secrets = [sb.base.as_str()];
         let release = subs::Release {
@@ -1301,10 +1440,261 @@ impl Session {
             j.stop().await;
         }
         let dir = self.dir.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+        let _ = tokio::task::spawn_blocking(move || crate::resume::remove(&dir)).await;
         self.wake.notify_one();
         true
     }
+
+    /// Stop the session for a shutdown without ending it: its ffmpeg is killed and reaped, and its scratch — its
+    /// record, `init.mp4` and finished GOPs — is kept for the next process to rebuild it from (`resume`).
+    pub async fn suspend(&self, st: &AppState) {
+        let job = {
+            let mut i = self.lock();
+            if i.ended {
+                return;
+            }
+            i.ended = true;
+            st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
+            i.bytes = 0;
+            i.job.take()
+        };
+        if let Some(j) = job {
+            if j.exit.is_none() {
+                eprintln!(
+                    "session {}: {}{}",
+                    self.short(),
+                    j.pull_line("suspended for a restart"),
+                    rid_tail(self.rid.as_deref())
+                );
+            }
+            j.stop().await;
+        }
+        self.wake.notify_one();
+    }
+
+    /// What this session is rebuilt from after a restart (`resume`): `start_at` is where its playlist was cut for,
+    /// `started_at` when it was created, in unix seconds.
+    fn record(&self, start_at: f64, started_at: u64) -> crate::resume::Record {
+        let i = self.lock();
+        crate::resume::Record {
+            schema: crate::resume::RECORD_SCHEMA,
+            sid: self.sid.clone(),
+            exp: self.exp,
+            owner: self.owner.clone(),
+            public: self.public,
+            started_at,
+            rid: self.rid.clone(),
+            imdb: self.imdb.clone(),
+            label: self.release.label.clone(),
+            filename: self.release.filename.clone(),
+            size: self.release.size,
+            pack_size: self.release.pack_size,
+            scout_base: self.source.base.clone(),
+            play_url: i.play_url.clone(),
+            service_key: self.source.key.is_some(),
+            opened_key: self.opened_key.clone(),
+            file_key: self.file_key.clone(),
+            info: crate::state::StoredMediaInfo::from(&self.info),
+            start_at,
+            audio: self.audio,
+            audio_copy: self.audio_copy.map(String::from),
+            audio_out: self.audio_out,
+            audio_channels: self.audio_channels,
+            subtitles: self.subs.as_ref().map(|s| s.base.clone()),
+            head_sum: self.subs.as_ref().and_then(|s| s.head_sum),
+            renditions: self.renditions.clone(),
+            dovi: self.dovi,
+            transcoded: self.transcoded,
+            transcode_reason: self.transcode_reason.clone(),
+            preset: self.preset,
+            max_bitrate: self.max_bitrate,
+            need: self.need,
+            master: self.master.clone(),
+            media: self.media.clone(),
+        }
+    }
+
+    /// The session `rec` describes, with what scratch still holds of it (`adopted`), and no release yet
+    /// (`ensure_resolved`). `None` when the record's playlist is not the one its own probe and start cut — a record
+    /// from rules this build no longer cuts by, which a player holding that playlist could not be served from.
+    fn from_record(
+        st: &AppState,
+        rec: crate::resume::Record,
+        info: MediaInfo,
+        adopted: crate::resume::Adopted,
+    ) -> Option<Session> {
+        let closed_gops = rec.transcoded || info.closed_gops;
+        let segments =
+            playlist::segments_for_start(&info.keyframes, info.duration, playlist::TARGET_SECS, rec.start_at);
+        if segments.is_empty() || playlist::media(&segments, rec.start_at, closed_gops) != rec.media {
+            return None;
+        }
+        let text_tracks: Vec<usize> = rec.renditions.iter().filter_map(|r| r.own).collect();
+        let mut own = crate::subs::OwnCues::default();
+        for run in &adopted.runs {
+            for &t in &text_tracks {
+                own.take(run.id, t, &job::text_file(&run.dir, t), run.start, run.upto);
+            }
+        }
+        let audio_copy = match rec.audio_copy.as_deref() {
+            None => None,
+            Some(c) => Some(dolby_codec(c).or_else(|| flac_codec(c))?),
+        };
+        let ago = Duration::from_secs(unix_now().saturating_sub(rec.started_at));
+        Some(Session {
+            sid: rec.sid.clone(),
+            sig: crate::auth::url_sig(&st.cfg.url_key, &rec.sid, rec.exp),
+            exp: rec.exp,
+            owner: rec.owner,
+            public: rec.public,
+            started: Instant::now().checked_sub(ago).unwrap_or_else(Instant::now),
+            rid: rec.rid,
+            imdb: rec.imdb,
+            dir: st.cfg.scratch_dir.join(format!("s-{}", rec.sid)),
+            release: Release {
+                label: rec.label,
+                filename: rec.filename,
+                size: rec.size,
+                pack_size: rec.pack_size,
+                requested: None,
+            },
+            info,
+            audio: rec.audio,
+            audio_copy,
+            audio_out: rec.audio_out,
+            audio_channels: rec.audio_channels,
+            subs: rec.subtitles.map(|base| crate::subs::Subs {
+                base,
+                head_sum: rec.head_sum,
+                cache: Default::default(),
+            }),
+            renditions: rec.renditions,
+            text_tracks,
+            own: Mutex::new(own),
+            dovi: rec.dovi,
+            transcoded: rec.transcoded,
+            transcode_reason: rec.transcode_reason,
+            preset: rec.preset,
+            segments,
+            // What only the answer to `POST /remux/session` carried.
+            prebuffer: None,
+            demand: None,
+            need: rec.need,
+            max_bitrate: rec.max_bitrate,
+            master: rec.master,
+            media: rec.media,
+            reports: AtomicU8::new(0),
+            speed_probes: AtomicU8::new(0),
+            door: std::sync::OnceLock::new(),
+            source: scout::ScoutSource {
+                base: rec.scout_base,
+                key: if rec.service_key { st.cfg.scout_key.clone() } else { None },
+            },
+            opened_key: rec.opened_key,
+            file_key: rec.file_key,
+            resolve_gate: tokio::sync::Mutex::new(()),
+            inner: Mutex::new(Inner {
+                job: None,
+                next_job: adopted.next_job,
+                gops: adopted.gops,
+                finished: adopted.finished,
+                init: adopted.init,
+                last_seen: Instant::now(),
+                last_heartbeat: None,
+                want: 0,
+                ended: false,
+                bytes: adopted.bytes,
+                failures: 0,
+                input: String::new(),
+                reresolved: false,
+                play_url: rec.play_url,
+                warming: false,
+                resolve_failed: None,
+                // Counted from the restart on: the summary line says what this process served.
+                segments_served: 0,
+                seconds_served: 0.0,
+                subtitle_used: None,
+            }),
+            producer_gate: tokio::sync::Mutex::new(()),
+            wake: Notify::new(),
+        })
+    }
+}
+
+/// What `revive` made of a request for a session this process doesn't know.
+pub enum Revived {
+    /// Rebuilt from its record, or by a request just ahead of this one.
+    Session(Arc<Session>),
+    /// No record vouches for it under this signature: as absent as a session that never existed.
+    Unknown,
+    /// Its signature holds, but it can't come back: expired, or a transcode with no GPU to run it now.
+    Gone,
+    /// Its owner's share or the server is full right now; a player's retry may find room.
+    Busy,
+}
+
+/// A request for the session `sid` that this process doesn't know: rebuild it from its record in scratch, if one opens
+/// and `sig` signs it (`resume`). One rebuild at a time, so many requests arriving together after a restart build it
+/// once and the rest find it built. Nothing here calls scout: the session serves what scratch holds, and fetches its
+/// release only as that runs out.
+pub async fn revive(st: &Arc<AppState>, sid: &str, sig: &str) -> Revived {
+    let _one = st.revive_lock.lock().await;
+    if let Some(s) = st.session(sid) {
+        return Revived::Session(s);
+    }
+    let dir = st.cfg.scratch_dir.join(format!("s-{sid}"));
+    let (key, owned_sid, owned_sig, d) =
+        (st.cfg.url_key.clone(), sid.to_string(), sig.to_string(), dir.clone());
+    // The signature is checked before anything in scratch is touched; the expiry it covers is the record's.
+    let opened = tokio::task::spawn_blocking(move || {
+        let rec = crate::resume::read(&d, &key, &owned_sid)?;
+        if !crate::auth::url_sig_ok(&key, &owned_sid, rec.exp, &owned_sig) {
+            return None;
+        }
+        let info = rec.info.clone().into_media()?;
+        let adopted =
+            (unix_now() < rec.exp).then(|| crate::resume::adopt(&d, &info.keyframes, info.duration));
+        Some((rec, info, adopted))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((rec, info, adopted)) = opened else { return Revived::Unknown };
+    let short = &sid[..6];
+    let gone = |why: &str| {
+        eprintln!("session {short}: not resumed after a restart: {why}");
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || crate::resume::remove(&dir))
+    };
+    let Some(adopted) = adopted else {
+        let _ = gone("expired").await;
+        return Revived::Gone;
+    };
+    if rec.transcoded && !st.can_transcode() {
+        let _ = gone("it is a transcode, and transcoding is unavailable").await;
+        return Revived::Gone;
+    }
+    let (gops, init) = (adopted.gops.len(), adopted.init.is_some());
+    let Some(session) = Session::from_record(st, rec, info, adopted) else {
+        let _ = gone("its record no longer cuts the playlist it promised").await;
+        return Revived::Gone;
+    };
+    let session = Arc::new(session);
+    let bytes = session.lock().bytes;
+    if !st.insert_revived(session.clone()) {
+        crate::log_limited("resume_full", || {
+            format!("session {short}: not resumed yet: its owner's share or the server is full")
+        });
+        return Revived::Busy;
+    }
+    st.scratch_bytes.fetch_add(bytes, Relaxed);
+    eprintln!(
+        "session {short}: resumed after a restart with {gops} GOP(s){} from scratch{}",
+        if init { " and its init.mp4" } else { "" },
+        rid_tail(session.rid.as_deref())
+    );
+    tokio::spawn(supervise(st.clone(), session.clone()));
+    Revived::Session(session)
 }
 
 /// oxyc/den#100's follow-up: tell den-edge how long a guest grant's session played, so its "your guests" list can
@@ -1489,7 +1879,7 @@ pub fn gone() -> Response<Body> {
     httputil::error(StatusCode::GONE, "session_ended", "This session has ended; start a new one.")
 }
 
-fn busy() -> Response<Body> {
+pub fn busy() -> Response<Body> {
     httputil::json(
         StatusCode::SERVICE_UNAVAILABLE,
         &serde_json::json!({"error": "not_ready", "detail": "The segment is still being made."}),
@@ -1509,6 +1899,13 @@ fn source_failed() -> Response<Body> {
 /// and the release by its size and name. Not its play URL: scout issues a new ticket with every listing.
 pub(crate) fn opened_key(base: &str, s: &scout::Stream) -> String {
     format!("{}/{}/{}", crate::auth::install_id(base), s.attributes.size_bytes.unwrap_or(0), s.filename())
+}
+
+/// A release's file by its size and the digest of its first `HASH_CHUNK` bytes (`state::probe_key`'s form): all of the
+/// head a link remembered in `AppState::opened` still has, so a session opened from there names its file as one opened
+/// afresh does. `None` without a size.
+fn file_key(r: &scout::Resolved) -> Option<String> {
+    crate::state::probe_key(r.size, &r.head[..r.head.len().min(crate::subs::HASH_CHUNK as usize)])
 }
 
 /// What `AppState::known` remembers a release's probe under: the title and the release's name, whoever listed it.
@@ -2003,7 +2400,7 @@ const NO_INDEX_HEADROOM: f64 = 1.5;
 /// What a copy needs of the link, in bits a second: from where the player starts, the rate at which it waits at most
 /// `MAX_PREBUFFER` and then never runs dry (`playlist::needed_rate`) — or, from a file with no byte index, its average
 /// with `NO_INDEX_HEADROOM`, which `indexed` says it is.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Need {
     pub bitrate: u64,
     pub indexed: bool,
@@ -2988,13 +3385,16 @@ pub async fn create(
             requested,
         },
         segments,
-        play_url: c.url.clone(),
         // Only where the file named its own size (`Content-Range`): the door answers ranges of it.
-        door: resolved
-            .size
-            .map(|size| st.doors.open(st.source_http.clone(), &resolved.url, &resolved.head, size)),
+        door: std::sync::OnceLock::from(
+            resolved
+                .size
+                .map(|size| st.doors.open(st.source_http.clone(), &resolved.url, &resolved.head, size)),
+        ),
         source,
         opened_key,
+        file_key: file_key(&resolved),
+        resolve_gate: tokio::sync::Mutex::new(()),
         info,
         audio,
         audio_copy,
@@ -3022,6 +3422,9 @@ pub async fn create(
             failures: 0,
             input: resolved.url,
             reresolved: false,
+            play_url: c.url.clone(),
+            warming: false,
+            resolve_failed: None,
             segments_served: 0,
             seconds_served: 0.0,
             subtitle_used: None,
@@ -3029,6 +3432,14 @@ pub async fn create(
         producer_gate: tokio::sync::Mutex::new(()),
         wake: Notify::new(),
     });
+    // Written once, before the session can be asked for anything: what a process after this one rebuilds it from.
+    let record = session.record(start_at, unix_now());
+    let (dir, key) = (session.dir.clone(), st.cfg.url_key.clone());
+    match tokio::task::spawn_blocking(move || crate::resume::write(&dir, &key, &record)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("session {short}: its restart record could not be written: {e}{rid_suffix}"),
+        Err(e) => eprintln!("session {short}: its restart record could not be written: {e}{rid_suffix}"),
+    }
     st.insert_session(session.clone());
     st.replacement_started(&slot, &session.sid);
     st.sessions_started.fetch_add(1, Relaxed);
@@ -3834,6 +4245,9 @@ mod tests {
             failures: 0,
             input: String::new(),
             reresolved: false,
+            play_url: String::new(),
+            warming: false,
+            resolve_failed: None,
             segments_served,
             seconds_served: 0.0,
             subtitle_used: None,
