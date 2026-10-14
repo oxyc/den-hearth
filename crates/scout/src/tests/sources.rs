@@ -37,18 +37,13 @@ fn normalize_sources() {
 // Sources ride in the install config, and an unusable one is dropped rather than refusing the config, like
 // every other field there.
 #[test]
-#[ignore = "needs blob (package 6, core.rs) for the config encoding"]
 fn decode_config_carries_sources() {
-    #[cfg(any())]
-    fn pending() {
         use crate::config::decode_config;
         use crate::tests::core::blob;
 
         let c = decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"sources":["https://mf.example/cfg/manifest.json","http://nope.example"]}"#))
             .expect("config decodes");
         assert!(c.sources.len() == 1 && c.sources[0] == "https://mf.example/cfg", "config = {c:?}");
-    }
-    todo!("pending: sources_test.go TestDecodeConfig_carriesSources")
 }
 
 #[test]
@@ -197,4 +192,80 @@ fn bounded_host_limiter_forgets_hosts_past_its_ceiling() {
         assert_eq!(l.bucket_count(), 1, "buckets = {}, want the map started over at the ceiling", l.bucket_count());
     }
     todo!("pending: sources_test.go TestBoundedHostLimiter_forgetsHostsPastItsCeiling")
+}
+
+// Not in the Go suite. Go refuses a non-public address in the dialer's Control hook, which sees every connection's
+// address. reqwest has no such hook, so the guard is built from a resolver filter, a check on an IP-literal host
+// before the first request, and the same check on each redirect hop; these pin each of the three.
+
+fn get(url: &str) -> reqwest::Request {
+    reqwest::Request::new(reqwest::Method::GET, url.parse().expect("test url parses"))
+}
+
+#[tokio::test]
+async fn source_client_refuses_an_ip_literal_on_the_first_request() {
+    use crate::scrape::Doer;
+    use crate::sources::{new_source_client, ERR_NOT_PUBLIC};
+
+    let client = new_source_client();
+    for url in [
+        "https://127.0.0.1:1/manifest.json",
+        "https://[::1]:1/manifest.json",
+        "https://10.0.0.5/cfg",
+        "https://192.168.86.193:8080/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://100.101.102.103/cfg",
+        "https://[::ffff:127.0.0.1]/cfg",
+        "https://[fd7a:115c:a1e0::1]/cfg",
+        // The url crate reads these as the IPv4 address they stand for, as getaddrinfo would.
+        "https://2130706433/cfg",
+        "https://0x7f.1/cfg",
+    ] {
+        let err = client.do_request(get(url)).await.expect_err(url);
+        assert_eq!(err.to_string(), ERR_NOT_PUBLIC, "{url} was not refused as a non-public address");
+    }
+}
+
+#[tokio::test]
+async fn source_client_refuses_a_name_that_resolves_to_a_non_public_address() {
+    use crate::scrape::Doer;
+    use crate::sources::{new_source_client, ERR_NOT_PUBLIC};
+
+    // `localhost` resolves to the loopback, and nothing in the config check is what stops it here.
+    let err = new_source_client().do_request(get("https://localhost:1/manifest.json")).await.expect_err("refused");
+    assert_eq!(err.to_string(), ERR_NOT_PUBLIC, "a name resolving to loopback was not refused");
+}
+
+#[test]
+fn source_redirects_are_judged_on_every_hop() {
+    use crate::sources::{redirect_verdict, RedirectVerdict::{Follow, Refuse, Stop}};
+
+    let cases = [
+        ("https://example.com/next", 1, Follow, "an ordinary hop"),
+        ("https://8.8.8.8/next", 2, Follow, "a public literal"),
+        ("https://example.com/next", 3, Stop, "past three hops"),
+        ("http://example.com/next", 1, Stop, "https only"),
+        // A downgrade is not followed, so the private address behind it is never dialled either.
+        ("http://127.0.0.1/next", 1, Stop, "https only comes first"),
+        ("https://127.0.0.1/next", 1, Refuse, "loopback literal"),
+        ("https://[::1]/next", 2, Refuse, "IPv6 loopback literal"),
+        ("https://10.1.2.3:8443/next", 1, Refuse, "private literal"),
+        ("https://169.254.169.254/latest/meta-data/", 1, Refuse, "cloud metadata"),
+        ("https://[::ffff:192.168.1.1]/next", 1, Refuse, "IPv4-mapped private literal"),
+        ("https://2130706433/next", 1, Refuse, "decimal loopback"),
+    ];
+    for (url, hops, want, why) in cases {
+        let got = redirect_verdict(&url.parse().expect("test url parses"), hops);
+        assert_eq!(got, want, "{url} after {hops} hops ({why})");
+    }
+}
+
+#[test]
+fn normalize_sources_refuses_what_go_does_not_read_as_a_plain_https_url() {
+    for link in ["https://@host.example/cfg", "https:host.example/cfg", "HTTP://host.example/cfg", "https://", "https:///cfg"] {
+        let got = crate::sources::normalize_sources(&[link.to_owned()]);
+        assert!(got.is_empty(), "{link:?} was kept as {got:?}");
+    }
+    let got = crate::sources::normalize_sources(&["HTTPS://host.example/cfg".to_owned()]);
+    assert_eq!(got, ["HTTPS://host.example/cfg"], "Go keeps the link as it was written when the scheme is upper-case");
 }
