@@ -13,10 +13,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use regex::Regex;
+
 use crate::rank::{RawStream, GIB};
-use crate::stores::short_hash;
+use crate::scrape::ScrapeQuery;
+use crate::stores::{short_hash, ResolveTarget};
 
 /// Go `maxLoggedTitle`: a release name in a log line is cut here; the line must stay one line.
 pub const MAX_LOGGED_TITLE: usize = 140;
@@ -58,18 +62,126 @@ pub fn decision_line(
     line
 }
 
-/// Go `truncateForLog`: cuts a string for a log line. Go cuts bytes; this cuts back to the nearest character boundary,
-/// so the cut never splits a character.
-fn truncate_for_log(s: &str, n: usize) -> String {
+/// Go `truncateForLog` cuts a string for a log line, the way storeErrorDetail already does for a debrid
+/// error body.
+///
+/// Go cuts at byte `n`, which can fall inside a multi-byte character. The result is bytes, not a `String`, for
+/// exactly that reason: `quote_go` then writes the stray bytes as `\xNN`, as Go's `%q` does, so the line matches.
+fn truncate_for_log(s: &str, n: usize) -> Vec<u8> {
     if s.len() <= n {
-        return s.to_owned();
+        return s.as_bytes().to_vec();
     }
-    let mut cut = n;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", &s[..cut])
+    let mut out = s.as_bytes()[..n].to_vec();
+    out.extend_from_slice("…".as_bytes());
+    out
 }
+
+/// Go `%q` (`strconv.Quote`) over bytes: double-quoted, with `"` and `\` escaped, the usual `\a\b\f\n\r\t\v`,
+/// other control characters as `\xNN`, non-printable runes as `\uNNNN` / `\UNNNNNNNN`, and every byte that is not
+/// valid UTF-8 as `\xNN`. Printable non-ASCII is written as is. This is what keeps a release name from writing a
+/// newline into the log.
+pub(crate) fn quote_go(b: &[u8]) -> String {
+    static PRINT: OnceLock<Regex> = OnceLock::new();
+    // strconv.IsPrint: letters, marks, numbers, punctuation and symbols, plus the ASCII space.
+    let print = PRINT.get_or_init(|| Regex::new(r"^[\p{L}\p{M}\p{N}\p{P}\p{S}]$").expect("a valid pattern"));
+    let mut out = String::with_capacity(b.len() + 2);
+    out.push('"');
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (c, width) = match std::str::from_utf8(rest) {
+            Ok(s) => (s.chars().next(), s.chars().next().map_or(0, char::len_utf8)),
+            Err(e) if e.valid_up_to() > 0 => {
+                // Valid up to here: take the first character of the valid prefix.
+                let c = std::str::from_utf8(&rest[..e.valid_up_to()]).ok().and_then(|s| s.chars().next());
+                (c, c.map_or(0, char::len_utf8))
+            }
+            Err(_) => (None, 1), // an invalid byte
+        };
+        let Some(c) = c else {
+            out.push_str(&format!("\\x{:02x}", rest[0]));
+            rest = &rest[1..];
+            continue;
+        };
+        rest = &rest[width..];
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            ' ' => out.push(' '),
+            c if print.is_match(c.encode_utf8(&mut [0u8; 4])) => out.push(c),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Go `scrapeIdentity` is the identity suffix for a per-indexer scrape decision line: the title being asked
+/// about. Built unconditionally and gated by `decision_line`.
+pub fn scrape_identity(q: &ScrapeQuery) -> String {
+    let mut parts = Vec::new();
+    if !q.imdb.is_empty() {
+        parts.push(format!("imdb={}", q.imdb));
+    }
+    if !q.kind.is_empty() {
+        parts.push(format!("type={}", q.kind));
+    }
+    if q.has_ep {
+        parts.push(format!("season={} episode={}", q.season, q.episode));
+    }
+    parts.join(" ")
+}
+
+/// Go `resolveIdentity` is the identity suffix for a play/probe/cancel decision line: the release a route is
+/// acting on. Built unconditionally and gated by `decision_line`, like every other identity suffix here.
+pub fn resolve_identity(rt: &ResolveTarget) -> String {
+    let mut parts = Vec::new();
+    if !rt.imdb.is_empty() {
+        parts.push(format!("imdb={}", rt.imdb));
+    }
+    if let Some(season) = rt.season {
+        parts.push(format!("season={season}"));
+    }
+    if let Some(episode) = rt.episode {
+        parts.push(format!("episode={episode}"));
+    }
+    if let Some(file_idx) = rt.file_idx {
+        parts.push(format!("file_idx={file_idx}"));
+    }
+    if !rt.info_hash.is_empty() {
+        parts.push(format!("hash={}", short_hash(&rt.info_hash)));
+    }
+    if !rt.title.is_empty() {
+        parts.push(format!("release={}", quote_go(&truncate_for_log(&rt.title, MAX_LOGGED_TITLE))));
+    }
+    parts.join(" ")
+}
+
+/// Go `playDecision` is a play/probe/cancel decision line: the shared shape plus the release it names.
+pub fn play_decision(
+    event: &str,
+    outcome: &str,
+    reason: &str,
+    upstream: &str,
+    dur: Duration,
+    rid: &str,
+    rt: &ResolveTarget,
+) -> String {
+    decision_line(event, outcome, reason, upstream, dur, rid, &resolve_identity(rt))
+}
+
+// TODO(rank): Go `logRankDecision`, `rankIdentity` and `rankRunnerUps` also live in decisionlog.go. They read
+// `rankDebug.DroppedBy`, and `RankDebug` is not in rank.rs yet; port them with it.
 
 /// Go `topDropReasons`: the `n` largest drop counts as `reason:count`, highest first, ties broken by name.
 /// Empty when nothing was dropped.
@@ -88,7 +200,6 @@ pub fn format_pick(s: &RawStream) -> String {
         Some(b) => format!("{:.1}", b as f64 / GIB as f64),
         None => "unknown".to_owned(),
     };
-    // Go `%q`; Debug quoting is the same line-safe form for a release name.
-    let title = truncate_for_log(&s.title, MAX_LOGGED_TITLE);
-    format!("{title:?}(hash={},size_gb={size_gb},{cached})", short_hash(&s.info_hash))
+    let title = quote_go(&truncate_for_log(&s.title, MAX_LOGGED_TITLE));
+    format!("{title}(hash={},size_gb={size_gb},{cached})", short_hash(&s.info_hash))
 }
