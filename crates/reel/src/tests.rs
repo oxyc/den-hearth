@@ -6562,9 +6562,12 @@ fn retry_after_reads_seconds_and_http_dates() {
     let ra = |v: &str| retry_after_ms(&with(&[(RETRY_AFTER.as_str(), v)]), now);
     assert_eq!(ra("120"), Some(120_000));
     assert_eq!(ra("Sun, 06 Nov 1994 08:51:37 GMT"), Some(120_000));
+    // RFC 9110 requires the obsolete date forms to be accepted too.
+    assert_eq!(ra("Sunday, 06-Nov-94 08:51:37 GMT"), Some(120_000));
+    assert_eq!(ra("Sun Nov  6 08:51:37 1994"), Some(120_000));
     assert_eq!(ra("86400"), Some(PAUSE_CAP_MS), "a day-long Retry-After switched discovery off for a day");
     // Past, zero or unreadable: no hint, so the caller's own backoff applies rather than "retry now".
-    for v in ["0", "Sun, 06 Nov 1994 08:00:00 GMT", "soon", "-5", "Sunday, 06-Nov-94 08:49:37 GMT"] {
+    for v in ["0", "Sun, 06 Nov 1994 08:00:00 GMT", "soon", "-5"] {
         assert_eq!(ra(v), None, "{v}");
     }
     assert_eq!(retry_after_ms(&HeaderMap::new(), now), None);

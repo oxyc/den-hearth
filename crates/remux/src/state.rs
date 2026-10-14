@@ -449,7 +449,7 @@ fn service_profile() -> ClientProfile {
         .user_agent(crate::user_agent())
 }
 
-/// The general client: redirects are reqwest's default.
+/// The general client (the grant usage report to den-edge): redirects are reqwest's default.
 pub fn http_profile() -> ClientProfile {
     service_profile()
 }

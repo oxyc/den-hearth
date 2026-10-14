@@ -13,24 +13,15 @@ pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 /// `Retry-After` as a wait: delta-seconds, or an HTTP-date, capped at [`MAX_RETRY_AFTER`]. A date already past is
 /// `Some(ZERO)`. `None` when the header is absent or unreadable, which leaves the caller on its own backoff.
 ///
-/// Only the IMF-fixdate form of the date is read (`Sun, 06 Nov 1994 08:49:37 GMT`). RFC 9110's two obsolete forms
-/// fall back to the caller's backoff rather than being guessed at.
+/// All three date forms RFC 9110 §5.6.7 requires a recipient to accept are read: the IMF-fixdate
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`), the obsolete RFC 850 form and asctime.
 pub fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     let wait = match value.parse::<u64>() {
         Ok(secs) => Duration::from_secs(secs),
-        Err(_) => imf_fixdate(value)?.duration_since(now).unwrap_or(Duration::ZERO),
+        Err(_) => httpdate::parse_http_date(value).ok()?.duration_since(now).unwrap_or(Duration::ZERO),
     };
     Some(wait.min(MAX_RETRY_AFTER))
-}
-
-/// `httpdate` reads three date forms; an IMF-fixdate is the only one exactly 29 bytes with its comma after the
-/// three-letter weekday.
-fn imf_fixdate(value: &str) -> Option<SystemTime> {
-    if value.len() != 29 || value.as_bytes()[3] != b',' {
-        return None;
-    }
-    httpdate::parse_http_date(value).ok()
 }
 
 /// How long until an upstream's allowance comes back, when its answer says none is left. Read from the IETF draft
@@ -134,13 +125,25 @@ mod tests {
             "Sun, 06 Nov 1994 08:49:37",
             "Sun, 06 Foo 1994 08:49:37 GMT",
             "Sun, 32 Nov 1994 08:49:37 GMT",
-            // RFC 9110's obsolete forms are not guessed at.
-            "Sunday, 06-Nov-94 08:49:37 GMT",
-            "Sun Nov  6 08:49:37 1994",
+            "Sunday, 06-Foo-94 08:49:37 GMT",
+            "Sun Nov  6 25:49:37 1994",
         ] {
             assert_eq!(ra(junk, DATE_UNIX), None, "{junk:?}");
         }
         assert_eq!(retry_after(&HeaderMap::new(), at(0)), None);
+    }
+
+    /// RFC 9110 §5.6.7: a recipient must accept the IMF-fixdate and both obsolete forms.
+    #[test]
+    fn retry_after_accepts_all_three_http_date_formats() {
+        let ra = |v: &str, now: u64| retry_after(&headers(&[("retry-after", v)]), at(now));
+        for date in
+            ["Sun, 06 Nov 1994 08:49:37 GMT", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"]
+        {
+            assert_eq!(ra(date, DATE_UNIX - 90), Some(Duration::from_secs(90)), "{date}");
+            assert_eq!(ra(date, DATE_UNIX + 5), Some(Duration::ZERO), "{date}");
+            assert_eq!(ra(date, 0), Some(MAX_RETRY_AFTER), "{date}");
+        }
     }
 
     #[test]
