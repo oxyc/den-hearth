@@ -38,3 +38,9 @@ pub trait Scraper: Send + Sync {
     fn id(&self) -> Indexer;
     async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError>;
 }
+
+/// Go `parseStremioStreams`: the streams in a Stremio `/stream` response, `source` naming the indexer
+/// they came from.
+pub(crate) fn parse_stremio_streams(_body: &[u8], _source: &str) -> Vec<RawStream> {
+    todo!()
+}

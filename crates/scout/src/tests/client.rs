@@ -118,46 +118,65 @@ fn client_playable_cost() {
     );
 }
 
-// Needs `NewHandler`, `testDeps`, `Deps`, `scraper` and the `do` request helper from package 4 (handler.rs);
-// the Go body is kept below as the reference for that port.
+// Needs the handler (package 4): `crate::handler::serve` and `crate::deps::Deps::for_test`. The body sits in
+// a `cfg(any())` item so it parses now; move it up and delete the wrapper when package 4 lands.
 #[test]
-#[ignore = "needs NewHandler, Deps, the scraper seam and the do helper from package 4 (handler)"]
+#[ignore = "needs crate::handler::serve and Deps::for_test from package 4 (handler)"]
 fn stream_list_ranked_for_the_browser_that_asked() {
-    todo!("port once handler.rs lands; Go body below")
-    // seeds := func(context.Context) ([]RawStream, error) {
-    //     return []RawStream{
-    //         {InfoHash: repeat("a", 40), Title: "Movie 2160p WEB-DL HDR HEVC AAC", SizeBytes: intp(18 * gib), Seeders: intp(100), FileIdx: intp(0)},
-    //         {InfoHash: repeat("b", 40), Title: "Movie 1080p WEB-DL H.264 AAC", SizeBytes: intp(8 * gib), Seeders: intp(50), FileIdx: intp(0)},
-    //     }, nil
-    // }
-    // h := NewHandler(testDeps(func(d *Deps) {
-    //     d.MakeScrapers = func(*Config) []scraper { return []scraper{fakeScraper{"torrentio", seeds}} }
-    // }))
-    // path := "/" + validBlob + "/stream/movie/tt1234567.json"
-    // first := func(rr *httptest.ResponseRecorder) string {
-    //     t.Helper()
-    //     var list streamsResponse
-    //     if rr.Code != 200 || json.Unmarshal(rr.Body.Bytes(), &list) != nil || len(list.Streams) == 0 {
-    //         t.Fatalf("list: %d %s", rr.Code, rr.Body.String())
-    //     }
-    //     return list.Streams[0].Title
-    // }
-    // noHEVC, _ := json.Marshal(aBrowser(func(p *ClientPlayable) { p.HEVCMain, p.HEVCMain10 = 0, 0 }))
-    //
-    // tv := do(h, path, nil)
-    // if got := first(tv); !strings.Contains(got, "2160p") {
-    //     t.Errorf("the TV's list starts %q, want the 4K release", got)
-    // }
-    // if !strings.Contains(tv.Header().Get("vary"), playableHeader) {
-    //     t.Errorf("vary = %q, want it to name %s", tv.Header().Get("vary"), playableHeader)
-    // }
-    // if got := first(do(h, path, map[string]string{playableHeader: string(noHEVC)})); !strings.Contains(got, "1080p") {
-    //     t.Errorf("a browser without HEVC gets %q first, want the 1080p H.264", got)
-    // }
-    // if got := first(do(h, path, nil)); !strings.Contains(got, "2160p") {
-    //     t.Errorf("after a browser's list the TV gets %q first: the two lists must be cached apart", got)
-    // }
-    // if got := first(do(h, path, map[string]string{playableHeader: "{not json"})); !strings.Contains(got, "2160p") {
-    //     t.Errorf("a report that doesn't parse gets %q first, want the TV's list", got)
-    // }
+    #[cfg(any())]
+    fn pending() {
+        use crate::handler::serve;
+        use crate::deps::Deps;
+        use crate::rank::RawStream;
+
+        // Go: seeds := func(context.Context) ([]RawStream, error) { ... } with repeat("a", 40) etc.
+        let seeds = vec![
+            RawStream {
+                info_hash: "a".repeat(40),
+                title: "Movie 2160p WEB-DL HDR HEVC AAC".into(),
+                size_bytes: Some(18 * GIB),
+                seeders: Some(100),
+                file_idx: Some(0),
+                ..Default::default()
+            },
+            RawStream {
+                info_hash: "b".repeat(40),
+                title: "Movie 1080p WEB-DL H.264 AAC".into(),
+                size_bytes: Some(8 * GIB),
+                seeders: Some(50),
+                file_idx: Some(0),
+                ..Default::default()
+            },
+        ];
+        let deps = Deps::for_test(|d| d.make_scrapers = fake_scrapers(seeds));
+        let path = format!("/{}/stream/movie/tt1234567.json", VALID_BLOB);
+        let first = |rr: &http::Response<String>| -> String {
+            let list: StreamsResponse = serde_json::from_str(rr.body()).expect("list json");
+            assert!(rr.status() == 200 && !list.streams.is_empty(), "list: {} {}", rr.status(), rr.body());
+            list.streams[0].title.clone()
+        };
+        let no_hevc = serde_json::to_string(&a_browser(|p| {
+            p.hevc_main = 0;
+            p.hevc_main10 = 0;
+        }))
+        .expect("json");
+
+        let tv = serve(&deps, request(&path, None));
+        assert!(first(&tv).contains("2160p"), "the TV's list starts {:?}, want the 4K release", first(&tv));
+        let vary = tv.headers().get("vary").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+        assert!(vary.contains(PLAYABLE_HEADER), "vary = {vary:?}, want it to name {PLAYABLE_HEADER}");
+        assert!(
+            first(&serve(&deps, request(&path, Some(&no_hevc)))).contains("1080p"),
+            "a browser without HEVC gets a list whose first release is not the 1080p H.264"
+        );
+        assert!(
+            first(&serve(&deps, request(&path, None))).contains("2160p"),
+            "after a browser's list the TV gets the wrong first release: the two lists must be cached apart"
+        );
+        assert!(
+            first(&serve(&deps, request(&path, Some("{not json")))).contains("2160p"),
+            "a report that doesn't parse gets the wrong first release, want the TV's list"
+        );
+    }
+    todo!("pending: client_test.go TestStreamList_rankedForTheBrowserThatAsked")
 }
