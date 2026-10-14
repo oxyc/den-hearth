@@ -222,8 +222,9 @@ Reading it:
 - **Subtitles dominates memory.** Idle the process holds 20 MiB RSS (11 MiB anon). After a cold-search run its
   anonymous memory is 118 MiB, and 146 MiB after cold downloads, against a 64 MiB memory-tier budget
   (`MAX_MEMORY_BYTES`): about 2x the budget. The likely cause is glibc keeping freed 100 KB bodies in its arenas,
-  which is an inference (nothing here profiled the allocator). The gate's `RUN_CACHE_FILL` allowance (160 MiB) is this
-  measurement plus margin, and a PR that changes the allocator should lower it.
+  which is an inference (nothing here profiled the allocator). These figures are glibc's; hearth now ships jemalloc,
+  which holds less (see [Allocators](#allocators)). The gate's `RUN_CACHE_FILL` allowance (160 MiB) is the glibc
+  measurement plus margin.
 - **Remux with ffmpeg**: two sessions of the 25 s sample keep the cgroup at 3 processes (hearth plus an ffmpeg per
   session), 174 MiB RSS summed, 2.4 cores, and serve about 100 segment requests a second at p50 102 ms (a segment is
   waited for until ffmpeg writes it). Both sessions end with 204 and the process count returns to 1.
@@ -345,6 +346,46 @@ Remux session case. `cargo build --release -p den-hearth --features stub-upstrea
 
 The emulated amd64 container is within noise of native arm64 on the CPU-bound cases; the byte-moving cases are faster in
 the container because Linux's loopback and veth are faster than macOS's loopback.
+
+### Allocators
+
+Does another global allocator, or glibc tuning, pay for itself ([#282](https://github.com/oxyc/den/issues/282))? Four
+builds of the same code through the container run above, six full runs each (24 in all, order rotated; the closed
+experiment is [#22](https://github.com/oxyc/den-hearth/pull/22), branch `perf/allocator`, with the per-run tables in
+`bench/results/allocator/tables.md`): glibc, glibc with `MALLOC_ARENA_MAX=2`, mimalloc 0.1.52, and jemalloc 5.3.1
+(`tikv-jemallocator` 0.7) tuned with `background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,lg_tcache_max:16`
+(the last is clipped to jemalloc's default of 32 KiB on a 4 KiB-page host, so it did nothing here and is not shipped).
+Median of six, MiB, range in brackets (cgroup `anon` is hearth plus the ffmpeg children it spawns; no OOM kill in any run):
+
+| | glibc | glibc-arena2 | mimalloc | jemalloc |
+|---|---:|---:|---:|---:|
+| anon peak, any case | 152 (144 to 168) | 154 (140 to 170) | 159 (146 to 165) | **135 (129 to 138)** |
+| anon after the 121 s idle drain | 123 (115 to 145) | 127 (114 to 148) | 123 (116 to 134) | **98 (94 to 100)** |
+| RSS after the idle drain | 124 | 129 | 124 | **99** |
+| anon peak, `reel-meta-warm` (an untouched process) | 12 | 12 | 21 to 39 | 15 |
+| gate failures | 2 of 6 | 1 of 6 | 5 of 6 | 0 of 6 |
+| image size | 775.32 MB | same | +0.18 MB | +0.57 MB |
+
+**Why jemalloc.** It is the only candidate that moved memory: 20% less anon after idle and 11% less at peak, its worst
+run better than glibc's best (100 against 115 at idle), no gate misses, for 0.57 MB of image. `MALLOC_ARENA_MAX=2` does
+nothing for memory, and mimalloc keeps more than glibc (an untouched process holds 21 to 39 MiB) and missed the "memory
+back within 8 MiB of the case start" gate in `remux-session-flow` in three runs. Throughput did not separate them:
+requests per second moved by up to 2x between runs on a laptop with a load average from 2.6 to 27, and every candidate,
+glibc itself included, "beat" glibc by 1.3x to 1.5x on the control case that allocates next to nothing. Single-thread
+hot loops gain at most 1.4x (Subtitles' ranking, 640 allocations per candidate). The win is 25 MiB, not 2x, and the
+page cache (380 of the 512 MiB) dwarfs it; it is adopted as a clear memory win with no throughput loss the noise can
+show.
+
+**How it is applied.** `crates/hearth/src/alloc.rs` installs jemalloc as the global allocator and exports the tuning
+as `_rjem_malloc_conf`, which jemalloc reads before its first allocation, so no environment is needed; an operator's
+`_RJEM_MALLOC_CONF` overrides it. The startup line `allocator: jemalloc ...` prints what jemalloc reports, and a unit
+test reads the same settings back. (Verified in the image: `background_thread=true dirty_decay_ms=1000
+muzzy_decay_ms=1000`, and the same line with an override in the environment.) Nothing returns to the 11 MiB baseline for any allocator: after the drain the process
+holds about 16 MiB more than its caches explain with jemalloc, about 40 MiB more with glibc (an inference from the
+declared cache sizes; nothing walked the heap).
+
+**Caveats.** amd64 under emulation on a loaded laptop, not the box; the microbenchmarks were aarch64; fragmentation was
+not measured directly.
 
 ### Test suite
 

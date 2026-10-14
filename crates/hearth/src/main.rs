@@ -13,6 +13,7 @@
 //! runtime and the signal handling, and gives each service its own environment (see `env`).
 
 mod admit;
+mod alloc;
 mod env;
 mod media;
 mod ports;
@@ -472,6 +473,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
             c.own.iter().map(|(s, p)| format!("{} :{p}", ports::name(*s))).collect::<Vec<_>>().join(", ")
         },
     );
+    eprintln!("{}", alloc::startup_line());
     eprintln!("scout: {}", hearth.scout.summary());
     // Each service's own startup line: operators read `transcode=` and the like from them.
     eprintln!("{}", den_reel::startup_line(&hearth.reel));

@@ -30,6 +30,9 @@ serde_json = "1"
 socket2 = "0.6"
 # Constant-time comparison of the /metrics bearer token, as in the services.
 subtle = "2"
+# The global allocator (alloc.rs, BENCHMARKS.md "Allocators"); the -ctl crate reads its settings back for the startup line.
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
+tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
