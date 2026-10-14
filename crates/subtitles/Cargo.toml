@@ -37,10 +37,17 @@ subtle = "2"
 # encoding the way Firefox does for unlabeled pages; encoding_rs decodes it.
 chardetng = "1"
 encoding_rs = "0.8"
+mimalloc = { version = "0.1.52", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 
 [features]
 # Forwards to the private modules' hot paths for benches/subtitles.rs (src/bench_api.rs). Off in every build that ships.
 bench = []
+# Allocator experiment (BENCHMARKS.md, "Allocators"): benches/subtitles.rs installs this allocator bare, without
+# divan's counting profiler, so its time is the allocator's. Benches only; nothing in src/ reads them.
+alloc-system = []
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator"]
 
 [[bench]]
 name = "subtitles"

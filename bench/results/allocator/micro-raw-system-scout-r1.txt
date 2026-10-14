@@ -1,0 +1,17 @@
+scout                     fastest       │ slowest       │ median        │ mean          │ samples │ iters
+├─ decode_torbox_listing  16.81 ms      │ 25.5 ms       │ 18.16 ms      │ 19.22 ms      │ 10      │ 10
+│                         623.4 MB/s    │ 411 MB/s      │ 577.1 MB/s    │ 545.3 MB/s    │         │
+├─ parse_stremio_streams                │               │               │               │         │
+│  ├─ streams-50.json     50.7 µs       │ 194.8 µs      │ 53.2 µs       │ 62.04 µs      │ 100     │ 100
+│  │                      210.3 MB/s    │ 54.75 MB/s    │ 200.4 MB/s    │ 171.9 MB/s    │         │
+│  ╰─ streams-500.json    493.4 µs      │ 727.6 µs      │ 519.5 µs      │ 530.6 µs      │ 100     │ 100
+│                         216.3 MB/s    │ 146.7 MB/s    │ 205.4 MB/s    │ 201.2 MB/s    │         │
+├─ rank_episode                         │               │               │               │         │
+│  ├─ 100                 678.9 µs      │ 843 µs        │ 697.3 µs      │ 703.4 µs      │ 100     │ 100
+│  ├─ 500                 3.537 ms      │ 8.399 ms      │ 3.997 ms      │ 4.308 ms      │ 100     │ 100
+│  ╰─ 2000                14.47 ms      │ 32.06 ms      │ 15.63 ms      │ 16.83 ms      │ 100     │ 100
+╰─ rank_movie                           │               │               │               │         │
+   ├─ 100                 652.5 µs      │ 921.2 µs      │ 673 µs        │ 686.3 µs      │ 100     │ 100
+   ├─ 500                 3.261 ms      │ 4.179 ms      │ 3.43 ms       │ 3.454 ms      │ 100     │ 100
+   ╰─ 2000                13.26 ms      │ 18.7 ms       │ 14.55 ms      │ 14.77 ms      │ 100     │ 100
+

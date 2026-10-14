@@ -20,8 +20,20 @@ use den_scout::util::b64url_encode;
 use divan::counter::BytesCount;
 use divan::{black_box, Bencher};
 
+// divan's counting profiler by default; an `alloc-*` feature installs that allocator bare (the profiler's own
+// bookkeeping would otherwise sit in every timing), so allocation counts are only reported without one.
+#[cfg(not(any(feature = "alloc-system", feature = "alloc-mimalloc", feature = "alloc-jemalloc")))]
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+#[cfg(feature = "alloc-system")]
+#[global_allocator]
+static ALLOC: std::alloc::System = std::alloc::System;
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
     divan::main();

@@ -50,10 +50,17 @@ url = "2"
 httpdate = "1"
 # Go `math/rand` for the jitter on an unnamed pause (upstreampause.go).
 fastrand = "2"
+mimalloc = { version = "0.1.52", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 
 [features]
 # Forwards to the pub(crate) hot paths for benches/scout.rs (src/bench_api.rs). Off in every build that ships.
 bench = []
+# Allocator experiment (BENCHMARKS.md, "Allocators"): benches/scout.rs installs this allocator bare, without divan's
+# counting profiler, so its time is the allocator's. Benches only; nothing in src/ reads them.
+alloc-system = []
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator"]
 
 [[bench]]
 name = "scout"
