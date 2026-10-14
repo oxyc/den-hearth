@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::attributes::StreamAttributes;
+use crate::attributes::{container_of, StreamAttributes};
 use crate::rank::RawStream;
 
 /// A browser's report of what it plays, as Den Web sends it to den-remux and den-remux passes on in
@@ -61,13 +61,110 @@ pub(crate) const NEVER_PLAYS_COST: i64 = 60000;
 impl ClientPlayable {
     /// Go `(*ClientPlayable).cost`: applies den-remux's own reading of scout's attributes (what it copies,
     /// what it converts, what it won't open).
-    pub(crate) fn cost(&self, _s: RawStream, _a: StreamAttributes) -> i64 {
-        todo!()
+    pub(crate) fn cost(&self, s: RawStream, a: StreamAttributes) -> i64 {
+        if a.three_d || !remux_opens(&s) {
+            return NEVER_PLAYS_COST;
+        }
+        let mut cost = 0;
+        // Most Profile 5 has no base layer, but a malformed class has a P5 container record over a regular HDR base.
+        // Keep proven P5 near the end so den-remux can inspect the HEVC VUI/RPU and either refuse genuine P5 or strip
+        // the false record. Treating it as impossible here prevented that definitive probe from ever running.
+        if a.dv_profile == 5 && !self.dolby_vision.p5 {
+            cost += VIDEO_CONVERTED_COST * 2;
+        }
+        // A profile 5 the name only suggests weighs like a transcode: most likely it won't play here, but the probe
+        // has the last word, so it stays in the list.
+        if a.dv_profile == 0 && a.dv_profile_guess == 5 && !self.dolby_vision.p5 {
+            cost += VIDEO_CONVERTED_COST;
+        }
+        let uhd = a.resolution.as_deref().unwrap_or("") == "2160p";
+        let ten_bit = a.bit_depth >= 10;
+        // beyond answers whether the video is past what the decoder takes: by the level the probe read, else by
+        // the level a 3840 × 2160 picture needs at least.
+        let beyond = |most: i64, uhd_level: i64| {
+            if a.video_level > 0 {
+                a.video_level > most
+            } else {
+                uhd && most < uhd_level
+            }
+        };
+        match a.codec.as_deref().unwrap_or("") {
+            "h264" => {
+                // A 10 the name inferred from "HDR" is no evidence of High 10: H.264 releases are not HDR.
+                let mut most = self.h264;
+                if ten_bit && (a.probed || !a.hdr) {
+                    most = self.h264_high10;
+                }
+                // Nothing on the box makes H.264 smaller.
+                if most == 0 || beyond(most, 51) {
+                    return NEVER_PLAYS_COST;
+                }
+            }
+            "hevc" => {
+                let mut most = self.hevc_main10;
+                if !ten_bit {
+                    most = most.max(self.hevc_main);
+                }
+                if a.high_tier {
+                    most = self.hevc_high_tier;
+                }
+                if most == 0 || beyond(most, 150) || (a.hdr && !self.hdr) {
+                    cost += VIDEO_CONVERTED_COST;
+                }
+            }
+            "av1" => {
+                let mut most = self.av1_main10;
+                if !ten_bit {
+                    most = most.max(self.av1);
+                }
+                // Nothing converts AV1, and a browser is only asked about its Main tier.
+                if most == 0 || a.high_tier || beyond(most, 12) || (a.hdr && !self.av1_hdr) {
+                    return NEVER_PLAYS_COST;
+                }
+            }
+            "vp9" => {
+                // Nothing converts VP9 either. Profile 2 is its 10-bit profile.
+                let takes = if ten_bit { self.vp9_profile2 } else { self.vp9 };
+                if !takes {
+                    return NEVER_PLAYS_COST;
+                }
+            }
+            "" => cost += VIDEO_UNNAMED_COST,
+            // MPEG-4 Part 2, VC-1, MPEG-2: den-remux converts none of them.
+            _ => return NEVER_PLAYS_COST,
+        }
+        match a.audio_codec.as_deref().unwrap_or("") {
+            "aac" => {}
+            "eac3" | "ac3" => {
+                if !self.eac3 {
+                    cost += AUDIO_CONVERTED_COST;
+                }
+            }
+            "flac" => {
+                if !self.flac {
+                    cost += AUDIO_CONVERTED_COST;
+                }
+            }
+            _ => cost += AUDIO_CONVERTED_COST,
+        }
+        cost
     }
+}
+
+/// Go `remuxRefusedExt`: den-remux opens Matroska and MP4 only, and refuses these by name.
+const REMUX_REFUSED_EXT: [&str; 9] = [".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"];
+
+/// Go `remuxOpens`.
+fn remux_opens(s: &RawStream) -> bool {
+    if matches!(container_of(s.clone()).as_str(), "avi" | "webm") {
+        return false;
+    }
+    let name = s.title.to_lowercase();
+    !REMUX_REFUSED_EXT.iter().any(|ext| name.ends_with(ext))
 }
 
 /// Go `webReady` (defined in `handler.go`, line 2190; placed here per PORTING.md's assignment of
 /// `webready_test.go`).
-pub(crate) fn web_ready(_s: &RawStream, _url: &str) -> bool {
-    todo!()
+pub(crate) fn web_ready(s: &RawStream, url: &str) -> bool {
+    url.starts_with("https://") && container_of(s.clone()) == "mp4"
 }

@@ -13,7 +13,10 @@
 use std::sync::Arc;
 
 use crate::scrape::{DoError, Doer};
-use crate::season::TorrentFile;
+use crate::season::{
+    bare_episode_patterns, base_name, cached_episode_patterns, matches_episode, names_episode, pick_episode_file,
+    season_only_pattern, EPISODE_PATTERN_CAP, TorrentFile,
+};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
 use crate::stores::{DeadLinkError, ResolveTarget, Store, StoreError};
@@ -79,10 +82,7 @@ fn pick_episode_file_name_match_beats_order() {
 // a single episode, and its one video is the only thing it could be. Killing this to fix the case above
 // would break every untagged single-episode release.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_unlabelled_still_falls_back() {
-    #[cfg(any())]
-    fn pending() {
         let single = [file(0, "Show.1080p.WEB-DL.x264.mkv", 4000)];
         want_pick(pick_episode_file(&single, 4, 7), 0, "an untagged release falls back to its video");
 
@@ -90,30 +90,20 @@ fn pick_episode_file_unlabelled_still_falls_back() {
         // makes a name episode-LABELLED, so this must still fall back rather than refuse.
         let yearly = [file(0, "Movie.2019.1080p.BluRay.mkv", 8000)];
         want_pick(pick_episode_file(&yearly, 1, 1), 0, "a year/resolution is not an episode label");
-    }
-    todo!("pending: stores_pick_test.go:72")
 }
 
 // Samples and extras carry the episode number too. The real episode is the big file.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_prefers_the_largest_match() {
-    #[cfg(any())]
-    fn pending() {
         // Samples and extras carry the episode number too. The real episode is the big file.
         let files = [file(0, "Show.S01E02.sample.mkv", 20), file(1, "Show.S01E02.1080p.mkv", 4000)];
         want_pick(pick_episode_file(&files, 1, 2), 1, "the sample must lose to the episode");
-    }
-    todo!("pending: stores_pick_test.go:85")
 }
 
 // Non-video files (nfo, subs, artwork) are excluded — but a pack of ONLY non-video must still be
 // searchable rather than answering nil, or a legitimate odd container becomes unplayable.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_videos_first_then_anything() {
-    #[cfg(any())]
-    fn pending() {
         // Non-video files (nfo, subs, artwork) are excluded — but a pack of ONLY non-video must still be
         // searchable rather than answering nil, or a legitimate odd container becomes unplayable.
         let mixed = [file(0, "Show.S01E02.nfo", 1), file(1, "Show.S01E02.mkv", 500)];
@@ -125,8 +115,6 @@ fn pick_episode_file_videos_first_then_anything() {
         // Nothing to pick, and nothing to be wrong about — an empty list is not a mismatch.
         let got = pick_episode_file(&[], 1, 2);
         assert!(matches!(got, Ok(None)), "an empty pack has nothing to pick: {got:?}");
-    }
-    todo!("pending: stores_pick_test.go:96")
 }
 
 // TorBox: name match first, then the caller's index, and an out-of-range index is handed back untouched
@@ -319,10 +307,7 @@ fn stores_the_fallback_never_picks_a_non_video() {
 // season 2 episode 1 is packed as `- 13` and nothing in the name says so. Only an unambiguous SxxExx
 // label, which carries its season, can condemn a pack; a bare miss defers to the indexer's file index.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_bare_numbered_packs() {
-    #[cfg(any())]
-    fn pending() {
         // A pack numbered the way most anime and much TV is packed: the episode is found by its own number.
         //
         // A miss, though, is NOT evidence the pack lacks the episode — bare numbering is often absolute, so
@@ -336,8 +321,6 @@ fn pick_episode_file_bare_numbered_packs() {
         want_pick(pick_episode_file(&pack, 1, 3), 2, "the episode is named by its own number");
         want_pick(pick_episode_file(&pack, 1, 1), 0, "and so is the first one");
         assert!(matches!(pick_episode_file(&pack, 1, 9), Ok(None)), "a bare-number miss must defer, not condemn");
-    }
-    todo!("pending: stores_pick_test.go:297")
 }
 
 // The bare-number matcher's boundaries, asserted where they can actually fail.
@@ -348,10 +331,7 @@ fn pick_episode_file_bare_numbered_packs() {
 // with 5.1 audio — most packs — match episode 1, and the largest was served: ask for E01 of a
 // ten-episode pack, get E10, 302, no error.
 #[test]
-#[ignore = "needs season.rs bareEpisodePatterns (package 5)"]
 fn episode_patterns_bare_number_boundaries() {
-    #[cfg(any())]
-    fn pending() {
         // The bare-number matcher's boundaries, asserted where they can actually fail.
         //
         // Every name below is a real release shape. A dot cannot open a standalone number and can only close one
@@ -385,8 +365,6 @@ fn episode_patterns_bare_number_boundaries() {
             let got = matches_episode(name, &bare_episode_patterns(episode));
             assert_eq!(got, want, "ep {episode} vs {name:?} — {why}");
         }
-    }
-    todo!("pending: stores_pick_test.go:319")
 }
 
 // The two failures the boundaries above prevent, driven through the real pickers.
@@ -529,10 +507,7 @@ fn pickers_map_position_to_the_stores_own_id() {
 // no fixture in this suite was path-shaped, which is why the directory could speak for every file.
 // A directory describes the pack; only the filename describes the file.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_the_directory_is_not_evidence_about_the_file() {
-    #[cfg(any())]
-    fn pending() {
         // All three stores hand back PATHS, so the torrent's root directory is part of every file's name — and
         // no fixture in this suite was path-shaped, which is why the directory could speak for every file.
         // A directory describes the pack; only the filename describes the file.
@@ -562,18 +537,13 @@ fn pick_episode_file_the_directory_is_not_evidence_about_the_file() {
             file(308, "Show Complete/Season 01/Show.S01E08.mkv", 9000),
         ];
         want_pick(pick_episode_file(&deep, 1, 1), 301, "only the last component names the file");
-    }
-    todo!("pending: stores_pick_test.go:466")
 }
 
 // A number that matches EVERY candidate is part of what they share — the show's own title — not what
 // tells them apart. Serving the largest of "all of them" is how a request for episode 1 of Stargate
 // SG-1 returned episode 2.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_a_title_number_is_not_an_episode() {
-    #[cfg(any())]
-    fn pending() {
         // A number that matches EVERY candidate is part of what they share — the show's own title — not what
         // tells them apart. Serving the largest of "all of them" is how a request for episode 1 of Stargate
         // SG-1 returned episode 2.
@@ -595,8 +565,6 @@ fn pick_episode_file_a_title_number_is_not_an_episode() {
             file(402, "Blake's 7 - 02 - Space Fall.mkv", 9000),
         ];
         assert!(matches!(pick_episode_file(&blake, 1, 7), Ok(None)), "a number in the title is not an episode");
-    }
-    todo!("pending: stores_pick_test.go:501")
 }
 
 // One labelled file must not switch the weak tier off for the rest of the pack. An anime batch commonly
@@ -686,10 +654,7 @@ fn pick_episode_file_one_stray_file_disarms_nothing() {
 // A backslash is legal in a POSIX filename, and these names come from the torrent. Splitting on it
 // unconditionally threw away the part of the name that carries the label.
 #[test]
-#[ignore = "needs season.rs baseName (package 5)"]
 fn base_name_only_splits_where_a_directory_really_ends() {
-    #[cfg(any())]
-    fn pending() {
         // A backslash is legal in a POSIX filename, and these names come from the torrent. Splitting on it
         // unconditionally threw away the part of the name that carries the label.
         let cases = [
@@ -710,8 +675,6 @@ fn base_name_only_splits_where_a_directory_really_ends() {
             file(1, r"Show S01E02 - Part 1 \ Part 2.mkv", 9000),
         ];
         want_pick(pick_episode_file(&backslashed, 1, 1), 0, "a backslash in the filename does not erase its episode label");
-    }
-    todo!("pending: stores_pick_test.go:605")
 }
 
 // An anime batch numbered absolutely, with a couple of labelled OVAs alongside — the shape the refusal
@@ -869,10 +832,7 @@ fn ambiguous_episode_guess_ignores_files_that_name_their_own_episode() {
 // The bare tier's own candidate restriction, asserted where it can fail: over the whole pool the labelled
 // file also matches the number, so the match is no longer unique and the tier answers nothing.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_the_bare_tier_ignores_labelled_files() {
-    #[cfg(any())]
-    fn pending() {
         // The bare tier's own candidate restriction, asserted where it can fail: over the whole pool the labelled
         // file also matches the number, so the match is no longer unique and the tier answers nothing.
         let files = [
@@ -880,8 +840,6 @@ fn pick_episode_file_the_bare_tier_ignores_labelled_files() {
             file(1, "[Grp] Show - 05 [1080p].mkv", 4000),
         ];
         want_pick(pick_episode_file(&files, 1, 5), 1, "the one unlabelled file carrying the number is the answer");
-    }
-    todo!("pending: stores_pick_test.go:765")
 }
 
 // The majority rule's boundary. Equal counts must NOT condemn: the unlabelled files may be absolutely
@@ -957,10 +915,7 @@ fn pick_episode_file_double_episodes_name_both_of_them() {
 // An episode number with no season anywhere: the strong patterns cannot fire and labelledEpisodeRe does
 // not see it, so every file looked identical and the largest was served for all twelve episodes.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_season_less_episode_labels() {
-    #[cfg(any())]
-    fn pending() {
         // An episode number with no season anywhere: the strong patterns cannot fire and labelledEpisodeRe does
         // not see it, so every file looked identical and the largest was served for all twelve episodes.
         for shape in ["Show - E%02d [1080p].mkv", "Show.E%02d.1080p.mkv", "Show_E%02d_1080p.mkv"] {
@@ -981,18 +936,13 @@ fn pick_episode_file_season_less_episode_labels() {
         for (name, episode) in cases {
             assert!(!matches_episode(name, &bare_episode_patterns(episode)), "{name:?} must not read as episode {episode}");
         }
-    }
-    todo!("pending: stores_pick_test.go:847")
 }
 
 // The second element of a double-episode range must look like an episode. Written as an optional `e`
 // over a possibly-empty separator it accepted whatever number came next after the label, and because
 // this is a STRONG match it also overrode the indexer's correct fileIdx.
 #[test]
-#[ignore = "needs season.rs namesEpisode (package 5)"]
 fn episode_patterns_the_range_second_element_must_be_an_episode() {
-    #[cfg(any())]
-    fn pending() {
         // The second element of a double-episode range must look like an episode. Written as an optional `e`
         // over a possibly-empty separator it accepted whatever number came next after the label, and because
         // this is a STRONG match it also overrode the indexer's correct fileIdx.
@@ -1028,8 +978,6 @@ fn episode_patterns_the_range_second_element_must_be_an_episode() {
             .map(|i| file(i, &format!("Show.S01E{i:02}.4K.HDR.WEB-DL.mkv"), 1000 + i))
             .collect();
         want_pick(pick_episode_file(&uhd, 1, 4), 4, "the 4K tag names no episode");
-    }
-    todo!("pending: stores_pick_test.go:891")
 }
 
 // A range is arithmetic, not punctuation. A tight dash was tried as the thing that made a bare second
@@ -1222,10 +1170,7 @@ fn names_episode_reads_every_episode_in_a_chain() {
 // it is fast — it is that it hands back the set that was asked for. A cache keyed too loosely would
 // answer episode 3 with episode 2's patterns, which is the whole pick decided wrong, silently.
 #[test]
-#[ignore = "needs season.rs cachedEpisodePatterns (package 5)"]
 fn cached_episode_patterns_answers_for_the_episode_asked_about() {
-    #[cfg(any())]
-    fn pending() {
         // The compiled pattern set is shared across picks, and the thing to prove about any cache is not that
         // it is fast — it is that it hands back the set that was asked for. A cache keyed too loosely would
         // answer episode 3 with episode 2's patterns, which is the whole pick decided wrong, silently.
@@ -1260,18 +1205,13 @@ fn cached_episode_patterns_answers_for_the_episode_asked_about() {
         }
         assert!(matches_episode("Show.S06E11.1080p.mkv", &cached_episode_patterns(6, 11)),
             "the pick that filled the cache was answered with someone else's patterns");
-    }
-    todo!("pending: stores_pick_test.go:1139")
 }
 
 // unresolvedSeasonPack: a title that never names this episode, with the season either generic or named
 // only by a range that happens to span it, is a pack whatever its declared size claims. A title that
 // does name this episode — plainly or by an explicit list — is trusted exactly as namesEpisode trusts it.
 #[test]
-#[ignore = "needs season.rs unresolvedSeasonPack (package 5)"]
 fn unresolved_season_pack() {
-    #[cfg(any())]
-    fn pending() {
         // unresolvedSeasonPack: a title that never names this episode, with the season either generic or named
         // only by a range that happens to span it, is a pack whatever its declared size claims. A title that
         // does name this episode — plainly or by an explicit list — is trusted exactly as namesEpisode trusts it.
@@ -1286,24 +1226,17 @@ fn unresolved_season_pack() {
             ("a movie, unrelated to any season wording", "Some.Other.Movie.2019.1080p.mkv", false),
         ];
         for (name, title, want) in cases {
-            let got = unresolved_season_pack(title, 1, 3);
+            let got = crate::season::unresolved_season_pack(title, 1, 3);
             assert_eq!(got, want, "{name}: unresolvedSeasonPack({title:?}, 1, 3) = {got}, want {want}");
         }
-    }
-    todo!("pending: stores_pick_test.go:1180")
 }
 
 // s01e03 itself must never trip the bare season pattern: there is no boundary between a season's digits
 // and an episode marker glued straight onto them.
 #[test]
-#[ignore = "needs season.rs seasonOnlyPattern (package 5)"]
 fn season_only_pattern_does_not_fire_inside_an_episode_marker() {
-    #[cfg(any())]
-    fn pending() {
         // s01e03 itself must never trip the bare season pattern: there is no boundary between a season's digits
         // and an episode marker glued straight onto them.
         assert!(!season_only_pattern(1).is_match("fauda.s01e03.web-dl.1080p.mkv"), r#""s01e03" matched the bare-season pattern for season 1"#);
         assert!(season_only_pattern(1).is_match("fauda.s01.complete.1080p"), r#""s01" alone did not match the bare-season pattern for season 1"#);
-    }
-    todo!("pending: stores_pick_test.go:1204")
 }

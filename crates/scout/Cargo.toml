@@ -34,13 +34,16 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http = "1"
-# Go `time.NewTicker`: `TieredCache::sweep_every` runs on a tokio interval and cancels by dropping the future.
-tokio = { version = "1", features = ["time"] }
+# Go `time.NewTicker` (`TieredCache::sweep_every`), `sync/singleflight` (indexerconfig.rs, cinemeta.rs),
+# and the name lookups household sources are guarded at (sources.rs).
+tokio = { version = "1", features = ["net", "sync", "time"] }
 # Go `regexp` (RE2 syntax, linear time): the release-title patterns in rank.go, attributes.go and label.go.
 regex = "1"
 # Go `regexp2`: the patterns that need lookaround, which RE2 lacks (rank.go's "upscaled" junk pattern,
 # season.go's episode matchers).
 fancy-regex = "0.19"
+# Go `net/url`, for the household source links in sources.go.
+url = "2"
 
 [dev-dependencies]
 # Go's `t.TempDir()`.
