@@ -589,6 +589,12 @@ async fn fetch_trailer_inner(
     // means the driver only ever removes its own entry.
     let shared: SharedDownload = {
         let mut map = state.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        // A FINISHED entry is not a download to join: its driver task clears it only after the
+        // waiters have woken, so for that window it still holds a verdict that may be older than the
+        // failure cache's TTL. Joining it would hand that verdict back for good; start afresh.
+        if map.get(&vid).is_some_and(|(_, existing)| existing.peek().is_some()) {
+            map.remove(&vid);
+        }
         if let Some((_, existing)) = map.get(&vid) {
             existing.clone()
         } else if state.youtube.remaining_ms((state.clock)()).is_some() {
