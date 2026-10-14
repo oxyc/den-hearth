@@ -79,8 +79,11 @@ What the web's trailers cost is there too, as counters since the process started
 `reel_index_builds_total{streams="video"|"video+audio"}` with `reel_index_build_milliseconds_total` beside it
 (divide for the mean), `reel_index_build_failures_total`, `reel_index_ranges_retried_total` (ranges refused for the moment and asked again), `reel_index_requests_total{index="built"|"waited"}`
 (how often a `/progressive` request found its index ready), and `reel_resolves_total` with
-`reel_resolve_milliseconds_total`. `reel_last_milliseconds{of=…}` holds the most recent of each, for a glance
-without a second scrape.
+`reel_resolve_milliseconds_total`. With `YOUTUBEI_WORKER` set, `reel_resolver_answers_total{resolver="youtubei"|"ytdlp"}`
+says who answered and `reel_youtubei_fallbacks_total{reason="error"|"unavailable"|"unusable"}` how often the fast
+resolver handed a resolve to yt-dlp (it failed for the video, could not be asked, or answered with nothing usable);
+the decision log has an `event=resolver` line for each. `reel_last_milliseconds{of=…}` holds the most recent of each,
+for a glance without a second scrape.
 
 It is **off unless `METRICS_TOKEN` is set**, and then answers only
 `Authorization: Bearer <METRICS_TOKEN>`; every refusal is the same 404 an unknown path gets. In-flight
@@ -575,6 +578,8 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube; below 144 (no rendition can match) it falls back to the default |
 | `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold; below 256 MB (under one trailer) it falls back to the default |
 | `CACHE_TTL_SECS` | `1209600` (14 days) | Drop a trailer this many seconds after it was last served; `0` = size cap only |
+| `YOUTUBEI_WORKER` | *(unset — off; the image sets it)* | A resident youtubei.js resolver (`worker/youtubei/main.mjs`, run by `DENO_PATH`), asked **before** yt-dlp: one player call instead of a page, a player call and an HLS manifest — about 0.12 s a resolve against 1.1 s, with the same format choice (compared video by video in `bench/results/reel-resolve/youtubei-compare.jsonl`). **Any failure of it falls through to yt-dlp**: a failure for the video, an answer with nothing usable, a worker that will not start, died or took over 10 s. It runs under deno with network to `www.youtube.com` and `youtubei.googleapis.com` and nothing else — no filesystem, environment or subprocesses — from the packages its lockfile pins, which the image builds in and the container only reads. The answer gets the same end-of-file check as yt-dlp's; if that refuses it, yt-dlp takes the second look. |
+| `DENO_PATH` | `deno` | the runtime for `YOUTUBEI_WORKER` |
 | `YTDLP_PLAYER_CLIENTS` | *(unset — yt-dlp chooses)* | Pin the YouTube innertube client(s) for `--extractor-args player_client`, comma-separated. **Normally leave this alone.** It used to default to `tv_embedded,android`; yt-dlp has since retired `tv_embedded`, and an unrecognised client is answered with a *warning* (`Skipping unsupported client`) that `--no-warnings` hides — so the pin silently degraded to `android` alone, which now needs a PO token for both HTTPS and DASH. Which client works is a judgement about what YouTube is enforcing this month, it is the judgement the yt-dlp team makes daily, and bumping `YTDLP_VERSION` is how we receive it. Set this only to ride out a specific outage, and check the name against the yt-dlp release you have pinned — a retired one fails quietly. |
 
 ## Run

@@ -1,0 +1,27 @@
+health: degraded (tmdb_key_missing) — set CONFIG_KEY (per-install BYOK) or TMDB_KEY
+den-reel 0.56.0 listening on :55688 — metrics=on log_requests=off sealed=off revoked=0 epoch=0 require_iid=off play_signing=off direct_media_max=16 env_tmdb_key=off cache=/private/tmp/claude-501/-Users-cindy-Projects-Personal-den/c3172490-d844-4499-9df1-37c099efe02f/scratchpad/reel-resolve/reel-bench-b2vhu4eh/warm-S-youtubei-broken max_height=1080
+resident youtubei.js: cannot start /nonexistent/deno ["run", "--quiet", "--no-prompt", "--cached-only", "--frozen", "--config=/Users/cindy/Projects/Personal/den-hearth-worktrees/p-reel/crates/reel/worker/youtubei/deno.json", "--lock=/Users/cindy/Projects/Personal/den-hearth-worktrees/p-reel/crates/reel/worker/youtubei/deno.lock", "--allow-net=www.youtube.com,youtubei.googleapis.com", "/Users/cindy/Projects/Personal/den-hearth-worktrees/p-reel/crates/reel/worker/youtubei/main.mjs"]: No such file or directory (os error 2)
+event=resolver outcome=fallback resolver=youtubei reason=unavailable upstream=youtube dur_ms=0 vid=Way9Dexny3w
+event=resolver outcome=served resolver=ytdlp reason=fallback upstream=youtube dur_ms=1598 vid=Way9Dexny3w
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1619 vid=Way9Dexny3w height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1619 vid=Way9Dexny3w
+event=resolver outcome=fallback resolver=youtubei reason=unavailable upstream=youtube dur_ms=0 vid=_YUzQa_1RCE
+event=resolver outcome=served resolver=ytdlp reason=fallback upstream=youtube dur_ms=962 vid=_YUzQa_1RCE
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1022 vid=_YUzQa_1RCE height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1022 vid=_YUzQa_1RCE
+event=resolver outcome=fallback resolver=youtubei reason=unavailable upstream=youtube dur_ms=0 vid=bK6ldnjE3Y0
+event=resolver outcome=served resolver=ytdlp reason=fallback upstream=youtube dur_ms=986 vid=bK6ldnjE3Y0
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1021 vid=bK6ldnjE3Y0 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1021 vid=bK6ldnjE3Y0
+event=resolver outcome=fallback resolver=youtubei reason=unavailable upstream=youtube dur_ms=0 vid=uYPbbksJxIg
+event=resolver outcome=served resolver=ytdlp reason=fallback upstream=youtube dur_ms=971 vid=uYPbbksJxIg
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1009 vid=uYPbbksJxIg height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1009 vid=uYPbbksJxIg
+event=resolver outcome=fallback resolver=youtubei reason=unavailable upstream=youtube dur_ms=0 vid=pBk4NYhWNMM
+event=resolver outcome=served resolver=ytdlp reason=fallback upstream=youtube dur_ms=1129 vid=pBk4NYhWNMM
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1192 vid=pBk4NYhWNMM height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1193 vid=pBk4NYhWNMM
+event=resolver outcome=fallback resolver=youtubei reason=unavailable upstream=youtube dur_ms=0 vid=R97vOlMD7q8
+event=resolver outcome=served resolver=ytdlp reason=fallback upstream=youtube dur_ms=884 vid=R97vOlMD7q8
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=934 vid=R97vOlMD7q8 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=934 vid=R97vOlMD7q8

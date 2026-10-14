@@ -1,0 +1,124 @@
+// A resident youtubei.js resolver, speaking the same line protocol as ../resolve.py:
+//
+//   {"id": "dQw4w9WgXcQ", "rungs": [1080, 720, 480]}
+//   {"ok": true, "width": 1920, "height": 1080, "urls": [video, audio], "hls": "https://...", "itags": [137, 140]}
+//   {"ok": false, "error": "ERROR: [youtube] ... Video unavailable"}
+//
+// It exists because one player call is all a resolve needs: yt-dlp spends ~1 s on a webpage, a player
+// request and the HLS manifest, this spends ~0.12 s. Reel asks it first and falls back to yt-dlp on ANY
+// failure, so it never has to be clever: a video it cannot answer is simply not its video.
+//
+// Selection mirrors `config::format_ladder`, rung by rung: the best avc1 video at or under the rung
+// plus the best mp4a audio, else the best muxed avc1+mp4a at or under it; after the last rung, itag 18,
+// else any muxed mp4 avc1+mp4a. `rungs` comes from Reel so the two cannot drift.
+//
+// Bundled with `deno bundle` from deno.lock (see the Dockerfile) and run with network access to
+// YouTube's API hosts only: no filesystem, no environment, no subprocesses.
+import { Innertube, UniversalCache } from "youtubei.js";
+import readline from "node:readline";
+import process from "node:process";
+import { thrown, unplayable } from "./errors.mjs";
+
+const CLIENT = "VISIONOS";
+// A session carries a visitor identity; a long-lived one is what keeps answers whole (see the
+// benchmark), but not forever. Rebuilt hourly, and at once after anything unexpected.
+const SESSION_MAX_AGE_MS = 60 * 60 * 1000;
+
+let tube = null;
+let builtAt = 0;
+
+async function session() {
+  if (!tube || Date.now() - builtAt > SESSION_MAX_AGE_MS) {
+    // No player: VISIONOS URLs arrive ready to fetch, so there is no signature to solve and no
+    // base.js to download. A format that does need one fails below and Reel falls back to yt-dlp.
+    tube = await Innertube.create({
+      cache: new UniversalCache(false),
+      enable_session_cache: false, // the default keeps one on disk under $TMPDIR
+      retrieve_player: false,
+    });
+    builtAt = Date.now();
+  }
+  return tube;
+}
+
+const has = (f, codec) => (f.mime_type ?? "").includes(codec);
+const best = (list, by) => list.reduce((a, b) => (a && by(a) >= by(b) ? a : b), null);
+
+function chooseVideo(adaptive, limit) {
+  const videos = adaptive.filter((f) => f.has_video && !f.has_audio && has(f, "avc1") && (f.height ?? 0) <= limit);
+  // Tallest, then smoothest, then richest: yt-dlp's own order for `bv*`.
+  return best(videos, (f) => (f.height ?? 0) * 1e9 + (f.fps ?? 0) * 1e6 + (f.bitrate ?? 0));
+}
+
+function chooseAudio(adaptive) {
+  const audios = adaptive.filter((f) => f.has_audio && !f.has_video && has(f, "mp4a"));
+  return best(audios, (f) => f.bitrate ?? 0);
+}
+
+function chooseMuxed(muxed, limit) {
+  const both = muxed.filter((f) => f.has_video && f.has_audio && has(f, "avc1") && has(f, "mp4a"));
+  const within = both.filter((f) => (f.height ?? 0) <= limit);
+  return best(within, (f) => (f.height ?? 0) * 1e9 + (f.bitrate ?? 0));
+}
+
+function select(streaming, rungs) {
+  const adaptive = streaming.adaptive_formats ?? [];
+  const muxed = streaming.formats ?? [];
+  for (const limit of rungs) {
+    const video = chooseVideo(adaptive, limit);
+    const audio = chooseAudio(adaptive);
+    if (video && audio) return [video, audio];
+    const whole = chooseMuxed(muxed, limit);
+    if (whole) return [whole];
+  }
+  const itag18 = muxed.find((f) => f.itag === 18);
+  if (itag18) return [itag18];
+  const any = muxed.find((f) => f.has_video && f.has_audio && has(f, "avc1") && has(f, "mp4a"));
+  return any ? [any] : [];
+}
+
+async function answer(request) {
+  const { id, rungs } = request;
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id ?? "")) return { ok: false, error: `ERROR: [youtube] ${id}: not a video id` };
+  const yt = await session();
+  const info = await yt.getBasicInfo(id, { client: CLIENT });
+  const status = info.playability_status;
+  if (status?.status && status.status !== "OK") {
+    return { ok: false, error: unplayable(id, status.status, status.reason) };
+  }
+  const streaming = info.streaming_data;
+  if (!streaming) return { ok: false, error: `ERROR: [youtube] ${id}: no streaming data` };
+  const chosen = select(streaming, rungs?.length ? rungs : [1080, 720, 480]);
+  if (!chosen.length) return { ok: false, error: `ERROR: [youtube] ${id}: Requested format is not available` };
+  const urls = [];
+  for (const format of chosen) {
+    const url = format.url ?? (await format.decipher(undefined));
+    if (!url) return { ok: false, error: `ERROR: [youtube] ${id}: a stream has no usable url` };
+    urls.push(url);
+  }
+  const head = chosen[0];
+  return {
+    ok: true,
+    width: head.width ?? null,
+    height: head.height ?? null,
+    urls,
+    hls: streaming.hls_manifest_url ?? null,
+    itags: chosen.map((f) => f.itag),
+  };
+}
+
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of lines) {
+  if (!line.trim()) continue;
+  let reply;
+  let id = "?";
+  try {
+    const request = JSON.parse(line);
+    id = request.id;
+    reply = await answer(request);
+  } catch (error) {
+    tube = null; // unknown state: build a new session for the next one
+    reply = { ok: false, error: thrown(id, error) };
+  }
+  process.stdout.write(JSON.stringify(reply) + "\n");
+}

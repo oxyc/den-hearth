@@ -474,6 +474,24 @@ fn metrics_body(state: &AppState) -> String {
         ],
     );
     counter("reel_resolves_total", "yt-dlp resolves that ran.", &[("", state.resolves.count.load(Relaxed))]);
+    let resolver = &state.resolver;
+    counter(
+        "reel_resolver_answers_total",
+        "Resolves that produced an answer, by the resolver that did.",
+        &[
+            ("resolver=\"youtubei\"", resolver.youtubei_answers.load(Relaxed)),
+            ("resolver=\"ytdlp\"", resolver.ytdlp_answers.load(Relaxed)),
+        ],
+    );
+    counter(
+        "reel_youtubei_fallbacks_total",
+        "Resolves the youtubei.js resolver handed to yt-dlp: it failed for the video, could not be asked, or answered with nothing usable.",
+        &[
+            ("reason=\"error\"", resolver.fallback_error.load(Relaxed)),
+            ("reason=\"unavailable\"", resolver.fallback_unavailable.load(Relaxed)),
+            ("reason=\"unusable\"", resolver.fallback_unusable.load(Relaxed)),
+        ],
+    );
     counter(
         "reel_resolve_milliseconds_total",
         "Time spent resolving, once each had its permit.",
@@ -1199,6 +1217,7 @@ pub fn init(cfg: Config) -> Arc<AppState> {
             loop {
                 tick.tick().await;
                 state.worker.reap_idle().await;
+                state.youtubei.reap_idle().await;
             }
         });
     }
@@ -1219,6 +1238,7 @@ pub async fn finish(state: &Arc<AppState>) {
         eprintln!("shutdown: killed {killed} in-flight download(s)");
     }
     state.worker.shutdown().await;
+    state.youtubei.shutdown().await;
     crate::play::sweep_own_temps(&state.cfg);
     state::save_resolve_cache(state);
     state::save_direct_cache(state);

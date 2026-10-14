@@ -67,6 +67,19 @@ impl Timings {
     }
 }
 
+/// Who answered each resolve, and how often the youtubei.js resolver handed one to yt-dlp.
+#[derive(Default)]
+pub struct ResolverStats {
+    pub youtubei_answers: AtomicU64,
+    pub ytdlp_answers: AtomicU64,
+    /// It answered, but with a failure for this video (removed, restricted, a bot check, no format).
+    pub fallback_error: AtomicU64,
+    /// It could not be asked: not startable, died, or timed out.
+    pub fallback_unavailable: AtomicU64,
+    /// It answered ok with nothing Reel could use.
+    pub fallback_unusable: AtomicU64,
+}
+
 pub struct AppState {
     pub cfg: Arc<Config>,
     /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
@@ -119,6 +132,11 @@ pub struct AppState {
     /// The resident yt-dlp, when one is configured and running (`worker.rs`). Every failure of it
     /// falls back to spawning the binary, so this is only ever an optimisation.
     pub worker: crate::worker::Worker,
+    /// The resident youtubei.js resolver, asked before the one above when `YOUTUBEI_WORKER` is set
+    /// (`direct::extract`). Any failure of it hands the same request to yt-dlp.
+    pub youtubei: crate::worker::Worker,
+    /// Which resolver answered, and why the fast one did not, for `/metrics`.
+    pub resolver: ResolverStats,
     pub upstream: Box<dyn Upstream>,
     /// The same HTTP client the upstream lookups use, for the HLS proxy's own fetches (`hls.rs`).
     /// Shared rather than a second one: a client is a connection pool, and googlevideo and TMDB are
@@ -227,6 +245,8 @@ impl AppState {
             direct_inflight: Mutex::new(HashMap::new()),
             progressive: Mutex::new(HashMap::new()),
             worker: Default::default(),
+            youtubei: crate::worker::Worker::youtubei(),
+            resolver: Default::default(),
             upstream,
             http,
             prober: default_prober(cfg.clone(), probe_sem.clone()),

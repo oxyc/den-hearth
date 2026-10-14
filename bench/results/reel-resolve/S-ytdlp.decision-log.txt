@@ -1,0 +1,90 @@
+health: degraded (tmdb_key_missing) — set CONFIG_KEY (per-install BYOK) or TMDB_KEY
+den-reel 0.56.0 listening on :50852 — metrics=on log_requests=off sealed=off revoked=0 epoch=0 require_iid=off play_signing=off direct_media_max=16 env_tmdb_key=off cache=/private/tmp/claude-501/-Users-cindy-Projects-Personal-den/c3172490-d844-4499-9df1-37c099efe02f/scratchpad/reel-resolve/reel-bench-1qfqshpi/warm-S-ytdlp max_height=1080
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1970 vid=Way9Dexny3w height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1970 vid=Way9Dexny3w
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1095 vid=_YUzQa_1RCE height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1095 vid=_YUzQa_1RCE
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1146 vid=bK6ldnjE3Y0 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1147 vid=bK6ldnjE3Y0
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=997 vid=uYPbbksJxIg height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=997 vid=uYPbbksJxIg
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1125 vid=pBk4NYhWNMM height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1125 vid=pBk4NYhWNMM
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1035 vid=R97vOlMD7q8 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1035 vid=R97vOlMD7q8
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=927 vid=YoHD9XEInc0 height=720 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=927 vid=YoHD9XEInc0
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1172 vid=8hP9D6kZseM height=798 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1172 vid=8hP9D6kZseM
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1037 vid=2LqzF5WauAw height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1037 vid=2LqzF5WauAw
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1043 vid=zSWdZVtXT7E height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1044 vid=zSWdZVtXT7E
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1253 vid=mqqft2x_Aa4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1253 vid=mqqft2x_Aa4
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=881 vid=-FZ-pPFAjYY height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=881 vid=-FZ-pPFAjYY
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1053 vid=qSqVVswa420 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1053 vid=qSqVVswa420
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=989 vid=giXco2jaZ_4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=989 vid=giXco2jaZ_4
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1144 vid=wxN1T1uxQ2g height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1144 vid=wxN1T1uxQ2g
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1345 vid=kIleZvrkj5k height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1345 vid=kIleZvrkj5k
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1109 vid=5xH0HfJHsaY height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1109 vid=5xH0HfJHsaY
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1083 vid=SEUXfv87Wpk height=804 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1083 vid=SEUXfv87Wpk
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=989 vid=hEJnMQG9ev8 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=989 vid=hEJnMQG9ev8
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1214 vid=YWNWi-ZWL3c height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1214 vid=YWNWi-ZWL3c
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1207 vid=gCcx85zbxz4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1207 vid=gCcx85zbxz4
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1059 vid=dZOaI_Fn5o4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1059 vid=dZOaI_Fn5o4
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1161 vid=qEVUtrk8_B4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1161 vid=qEVUtrk8_B4
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1109 vid=yjRHZEUamCc height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1109 vid=yjRHZEUamCc
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1130 vid=cqGjhVJWtEg height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1130 vid=cqGjhVJWtEg
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1022 vid=shW9i6k8cB0 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1022 vid=shW9i6k8cB0
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1202 vid=1Fg5iWmQjwk height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1202 vid=1Fg5iWmQjwk
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1054 vid=zru-1DbbcsA height=720 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1055 vid=zru-1DbbcsA
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1148 vid=DzfpyUB60YY height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1148 vid=DzfpyUB60YY
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1078 vid=oB6HNuKxLmo height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1078 vid=oB6HNuKxLmo
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1418 vid=qGqiHJTsRkQ height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1418 vid=qGqiHJTsRkQ
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1002 vid=sL-9Khv7wa4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1003 vid=sL-9Khv7wa4
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1094 vid=tFMo3UJ4B4g height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1094 vid=tFMo3UJ4B4g
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=987 vid=ZLO4X6UI8OY height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=987 vid=ZLO4X6UI8OY
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1060 vid=zAGVQLHvwOY height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1060 vid=zAGVQLHvwOY
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1038 vid=t433PEQGErc height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1038 vid=t433PEQGErc
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=945 vid=RlbR5N6veqw height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=946 vid=RlbR5N6veqw
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=939 vid=_klfx5sGzFk height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=939 vid=_klfx5sGzFk
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1039 vid=kA244xewjcI height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1039 vid=kA244xewjcI
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=928 vid=C7BiI8h2McM height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=928 vid=C7BiI8h2McM
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1141 vid=FUXawkH-ONM height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1141 vid=FUXawkH-ONM
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1145 vid=fTrsp5BMloA height=1038 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1145 vid=fTrsp5BMloA
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=1138 vid=AhKLpJmHhIg height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=1138 vid=AhKLpJmHhIg
+event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=992 vid=EyFdVoPR_h4 height=1080 has_audio=true
+event=transport transport=direct outcome=served reason=ok upstream=youtube dur_ms=992 vid=EyFdVoPR_h4
