@@ -12,6 +12,7 @@
 //! Each service is the same library its standalone binary runs; hearth supplies the listeners, the
 //! runtime and the signal handling, and gives each service its own environment (see `env`).
 
+mod alloc;
 mod env;
 mod ports;
 mod route;

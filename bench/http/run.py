@@ -104,6 +104,8 @@ class Run:
             "REMUX_MAX_SESSIONS_PER_INSTALL": "2", "REMUX_TRUSTED_PROXIES": driver_ip,
             "REMUX_SESSION_IDLE_SECS": "300",
         }
+        # EXTRA_ENV="A=1,B=2": more variables for the process under test (the allocator comparison sets MALLOC_ARENA_MAX).
+        env |= dict(pair.split("=", 1) for pair in os.environ.get("EXTRA_ENV", "").split(",") if pair)
         envargs = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
         engine(*common, "--name", HEARTH, "--network-alias", "hearth", "--memory", MEMORY, "--memory-swap", MEMORY,
                "--pids-limit", "512", "-v", "/cache", *envargs, IMAGE)
@@ -424,6 +426,7 @@ def main():
         header = {"kind": "meta", "run": RUN_ID, "date": stamp, "image": IMAGE, "platform": PLATFORM, "memory": MEMORY,
                   "memory_max_bytes": run.memory_max, "worker_threads": WORKERS, "duration_s": DURATION,
                   "soak_s": SOAK_DURATION, "concurrency": CONCURRENCY, "egress": "blocked (internal network)",
+                  "extra_env": os.environ.get("EXTRA_ENV", ""),
                   "docker": engine("version", "-f", "{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}").stdout.strip(),
                   "cpus": engine("info", "-f", "{{.NCPU}}").stdout.strip(), "vm_memory": engine("info", "-f", "{{.MemTotal}}").stdout.strip(),
                   "baseline": {"rss_kib": run.baseline["cgroup_processes"]["rss_kib"], "cgroup_current": run.baseline["cgroup"]["current"],

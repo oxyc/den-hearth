@@ -9,6 +9,9 @@ license = "MIT"
 [features]
 # Benchmark builds only: the upstream bases come from HEARTH_STUB_* (see main.rs). Never in a shipped image.
 stub-upstreams = []
+# Global allocator candidates (BENCHMARKS.md, "Allocators"). At most one; with none, the system (glibc) allocator.
+mimalloc = ["dep:mimalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
 den-reel = { path = "../reel" }
@@ -25,3 +28,5 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"]
 http-body-util = "0.1"
 bytes = "1"
 serde_json = "1"
+mimalloc = { version = "0.1.52", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads"] }
