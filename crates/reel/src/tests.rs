@@ -6,6 +6,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hyper::service::service_fn;
@@ -6421,28 +6422,62 @@ fn classify_recognises_a_youtube_throttle() {
     assert_eq!(classify(Some(1), "ERROR: Sign in to confirm your age").reason, "restricted");
 }
 
-/// The pause doubles per episode, never passes its cap, and counts one episode once: requests that
-/// left before the pause report back inside it, and must not double it once each.
+/// The YouTube pause doubles per episode from five minutes, never passes three hours, and counts one episode once:
+/// requests that left before the pause report back inside it, and must not double it once each.
 #[test]
-fn a_backoff_doubles_caps_and_counts_one_episode_once() {
-    use crate::backoff::{window_ms, Backoff};
-    assert_eq!(window_ms(1000, 60_000, 1, 0), 1000);
-    assert_eq!(window_ms(1000, 60_000, 3, 0), 4000);
-    assert_eq!(window_ms(1000, 60_000, 3, 199), 4796);
-    assert_eq!(window_ms(1000, 60_000, 30, 199), 60_000);
-
-    let b = Backoff::new("test", 1000, 60_000);
+fn the_youtube_pause_doubles_caps_and_counts_one_episode_once() {
+    let b = crate::state::youtube_backoff();
+    let base = crate::YOUTUBE_PAUSE_BASE_MS;
     assert_eq!(b.remaining_ms(0), None);
-    let first = b.trip(0, None, "refused");
-    assert!((1000..=1200).contains(&first), "{first}");
-    assert_eq!(b.trip(10, None, "refused"), first - 10, "a refusal inside the pause started a new episode");
-    assert_eq!(b.trip(10, Some(5000), "refused"), 5000, "a longer stated delay must extend the pause");
-    let second = b.trip(5010, None, "refused");
-    assert!((2000..=2400).contains(&second), "the next episode did not double: {second}");
+    let first = b.trip(0, "refused");
+    assert!((base..=base * 6 / 5).contains(&first), "{first}");
+    assert_eq!(b.trip(10, "refused"), first - 10, "a refusal inside the pause started a new episode");
+    let second = b.trip(first + 10, "refused");
+    assert!((base * 2..=base * 12 / 5).contains(&second), "the next episode did not double: {second}");
+    let mut now = first + 10;
+    for _ in 0..12 {
+        now += b.trip(now, "refused") + 1;
+    }
+    assert!(b.trip(now, "refused") <= crate::YOUTUBE_PAUSE_CAP_MS, "the pause passed its cap");
     b.clear();
-    assert_eq!(b.remaining_ms(5011), None, "an answer did not end the pause");
-    let after = b.trip(5011, None, "refused");
-    assert!((1000..=1200).contains(&after), "an answer did not forget the strikes: {after}");
+    assert_eq!(b.remaining_ms(now + 1), None, "an answer did not end the pause");
+    let after = b.trip(now + 1, "refused");
+    assert!((base..=base * 6 / 5).contains(&after), "an answer did not forget the strikes: {after}");
+}
+
+/// Reel's discovery pause (TMDB and KinoCheck): 30 s doubling to an hour, a stated wait capped at an hour, a
+/// thousand credentials remembered.
+#[test]
+fn the_discovery_pause_policy_is_pinned() {
+    let policy = *crate::state::discovery_pauses::<u64>().policy();
+    assert_eq!(policy.base, Duration::from_secs(30));
+    assert_eq!(policy.cap, Duration::from_secs(60 * 60));
+    assert_eq!(policy.jitter_permille, 200);
+    assert_eq!(policy.max_keys, 1024);
+    assert_eq!(den_upstream::MAX_RETRY_AFTER, Duration::from_secs(60 * 60));
+}
+
+/// The two Reel client profiles keep the settings each was fixed for: metadata lookups carry a total timeout so a
+/// wedged upstream cannot pin a request, and the media relay carries none (B1), because a total or read timeout
+/// counts the time a paused player leaves the response unread. Both follow redirects, as reqwest does.
+#[test]
+fn the_client_profiles_keep_their_timeouts_redirects_and_agent() {
+    let ua = format!("den-reel/{}", crate::release_version());
+    let metadata = crate::state::metadata_profile();
+    assert_eq!(metadata.total_timeout(), Some(Duration::from_secs(15)));
+    assert_eq!(metadata.connect_timeout(), None);
+    assert_eq!(metadata.read_idle_timeout(), None);
+
+    let media = crate::state::media_profile();
+    assert_eq!(media.connect_timeout(), Some(Duration::from_secs(15)));
+    assert_eq!(media.total_timeout(), None, "a total timeout would cut a paused player's relay");
+    assert_eq!(media.read_idle_timeout(), None, "a read timeout would cut a paused player's relay");
+
+    for profile in [&metadata, &media] {
+        assert_eq!(profile.user_agent_str(), Some(ua.as_str()));
+        assert!(matches!(profile.redirect_policy(), den_upstream::Redirect::Default));
+        assert_eq!(profile.address_guard(), &den_upstream::Guard::None);
+    }
 }
 
 /// Every new extraction waits out a YouTube throttle — a different id is refused without spawning
@@ -6511,7 +6546,8 @@ async fn a_youtube_throttle_pauses_every_new_extraction_until_one_works() {
 
 #[test]
 fn retry_after_reads_seconds_and_http_dates() {
-    use crate::upstream::{http_date_ms, rate_limit_spent_ms, retry_after_ms, PAUSE_CAP_MS};
+    use crate::upstream::{rate_limit_spent_ms, retry_after_ms};
+    const PAUSE_CAP_MS: u64 = 60 * 60 * 1000;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     let with = |pairs: &[(&'static str, &str)]| {
         let mut h = HeaderMap::new();
@@ -6520,8 +6556,8 @@ fn retry_after_reads_seconds_and_http_dates() {
         }
         h
     };
-    let now = http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT").expect("an IMF-fixdate");
-    assert_eq!(now, 784_111_777_000);
+    // "Sun, 06 Nov 1994 08:49:37 GMT", the date the Retry-After examples below are written against.
+    let now = 784_111_777_000;
 
     let ra = |v: &str| retry_after_ms(&with(&[(RETRY_AFTER.as_str(), v)]), now);
     assert_eq!(ra("120"), Some(120_000));

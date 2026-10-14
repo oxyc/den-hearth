@@ -18,7 +18,6 @@
 //! take a video stream plus a separate audio one, which is what YouTube now answers with.
 
 mod addon;
-mod backoff;
 mod client;
 mod config;
 mod crop;

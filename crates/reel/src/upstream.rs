@@ -1,16 +1,16 @@
 //! ADDON discovery: imdb id → ordered YouTube trailer candidates, via TMDB (primary) and KinoCheck
 //! (fallback). Behind a trait so tests can swap in a fake with no network.
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use den_upstream::{Pauses, Throttle};
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::backoff::Backoff;
 use crate::config::Config;
 
 /// Max upstream JSON body we'll buffer.
@@ -25,12 +25,6 @@ use crate::config::Config;
 /// 256 KB still admits roughly a thousand videos for one title, which is orders of magnitude past
 /// anything TMDB actually returns.
 const MAX_UPSTREAM_BODY: usize = 256 * 1024;
-
-/// How long a credential's upstream is left alone after a 429 or 503 that did not say how long itself,
-/// doubling per consecutive refusal. The cap also bounds what a `Retry-After` may ask for, so a misconfigured or
-/// hostile upstream cannot switch discovery off for a day.
-const PAUSE_BASE_MS: u64 = 30 * 1000;
-pub(crate) const PAUSE_CAP_MS: u64 = 60 * 60 * 1000;
 
 /// A source could not be asked: transport error, a wrong key's 401, a 429, a 5xx, a 200 whose body
 /// never arrived, or the host pause one of those started. Distinct from a source that answered with
@@ -139,17 +133,19 @@ pub struct HttpUpstream {
     /// title straight back to an upstream that had just refused. TMDB keys are per install, so one
     /// install's throttle must not stop another's lookups; the server-side fallback key is a single
     /// credential and so a single pause. Keyed by (is TMDB, hash of the credential).
-    pauses: Mutex<HashMap<PauseKey, Arc<Backoff>>>,
+    pauses: Pauses<PauseKey>,
 }
 
 type PauseKey = (bool, u64);
 
-/// How many pauses are remembered. Keys come from install configs anyone can build.
-const MAX_PAUSES: usize = 1024;
+/// Epoch time as the pause table's clock.
+fn now() -> Duration {
+    Duration::from_millis(crate::state::default_clock())
+}
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream { cfg, http, fails: AtomicU32::new(0), pauses: Mutex::new(HashMap::new()) }
+        HttpUpstream { cfg, http, fails: AtomicU32::new(0), pauses: crate::state::discovery_pauses() }
     }
 
     /// The pause a request belongs to: its upstream, and the credential it carries (TMDB's `api_key`
@@ -168,39 +164,26 @@ impl HttpUpstream {
         (self.counts_toward_health(url), h.finish())
     }
 
-    fn pauses(&self) -> MutexGuard<'_, HashMap<PauseKey, Arc<Backoff>>> {
-        self.pauses.lock().unwrap_or_else(|e| e.into_inner())
+    fn pause_name(key: PauseKey) -> &'static str {
+        if key.0 {
+            "tmdb"
+        } else {
+            "kinocheck"
+        }
     }
 
     /// Is this credential's upstream paused?
-    fn is_paused(&self, key: PauseKey, now: u64) -> bool {
-        self.pauses().get(&key).is_some_and(|b| b.remaining_ms(now).is_some())
+    fn is_paused(&self, key: PauseKey) -> bool {
+        self.pauses.remaining(&key, now()).is_some()
     }
 
-    fn trip(&self, key: PauseKey, now: u64, hint: Option<u64>, why: &str) {
-        let backoff = {
-            let mut pauses = self.pauses();
-            if !pauses.contains_key(&key) && pauses.len() >= MAX_PAUSES {
-                pauses.retain(|_, b| b.remaining_ms(now).is_some());
-                if pauses.len() >= MAX_PAUSES {
-                    pauses.clear();
-                }
-            }
-            let name = if key.0 { "tmdb" } else { "kinocheck" };
-            pauses
-                .entry(key)
-                .or_insert_with(|| Arc::new(Backoff::new(name, PAUSE_BASE_MS, PAUSE_CAP_MS)))
-                .clone()
-        };
-        backoff.trip(now, hint, why);
+    fn trip(&self, key: PauseKey, stated: Option<Duration>, why: &str) {
+        crate::state::note_paused(Self::pause_name(key), why, self.pauses.refuse(&key, stated, now()));
     }
 
-    /// The upstream answered this credential: end its pause.
-    fn clear_pause(&self, key: PauseKey) {
-        let removed = self.pauses().remove(&key);
-        if let Some(b) = removed {
-            b.clear();
-        }
+    /// The upstream answered this credential's request: end its pause, unless a refusal landed since it left.
+    fn clear_pause(&self, key: PauseKey, observed: den_upstream::Observation) {
+        crate::state::note_lifted(Self::pause_name(key), self.pauses.answered(&key, observed));
     }
 
     /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
@@ -223,7 +206,7 @@ impl HttpUpstream {
     /// not get an answer at all.
     async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Answered<Option<Value>> {
         let pause_key = self.pause_key(url, headers);
-        if self.is_paused(pause_key, crate::state::default_clock()) {
+        if self.is_paused(pause_key) {
             // Not asked: the host told us to back off, and asking anyway is what keeps a throttle
             // from lifting. Still no answer — and counted for /health like the 429 it stands in
             // for, or a throttled TMDB would read as healthy just because we stopped asking.
@@ -232,6 +215,7 @@ impl HttpUpstream {
             }
             return Err(NoAnswer);
         }
+        let observed = self.pauses.begin(&pause_key);
         let mut req = self.http.get(url);
         for (k, v) in headers {
             req = req.header(*k, *v);
@@ -255,19 +239,27 @@ impl HttpUpstream {
             }
         };
         let status = res.status();
-        let now = crate::state::default_clock();
-        let hint = retry_after_ms(res.headers(), now);
         // Only a 429, or a 503 that says how long, is the upstream telling this credential to wait. Any
         // other 5xx is that one request failing and says nothing about the next, so it pauses nobody.
-        if status == 429 || (status == 503 && hint.is_some()) {
-            self.trip(pause_key, now, hint, &format!("answered {}", status.as_u16()));
-        } else if !status.is_server_error() {
-            // Any other status is the host answering, which ends a pause — a 404 or a bad key's 401
-            // included, since those are about the title or the install, not the host's capacity.
-            self.clear_pause(pause_key);
-            if let Some(ms) = rate_limit_spent_ms(res.headers(), now) {
-                self.trip(pause_key, now, Some(ms), "rate limit spent");
+        match den_upstream::throttle(status, res.headers(), SystemTime::now()) {
+            Some(Throttle::Stated(wait)) => {
+                self.trip(pause_key, Some(wait), &format!("answered {}", status.as_u16()))
             }
+            Some(Throttle::Unstated) => self.trip(pause_key, None, &format!("answered {}", status.as_u16())),
+            None if !status.is_server_error() => {
+                // Any other status is the host answering, which ends a pause — a 404 or a bad key's 401
+                // included, since those are about the title or the install, not the host's capacity.
+                self.clear_pause(pause_key, observed);
+                if let Some(ms) = rate_limit_spent_ms(res.headers(), crate::state::default_clock()) {
+                    self.pauses.hold(&pause_key, Duration::from_millis(ms), now());
+                    eprintln!(
+                        "{}: rate limit spent — pausing requests for {}s",
+                        Self::pause_name(pause_key),
+                        ms.div_ceil(1000)
+                    );
+                }
+            }
+            None => {}
         }
         if !status.is_success() {
             // A 404 is a real "this title is not there": a miss, not a fault. KinoCheck answers it
@@ -379,55 +371,15 @@ fn redact(url: &str) -> &str {
 /// when absent, unreadable or already past, and the caller falls back to its own exponential window:
 /// "retry now" on a 429 is not advice worth taking.
 pub(crate) fn retry_after_ms(headers: &reqwest::header::HeaderMap, now: u64) -> Option<u64> {
-    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
-    let ms = match v.parse::<u64>() {
-        Ok(secs) => secs.saturating_mul(1000),
-        Err(_) => http_date_ms(v)?.checked_sub(now)?,
-    };
-    (ms > 0).then_some(ms.min(PAUSE_CAP_MS))
+    let wait = den_upstream::retry_after(headers, UNIX_EPOCH + Duration::from_millis(now))?;
+    (!wait.is_zero()).then_some(wait.as_millis() as u64)
 }
 
-/// Epoch ms for an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the HTTP-date form servers send.
-/// Rewritten as RFC 3339 so the one date parser in the tree does the validating.
-pub(crate) fn http_date_ms(s: &str) -> Option<u64> {
-    const MONTHS: [&str; 12] =
-        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let f: Vec<&str> = s.split_whitespace().collect();
-    let [_weekday, day, month, year, time, "GMT"] = f.as_slice() else { return None };
-    let month = MONTHS.iter().position(|m| m == month)? + 1;
-    if day.len() != 2 {
-        return None;
-    }
-    crate::config::parse_rfc3339_ms(&format!("{year}-{month:02}-{day}T{time}Z"))
-}
-
-/// How long until the rate-limit window resets, when a response says none of it is left:
-/// `X-RateLimit-Remaining: 0` with `X-RateLimit-Reset`, or the IETF draft `RateLimit` field
-/// (`remaining=0, reset=N` in early drafts, `r=0;t=N` in later ones). A reset above a billion is a
-/// unix timestamp and anything smaller a delay in seconds — both conventions are in use, and no
-/// window is thirty years long. Capped like `Retry-After`.
+/// How long until the rate-limit window resets, in ms, when a response says none of it is left
+/// (`den_upstream::exhausted_for` reads the spellings).
 pub(crate) fn rate_limit_spent_ms(headers: &reqwest::header::HeaderMap, now: u64) -> Option<u64> {
-    fn field<'a>(h: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
-        h.get(name).and_then(|v| v.to_str().ok()).map(str::trim)
-    }
-    let mut remaining = field(headers, "x-ratelimit-remaining");
-    let mut reset = field(headers, "x-ratelimit-reset");
-    if let Some(draft) = field(headers, "ratelimit") {
-        for (k, v) in draft.split([',', ';']).filter_map(|p| p.split_once('=')) {
-            match k.trim() {
-                "remaining" | "r" => remaining = Some(v.trim()),
-                "reset" | "t" => reset = Some(v.trim()),
-                _ => {}
-            }
-        }
-    }
-    if remaining? != "0" {
-        return None;
-    }
-    let n: u64 = reset?.parse().ok()?;
-    let ms =
-        if n > 1_000_000_000 { n.saturating_mul(1000).checked_sub(now)? } else { n.saturating_mul(1000) };
-    (ms > 0).then_some(ms.min(PAUSE_CAP_MS))
+    den_upstream::exhausted_for(headers, UNIX_EPOCH + Duration::from_millis(now))
+        .map(|w| w.as_millis() as u64)
 }
 
 #[async_trait]

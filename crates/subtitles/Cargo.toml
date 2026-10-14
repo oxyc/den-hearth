@@ -11,6 +11,8 @@ license = "MIT"
 den-net = { path = "../net" }
 # Response builders, conditional GETs, CORS, the request log line and the metrics bearer check, shared with Reel and Remux.
 den-http = { path = "../http" }
+# Client profiles, the address guard, Retry-After and the per-credential pause, shared with Reel, Remux and Scout.
+den-upstream = { path = "../upstream" }
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }

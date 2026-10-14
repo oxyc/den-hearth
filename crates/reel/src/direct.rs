@@ -580,7 +580,7 @@ pub(crate) async fn answer(
                     Ok(_) => st.youtube.clear(),
                     // A trip while already paused is a no-op, so the gated answer above costs nothing.
                     Err(e) if e.reason == "throttled" => {
-                        st.youtube.trip(now, None, "YouTube is throttling extractions");
+                        st.youtube.trip(now, "YouTube is throttling extractions");
                     }
                     // Once per resolve that actually ran, at most once a minute per reason — the
                     // shape the download path logs with, and for the same reason: in an outage
