@@ -35,9 +35,30 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      # The #[ignore]d Remux tests run real ffmpeg; the e2e job runs them with the image's own.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # The #[ignore]d Remux tests run real ffmpeg; the e2e job runs them with the image's own. nextest runs each
+      # test in its own process and kills one that hangs (.config/nextest.toml) instead of stalling the job.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo nextest run --workspace --locked --profile ci
+      - name: Doc tests
+        run: cargo test --workspace --locked --doc
+      - name: Test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+      # Each benchmark once, so a bench that no longer builds or panics fails here rather than at measuring time.
+      - name: Benchmarks run once
+        run: bench/micro.sh --test
+        env:
+          CARGO_PROFILE_BENCH_LTO: "false"
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
+      - name: Load harness checks
+        run: python3 bench/http/test.py
 
   # Remux's #[ignore]d end-to-end tests, in the Dockerfile's e2e stage: the ffmpeg the image ships, because another
   # version seeks differently and the segment alignment depends on exactly how it seeks. The stage builds no
