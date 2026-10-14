@@ -139,16 +139,11 @@ fn stream_attributes_follow_the_probe() {
 
 // Unknown depth and profile are omitted from the wire rather than sent as 0.
 #[test]
-#[ignore = "needs serde_json as a dev-dependency (not in crates/scout/Cargo.toml yet)"]
 fn stream_attributes_wire_shape() {
-    #[cfg(any())]
-    fn pending() {
-        let body = serde_json::to_value(stream_attributes(RawStream { title: "Movie 1080p".into(), ..Default::default() }))
-            .expect("json");
-        assert!(body.get("bitDepth").is_none(), "an unknown bit depth must be omitted, not sent as 0");
-        assert!(body.get("dvProfile").is_none(), "an unknown DV profile must be omitted, not sent as 0");
-    }
-    todo!("pending: attributes_web_test.go TestStreamAttributes_wireShape")
+    let body = serde_json::to_value(stream_attributes(RawStream { title: "Movie 1080p".into(), ..Default::default() }))
+        .expect("json");
+    assert!(body.get("bitDepth").is_none(), "an unknown bit depth must be omitted, not sent as 0");
+    assert!(body.get("dvProfile").is_none(), "an unknown DV profile must be omitted, not sent as 0");
 }
 
 #[test]
