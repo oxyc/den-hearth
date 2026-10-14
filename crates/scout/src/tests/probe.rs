@@ -163,7 +163,7 @@ async fn probe_tracks_reads_only_the_head_when_range_is_ignored() {
         }
     });
 
-    let client = reqwest::Client::new();
+    let client = crate::deps::ReqwestDoer(reqwest::Client::new());
     let p = crate::probe::probe_tracks(&client, &url).await.expect("probe");
     let got = served.load(Ordering::SeqCst);
     assert!(got <= 8 << 20, "pulled {got} bytes for a 1 MiB probe — the drain is unbounded");
@@ -193,7 +193,7 @@ async fn probe_tracks_size_bytes_is_the_episode_not_the_pack() {
         let _ = conn.write_all(&head);
     });
 
-    let client = reqwest::Client::new();
+    let client = crate::deps::ReqwestDoer(reqwest::Client::new());
     let p = crate::probe::probe_tracks(&client, &url).await.expect("probe");
     assert_eq!(p.size_bytes, EPISODE_SIZE, "SizeBytes = {} (the episode's own size)", p.size_bytes);
 }

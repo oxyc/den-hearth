@@ -68,7 +68,7 @@ fn answering(status: u16, headers: &[(&str, &str)]) -> Answer {
 }
 
 /// Go `get`: one request through a `Doer`, the way a caller would make it.
-async fn get(doer: &impl Doer, url: &str, authorization: Option<&str>) -> reqwest::Response {
+async fn get(doer: &(impl Doer + ?Sized), url: &str, authorization: Option<&str>) -> reqwest::Response {
     let mut b = reqwest::Client::new().get(url);
     if let Some(a) = authorization {
         b = b.header("authorization", a);
@@ -251,5 +251,32 @@ fn add_budget_frees_in_when_its_oldest_charge_drains() {
         b.frees_in("acct", false),
         Duration::from_secs(50 * 60),
         "freesIn: want the first charge's 50 minutes left"
+    );
+}
+
+// Go's ProbeClient is the same client as the stores' (cmd/den-scout/main.go wraps its transport), and Go has one
+// process-wide pause memory. A probe, link check or token validation must honour a pause the stores learned, and
+// a second handler built over the same client (hearth serves one per origin) must share it.
+#[tokio::test]
+async fn the_probe_doer_shares_the_pause_with_every_handler_built_over_one_client() {
+    use crate::cache::MemoryCache;
+    use crate::deps::{build_deps_shared, settings_from_env};
+
+    let next = Arc::new(CountingDoer::new(answering(429, &[("retry-after", "120")])));
+    let http: Arc<dyn Doer> = Arc::new(pause_on_refusal(Arc::clone(&next)));
+    let settings = settings_from_env(|_| String::new());
+    let first = build_deps_shared(&settings, http.clone(), Arc::new(MemoryCache::new(1 << 20)));
+    let second = build_deps_shared(&settings, http, Arc::new(MemoryCache::new(1 << 20)));
+
+    let probe = |d: &crate::deps::Deps| d.probe_doer.clone().expect("the probe client is the shared one");
+    let url = "https://cdn.example/dld/abc";
+    let resp = get(&*probe(&first), url, None).await;
+    assert!(resp.status() == 429 && next.calls() == 1, "the upstream was not asked once: {}", next.calls());
+
+    let resp = get(&*probe(&second), url, None).await;
+    assert!(
+        resp.status() == 429 && next.calls() == 1,
+        "the second handler's probe asked a paused upstream ({} calls)",
+        next.calls()
     );
 }

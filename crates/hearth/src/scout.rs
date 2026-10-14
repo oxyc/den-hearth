@@ -17,9 +17,10 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Response, StatusCode};
 
 use den_scout::cache::Cache;
-use den_scout::deps::{build_deps, refuse_redirect_replay, startup_summary, Settings};
+use den_scout::deps::{build_deps_shared, shared_http, startup_summary, GuardedClient, Settings};
 use den_scout::diskcache::{TieredCache, SWEEP_INTERVAL};
 use den_scout::handler::{new_handler, Handler};
+use den_scout::scrape::Doer;
 
 use crate::Body;
 
@@ -35,28 +36,18 @@ pub struct Scout {
     summary: String,
 }
 
-/// Go's pooled keep-alive client (cmd/den-scout/main.go). A redirect is refused where it would hand a
-/// credential to another host (see `refuse_redirect_replay`).
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(32)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            // reqwest does not say which method a redirected request carries, so every hop reads as a GET:
-            // the host rule (a debrid API redirecting elsewhere) holds, the method rule cannot.
-            let via: Vec<_> =
-                attempt.previous().iter().map(|url| (reqwest::Method::GET, url.clone())).collect();
-            if refuse_redirect_replay(&reqwest::Method::GET, attempt.url(), &via) {
-                attempt.stop()
-            } else if attempt.previous().len() >= 10 {
-                attempt.error("stopped after 10 redirects")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .expect("scout http client")
+/// Go's pooled keep-alive client (cmd/den-scout/main.go), built once for both handlers so they share one memory of
+/// which upstreams asked to be left alone. A redirect is refused where it would replay a body or hand a credential
+/// to another host (see `GuardedClient`).
+fn client() -> Arc<dyn Doer> {
+    let guarded = GuardedClient::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(90))
+    })
+    .expect("scout http client");
+    shared_http(guarded)
 }
 
 impl Scout {
@@ -66,7 +57,7 @@ impl Scout {
         let cache = Arc::new(TieredCache::new(legacy.cache_bytes, std::path::Path::new(&legacy.cache_dir)));
         let client = client();
         let handler = |settings: &Settings| {
-            new_handler(build_deps(settings, client.clone(), cache.clone() as Arc<dyn Cache>))
+            new_handler(build_deps_shared(settings, client.clone(), cache.clone() as Arc<dyn Cache>))
         };
         let summary = startup_summary(&legacy, cache.persistent().unwrap_or(false));
         Scout { mount: handler(&mount), legacy: handler(&legacy), cache, summary }

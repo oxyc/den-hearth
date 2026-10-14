@@ -296,6 +296,63 @@ pub fn refuse_redirect_replay(
     false
 }
 
+/// The redirect policy for a request that is a GET or HEAD from the start (Go's `CheckRedirect` sees GET at every
+/// hop): refuses by host only, and stops after ten hops as Go's client does.
+fn follow_read_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    let via: Vec<_> = attempt.previous().iter().map(|url| (reqwest::Method::GET, url.clone())).collect();
+    if refuse_redirect_replay(&reqwest::Method::GET, attempt.url(), &via) {
+        attempt.stop()
+    } else if attempt.previous().len() >= 10 {
+        attempt.error("stopped after 10 redirects")
+    } else {
+        attempt.follow()
+    }
+}
+
+/// The redirect policy for a request that carries a body. reqwest's hook is not told the method of the request it
+/// is redirecting, so the method rule is applied from what the first hop's status implies: a 301, 302 or 303
+/// turns the POST into a GET (as Go does, and as `refuse_redirect_replay` allows), so the chain continues as a
+/// read; any other redirect would REPLAY the POST and is stopped, leaving the caller the 3xx. Scout sends only
+/// GET, HEAD and POST.
+fn follow_write_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    if attempt.previous().len() == 1 && !matches!(attempt.status().as_u16(), 301..=303) {
+        return attempt.stop();
+    }
+    follow_read_redirect(attempt)
+}
+
+/// The outbound client Scout's stores, scrapers and probes share: enforces `refuse_redirect_replay` for real.
+///
+/// reqwest cannot judge a redirect by the method of the request it follows, so there are two clients that differ
+/// only in redirect policy, and a request goes to the one for its method. Build it with the same pool and timeout
+/// settings for both.
+pub struct GuardedClient {
+    reads: reqwest::Client,
+    writes: reqwest::Client,
+}
+
+impl GuardedClient {
+    /// `builder` is called twice, once per client, and must not set a redirect policy of its own.
+    pub fn new(builder: impl Fn() -> reqwest::ClientBuilder) -> Result<GuardedClient, reqwest::Error> {
+        Ok(GuardedClient {
+            reads: builder().redirect(reqwest::redirect::Policy::custom(follow_read_redirect)).build()?,
+            writes: builder().redirect(reqwest::redirect::Policy::custom(follow_write_redirect)).build()?,
+        })
+    }
+}
+
+#[async_trait]
+impl Doer for GuardedClient {
+    async fn do_request(&self, req: reqwest::Request) -> Result<reqwest::Response, DoError> {
+        let client = if req.method() == reqwest::Method::GET || req.method() == reqwest::Method::HEAD {
+            &self.reads
+        } else {
+            &self.writes
+        };
+        client.execute(req).await.map_err(|e| Box::new(e.without_url()) as DoError)
+    }
+}
+
 /// Builds the indexer scrapers for one request's config.
 pub type ScraperFactory = Arc<dyn Fn(&Config) -> Vec<Box<dyn Scraper>> + Send + Sync>;
 /// Builds the debrid stores for one request's config.
@@ -360,6 +417,30 @@ impl Doer for ReqwestDoer {
 
 /// Go `BuildDeps`: wires the core to a concrete HTTP client and cache.
 pub fn build_deps(settings: &Settings, client: reqwest::Client, cache: Arc<dyn Cache>) -> Deps {
+    // Go wraps the client's transport in PauseOnRefusal (cmd/den-scout/main.go): every debrid and indexer
+    // request shares one memory of who asked to be left alone.
+    let http: Arc<dyn Doer> = Arc::new(pause_on_refusal(ReqwestDoer(client.clone())));
+    build_deps_with(settings, http, Some(client), cache)
+}
+
+/// `build_deps` over an outbound client built once by the caller. Go has one process-wide client, and so one memory
+/// of who asked to be left alone; a process serving several handlers builds `http` once (see `shared_http`) and
+/// passes it to each, so a pause one handler learns is honoured by the others.
+pub fn build_deps_shared(settings: &Settings, http: Arc<dyn Doer>, cache: Arc<dyn Cache>) -> Deps {
+    build_deps_with(settings, http, None, cache)
+}
+
+/// Go `main.go`'s client: `client` with its redirect policy enforced per method, under one pause memory.
+pub fn shared_http(client: GuardedClient) -> Arc<dyn Doer> {
+    Arc::new(pause_on_refusal(client))
+}
+
+fn build_deps_with(
+    settings: &Settings,
+    doer: Arc<dyn Doer>,
+    probe_client: Option<reqwest::Client>,
+    cache: Arc<dyn Cache>,
+) -> Deps {
     // Decided once, at startup, from the operator's environment — never from a request.
     enable_indexer_config_minting(settings.mint_indexer_configs);
     set_play_reserve(settings.play_reserve_adds);
@@ -375,18 +456,16 @@ pub fn build_deps(settings: &Settings, client: reqwest::Client, cache: Arc<dyn C
             go_duration(3 * settings.list_ttl)
         ));
     }
-    // Go wraps the client's transport in PauseOnRefusal (cmd/den-scout/main.go): every debrid and indexer
-    // request shares one memory of who asked to be left alone.
-    let doer: Arc<dyn Doer> = Arc::new(pause_on_refusal(ReqwestDoer(client.clone())));
+    // Go's ProbeClient is that same client, so a probe, a link check and a token validation honour the pause too.
     let source_doer = new_source_doer();
     let indexer_urls = settings.indexer_urls.clone();
     let scraper_doer = doer.clone();
     let (store_doer, store_cache) = (doer.clone(), cache.clone());
     Deps {
+        probe_doer: Some(doer.clone()),
         meta: Some(Arc::new(cinemeta_meta(doer, &settings.cinemeta_url, cache.clone()))),
         cache,
-        probe_client: Some(client),
-        probe_doer: None,
+        probe_client,
         scrape_timeout: settings.scrape_timeout,
         list_ttl: settings.list_ttl,
         public_url: settings.public_url.clone(),

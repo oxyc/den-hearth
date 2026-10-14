@@ -2182,7 +2182,7 @@ impl Inner {
         // Opt-in: no client, no probing. Probing costs a debrid RESOLVE per release, so it must never happen
         // by accident — a caller that hasn't asked for it (a test, an embedder) gets the old behaviour
         // exactly, and the stream list is built without touching the debrid account at all.
-        if self.deps.probe_client.is_none() {
+        if self.probe_doer().is_none() {
             return false;
         }
         let frontier: HashSet<usize> = match client {
@@ -2275,8 +2275,8 @@ impl Inner {
                         return;
                     }
                 };
-                let Some(client) = &self.deps.probe_client else { return };
-                let probed = match timeout_at(deadline, crate::probe::probe_tracks(client, &link)).await {
+                let Some(client) = self.probe_doer() else { return };
+                let probed = match timeout_at(deadline, crate::probe::probe_tracks(&*client, &link)).await {
                     Ok(r) => r,
                     Err(_) => Err("context deadline exceeded".to_owned()),
                 };

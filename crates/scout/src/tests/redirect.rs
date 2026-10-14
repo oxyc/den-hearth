@@ -13,7 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::addbudget::{budget_account, global_add_budget};
 use crate::cache::MemoryCache;
 use crate::config::DebridService;
-use crate::deps::{refuse_redirect_replay, ReqwestDoer};
+use crate::deps::{refuse_redirect_replay, GuardedClient};
+use crate::scrape::Doer;
 use crate::stores::torbox::TorBoxStore;
 use crate::stores::{ResolveTarget, Store};
 
@@ -95,27 +96,13 @@ async fn an_add_is_not_replayed_to_the_redirect_target() {
         let token = format!("redirect-{name}");
         let hash = "a".repeat(40);
         let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
-        // Go's CheckRedirect is handed the redirected request, whose method a 301/302/303 has already turned into
-        // a GET; reqwest's policy sees only the status, so the method is worked out from it. The earlier hops are
-        // the add itself.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::custom(|a| {
-                let method =
-                    if matches!(a.status().as_u16(), 301..=303) { Method::GET } else { Method::POST };
-                let via = a.previous().iter().map(|u| (Method::POST, u.clone())).collect::<Vec<_>>();
-                if refuse_redirect_replay(&method, a.url(), &via) {
-                    a.stop()
-                } else {
-                    a.follow()
-                }
-            }))
-            .build()
-            .expect("a client");
+        // The client the stores really use: the shared one `build_deps_shared` is handed.
+        let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
         let s = TorBoxStore {
             token: token.clone(),
             cache: Some(Arc::new(MemoryCache::new(1 << 20))),
             api: base,
-            client: Arc::new(ReqwestDoer(client)),
+            client: Arc::new(client),
         };
         let _ = s.resolve(&ResolveTarget { info_hash: hash, ..ResolveTarget::default() }).await;
         assert_eq!(replayed.load(Ordering::SeqCst), 0, "{name}: the add was re-sent to the redirect target");
@@ -180,21 +167,12 @@ async fn reads_still_follow_redirects() {
         })
         .await;
 
-        let m = method.clone();
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                let via: Vec<(Method, Url)> =
-                    attempt.previous().iter().map(|u| (m.clone(), u.clone())).collect();
-                if refuse_redirect_replay(&m, attempt.url(), &via) {
-                    attempt.stop()
-                } else {
-                    attempt.follow()
-                }
-            }))
-            .build()
-            .expect("a client");
-        let resp =
-            client.request(method.clone(), format!("{base}/start")).send().await.expect("the request sends");
+        let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
+        let target = Url::parse(&format!("{base}/start")).expect("a url");
+        let resp = client
+            .do_request(reqwest::Request::new(method.clone(), target))
+            .await
+            .expect("the request sends");
 
         assert!(
             resp.status() == 200 && served.load(Ordering::SeqCst) == 1,
@@ -204,4 +182,74 @@ async fn reads_still_follow_redirects() {
             served.load(Ordering::SeqCst)
         );
     }
+}
+
+// Through the client every store uses, a POST that is answered 307 or 308 (to the same host, or back to itself in
+// a loop) is sent exactly once and the caller is handed the 3xx, as Go's `http.ErrUseLastResponse` hands it. A
+// 303 turns the POST into a GET, which is followed once and is not a replay.
+#[tokio::test]
+async fn a_post_redirect_is_not_replayed_by_the_shared_client() {
+    for (status, location, name) in [
+        (307u16, "/moved", "307 to another path"),
+        (308, "/moved", "308 to another path"),
+        (307, "/add", "307 loop onto itself"),
+    ] {
+        let posts = Arc::new(AtomicI32::new(0));
+        let requests = Arc::new(AtomicI32::new(0));
+        let (p, r) = (posts.clone(), requests.clone());
+        let base = spawn_server(move |method, _| {
+            r.fetch_add(1, Ordering::SeqCst);
+            if method == "POST" {
+                p.fetch_add(1, Ordering::SeqCst);
+            }
+            (status, Some(location.to_owned()), "")
+        })
+        .await;
+        let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
+        let mut req = reqwest::Request::new(Method::POST, Url::parse(&format!("{base}/add")).expect("a url"));
+        *req.body_mut() = Some(reqwest::Body::from("hash=abc"));
+        let resp = client.do_request(req).await.expect("the request sends");
+        assert_eq!(resp.status().as_u16(), status, "{name}: the caller must see the 3xx");
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "{name}: the POST was sent more than once");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "{name}: something followed the redirect");
+    }
+
+    let gets = Arc::new(AtomicI32::new(0));
+    let posts = Arc::new(AtomicI32::new(0));
+    let (g, p) = (gets.clone(), posts.clone());
+    let base = spawn_server(move |method, path| match (method, path) {
+        ("POST", "/add") => {
+            p.fetch_add(1, Ordering::SeqCst);
+            (303, Some("/done".to_owned()), "")
+        }
+        ("GET", "/done") => {
+            g.fetch_add(1, Ordering::SeqCst);
+            (200, None, "ok")
+        }
+        _ => (404, None, ""),
+    })
+    .await;
+    let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
+    let mut req = reqwest::Request::new(Method::POST, Url::parse(&format!("{base}/add")).expect("a url"));
+    *req.body_mut() = Some(reqwest::Body::from("hash=abc"));
+    let resp = client.do_request(req).await.expect("the request sends");
+    assert_eq!(resp.status().as_u16(), 200, "a 303 is followed as a GET, as Go does");
+    assert_eq!((posts.load(Ordering::SeqCst), gets.load(Ordering::SeqCst)), (1, 1));
+}
+
+// A GET redirect loop is cut off at ten hops with an error, as Go's client does, not followed forever.
+#[tokio::test]
+async fn a_get_redirect_loop_stops_after_ten_hops() {
+    let hits = Arc::new(AtomicI32::new(0));
+    let h = hits.clone();
+    let base = spawn_server(move |_, _| {
+        h.fetch_add(1, Ordering::SeqCst);
+        (302, Some("/again".to_owned()), "")
+    })
+    .await;
+    let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
+    let req = reqwest::Request::new(Method::GET, Url::parse(&format!("{base}/again")).expect("a url"));
+    assert!(client.do_request(req).await.is_err(), "a redirect loop was not cut off");
+    // Go's client stops when `len(via) >= 10`, so ten requests are made and the eleventh is refused.
+    assert_eq!(hits.load(Ordering::SeqCst), 10);
 }

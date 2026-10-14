@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::indexerconfig::null_default;
+use crate::scrape::Doer;
 use crate::util::go_to_lower;
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -87,13 +88,14 @@ const TRACK_TYPE_SUB: u8 = 17;
 
 /// Go `ProbeTracks`: reads the head of a resolved link and parses it. The size comes from the response's
 /// total, not from the bytes read.
-pub(crate) async fn probe_tracks(client: &reqwest::Client, url: &str) -> Result<Probe, String> {
-    let mut resp = client
-        .get(url)
-        .header(reqwest::header::RANGE, format!("bytes=0-{}", PROBE_BYTES - 1))
-        .send()
-        .await
-        .map_err(|e| e.without_url().to_string())?;
+pub(crate) async fn probe_tracks(client: &dyn Doer, url: &str) -> Result<Probe, String> {
+    let target = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
+    let mut req = reqwest::Request::new(reqwest::Method::GET, target);
+    req.headers_mut().insert(
+        reqwest::header::RANGE,
+        format!("bytes=0-{}", PROBE_BYTES - 1).parse().expect("a header value"),
+    );
+    let mut resp = client.do_request(req).await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if status != reqwest::StatusCode::PARTIAL_CONTENT && status != reqwest::StatusCode::OK {
         return Err(format!("probe: unexpected status {}", status.as_u16()));
