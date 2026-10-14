@@ -1974,7 +1974,10 @@ pub(crate) fn opened_label(
         return (label.to_string(), pack);
     }
     let (was, is) = (size_label(listed), size_label(opened));
-    (format!("{} · from a {was} pack", label.replacen(&was, &is, 1)), Some(listed))
+    // A label that doesn't carry the listed size (another rounding, or none) gets the file's appended, so the pack
+    // is never named without the size of what plays.
+    let named = if label.contains(&was) { label.replacen(&was, &is, 1) } else { format!("{label} • {is}") };
+    (format!("{named} · from a {was} pack"), Some(listed))
 }
 
 /// What an opened release is remembered under: the install that listed it, by its hash as a session's owner is,
@@ -3215,8 +3218,11 @@ pub async fn create(
     };
     let bitrate =
         |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| need(&t.1 .1, &delivery(t)).map(|n| n.bitrate);
+    // Waited out at the link with its headroom, as fitting is weighed: a copy that only the whole link would carry
+    // is the one that stalls when the link dips, and a wait up front does not make it fit.
+    let usable = max_bitrate.map(|m| (m as f64 * LINK_HEADROOM) as u64);
     let head_start = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        prebuffer(&t.1 .1, &delivery(t), max_bitrate).unwrap_or(f64::INFINITY)
+        prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
     };
     if chosen.is_none() && !want.fits_only {
         let longer = (0..too_big.len())
@@ -3438,7 +3444,7 @@ pub async fn create(
             let delivery = Delivery::of(&info, size, want);
             let bytes = playlist::segment_bytes(&segments, &info.byte_index, delivery.bytes);
             (
-                prebuffer(&info, &delivery, max_bitrate),
+                prebuffer(&info, &delivery, usable),
                 need(&info, &delivery),
                 bytes.map(|b| segments.iter().zip(b).map(|(s, b)| (s.start, b.round() as u64)).collect()),
             )
@@ -4614,6 +4620,11 @@ mod tests {
             (label.to_string(), Some(gb105))
         );
         assert_eq!(opened_label(label, None, None, Some(gb12)), (label.to_string(), None));
+        assert_eq!(
+            opened_label("4K • WEB-DL", Some(gb105), None, Some(gb12)),
+            ("4K • WEB-DL • 11 GB · from a 105 GB pack".to_string(), Some(gb105)),
+            "a label without the listed size gets the file's"
+        );
     }
 
     /// Without a configured uplink, a session's own measured link is the whole budget — today's behaviour,
