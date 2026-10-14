@@ -23,7 +23,7 @@ use tokio::time::{timeout_at, Instant as TokioInstant};
 use crate::cache::CacheClass;
 use crate::config::{Config, DebridService};
 use crate::handler::{
-    error, json_response, lock, marshal, method_not_allowed, spawn_background, split_path, Inner, RankOpts,
+    error, json_response, lock, method_not_allowed, spawn_background, split_path, to_json, Inner, RankOpts,
     RankedList, Resp, LIST_BUILD_SLACK, MAX_SEEDS,
 };
 use crate::id::StreamId;
@@ -65,9 +65,9 @@ fn is_imdb_id(s: &str) -> bool {
 /// separately, so it carries an id of its own.
 pub(crate) fn verdict_prefix(config: &Config) -> String {
     let f = &config.filters;
-    // Go hashes `json.Marshal` of the config with its scope, install id and epoch cleared; what matters is that every
-    // other field takes part, so two configs that ask different questions never share a verdict.
-    let canonical = marshal(&json!({
+    // The hash of the config with its scope, install id and epoch cleared; what matters is that every other field
+    // takes part, so two configs that ask different questions never share a verdict.
+    let canonical = to_json(&json!({
         "CachedOnly": config.cached_only,
         "Debrid": config.debrid.iter().map(|d| json!({"Service": d.service.as_str(), "Token": d.token})).collect::<Vec<_>>(),
         "Epoch": 0,

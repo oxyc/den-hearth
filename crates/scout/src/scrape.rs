@@ -36,7 +36,7 @@ use crate::rank::{re2, RawStream, GIB};
 use crate::sources::{new_source_client, source_host, ERR_NOT_PUBLIC, OWN_SOURCES, SOURCE_LIMITER};
 use crate::stores::join_all;
 use crate::upstreampause::pause_on_refusal;
-use crate::util::{fold_json_keys, go_to_lower, go_url_parse, key_hash, DetachedFlight, Shape, LEAF};
+use crate::util::{fold_json_keys, go_url_parse, key_hash, DetachedFlight, Shape, LEAF};
 
 /// What a `Doer` can fail with. Go returns `error`; a mock in a test returns whichever it likes.
 pub type DoError = Box<dyn std::error::Error + Send + Sync>;
@@ -227,7 +227,7 @@ pub(crate) fn parse_seeders(s: &str) -> Option<i64> {
 
 /// Go `normalizeHash`: a 40- or 32-character lower-case alphanumeric hash, trimmed and lower-cased.
 pub(crate) fn normalize_hash(h: &str) -> Option<String> {
-    let h = go_to_lower(h.trim());
+    let h = str::to_lowercase(h.trim());
     let well_formed =
         (h.len() == 40 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     well_formed.then_some(h)
@@ -259,28 +259,6 @@ fn first_meaningful_line(text: &str) -> String {
         return (*l).to_owned();
     }
     lines.first().map_or_else(String::new, |l| (*l).to_owned())
-}
-
-/// Go's lossy decoding of a JSON string: every byte that is not part of a valid UTF-8 sequence becomes U+FFFD on its
-/// own, where `String::from_utf8_lossy` folds a broken sequence into one. Outside a string such a byte is a syntax
-/// error in Go, and U+FFFD is one here.
-fn go_lossy_utf8(mut b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len());
-    while !b.is_empty() {
-        match std::str::from_utf8(b) {
-            Ok(s) => {
-                out.push_str(s);
-                break;
-            }
-            Err(e) => {
-                let (valid, rest) = b.split_at(e.valid_up_to());
-                out.push_str(std::str::from_utf8(valid).unwrap_or_default());
-                out.push('\u{fffd}');
-                b = &rest[1..];
-            }
-        }
-    }
-    out
 }
 
 /// The fields of Go's `wireStream` that `json.Unmarshal` reads, in their exact spelling.
@@ -350,9 +328,12 @@ fn wire_stream(v: &Value) -> Option<WireStream> {
 }
 
 /// Go `parseStremioStreams`: the streams in a Stremio `/stream` response, `source` naming the indexer
-/// they came from.
+/// they came from. A byte that is not UTF-8 is read as U+FFFD: inside a string it is kept as that, outside one it is
+/// a syntax error.
 pub(crate) fn parse_stremio_streams(body: &[u8], source: &str) -> Vec<RawStream> {
-    let Ok(mut doc) = serde_json::from_str::<Value>(&go_lossy_utf8(body)) else { return Vec::new() };
+    let Ok(mut doc) = serde_json::from_str::<Value>(&String::from_utf8_lossy(body)) else {
+        return Vec::new();
+    };
     fold_json_keys(&mut doc, &RESPONSE_SHAPE);
     let streams = match &doc {
         Value::Object(o) => match o.get("streams") {

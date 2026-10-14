@@ -1,7 +1,6 @@
 //! Port of `internal/scout/probe_avi.go`. Work package 5.
 
 use crate::probe::{channel_count, channel_layout, Probe};
-use crate::util::go_to_lower;
 
 /// Go `maxAVIDepth`: how many LIST chunks the walk nests before it stops.
 ///
@@ -84,7 +83,7 @@ fn walk(buf: &[u8], start: usize, end: usize, depth: usize, p: &mut Probe, last_
 /// empty rather than guessing — an unrecognised fourcc is not evidence of anything. Shared with the MP4
 /// parser, which reads the same FourCCs from its sample entries.
 pub(crate) fn codec_from_four_cc(cc: &str) -> &'static str {
-    match go_to_lower(cc).as_str() {
+    match str::to_lowercase(cc).as_str() {
         "xvid" | "divx" | "dx50" | "divx5" | "mp4v" | "fmp4" | "mp43" => "mpeg4",
         // dva1/dvav and dvh1/dvhe are the MP4 sample entries of Dolby Vision over AVC and HEVC. Profile 5 has
         // no other tag, so without them a DV profile 5 MP4 reported no codec at all.

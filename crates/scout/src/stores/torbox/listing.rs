@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use crate::play::{MAX_INFO_HASH_LEN, MIN_INFO_HASH_LEN};
-use crate::util::go_to_lower;
 
 use super::MAX_LISTING_ENTRIES;
 
@@ -774,8 +773,8 @@ fn push_code(out: &mut Esc, code: u16) {
     push_char(out, char::from_u32(u32::from(code)).unwrap_or('\u{FFFD}'));
 }
 
-/// The listing's hash as the map key: Go `strings.ToLower` of the decoded text, None when it is not the length
-/// of an infohash. An ASCII hash is checked by its length before anything is built and is allocated exactly
+/// The listing's hash as the map key: the decoded text lower-cased, None when it is not the length of an
+/// infohash. An ASCII hash is checked by its length before anything is built and is allocated exactly
 /// once, at its final size; a hash with other characters takes the slow road, where the lowered length is what
 /// decides.
 fn lowered_hash(raw: &[u8]) -> Option<String> {
@@ -787,28 +786,8 @@ fn lowered_hash(raw: &[u8]) -> Option<String> {
         s.extend(raw.iter().map(|b| char::from(b.to_ascii_lowercase())));
         return Some(s);
     }
-    let hash = go_to_lower(&go_lossy_utf8(raw));
+    let hash = String::from_utf8_lossy(raw).to_lowercase();
     (MIN_INFO_HASH_LEN..=MAX_INFO_HASH_LEN).contains(&hash.len()).then_some(hash)
-}
-
-/// Go's string decoding of bytes that are not UTF-8: every byte that does not begin a valid sequence becomes
-/// its own U+FFFD, where `String::from_utf8_lossy` turns a whole broken sequence into one.
-fn go_lossy_utf8(mut b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len());
-    loop {
-        match std::str::from_utf8(b) {
-            Ok(v) => {
-                s.push_str(v);
-                return s;
-            }
-            Err(e) => {
-                let (valid, rest) = b.split_at(e.valid_up_to());
-                s.push_str(&String::from_utf8_lossy(valid));
-                s.push('\u{FFFD}');
-                b = &rest[1..];
-            }
-        }
-    }
 }
 
 /// Go `listingFaultFor` splits a decode error into the kind worth remembering and the kind worth retrying.

@@ -64,7 +64,7 @@ use crate::stores::{
     FETCH_QUEUED,
 };
 use crate::ticket::{TicketError, TicketKeys, TICKET_ROUTE};
-use crate::util::{etag_hex, fold_json_keys, go_to_lower, key_hash, Shape, LEAF};
+use crate::util::{etag_hex, fold_json_keys, key_hash, Shape, LEAF};
 use crate::validate::{validate_debrid_token, ValidateResult, MAX_VALIDATE_BODY, VALIDATE_BUDGET};
 
 /// Go `staticCache`.
@@ -399,7 +399,7 @@ pub(crate) fn json_response(status: StatusCode, body: &(impl Serialize + ?Sized)
         .status(status)
         .header(CONTENT_TYPE, JSON_TYPE)
         .header(CACHE_CONTROL, NO_STORE)
-        .body(full(marshal(body)))
+        .body(full(to_json(body)))
         .expect("a static response")
 }
 
@@ -439,37 +439,23 @@ fn cacheable(body: impl Into<Bytes>, etag: &str, content_type: &'static str, cac
     resp
 }
 
-/// Go `json.Marshal`: serde's output, with the characters Go's encoder escapes for HTML safety written as it
-/// writes them (`<`, `>`, `&`, U+2028 and U+2029). Only strings can hold any of them, so the whole text is safe to
-/// rewrite.
-pub(crate) fn marshal<T: Serialize + ?Sized>(v: &T) -> String {
-    let s = serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned());
-    if !s.contains(['<', '>', '&', '\u{2028}', '\u{2029}']) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("\\u003c"),
-            '>' => out.push_str("\\u003e"),
-            '&' => out.push_str("\\u0026"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            c => out.push(c),
-        }
-    }
-    out
+/// A value as JSON text. Every type serialized here has string keys, so this cannot fail; "null" stands in if it
+/// ever does.
+pub(crate) fn to_json<T: Serialize + ?Sized>(v: &T) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned())
 }
 
-/// A number as Go's encoder writes a float64: whole values without a decimal point.
-fn go_num(f: f64) -> serde_json::Value {
+/// The 202's `progress`: a whole value without a fraction (`0`, `1`), as clients have always been sent it, and a
+/// fraction as it is.
+fn progress_number(f: f64) -> serde_json::Value {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         return serde_json::Value::from(f as i64);
     }
     serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number)
 }
 
-/// Go `time.Duration.String()`, for the lines that print one.
+/// A duration as the log lines and the startup warning have always printed one (`10m0s`, `1.5s`, `250ms`, Go's
+/// `time.Duration` form): operators grep for it, and the startup warning's test pins it.
 pub(crate) fn go_duration(d: Duration) -> String {
     fn frac(v: u128, unit: u128) -> String {
         let (whole, rem) = (v / unit, v % unit);
@@ -643,7 +629,7 @@ fn to_stremio_stream(s: &RawStream, sid: &StreamId, play_url: &dyn Fn(&PlayTarge
         name: "Den Scout".to_owned(),
         title: s.title.clone(), // raw release name
         behavior_hints: StreamHints {
-            binge_group: binge_group(&go_to_lower(&s.title), &s.title),
+            binge_group: binge_group(&str::to_lowercase(&s.title), &s.title),
             not_web_ready: !web_ready(s, &url),
             filename: s.title.clone(),
         },
@@ -720,7 +706,7 @@ pub(crate) fn client_playable(req: &Request<Bytes>) -> (Option<ClientPlayable>, 
         );
         return (None, String::new());
     };
-    let canonical = marshal(&p);
+    let canonical = to_json(&p);
     (Some(p), key_hash(&canonical))
 }
 
@@ -1122,7 +1108,7 @@ impl Inner {
         // No stale-if-error on a stale body: the client should come back once the rebuild this response
         // booked has landed, not hold the old list for a day on the next error.
         let stale_list_cache = format!("private, max-age={short_sec}");
-        let manifest_unconf = marshal(&build_manifest(None));
+        let manifest_unconf = to_json(&build_manifest(None));
         let manifest_unconf_etag = etag_for(&manifest_unconf);
         let manifest_unconf = Bytes::from(manifest_unconf);
         Inner {
@@ -1284,7 +1270,7 @@ impl Inner {
                     // The epoch rides along: /configure stamps it into a new config as `ep`, so a link built after
                     // CONFIG_EPOCH is bumped is not refused by it. The page fetches with cache: "no-cache", so
                     // a browser revalidates (a 304 while nothing changed) rather than keeping a pre-bump epoch.
-                    let body = marshal(&json!({"epoch": self.deps.revocation.epoch(), "key": pub_key}));
+                    let body = to_json(&json!({"epoch": self.deps.revocation.epoch(), "key": pub_key}));
                     return cacheable(body, "", JSON_TYPE, KEY_CACHE);
                 }
                 // The epoch rides the 404 too: a plaintext link built while CONFIG_EPOCH > 0 must still carry
@@ -1309,7 +1295,7 @@ impl Inner {
                 let Some(config) = self.open_config(config_blob) else {
                     return error(StatusCode::BAD_REQUEST, "bad_config");
                 };
-                let body = marshal(&build_manifest(Some(&config)));
+                let body = to_json(&build_manifest(Some(&config)));
                 cacheable(body, "", JSON_TYPE, CONFIGURED_MANIFEST_CACHE)
             }
             "stream" => self.handle_stream(req, config_blob, &parts).await,
@@ -2030,7 +2016,7 @@ impl Inner {
             expires_at: cached.then(|| whole_seconds(now + ttl)),
             coverage,
         };
-        let body = marshal(&StreamsResponse { streams: out, debug: dbg, den: env });
+        let body = to_json(&StreamsResponse { streams: out, debug: dbg, den: env });
         let etag = etag_for(&body);
         let value = join_cached(scrape_complete, fresh_until, &etag, &body);
         if degraded {
@@ -2256,7 +2242,7 @@ impl Inner {
                     self.links.put(&link_memo_key(config, &job.target), &link, false, SystemTime::now());
                 }
                 if let Ok(p) = probed {
-                    self.deps.cache.put(&job.key, &marshal(&p), PROBE_TTL);
+                    self.deps.cache.put(&job.key, &to_json(&p), PROBE_TTL);
                 }
             })
             .await;
@@ -3526,7 +3512,7 @@ pub(crate) fn write_queued_body(status: &StoreStatus) -> Resp {
 pub(crate) fn queued_body(status: &StoreStatus) -> serde_json::Value {
     let mut body = serde_json::Map::new();
     body.insert("state".to_owned(), json!(queued_state(status)));
-    body.insert("progress".to_owned(), go_num(status.progress));
+    body.insert("progress".to_owned(), progress_number(status.progress));
     if let Some(service) = status.service {
         body.insert("service".to_owned(), json!(service.as_str()));
     }

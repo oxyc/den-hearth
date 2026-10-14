@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::indexerconfig::null_default;
 use crate::scrape::Doer;
-use crate::util::go_to_lower;
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
@@ -305,8 +304,8 @@ pub(crate) fn parse_track_entry(entry: &[u8]) -> (u8, String) {
 /// group or match on. Everything lands on ISO 639-1 where a mapping exists; anything else passes through
 /// as given rather than being dropped.
 pub(crate) fn clean_lang(b: &[u8]) -> String {
-    let raw = go_lossy_utf8(b);
-    let s = go_to_lower(raw.trim_end_matches('\0').trim());
+    let raw = String::from_utf8_lossy(b);
+    let s = raw.trim_end_matches('\0').trim().to_lowercase();
     if s == "und" || s.is_empty() {
         return String::new();
     }
@@ -319,28 +318,6 @@ pub(crate) fn clean_lang(b: &[u8]) -> String {
         Some((_, two)) => (*two).to_string(),
         None => base.to_string(),
     }
-}
-
-/// Go's reading of bytes that may not be UTF-8: `strings.ToLower` and friends turn each byte that is not part of a
-/// valid sequence into its own U+FFFD, where `String::from_utf8_lossy` turns a whole broken sequence into one. A
-/// language tag is whatever bytes the muxer wrote, and it is passed through as given, so the count shows.
-fn go_lossy_utf8(mut b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len());
-    while !b.is_empty() {
-        match std::str::from_utf8(b) {
-            Ok(valid) => {
-                out.push_str(valid);
-                break;
-            }
-            Err(e) => {
-                let (valid, rest) = b.split_at(e.valid_up_to());
-                out.push_str(std::str::from_utf8(valid).unwrap_or_default());
-                out.push('\u{FFFD}');
-                b = rest.get(1..).unwrap_or_default();
-            }
-        }
-    }
-    out
 }
 
 /// Go `iso639`: ISO 639-2 (bibliographic AND terminological — muxers emit both) to 639-1, for the languages

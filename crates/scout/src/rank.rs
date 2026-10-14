@@ -13,7 +13,6 @@ use crate::client::ClientPlayable;
 use crate::label::MIB;
 use crate::probe::Probe;
 use crate::season::{declares_episode, names_episode};
-use crate::util::go_to_lower;
 
 /// FROZEN. Go `RawStream`: one release from one indexer.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -189,7 +188,7 @@ pub(crate) fn junk_class_of(t: &str) -> &'static str {
 
 /// Go `junkClass`: "" if the title is a legit source.
 pub(crate) fn junk_class(title: &str) -> &'static str {
-    junk_class_of(&go_to_lower(title))
+    junk_class_of(&str::to_lowercase(title))
 }
 
 pub(crate) static RES_2160: LazyLock<Regex> = LazyLock::new(|| re2(r"2160p?"));
@@ -218,7 +217,7 @@ pub(crate) fn detect_resolution_lower(t: &str) -> &'static str {
 
 /// Go `detectResolution`: "" when the title names none.
 pub(crate) fn detect_resolution(title: &str) -> &'static str {
-    detect_resolution_lower(&go_to_lower(title))
+    detect_resolution_lower(&str::to_lowercase(title))
 }
 
 /// Go `fake4KFloor`: a "2160p" file smaller than this is not 4K in any sense that matters (mislabelled or
@@ -300,7 +299,7 @@ pub(crate) fn cap_seeds(streams: &[RawStream], limit: i64) -> Vec<RawStream> {
 
 /// Go `qualityScore`: additive, higher wins.
 pub(crate) fn quality_score(s: RawStream) -> i64 {
-    let t = go_to_lower(&s.title);
+    let t = str::to_lowercase(&s.title);
     quality_score_lower(&t, &s, junk_class_of(&t))
 }
 
@@ -401,7 +400,7 @@ const RD_BLOCK_DOT_ADJACENT: &[&str] = &["bluray.x264", "hdtv.x264", "hdtv.xvid"
 
 /// Go `realDebridBlocked`.
 pub(crate) fn real_debrid_blocked(title: &str) -> bool {
-    let t = go_to_lower(title);
+    let t = str::to_lowercase(title);
     RD_BLOCK_SUBSTRINGS.iter().any(|s| t.contains(s)) || RD_BLOCK_DOT_ADJACENT.iter().any(|s| t.contains(s))
 }
 
@@ -443,7 +442,7 @@ fn fold_diacritics(s: &str) -> String {
 /// Go `titleTokens`: significant lowercase tokens (stopwords, format noise, bare years and single-letter
 /// noise removed). Used to sanity-check a year-less release against the request.
 pub(crate) fn title_tokens(s: &str) -> HashSet<String> {
-    let folded = fold_diacritics(&go_to_lower(s));
+    let folded = fold_diacritics(&str::to_lowercase(s));
     let mut out = HashSet::new();
     for m in TITLE_TOKEN_RE.find_iter(&folded) {
         let tok = m.as_str();
@@ -513,7 +512,7 @@ pub(crate) fn title_overlap(release_title: &str, expected: &HashSet<String>) -> 
 
 /// Go `releaseYears`: every plausible year in a release name (usually one, e.g. "(2026)").
 pub(crate) fn release_years(title: &str) -> Vec<i64> {
-    let t = go_to_lower(title);
+    let t = str::to_lowercase(title);
     let bytes = t.as_bytes();
     let mut out = Vec::new();
     for m in YEAR_TOKEN.find_iter(&t) {
@@ -673,7 +672,7 @@ pub(crate) fn rank_streams_debug(
     }
     let mut out: Vec<Scored> = Vec::new();
     for (i, s) in streams.iter().enumerate() {
-        let lower = go_to_lower(&s.title);
+        let lower = str::to_lowercase(&s.title);
         let junk = junk_class_of(&lower);
         if f.exclude_cam && !junk.is_empty() {
             drop_n(&mut debug, junk, 1);

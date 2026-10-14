@@ -12,7 +12,6 @@ use crate::rank::{
     RE_BR_RIP, RE_DTS, RE_DTSHD_MA, RE_DTSX, RE_DVD_RIP, RE_EAC3, RE_HDR10P, RE_HDTV, RE_KORSUB_HC, RE_REMUX,
     RE_TRUEHD, RE_WEB, RE_WEB_DL, RE_WEB_RIP,
 };
-use crate::util::go_to_lower;
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
@@ -261,7 +260,7 @@ fn detect_audio(t: &str) -> &'static str {
 
 /// Go `streamAttributes`: the attributes of one stream, read from its title and, when probed, the file.
 pub(crate) fn stream_attributes(s: RawStream) -> StreamAttributes {
-    let t = go_to_lower(&s.title);
+    let t = str::to_lowercase(&s.title);
     let dolby_vision = RE_DOVI_ATTR.is_match(&t);
     let hdr = dolby_vision || RE_HDR_EXTRA.is_match(&t);
     let mut attrs = StreamAttributes {
@@ -373,7 +372,7 @@ pub(crate) fn container_of(s: RawStream) -> String {
             return p.container.clone();
         }
     }
-    let t = go_to_lower(&s.title);
+    let t = str::to_lowercase(&s.title);
     if t.ends_with(".mp4") || t.ends_with(".m4v") {
         "mp4".to_string()
     } else if t.ends_with(".mkv") {

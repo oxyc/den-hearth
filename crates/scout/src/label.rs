@@ -10,7 +10,6 @@ use crate::rank::{
     RES_576, RES_720, RE_ATMOS, RE_BLURAY, RE_BR_RIP, RE_DOVI, RE_HDR10P, RE_REMUX, RE_WEB, RE_WEB_DL,
     RE_WEB_RIP,
 };
-use crate::util::go_to_lower;
 
 /// Go `mib` (label.go).
 pub(crate) const MIB: i64 = 1_048_576;
@@ -126,11 +125,11 @@ pub(crate) fn release_group(title: &str) -> String {
         return String::new();
     }
     let tail = base[dash + 1..].trim();
-    let lower = go_to_lower(tail);
+    let lower = str::to_lowercase(tail);
     if tail.is_empty() || tail.len() > 14 || tail.contains(' ') || lower.contains("www") {
         return String::new();
     }
-    let lower_base = go_to_lower(&base);
+    let lower_base = str::to_lowercase(&base);
     for m in GROUP_METADATA {
         // The suffix test catches a hyphenated token straddling the last dash: "…1080p WEB-DL" ends on metadata,
         // and its "group" would otherwise be "dl".
@@ -143,7 +142,7 @@ pub(crate) fn release_group(title: &str) -> String {
 
 /// Go `cleanLabel` is the bullet-joined quality summary shown as attributes.label.
 pub(crate) fn clean_label(s: &RawStream) -> String {
-    clean_label_lower(&go_to_lower(&s.title), s)
+    clean_label_lower(&str::to_lowercase(&s.title), s)
 }
 
 /// Go `cleanLabelLower` is `clean_label` when the caller already has the lowercased title.

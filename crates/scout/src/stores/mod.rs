@@ -24,7 +24,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::config::DebridService;
-use crate::util::go_to_lower;
 
 /// Go `resolveCacheTTL` (stores.go:449): how long a remembered torrent id, file list or held mark lives.
 pub(crate) const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -391,7 +390,7 @@ impl CacheTruth {
 /// on lowercase prefixes because the documented spellings carry parenthesised qualifiers and casing varies.
 /// Anything unrecognised is "downloading", which is what every wait was called before this existed.
 pub fn torbox_fetch_state(raw: &str) -> &'static str {
-    let s = go_to_lower(raw.trim());
+    let s = str::to_lowercase(raw.trim());
     if s.starts_with("failed")
         || s.starts_with("error")
         || s.starts_with("expired")

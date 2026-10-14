@@ -18,7 +18,7 @@ use sha2::Sha256;
 use crate::config::{Config, DebridAccount, DebridService, MAX_CONFIG_BLOB, SCOPE_AVAILABILITY};
 use crate::play::{is_info_hash, PlayTarget};
 use crate::seal::SealKeyring;
-use crate::util::{b64url_decode, b64url_encode, fold_json_keys, go_to_lower, Shape, LEAF};
+use crate::util::{b64url_decode, b64url_encode, fold_json_keys, Shape, LEAF};
 
 pub const PLAY_TICKET_INFO: &str = "den-scout/play/v1";
 /// The first path segment of a ticketed play URL. No config segment can be "p" — it does not decode.
@@ -281,7 +281,7 @@ impl TicketKeys {
         }
         // Only this process can have written a ticket that authenticates, so these checks are not the defence.
         // They hold the resolve to the same shapes the legacy route validates, whatever a future minter writes.
-        let h = go_to_lower(&w.h);
+        let h = str::to_lowercase(&w.h);
         if !is_info_hash(&h) {
             return Err(TicketError::Bad);
         }

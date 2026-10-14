@@ -187,7 +187,7 @@ pub(crate) fn stale_body(body: &str, degraded: &str) -> Option<String> {
     let mut den = held.den?;
     den.answer_kind = ANSWER_STALE.to_owned();
     den.degraded = degraded.to_owned();
-    Some(crate::handler::marshal(&HeldOut { streams: held.streams, den }))
+    Some(crate::handler::to_json(&HeldOut { streams: held.streams, den }))
 }
 
 // --- RFC 3339 -------------------------------------------------------------------------------------------------
