@@ -49,11 +49,7 @@ async fn check_link_verdicts() {
     ];
     for (name, status, ctype, rng, want_size, want) in cases {
         let doer = MockDoer(move |req: reqwest::Request| {
-            assert_eq!(
-                req.headers().get("range").and_then(|v| v.to_str().ok()),
-                Some("bytes=0-0"),
-                "range"
-            );
+            assert_eq!(req.headers().get("range").and_then(|v| v.to_str().ok()), Some("bytes=0-0"), "range");
             let mut headers = vec![("content-type", ctype)];
             if !rng.is_empty() {
                 headers.push(("content-range", rng));
@@ -82,7 +78,9 @@ async fn check_link_its_own_failure_does_not_condemn_the_link() {
 // space in the host); a link it takes but cannot dial is a failure of the check, which never condemns the link.
 #[tokio::test]
 async fn check_link_condemns_only_what_go_cannot_parse() {
-    let unreached = MockDoer(|_req: reqwest::Request| -> Result<reqwest::Response, DoError> { panic!("no request expected") });
+    let unreached = MockDoer(|_req: reqwest::Request| -> Result<reqwest::Response, DoError> {
+        panic!("no request expected")
+    });
     for (link, want) in [
         ("/relative/f.mkv", LinkVerdict::Unverified),
         ("ftp-less-host/f.mkv", LinkVerdict::Unverified),
@@ -123,12 +121,20 @@ mod pending_handler {
 
     /// Go `tbTorrent`: answers as TorBox holding torrent 42 with `files`. `mylist` lists them, and `requestdl`
     /// links each file id to `<cdn>/<id>.mkv`.
-    pub(super) fn tb_torrent(cdn: String, files: Vec<TbFile>) -> impl Fn(&reqwest::Request) -> reqwest::Response {
+    pub(super) fn tb_torrent(
+        cdn: String,
+        files: Vec<TbFile>,
+    ) -> impl Fn(&reqwest::Request) -> reqwest::Response {
         move |req: &reqwest::Request| {
             let last = req.url().path().rsplit('/').next().unwrap_or("");
             match last {
                 "requestdl" => {
-                    let file_id = req.url().query_pairs().find(|(k, _)| k == "file_id").map(|(_, v)| v.into_owned()).unwrap_or_default();
+                    let file_id = req
+                        .url()
+                        .query_pairs()
+                        .find(|(k, _)| k == "file_id")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
                     resp(200, &format!(r#"{{"success":true,"data":"{cdn}/{file_id}.mkv"}}"#))
                 }
                 "mylist" => {
@@ -136,7 +142,10 @@ mod pending_handler {
                         .iter()
                         .map(|f| format!(r#"{{"id":{},"name":{:?},"size":{}}}"#, f.id, f.name, f.size))
                         .collect();
-                    resp(200, &format!(r#"{{"success":true,"data":{{"id":42,"files":[{}]}}}}"#, list.join(",")))
+                    resp(
+                        200,
+                        &format!(r#"{{"success":true,"data":{{"id":42,"files":[{}]}}}}"#, list.join(",")),
+                    )
                 }
                 _ => resp(404, "{}"),
             }
@@ -164,7 +173,8 @@ mod pending_handler {
         cdn: &str,
         files: Vec<TbFile>,
         target: PlayTarget,
-    ) -> (Box<dyn Fn(&str) -> http::Response<String>>, std::sync::Arc<std::sync::Mutex<Vec<String>>>, String) {
+    ) -> (Box<dyn Fn(&str) -> http::Response<String>>, std::sync::Arc<std::sync::Mutex<Vec<String>>>, String)
+    {
         let kr = ticket_keyring();
         let (serve_fn, calls) = held_torbox_play(&target.info_hash, tb_torrent(cdn.to_owned(), files), {
             let kr = kr.clone();
@@ -174,7 +184,10 @@ mod pending_handler {
             }
         });
         let ticket = ticket_keys(&kr).mint(
-            &Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "tb-secret".to_owned() }], ..Default::default() },
+            &Config {
+                debrid: vec![DebridAccount { service: DebridService::TorBox, token: "tb-secret".to_owned() }],
+                ..Default::default()
+            },
             &target,
             SystemTime::now() + Duration::from_secs(3600),
         );
@@ -194,15 +207,29 @@ fn play_a_link_that_fails_its_check_is_a_dead_link() {
         use crate::deps::Deps;
         use crate::tests::linkmemo::TallyStore;
         let cdn = sized_cdn(&[]);
-        let store = TallyStore::new(crate::config::DebridService::TorBox, move |_| Ok(format!("{cdn}/f.mkv")));
+        let store =
+            TallyStore::new(crate::config::DebridService::TorBox, move |_| Ok(format!("{cdn}/f.mkv")));
         let deps = Deps::for_test(|d| {
             d.probe_client = Some(store.cdn_client());
             d.make_stores = Box::new(move |_| vec![store.clone_box()]);
         });
-        let path = format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let path = format!(
+            "/{}/play/{}",
+            valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
         for i in 1..=2 {
             let rr = serve(&deps, get_request(&path));
-            assert!(rr.status() == 404 && rr.body().contains("dead_link"), "play {i}: {} {}, want 404 dead_link", rr.status(), rr.body());
+            assert!(
+                rr.status() == 404 && rr.body().contains("dead_link"),
+                "play {i}: {} {}, want 404 dead_link",
+                rr.status(),
+                rr.body()
+            );
         }
         assert_eq!(store.resolves(), 2, "resolves: a rejected link must not be served from the memo");
     }
@@ -227,10 +254,22 @@ fn play_a_check_that_cannot_answer_passes_the_link_through() {
         });
         let config = crate::config::decode_config(None, &valid_blob()).unwrap_or_default();
         let target = ResolveTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() };
-        let path = format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: target.info_hash.clone(), file_idx: target.file_idx, ..Default::default() }));
+        let path = format!(
+            "/{}/play/{}",
+            valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: target.info_hash.clone(),
+                file_idx: target.file_idx,
+                ..Default::default()
+            })
+        );
 
         let rr = serve(&deps, get_request(&path));
-        assert!(rr.status() == 302 && rr.headers().get("location").map(|v| v.as_bytes()) == Some(link.as_bytes()), "play: {} want 302 to the unchecked link", rr.status());
+        assert!(
+            rr.status() == 302 && rr.headers().get("location").map(|v| v.as_bytes()) == Some(link.as_bytes()),
+            "play: {} want 302 to the unchecked link",
+            rr.status()
+        );
         let hit = deps.links.get(&link_memo_key(&config, &target), SystemTime::now());
         assert!(matches!(&hit, Some(h) if !h.checked), "memo = {hit:?}, want an unchecked entry");
     }
@@ -250,17 +289,31 @@ fn play_a_checked_link_is_not_checked_again() {
         use std::sync::atomic::{AtomicI32, Ordering};
         let checks = std::sync::Arc::new(AtomicI32::new(0));
         let cdn = sized_cdn(&[("/f.mkv", 1000)]);
-        let store = TallyStore::new(crate::config::DebridService::TorBox, move |_| Ok(format!("{cdn}/f.mkv")));
+        let store =
+            TallyStore::new(crate::config::DebridService::TorBox, move |_| Ok(format!("{cdn}/f.mkv")));
         let deps = Deps::for_test(|d| {
             d.probe_client = Some(crate::scrape::default_client());
             d.make_stores = Box::new(move |_| vec![store.clone_box()]);
         });
-        let path = format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let path = format!(
+            "/{}/play/{}",
+            valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
         for i in 1..=3 {
             let rr = serve(&deps, get_request(&path));
             assert_eq!(rr.status(), 302, "play {i}");
         }
-        assert_eq!(checks.load(Ordering::SeqCst), 1, "link checked {} times, want once", checks.load(Ordering::SeqCst));
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            1,
+            "link checked {} times, want once",
+            checks.load(Ordering::SeqCst)
+        );
     }
     todo!("pending: linkcheck_test.go:~153 TestPlay_aCheckedLinkIsNotCheckedAgain")
 }
@@ -269,46 +322,62 @@ fn play_a_checked_link_is_not_checked_again() {
 // 1 and 2).
 #[tokio::test]
 async fn known_file_size_from_what_the_stores_already_hold() {
-        use std::sync::Arc;
+    use std::sync::Arc;
 
-        use crate::cache::{Cache, MemoryCache};
-        use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
-        use crate::stores::refusal::resolve_key;
-        use crate::stores::torbox::{TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
-        use crate::stores::{ResolveTarget, Store};
-        use crate::tests::mock::{resp, MockDoer};
-        let h = "b".repeat(40);
-        let cache = Arc::new(MemoryCache::new(1 << 20));
-        let tb = TorBoxStore {
-            token: "t".into(),
-            client: Arc::new(MockDoer(|_| Ok(resp(404, "{}")))),
-            cache: Some(cache.clone()),
-            api: TORBOX_API.into(),
-        };
-        cache.put(&resolve_key("t", &h), r#"{"torrentId":9,"files":[{"Index":0,"Name":"S01E01.mkv","SizeBytes":10},{"Index":1,"Name":"S01E02.mkv","SizeBytes":20}]}"#, RESOLVE_CACHE_TTL);
-        assert_eq!(tb.known_file_size(&ResolveTarget { info_hash: h.clone(), season: Some(1), episode: Some(2), ..Default::default() }), Some(20), "torbox size");
-        assert_eq!(tb.known_file_size(&ResolveTarget { info_hash: "f".repeat(40), ..Default::default() }), None, "torbox claimed a size for a release it has no entry for");
+    use crate::cache::{Cache, MemoryCache};
+    use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
+    use crate::stores::refusal::resolve_key;
+    use crate::stores::torbox::{TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
+    use crate::stores::{ResolveTarget, Store};
+    use crate::tests::mock::{resp, MockDoer};
+    let h = "b".repeat(40);
+    let cache = Arc::new(MemoryCache::new(1 << 20));
+    let tb = TorBoxStore {
+        token: "t".into(),
+        client: Arc::new(MockDoer(|_| Ok(resp(404, "{}")))),
+        cache: Some(cache.clone()),
+        api: TORBOX_API.into(),
+    };
+    cache.put(&resolve_key("t", &h), r#"{"torrentId":9,"files":[{"Index":0,"Name":"S01E01.mkv","SizeBytes":10},{"Index":1,"Name":"S01E02.mkv","SizeBytes":20}]}"#, RESOLVE_CACHE_TTL);
+    assert_eq!(
+        tb.known_file_size(&ResolveTarget {
+            info_hash: h.clone(),
+            season: Some(1),
+            episode: Some(2),
+            ..Default::default()
+        }),
+        Some(20),
+        "torbox size"
+    );
+    assert_eq!(
+        tb.known_file_size(&ResolveTarget { info_hash: "f".repeat(40), ..Default::default() }),
+        None,
+        "torbox claimed a size for a release it has no entry for"
+    );
 
-        let target = ResolveTarget { info_hash: h.clone(), ..Default::default() };
-        let rd_cache = Arc::new(MemoryCache::new(1 << 20));
-        rd_cache.put(&rd_torrent_key("k", &h, &target), "abc", RESOLVE_CACHE_TTL);
-        let rd = RealDebridStore {
-            token: "k".into(),
-            api: REAL_DEBRID_API.into(),
-            cache: Some(rd_cache.clone()),
-            client: Arc::new(MockDoer(|req| {
-                let path = req.url().path();
-                if path.contains("torrents/info") {
-                    return Ok(resp(200, r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Movie.mkv","bytes":900,"selected":1}]}"#));
-                }
-                if path.contains("unrestrict") {
-                    return Ok(resp(200, r#"{"download":"https://rd/final.mkv"}"#));
-                }
-                Ok(resp(404, "{}"))
-            })),
-        };
-        rd.resolve(&target).await.expect("resolve");
-        assert_eq!(rd.known_file_size(&target), Some(900), "realdebrid size");
+    let target = ResolveTarget { info_hash: h.clone(), ..Default::default() };
+    let rd_cache = Arc::new(MemoryCache::new(1 << 20));
+    rd_cache.put(&rd_torrent_key("k", &h, &target), "abc", RESOLVE_CACHE_TTL);
+    let rd = RealDebridStore {
+        token: "k".into(),
+        api: REAL_DEBRID_API.into(),
+        cache: Some(rd_cache.clone()),
+        client: Arc::new(MockDoer(|req| {
+            let path = req.url().path();
+            if path.contains("torrents/info") {
+                return Ok(resp(
+                    200,
+                    r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Movie.mkv","bytes":900,"selected":1}]}"#,
+                ));
+            }
+            if path.contains("unrestrict") {
+                return Ok(resp(200, r#"{"download":"https://rd/final.mkv"}"#));
+            }
+            Ok(resp(404, "{}"))
+        })),
+    };
+    rd.resolve(&target).await.expect("resolve");
+    assert_eq!(rd.known_file_size(&target), Some(900), "realdebrid size");
 }
 
 // The release size condemns a link only where nothing better is known: a movie, whose file size no store
@@ -329,18 +398,85 @@ fn verify_link_wrong_file_only_for_a_movie_whose_file_size_is_unknown() {
         const H: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let cdn = sized_cdn(&[("/sample.mkv", 522)]);
         let h = Handler { deps: Deps::for_test(|d| d.probe_client = Some(crate::scrape::default_client())) };
-        let unknown = StorePool::new(vec![Box::new(TorBoxStore::new("t", Arc::new(MemoryCache::new(1 << 20))))]);
+        let unknown =
+            StorePool::new(vec![Box::new(TorBoxStore::new("t", Arc::new(MemoryCache::new(1 << 20))))]);
         let cache = Arc::new(MemoryCache::new(1 << 20));
-        cache.put(&crate::stores::resolve_key("t", H), r#"{"torrentId":9,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":522}]}"#, crate::stores::RESOLVE_CACHE_TTL);
+        cache.put(
+            &crate::stores::resolve_key("t", H),
+            r#"{"torrentId":9,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":522}]}"#,
+            crate::stores::RESOLVE_CACHE_TTL,
+        );
         let listed = StorePool::new(vec![Box::new(TorBoxStore::new("t", cache))]);
         const RELEASE: i64 = 16_000_000_000;
         let cases: Vec<(&str, &StorePool, ResolveTarget, &str, LinkVerdict)> = vec![
-            ("a movie whose file size is unknown", &unknown, ResolveTarget { info_hash: H.into(), file_idx: Some(0), release_size: RELEASE, ..Default::default() }, "/sample.mkv", LinkVerdict::WrongFile),
-            ("no release size", &unknown, ResolveTarget { info_hash: H.into(), file_idx: Some(0), ..Default::default() }, "/sample.mkv", LinkVerdict::Playable),
-            ("an episode", &unknown, ResolveTarget { info_hash: H.into(), season: Some(1), episode: Some(2), release_size: RELEASE, ..Default::default() }, "/sample.mkv", LinkVerdict::Playable),
-            ("the file size is known", &listed, ResolveTarget { info_hash: H.into(), file_idx: Some(0), release_size: RELEASE, ..Default::default() }, "/sample.mkv", LinkVerdict::Playable),
-            ("at least half the release", &unknown, ResolveTarget { info_hash: H.into(), file_idx: Some(0), release_size: 1000, ..Default::default() }, "/sample.mkv", LinkVerdict::Playable),
-            ("no total served", &unknown, ResolveTarget { info_hash: H.into(), file_idx: Some(0), release_size: RELEASE, ..Default::default() }, "/whole.mkv", LinkVerdict::Playable),
+            (
+                "a movie whose file size is unknown",
+                &unknown,
+                ResolveTarget {
+                    info_hash: H.into(),
+                    file_idx: Some(0),
+                    release_size: RELEASE,
+                    ..Default::default()
+                },
+                "/sample.mkv",
+                LinkVerdict::WrongFile,
+            ),
+            (
+                "no release size",
+                &unknown,
+                ResolveTarget { info_hash: H.into(), file_idx: Some(0), ..Default::default() },
+                "/sample.mkv",
+                LinkVerdict::Playable,
+            ),
+            (
+                "an episode",
+                &unknown,
+                ResolveTarget {
+                    info_hash: H.into(),
+                    season: Some(1),
+                    episode: Some(2),
+                    release_size: RELEASE,
+                    ..Default::default()
+                },
+                "/sample.mkv",
+                LinkVerdict::Playable,
+            ),
+            (
+                "the file size is known",
+                &listed,
+                ResolveTarget {
+                    info_hash: H.into(),
+                    file_idx: Some(0),
+                    release_size: RELEASE,
+                    ..Default::default()
+                },
+                "/sample.mkv",
+                LinkVerdict::Playable,
+            ),
+            (
+                "at least half the release",
+                &unknown,
+                ResolveTarget {
+                    info_hash: H.into(),
+                    file_idx: Some(0),
+                    release_size: 1000,
+                    ..Default::default()
+                },
+                "/sample.mkv",
+                LinkVerdict::Playable,
+            ),
+            (
+                "no total served",
+                &unknown,
+                ResolveTarget {
+                    info_hash: H.into(),
+                    file_idx: Some(0),
+                    release_size: RELEASE,
+                    ..Default::default()
+                },
+                "/whole.mkv",
+                LinkVerdict::Playable,
+            ),
         ];
         for (name, pool, rt, path, want) in cases {
             let got = h.verify_link(pool, &rt, &format!("{cdn}{path}"));
@@ -367,16 +503,37 @@ fn play_a_movie_link_to_another_file_is_re_resolved_with_the_file_list() {
                 TbFile { id: 0, name: "Movie/Sample/sample.mkv", size: 522 },
                 TbFile { id: 1, name: "Movie/Movie.2160p.REMUX.mkv", size: 16_000_000_000 },
             ],
-            PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), release_size: 16_000_000_000, ..Default::default() },
+            PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                release_size: 16_000_000_000,
+                ..Default::default()
+            },
         );
         let rr = serve_fn(&play);
-        assert!(rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/1.mkv"), "play: {} want 302 to the feature", rr.status());
-        assert!(same_calls(&calls.lock().unwrap(), &["requestdl", "mylist", "requestdl"]), "upstream calls = {:?}", calls.lock().unwrap());
+        assert!(
+            rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/1.mkv"),
+            "play: {} want 302 to the feature",
+            rr.status()
+        );
+        assert!(
+            same_calls(&calls.lock().unwrap(), &["requestdl", "mylist", "requestdl"]),
+            "upstream calls = {:?}",
+            calls.lock().unwrap()
+        );
 
         calls.lock().unwrap().clear();
         let rr = serve_fn(&format!("{play}?fresh=1"));
-        assert!(rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/1.mkv"), "second play: {} want 302 to the feature", rr.status());
-        assert!(same_calls(&calls.lock().unwrap(), &["requestdl"]), "second play calls = {:?} — the list should have been kept", calls.lock().unwrap());
+        assert!(
+            rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/1.mkv"),
+            "second play: {} want 302 to the feature",
+            rr.status()
+        );
+        assert!(
+            same_calls(&calls.lock().unwrap(), &["requestdl"]),
+            "second play calls = {:?} — the list should have been kept",
+            calls.lock().unwrap()
+        );
     }
     todo!("pending: linkcheck_test.go:~260 TestPlay_aMovieLinkToAnotherFileIsReResolvedWithTheFileList")
 }
@@ -393,11 +550,24 @@ fn play_a_movie_link_of_the_release_size_costs_nothing_more() {
         let (serve_fn, calls, play) = sized_ticket_play(
             &cdn,
             vec![],
-            PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), release_size: 16_000_000_000, ..Default::default() },
+            PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                release_size: 16_000_000_000,
+                ..Default::default()
+            },
         );
         let rr = serve_fn(&play);
-        assert!(rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/0.mkv"), "play: {}", rr.status());
-        assert!(same_calls(&calls.lock().unwrap(), &["requestdl"]), "upstream calls = {:?}", calls.lock().unwrap());
+        assert!(
+            rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/0.mkv"),
+            "play: {}",
+            rr.status()
+        );
+        assert!(
+            same_calls(&calls.lock().unwrap(), &["requestdl"]),
+            "upstream calls = {:?}",
+            calls.lock().unwrap()
+        );
     }
     todo!("pending: linkcheck_test.go:~291 TestPlay_aMovieLinkOfTheReleaseSizeCostsNothingMore")
 }
@@ -411,7 +581,8 @@ fn play_a_collection_film_smaller_than_half_the_release_still_plays() {
     #[cfg(any())]
     fn pending() {
         use super::pending_handler::*;
-        let cdn = sized_cdn(&[("/0.mkv", 9_000_000_000), ("/1.mkv", 10_000_000_000), ("/2.mkv", 11_000_000_000)]);
+        let cdn =
+            sized_cdn(&[("/0.mkv", 9_000_000_000), ("/1.mkv", 10_000_000_000), ("/2.mkv", 11_000_000_000)]);
         let (serve_fn, calls, play) = sized_ticket_play(
             &cdn,
             vec![
@@ -419,11 +590,24 @@ fn play_a_collection_film_smaller_than_half_the_release_still_plays() {
                 TbFile { id: 1, name: "Trilogy/Part.2.mkv", size: 10_000_000_000 },
                 TbFile { id: 2, name: "Trilogy/Part.3.mkv", size: 11_000_000_000 },
             ],
-            PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), release_size: 30_000_000_000, ..Default::default() },
+            PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                release_size: 30_000_000_000,
+                ..Default::default()
+            },
         );
         let rr = serve_fn(&play);
-        assert!(rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/0.mkv"), "play: {} want 302 to part 1", rr.status());
-        assert!(same_calls(&calls.lock().unwrap(), &["requestdl", "mylist", "requestdl"]), "upstream calls = {:?}", calls.lock().unwrap());
+        assert!(
+            rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/0.mkv"),
+            "play: {} want 302 to part 1",
+            rr.status()
+        );
+        assert!(
+            same_calls(&calls.lock().unwrap(), &["requestdl", "mylist", "requestdl"]),
+            "upstream calls = {:?}",
+            calls.lock().unwrap()
+        );
     }
     todo!("pending: linkcheck_test.go:~308 TestPlay_aCollectionFilmSmallerThanHalfTheReleaseStillPlays")
 }
@@ -459,14 +643,33 @@ fn play_a_wrong_file_whose_re_resolve_fails_serves_the_first_link() {
         let play = format!(
             "/p/{}",
             ticket_keys(&ticket_keyring()).mint(
-                &Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "tb-secret".to_owned() }], ..Default::default() },
-                &PlayTarget { info_hash: hash.clone(), file_idx: Some(0), release_size: 16_000_000_000, ..Default::default() },
+                &Config {
+                    debrid: vec![DebridAccount {
+                        service: DebridService::TorBox,
+                        token: "tb-secret".to_owned()
+                    }],
+                    ..Default::default()
+                },
+                &PlayTarget {
+                    info_hash: hash.clone(),
+                    file_idx: Some(0),
+                    release_size: 16_000_000_000,
+                    ..Default::default()
+                },
                 SystemTime::now() + Duration::from_secs(3600),
             )
         );
         let rr = serve_fn(&play);
-        assert!(rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/0.mkv"), "play: {} want 302 to the first link", rr.status());
-        assert!(same_calls(&calls.lock().unwrap(), &["requestdl", "mylist"]), "upstream calls = {:?}", calls.lock().unwrap());
+        assert!(
+            rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/0.mkv"),
+            "play: {} want 302 to the first link",
+            rr.status()
+        );
+        assert!(
+            same_calls(&calls.lock().unwrap(), &["requestdl", "mylist"]),
+            "upstream calls = {:?}",
+            calls.lock().unwrap()
+        );
     }
     todo!("pending: linkcheck_test.go:~343 TestPlay_aWrongFileWhoseReResolveFailsServesTheFirstLink")
 }

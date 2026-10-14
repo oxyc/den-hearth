@@ -6,7 +6,10 @@ use crate::attributes::stream_attributes;
 use crate::label::clean_label;
 use crate::probe::codec_from_matroska_id;
 use crate::probe_avi::codec_from_four_cc;
-use crate::rank::{detect_resolution, quality_score, rank_streams, release_years, title_overlap, title_tokens, year_mismatch, RankFilters, RawStream, GIB};
+use crate::rank::{
+    detect_resolution, quality_score, rank_streams, release_years, title_overlap, title_tokens,
+    year_mismatch, RankFilters, RawStream, GIB,
+};
 use crate::scrape::parse_stremio_streams;
 use crate::season::{episode_patterns, matches_episode};
 
@@ -42,18 +45,26 @@ fn release_years_and_mismatch() {
     );
     assert!(year_mismatch("Steven Spielberg (2024) doc", 2026), "2024 mistag should mismatch expected 2026");
     // no-year title: can't tell, so keep
-    assert!(!year_mismatch("Some Release WEB-DL", 2026), "no-year title must not be a mismatch (can't tell → keep)");
+    assert!(
+        !year_mismatch("Some Release WEB-DL", 2026),
+        "no-year title must not be a mismatch (can't tell → keep)"
+    );
     assert!(!year_mismatch("Movie (2025)", 2026), "±1 year should be tolerated");
 }
 
 #[test]
 fn rank_drops_year_mistag() {
     let streams = [
-        rs("Steven Spielberg el rey midas de Hollywood (2024) [HDTV 1080p]", |s| s.info_hash = "a".repeat(40)),
+        rs("Steven Spielberg el rey midas de Hollywood (2024) [HDTV 1080p]", |s| {
+            s.info_hash = "a".repeat(40)
+        }),
         rs("El día de la Revelación (Spielberg's 2026) HdTScr Lat", |s| s.info_hash = "b".repeat(40)),
         rs("Disclosure Day (2026) CinemaCity", |s| s.info_hash = "c".repeat(40)),
     ];
-    let out = rank_streams(&streams, RankFilters { expected_year: Some(2026), result_cap: 10, ..Default::default() });
+    let out = rank_streams(
+        &streams,
+        RankFilters { expected_year: Some(2026), result_cap: 10, ..Default::default() },
+    );
     assert_eq!(out.len(), 2, "want 2 (2024 mistag dropped, both 2026 kept), got {}: {out:?}", out.len());
     for s in &out {
         assert!(!s.title.contains("2024"), "mistagged 2024 stream survived: {:?}", s.title);
@@ -77,8 +88,14 @@ fn title_tokens_would_empty_real_series() {
     ];
     for (show, release, why) in cases {
         let tokens = title_tokens(show);
-        assert!(release_years(release).is_empty(), "{show}: the fixture carries a year, which is not the case under test");
-        assert!(!title_overlap(release, &tokens), "{show}: this example no longer demonstrates the problem ({why})");
+        assert!(
+            release_years(release).is_empty(),
+            "{show}: the fixture carries a year, which is not the case under test"
+        );
+        assert!(
+            !title_overlap(release, &tokens),
+            "{show}: this example no longer demonstrates the problem ({why})"
+        );
     }
     // The one case that does work, which is what made the first attempt at this look fine.
     assert!(
@@ -108,18 +125,29 @@ async fn cinemeta_meta() {
     // keeps it out of both mistag filters — see cinemeta.go and title_tokens_would_empty_real_series.
     let path = Arc::new(Mutex::new(String::new()));
     let seen = Arc::clone(&path);
-    let series_client: Arc<dyn Doer> = Arc::new(crate::tests::mock::MockDoer(move |r: reqwest::Request| -> Answer {
-        *seen.lock().expect("lock") = r.url().path().to_owned();
-        Ok(crate::tests::mock::resp(200, r#"{"meta":{"id":"tt1","name":"The Bear","releaseInfo":"2022–2025"}}"#))
-    }));
-    let series = cinemeta_meta(series_client, "https://cinemeta.example", Arc::new(MemoryCache::new(1 << 20)));
+    let series_client: Arc<dyn Doer> =
+        Arc::new(crate::tests::mock::MockDoer(move |r: reqwest::Request| -> Answer {
+            *seen.lock().expect("lock") = r.url().path().to_owned();
+            Ok(crate::tests::mock::resp(
+                200,
+                r#"{"meta":{"id":"tt1","name":"The Bear","releaseInfo":"2022–2025"}}"#,
+            ))
+        }));
+    let series =
+        cinemeta_meta(series_client, "https://cinemeta.example", Arc::new(MemoryCache::new(1 << 20)));
     let (m, found) = series.lookup("series", "tt1").await;
     assert!(found && m.title == "The Bear", "series meta: {m:?} found={found}");
-    assert_eq!(path.lock().expect("lock").as_str(), "/meta/series/tt1.json", "a series was asked for at the wrong path");
+    assert_eq!(
+        path.lock().expect("lock").as_str(),
+        "/meta/series/tt1.json",
+        "a series was asked for at the wrong path"
+    );
 
     // upstream failure → found=false (list served unfiltered)
     let bad_client: Arc<dyn Doer> =
-        Arc::new(crate::tests::mock::MockDoer(|_r: reqwest::Request| -> Answer { Ok(crate::tests::mock::resp(500, "")) }));
+        Arc::new(crate::tests::mock::MockDoer(|_r: reqwest::Request| -> Answer {
+            Ok(crate::tests::mock::resp(500, ""))
+        }));
     let bad = cinemeta_meta(bad_client, "x", Arc::new(MemoryCache::new(1 << 20)));
     let (_, found) = bad.lookup("movie", "tt1").await;
     assert!(!found, "cinemeta failure should return found=false");
@@ -175,10 +203,14 @@ async fn cinemeta_meta_caches_answers_and_failures() {
     let status = Arc::new(AtomicU16::new(200));
     let cache = Arc::new(TtlCache { inner: MemoryCache::new(1 << 20), ttls: Mutex::new(Default::default()) });
     let (n, s) = (Arc::clone(&asked), Arc::clone(&status));
-    let client: Arc<dyn Doer> = Arc::new(crate::tests::mock::MockDoer(move |_r: reqwest::Request| -> Answer {
-        n.fetch_add(1, Ordering::SeqCst);
-        Ok(crate::tests::mock::resp(s.load(Ordering::SeqCst), r#"{"meta":{"name":"Disclosure Day","year":"2026"}}"#))
-    }));
+    let client: Arc<dyn Doer> =
+        Arc::new(crate::tests::mock::MockDoer(move |_r: reqwest::Request| -> Answer {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tests::mock::resp(
+                s.load(Ordering::SeqCst),
+                r#"{"meta":{"name":"Disclosure Day","year":"2026"}}"#,
+            ))
+        }));
     let shared: Arc<dyn Cache> = cache.clone();
     let meta = cinemeta_meta(client, "https://cinemeta.example", Arc::clone(&shared));
 
@@ -222,10 +254,11 @@ async fn cinemeta_meta_keeps_configured_providers_apart() {
     let cache = Arc::new(MemoryCache::new(1 << 20));
     let meta = |base: &str, name: &'static str, asked: &Arc<AtomicUsize>| -> Cinemeta {
         let asked = Arc::clone(asked);
-        let client: Arc<dyn Doer> = Arc::new(crate::tests::mock::MockDoer(move |_r: reqwest::Request| -> Answer {
-            asked.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::tests::mock::resp(200, &format!(r#"{{"meta":{{"name":"{name}","year":"2026"}}}}"#)))
-        }));
+        let client: Arc<dyn Doer> =
+            Arc::new(crate::tests::mock::MockDoer(move |_r: reqwest::Request| -> Answer {
+                asked.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::tests::mock::resp(200, &format!(r#"{{"meta":{{"name":"{name}","year":"2026"}}}}"#)))
+            }));
         cinemeta_meta(client, base, cache.clone())
     };
     let (asked_a, asked_b) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -234,11 +267,18 @@ async fn cinemeta_meta_keeps_configured_providers_apart() {
 
     let (first, ok_a) = a.lookup("movie", "tt-same").await;
     let (second, ok_b) = b.lookup("movie", "tt-same").await;
-    assert!(ok_a && ok_b && first.title == "Provider A" && second.title == "Provider B", "provider answers crossed: A={first:?}/{ok_a} B={second:?}/{ok_b}");
+    assert!(
+        ok_a && ok_b && first.title == "Provider A" && second.title == "Provider B",
+        "provider answers crossed: A={first:?}/{ok_a} B={second:?}/{ok_b}"
+    );
     let (n_a, n_b) = (asked_a.load(Ordering::SeqCst), asked_b.load(Ordering::SeqCst));
     assert!(n_a == 1 && n_b == 1, "provider requests A={n_a} B={n_b}, want one each");
     let (again, _) = a.lookup("movie", "tt-same").await;
-    assert!(again.title == "Provider A" && asked_a.load(Ordering::SeqCst) == 1, "provider A cache changed: {again:?}, calls={}", asked_a.load(Ordering::SeqCst));
+    assert!(
+        again.title == "Provider A" && asked_a.load(Ordering::SeqCst) == 1,
+        "provider A cache changed: {again:?}, calls={}",
+        asked_a.load(Ordering::SeqCst)
+    );
 }
 
 #[test]
@@ -262,7 +302,12 @@ fn rank_drops_yearless_junk() {
             ..Default::default()
         },
     );
-    assert_eq!(out.len(), 2, "want 2 (year-less junk dropped, foreign-lang + matching-year kept), got {}: {out:?}", out.len());
+    assert_eq!(
+        out.len(),
+        2,
+        "want 2 (year-less junk dropped, foreign-lang + matching-year kept), got {}: {out:?}",
+        out.len()
+    );
     for s in &out {
         assert!(
             !s.title.contains("B-Bead") && !s.title.contains("Random Junk"),
@@ -291,7 +336,8 @@ fn detect_audio_codec_branches() {
     // The spellings here must be the ones the container parsers produce, since withProbe overwrites
     // Codec outright — see detectCodec. TestAttributes_titleAndProbeAgreeOnCodecSpelling holds the two
     // paths together; this table only pins the title half.
-    let codec = [("x AV1", "av1"), ("x x265", "hevc"), ("x HEVC", "hevc"), ("x x264", "h264"), ("x h264", "h264")];
+    let codec =
+        [("x AV1", "av1"), ("x x265", "hevc"), ("x HEVC", "hevc"), ("x x264", "h264"), ("x h264", "h264")];
     for (title, want) in codec {
         let got = stream_attributes(RawStream { title: title.into(), ..Default::default() }).codec;
         assert!(got.as_deref() == Some(want), "codec({title:?})={got:?} want {want:?}");
@@ -339,7 +385,10 @@ fn attributes_title_and_probe_agree_on_codec_spelling() {
         let s = codec_from_four_cc(four_cc);
         assert!(s == codec, "avi fourCC {four_cc:?} → {s:?}, but the title path says {codec:?}");
         let s = codec_from_four_cc(mp4_sample_entry);
-        assert!(s == codec, "mp4 sample entry {mp4_sample_entry:?} → {s:?}, but the title path says {codec:?}");
+        assert!(
+            s == codec,
+            "mp4 sample entry {mp4_sample_entry:?} → {s:?}, but the title path says {codec:?}"
+        );
     }
 }
 
@@ -394,7 +443,10 @@ fn label_branches() {
 fn season_absolute_numbering_no_resolution_match() {
     // concatenated form is "720"
     let p = episode_patterns(7, 20);
-    assert!(!matches_episode("Show.720p.WEB-DL.x264.mkv", &p), "S7E20 must not match a 720p resolution token");
+    assert!(
+        !matches_episode("Show.720p.WEB-DL.x264.mkv", &p),
+        "S7E20 must not match a 720p resolution token"
+    );
     assert!(matches_episode("Show.720.mkv", &p), "S7E20 should still match a bare 720 episode token");
     assert!(
         matches_episode("Show.S07E20.1080p.mkv", &episode_patterns(7, 20)),
@@ -413,7 +465,8 @@ fn rank_min_seeders_keeps_unknown() {
             s.seeders = intp(1);
         }),
     ];
-    let out = rank_streams(&streams, RankFilters { min_seeders: intp(5), result_cap: 10, ..Default::default() });
+    let out =
+        rank_streams(&streams, RankFilters { min_seeders: intp(5), result_cap: 10, ..Default::default() });
     assert!(
         out.len() == 1 && out[0].info_hash == "a".repeat(40),
         "minSeeders should keep unknown-seeder streams and drop known-below-threshold: {out:?}"

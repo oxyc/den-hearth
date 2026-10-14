@@ -89,7 +89,10 @@ fn account_known_plan() {
         let rr = do_req(&h, &format!("/{}/account", valid_blob()), None);
         assert_eq!(rr.status(), 200, "account");
         let out = decode_account_body(rr.body());
-        assert!(out.len() == 1 && out[0]["service"] == "torbox" && out[0]["plan"] == "pro", "account body = {out:?}");
+        assert!(
+            out.len() == 1 && out[0]["service"] == "torbox" && out[0]["plan"] == "pro",
+            "account body = {out:?}"
+        );
         // "active" counts the active, unfinished entries only.
         assert_eq!(out[0]["slots"]["active"], 1, "slots = {:?}, want active=1", out[0]["slots"]);
         assert_eq!(out[0]["queued"], 2, "queued = {:?}, want 2", out[0]["queued"]);
@@ -134,7 +137,8 @@ fn account_refused_upstream() {
     // Enable when package 4 lands: move this body up and delete the wrapper.
     #[cfg(any())]
     fn pending() {
-        let (h, _) = account_torbox_handler("tb-account-refused", |_| resp(500, r#"{"error":"server_error"}"#));
+        let (h, _) =
+            account_torbox_handler("tb-account-refused", |_| resp(500, r#"{"error":"server_error"}"#));
         let rr = do_req(&h, &format!("/{}/account", valid_blob()), None);
         assert_eq!(rr.status(), 200, "account: degraded per-account, not a route failure");
         let out = decode_account_body(rr.body());
@@ -161,7 +165,12 @@ fn account_cache_reuse_within_30s() {
         let first = calls.load(Ordering::SeqCst);
         do_req(&h, &format!("/{}/account", valid_blob()), None);
         let second = calls.load(Ordering::SeqCst);
-        assert_eq!(second, first, "a second read within 30s made {} more upstream calls, want 0", second - first);
+        assert_eq!(
+            second,
+            first,
+            "a second read within 30s made {} more upstream calls, want 0",
+            second - first
+        );
     }
     todo!("pending: account_test.go:122 TestAccount_cacheReuseWithin30s")
 }
@@ -288,7 +297,10 @@ mod store {
             _ => resp(404, "{}"),
         });
         let sum = s.account_summary().await.expect("summary");
-        assert_eq!(sum.cooldown_until.map(|t| t.to_rfc3339()).as_deref(), Some("2027-01-02T03:04:05.5+02:00"));
+        assert_eq!(
+            sum.cooldown_until.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2027-01-02T03:04:05.5+02:00")
+        );
         assert!(sum.premium_expires_at.is_none(), "an unparseable time is unknown, not a failure");
     }
 }

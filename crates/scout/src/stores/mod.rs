@@ -496,7 +496,10 @@ pub(crate) async fn read_store_error(resp: &mut reqwest::Response) -> String {
 }
 
 /// Go `io.ReadAll(io.LimitReader(body, limit))`: the body up to `limit` bytes, the rest unread.
-pub(crate) async fn read_limited(resp: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>, reqwest::Error> {
+pub(crate) async fn read_limited(
+    resp: &mut reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, reqwest::Error> {
     let mut out = Vec::new();
     while out.len() < limit {
         match resp.chunk().await? {
@@ -511,10 +514,8 @@ pub(crate) async fn read_limited(resp: &mut reqwest::Response, limit: usize) -> 
 }
 
 /// The two fields of a store's error body. A key matches case-insensitively, as Go's decoder matches it.
-static STORE_ERROR_SHAPE: crate::util::Shape = crate::util::Shape::Object(&[
-    ("error", &crate::util::LEAF),
-    ("detail", &crate::util::LEAF),
-]);
+static STORE_ERROR_SHAPE: crate::util::Shape =
+    crate::util::Shape::Object(&[("error", &crate::util::LEAF), ("detail", &crate::util::LEAF)]);
 
 /// Go's `fmt.Sprintf("%v", v)` for a decoded JSON value, which is how `storeErrorText` prints `error`.
 fn go_v(v: &serde_json::Value) -> String {
@@ -643,7 +644,10 @@ pub(crate) fn build_request(
 
 /// Go's `json.NewDecoder(r).Decode(&v)` over bytes already in hand: the first JSON value, whatever follows
 /// it ignored, with keys matched to `shape`'s fields case-insensitively. `None` where Go returns an error.
-pub(crate) fn decode_first<T: serde::de::DeserializeOwned>(raw: &[u8], shape: &crate::util::Shape) -> Option<T> {
+pub(crate) fn decode_first<T: serde::de::DeserializeOwned>(
+    raw: &[u8],
+    shape: &crate::util::Shape,
+) -> Option<T> {
     let mut stream = serde_json::Deserializer::from_slice(raw).into_iter::<serde_json::Value>();
     let mut value = stream.next()?.ok()?;
     crate::util::fold_json_keys(&mut value, shape);
@@ -651,7 +655,10 @@ pub(crate) fn decode_first<T: serde::de::DeserializeOwned>(raw: &[u8], shape: &c
 }
 
 /// Go's `json.Unmarshal(raw, &v)`: the whole document must be valid JSON, then it is decoded the same way.
-pub(crate) fn decode_all<T: serde::de::DeserializeOwned>(raw: &[u8], shape: &crate::util::Shape) -> Option<T> {
+pub(crate) fn decode_all<T: serde::de::DeserializeOwned>(
+    raw: &[u8],
+    shape: &crate::util::Shape,
+) -> Option<T> {
     let mut value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
     crate::util::fold_json_keys(&mut value, shape);
     serde_json::from_value(value).ok()

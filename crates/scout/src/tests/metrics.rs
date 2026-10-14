@@ -7,7 +7,10 @@ use tempfile::TempDir;
 
 use crate::cache::MemoryCache;
 use crate::diskcache::{write_file, TieredCache};
-use crate::metrics::{cache_persistent_gauge, new_metric_set, METRIC_TORBOX_AVOIDED, METRIC_TORBOX_ENDPOINTS, METRIC_TORBOX_OUTCOMES};
+use crate::metrics::{
+    cache_persistent_gauge, new_metric_set, METRIC_TORBOX_AVOIDED, METRIC_TORBOX_ENDPOINTS,
+    METRIC_TORBOX_OUTCOMES,
+};
 
 const METRICS_TOKEN: &str = "metrics-shared-secret";
 
@@ -20,10 +23,7 @@ fn sample_value(body: &str, series: &str) -> i64 {
         .lines()
         .find(|l| l.starts_with(&prefix))
         .unwrap_or_else(|| panic!("no series {series:?} in:\n{body}"));
-    line[prefix.len()..]
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("unparseable sample {line:?}"))
+    line[prefix.len()..].trim().parse().unwrap_or_else(|_| panic!("unparseable sample {line:?}"))
 }
 
 // The counters are process-wide and every other test in this package feeds them too, so the route tests assert
@@ -147,16 +147,20 @@ fn metrics_counts_stale_hits() {
         let path = format!("/{}/stream/movie/tt1234567.json", crate::tests::ticket::valid_blob());
         get(&deps, &path, &[]);
 
-        let before = sample_value(get(&deps, "/metrics", &auth).body(), r#"scout_list_cache_total{result="stale"}"#);
+        let before =
+            sample_value(get(&deps, "/metrics", &auth).body(), r#"scout_list_cache_total{result="stale"}"#);
 
         let key = cache.last_key();
         let held = cache.get(&key).expect("nothing cached");
         let (complete, _, etag, body) = split_cached(&held);
-        let backdated = (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH).expect("epoch").as_secs() as i64;
+        let backdated =
+            (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH).expect("epoch").as_secs()
+                as i64;
         cache.put(&key, &join_cached(&complete, backdated, &etag, &body), Duration::from_secs(60));
         get(&deps, &path, &[]);
 
-        let after = sample_value(get(&deps, "/metrics", &auth).body(), r#"scout_list_cache_total{result="stale"}"#);
+        let after =
+            sample_value(get(&deps, "/metrics", &auth).body(), r#"scout_list_cache_total{result="stale"}"#);
         assert_eq!(after - before, 1, "stale hits moved by {}, want 1", after - before);
     }
     todo!("pending: metrics_test.go:~101 TestMetrics_countsStaleHits")
@@ -171,8 +175,8 @@ fn metrics_carries_no_account_or_service_detail() {
     // Enable when package 4 lands: move this body up and delete the wrapper.
     #[cfg(any())]
     fn pending() {
-        use crate::deps::Deps;
         use crate::config::DebridService;
+        use crate::deps::Deps;
         let deps = Deps::for_test(|d| d.metrics_token = Some(METRICS_TOKEN.to_owned()));
         get(&deps, &format!("/{}/stream/movie/tt1234567.json", crate::tests::ticket::valid_blob()), &[]);
         let auth = [("authorization", &format!("Bearer {METRICS_TOKEN}") as &str)];

@@ -22,11 +22,22 @@ fn rank_streams_a_spin_off_or_another_episode_sinks_below_the_show() {
     ];
     let ranked = rank_streams(
         &streams,
-        RankFilters { result_cap: 10, show_tokens: title_tokens("Pokémon"), episode: Some([1, 1]), ..Default::default() },
+        RankFilters {
+            result_cap: 10,
+            show_tokens: title_tokens("Pokémon"),
+            episode: Some([1, 1]),
+            ..Default::default()
+        },
     );
     let got = titles(&ranked);
-    assert_eq!(got[0], streams[4].title, "the 1997 show's own S01E01 must lead, uncached or not; got {got:?}");
-    assert_eq!(got[1], streams[5].title, "a season word and number between show and episode name neither; got {got:?}");
+    assert_eq!(
+        got[0], streams[4].title,
+        "the 1997 show's own S01E01 must lead, uncached or not; got {got:?}"
+    );
+    assert_eq!(
+        got[1], streams[5].title,
+        "a season word and number between show and episode name neither; got {got:?}"
+    );
 }
 
 #[test]

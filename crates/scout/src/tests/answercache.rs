@@ -12,7 +12,7 @@ mod pending_fixtures {
 
     use crate::config::Indexer;
     use crate::rank::RawStream;
-    use crate::scrape::{DoError, Scraper, ScrapeQuery};
+    use crate::scrape::{DoError, ScrapeQuery, Scraper};
     use crate::util::key_hash;
 
     // Go `askCountingScraper`: counts its asks and can be made to fail.
@@ -41,7 +41,11 @@ mod pending_fixtures {
             if self.fail {
                 return Err("indexer down".into());
             }
-            Ok(vec![RawStream { info_hash: "a".repeat(40), title: "Movie 1080p WEB-DL".into(), ..Default::default() }])
+            Ok(vec![RawStream {
+                info_hash: "a".repeat(40),
+                title: "Movie 1080p WEB-DL".into(),
+                ..Default::default()
+            }])
         }
         fn answer_key(&self) -> Option<String> {
             Some(key_hash(&self.base))
@@ -57,7 +61,11 @@ mod pending_fixtures {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = self.started.send(());
             self.release.notified().await;
-            Ok(vec![RawStream { info_hash: "b".repeat(40), title: "Shared 1080p WEB-DL".into(), ..Default::default() }])
+            Ok(vec![RawStream {
+                info_hash: "b".repeat(40),
+                title: "Shared 1080p WEB-DL".into(),
+                ..Default::default()
+            }])
         }
         fn answer_key(&self) -> Option<String> {
             Some(key_hash(&self.base))
@@ -80,23 +88,54 @@ async fn scrape_all_cached_keeps_answers_not_failures() {
     let movie = ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() };
 
     let calls = Arc::new(AtomicI32::new(0));
-    let up = AskCountingScraper { base: "https://torrentio.example".into(), calls: Arc::clone(&calls), fail: false };
+    let up = AskCountingScraper {
+        base: "https://torrentio.example".into(),
+        calls: Arc::clone(&calls),
+        fail: false,
+    };
     for _ in 0..2 {
-        let (out, ok, complete) =
-            scrape_all_cached(&[Arc::new(up.clone())], &movie, Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
+        let (out, ok, complete) = scrape_all_cached(
+            &[Arc::new(up.clone())],
+            &movie,
+            Duration::from_secs(1),
+            Some(cache.clone()),
+            Duration::from_secs(60),
+        )
+        .await;
         assert!(out.len() == 1 && ok && complete, "got {} releases, ok={ok} complete={complete}", out.len());
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "asked for one title more than once");
 
-    let episode = ScrapeQuery { kind: "series".into(), imdb: "tt1".into(), season: 1, episode: 2, has_ep: true, ..Default::default() };
-    scrape_all_cached(&[Arc::new(up.clone())], &episode, Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
+    let episode = ScrapeQuery {
+        kind: "series".into(),
+        imdb: "tt1".into(),
+        season: 1,
+        episode: 2,
+        has_ep: true,
+        ..Default::default()
+    };
+    scrape_all_cached(
+        &[Arc::new(up.clone())],
+        &episode,
+        Duration::from_secs(1),
+        Some(cache.clone()),
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(calls.load(Ordering::SeqCst), 2, "asked after another title: want 2");
 
     let failures = Arc::new(AtomicI32::new(0));
-    let down = AskCountingScraper { base: "https://down.example".into(), calls: Arc::clone(&failures), fail: true };
+    let down =
+        AskCountingScraper { base: "https://down.example".into(), calls: Arc::clone(&failures), fail: true };
     for _ in 0..2 {
-        let (_, ok, _) =
-            scrape_all_cached(&[Arc::new(down.clone())], &movie, Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
+        let (_, ok, _) = scrape_all_cached(
+            &[Arc::new(down.clone())],
+            &movie,
+            Duration::from_secs(1),
+            Some(cache.clone()),
+            Duration::from_secs(60),
+        )
+        .await;
         assert!(!ok, "a failed indexer reported an answer");
     }
     assert_eq!(failures.load(Ordering::SeqCst), 2, "a failing indexer must not have its failure kept");
@@ -141,7 +180,11 @@ async fn scrape_all_cached_coalesces_a_provider_question_in_flight() {
         assert_eq!(answer.len(), 1, "shared answer has {} releases, want 1", answer.len());
         got.push(answer);
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "same provider and title started more than one indexer request");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "same provider and title started more than one indexer request"
+    );
     got[0][0].title.clone_from(&"caller-local annotation".to_owned());
     assert_ne!(got[1][0].title, got[0][0].title, "shared callers received the same mutable RawStream slice");
 }
@@ -178,7 +221,8 @@ async fn scrape_all_cached_keeps_provider_identities_apart() {
         let query = query.clone();
         handles.push(tokio::spawn(async move {
             let cache: Arc<dyn crate::cache::Cache> = Arc::new(MemoryCache::new(1 << 20));
-            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60)).await;
+            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60))
+                .await;
         }));
     }
     started_rx.recv().await;
@@ -217,7 +261,13 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
         tokio::spawn(async move {
             tokio::time::timeout(
                 Duration::from_millis(50),
-                scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60)),
+                scrape_all_cached(
+                    &[up],
+                    &query,
+                    Duration::from_secs(1),
+                    Some(cache),
+                    Duration::from_secs(60),
+                ),
             )
             .await
             .ok()
@@ -230,7 +280,9 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
     let stayed = {
         let (up, query, cache) = (Arc::clone(&up), query.clone(), Arc::clone(&cache));
         tokio::spawn(async move {
-            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60)).await.0
+            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60))
+                .await
+                .0
         })
     };
     release.notify_waiters();
@@ -245,19 +297,28 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
 fn scrape_all_cached_does_not_start_detached_work_for_a_canceled_caller() {
     #[cfg(any())]
     async fn pending() {
-        use crate::tests::answercache::pending_fixtures::AskCountingScraper;
         use crate::scrape::{scrape_all_cached, ScrapeQuery};
+        use crate::tests::answercache::pending_fixtures::AskCountingScraper;
         use std::sync::atomic::{AtomicI32, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
 
         let calls = Arc::new(AtomicI32::new(0));
-        let up = AskCountingScraper { base: "https://configured.example/canceled".into(), calls: Arc::clone(&calls), fail: false };
+        let up = AskCountingScraper {
+            base: "https://configured.example/canceled".into(),
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
         let canceled = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await;
         assert!(canceled.is_err());
         let query = ScrapeQuery { kind: "movie".into(), imdb: "tt-canceled".into(), ..Default::default() };
-        let (out, ok, complete) = scrape_all_cached(&[Arc::new(up)], &query, Duration::from_secs(1), None, Duration::from_secs(60)).await;
-        assert!(out.is_empty() && !ok && !complete && calls.load(Ordering::SeqCst) == 0, "canceled scrape started work");
+        let (out, ok, complete) =
+            scrape_all_cached(&[Arc::new(up)], &query, Duration::from_secs(1), None, Duration::from_secs(60))
+                .await;
+        assert!(
+            out.is_empty() && !ok && !complete && calls.load(Ordering::SeqCst) == 0,
+            "canceled scrape started work"
+        );
     }
     todo!("pending: answercache_test.go TestScrapeAllCached_doesNotStartDetachedWorkForACanceledCaller")
 }

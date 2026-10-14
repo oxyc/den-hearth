@@ -18,7 +18,8 @@ use crate::ticket::TICKET_ROUTE;
 /// the handler reads as the config, not the empty one before it.
 pub(crate) fn redact_path(p: &str) -> String {
     match p {
-        "/" | "/configure" | "/configure/" | "/health" | "/metrics" | "/manifest.json" | "/config-key" | "/validate" => {
+        "/" | "/configure" | "/configure/" | "/health" | "/metrics" | "/manifest.json" | "/config-key"
+        | "/validate" => {
             return p.to_owned();
         }
         _ => {}
@@ -48,9 +49,19 @@ fn path_segment_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@' => {
-                out.push(char::from(b))
-            }
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b':'
+            | b'='
+            | b'@' => out.push(char::from(b)),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

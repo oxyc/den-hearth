@@ -25,7 +25,9 @@ pub(crate) struct TallyStore {
 
 impl TallyStore {
     pub(crate) fn calls(&self) -> i32 {
-        self.resolves.load(Ordering::SeqCst) + self.statuses.load(Ordering::SeqCst) + self.checks.load(Ordering::SeqCst)
+        self.resolves.load(Ordering::SeqCst)
+            + self.statuses.load(Ordering::SeqCst)
+            + self.checks.load(Ordering::SeqCst)
     }
 }
 
@@ -100,14 +102,25 @@ fn link_memo_mark_checked_keeps_the_mint_time() {
 // read-only target must land on the same entry /play reads.
 #[test]
 fn link_memo_key_scopes_by_account_and_file() {
-    let a = Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "one".to_owned() }], ..Default::default() };
-    let b = Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "two".to_owned() }], ..Default::default() };
+    let a = Config {
+        debrid: vec![DebridAccount { service: DebridService::TorBox, token: "one".to_owned() }],
+        ..Default::default()
+    };
+    let b = Config {
+        debrid: vec![DebridAccount { service: DebridService::TorBox, token: "two".to_owned() }],
+        ..Default::default()
+    };
     let hash = "a".repeat(40);
     let movie = ResolveTarget { info_hash: hash.clone(), file_idx: Some(0), ..Default::default() };
     assert!(link_memo_key(&a, &movie) != link_memo_key(&b, &movie), "two accounts share a memo key");
     let read_only = ResolveTarget { no_add: true, ..movie.clone() };
-    assert_eq!(link_memo_key(&a, &movie), link_memo_key(&a, &read_only), "the probe's NoAdd target keys differently from /play's");
-    let ep1 = ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
+    assert_eq!(
+        link_memo_key(&a, &movie),
+        link_memo_key(&a, &read_only),
+        "the probe's NoAdd target keys differently from /play's"
+    );
+    let ep1 =
+        ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
     let ep2 = ResolveTarget { info_hash: hash, season: Some(1), episode: Some(2), ..Default::default() };
     assert!(link_memo_key(&a, &ep1) != link_memo_key(&a, &ep2), "two episodes of one pack share a memo key");
 }
@@ -122,15 +135,38 @@ fn play_memo_serves_a_repeat_with_no_upstream_calls() {
     fn pending() {
         use crate::deps::Deps;
         use crate::handler::serve;
-        let store = Arc::new(TallyStore { svc: DebridService::TorBox, resolve: Box::new(numbered_links), resolves: AtomicI32::new(0), statuses: AtomicI32::new(0), checks: AtomicI32::new(0) });
-        let deps = Deps::for_test(|d| d.make_stores = Box::new({ let s = store.clone(); move |_| vec![s.clone()] }));
-        let path = format!("/{}/play/{}", crate::tests::ticket::valid_blob(), encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let store = Arc::new(TallyStore {
+            svc: DebridService::TorBox,
+            resolve: Box::new(numbered_links),
+            resolves: AtomicI32::new(0),
+            statuses: AtomicI32::new(0),
+            checks: AtomicI32::new(0),
+        });
+        let deps = Deps::for_test(|d| {
+            d.make_stores = Box::new({
+                let s = store.clone();
+                move |_| vec![s.clone()]
+            })
+        });
+        let path = format!(
+            "/{}/play/{}",
+            crate::tests::ticket::valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
 
         let first = serve(&deps, get(&path));
         assert_eq!(first.status(), 302, "first play");
         let before = store.calls();
         let second = serve(&deps, get(&path));
-        assert!(second.status() == 302 && second.headers()["location"] == first.headers()["location"], "repeat play: {} want 302 to the first link", second.status());
+        assert!(
+            second.status() == 302 && second.headers()["location"] == first.headers()["location"],
+            "repeat play: {} want 302 to the first link",
+            second.status()
+        );
         assert_eq!(store.calls() - before, 0, "a memo hit made store calls, want 0");
     }
     todo!("pending: linkmemo_test.go:~106 TestPlay_memoServesARepeatWithNoUpstreamCalls")
@@ -145,16 +181,49 @@ fn play_fresh_bypasses_and_replaces_the_memo() {
     fn pending() {
         use crate::deps::Deps;
         use crate::handler::serve;
-        let store = Arc::new(TallyStore { svc: DebridService::TorBox, resolve: Box::new(numbered_links), resolves: AtomicI32::new(0), statuses: AtomicI32::new(0), checks: AtomicI32::new(0) });
-        let deps = Deps::for_test(|d| d.make_stores = Box::new({ let s = store.clone(); move |_| vec![s.clone()] }));
-        let path = format!("/{}/play/{}", crate::tests::ticket::valid_blob(), encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let store = Arc::new(TallyStore {
+            svc: DebridService::TorBox,
+            resolve: Box::new(numbered_links),
+            resolves: AtomicI32::new(0),
+            statuses: AtomicI32::new(0),
+            checks: AtomicI32::new(0),
+        });
+        let deps = Deps::for_test(|d| {
+            d.make_stores = Box::new({
+                let s = store.clone();
+                move |_| vec![s.clone()]
+            })
+        });
+        let path = format!(
+            "/{}/play/{}",
+            crate::tests::ticket::valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
 
         let rr = serve(&deps, get(&path));
-        assert_eq!(rr.headers()["location"], "https://cdn.example/minted-1.mkv", "first play: {}", rr.status());
+        assert_eq!(
+            rr.headers()["location"],
+            "https://cdn.example/minted-1.mkv",
+            "first play: {}",
+            rr.status()
+        );
         let rr = serve(&deps, get(&format!("{path}?fresh=1")));
-        assert_eq!(rr.headers()["location"], "https://cdn.example/minted-2.mkv", "fresh play did not mint a new link: {}", rr.status());
+        assert_eq!(
+            rr.headers()["location"],
+            "https://cdn.example/minted-2.mkv",
+            "fresh play did not mint a new link: {}",
+            rr.status()
+        );
         let rr = serve(&deps, get(&path));
-        assert_eq!(rr.headers()["location"], "https://cdn.example/minted-2.mkv", "the fresh link did not replace the memo");
+        assert_eq!(
+            rr.headers()["location"],
+            "https://cdn.example/minted-2.mkv",
+            "the fresh link did not replace the memo"
+        );
         assert_eq!(store.resolves.load(Ordering::SeqCst), 2, "resolves");
     }
     todo!("pending: linkmemo_test.go:~128 TestPlay_freshBypassesAndReplacesTheMemo")
@@ -172,19 +241,43 @@ fn play_fresh_drops_the_old_link_even_when_the_resolve_fails() {
         use crate::handler::serve;
         let store = Arc::new(TallyStore {
             svc: DebridService::TorBox,
-            resolve: Box::new(|n| if n == 1 { numbered_links(n) } else { Err(StoreError::DeadLink(DeadLinkError { reason: "gone".to_owned() })) }),
+            resolve: Box::new(|n| {
+                if n == 1 {
+                    numbered_links(n)
+                } else {
+                    Err(StoreError::DeadLink(DeadLinkError { reason: "gone".to_owned() }))
+                }
+            }),
             resolves: AtomicI32::new(0),
             statuses: AtomicI32::new(0),
             checks: AtomicI32::new(0),
         });
-        let deps = Deps::for_test(|d| d.make_stores = Box::new({ let s = store.clone(); move |_| vec![s.clone()] }));
-        let path = format!("/{}/play/{}", crate::tests::ticket::valid_blob(), encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let deps = Deps::for_test(|d| {
+            d.make_stores = Box::new({
+                let s = store.clone();
+                move |_| vec![s.clone()]
+            })
+        });
+        let path = format!(
+            "/{}/play/{}",
+            crate::tests::ticket::valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
 
         serve(&deps, get(&path));
         let rr = serve(&deps, get(&format!("{path}?fresh=1")));
         assert_eq!(rr.status(), 404, "fresh play");
         let rr = serve(&deps, get(&path));
-        assert_ne!(rr.status(), 302, "the link the client reported as unopenable was served again: {:?}", rr.headers().get("location"));
+        assert_ne!(
+            rr.status(),
+            302,
+            "the link the client reported as unopenable was served again: {:?}",
+            rr.headers().get("location")
+        );
     }
     todo!("pending: linkmemo_test.go:~153 TestPlay_freshDropsTheOldLinkEvenWhenTheResolveFails")
 }
@@ -200,13 +293,32 @@ fn play_a_failed_resolve_is_not_memoised() {
         use crate::handler::serve;
         let store = Arc::new(TallyStore {
             svc: DebridService::TorBox,
-            resolve: Box::new(|n| if n == 1 { Err(StoreError::DeadLink(DeadLinkError { reason: "not yet".to_owned() })) } else { numbered_links(n) }),
+            resolve: Box::new(|n| {
+                if n == 1 {
+                    Err(StoreError::DeadLink(DeadLinkError { reason: "not yet".to_owned() }))
+                } else {
+                    numbered_links(n)
+                }
+            }),
             resolves: AtomicI32::new(0),
             statuses: AtomicI32::new(0),
             checks: AtomicI32::new(0),
         });
-        let deps = Deps::for_test(|d| d.make_stores = Box::new({ let s = store.clone(); move |_| vec![s.clone()] }));
-        let path = format!("/{}/play/{}", crate::tests::ticket::valid_blob(), encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let deps = Deps::for_test(|d| {
+            d.make_stores = Box::new({
+                let s = store.clone();
+                move |_| vec![s.clone()]
+            })
+        });
+        let path = format!(
+            "/{}/play/{}",
+            crate::tests::ticket::valid_blob(),
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
 
         assert_eq!(serve(&deps, get(&path)).status(), 404, "first play");
         assert_eq!(serve(&deps, get(&path)).status(), 302, "second play, from a second resolve");
@@ -227,13 +339,31 @@ fn probe_behind_fills_the_link_memo_for_play() {
         use crate::handler::{probe_job, Handler};
         // Go httptest.NewServer + http.ServeFile of testdata/tracks.mkv, as a loopback CDN.
         let cdn = loopback_cdn_serving("testdata/tracks.mkv");
-        let store = Arc::new(TallyStore { svc: DebridService::TorBox, resolve: Box::new(move |_| Ok(format!("{cdn}/tracks.mkv"))), resolves: AtomicI32::new(0), statuses: AtomicI32::new(0), checks: AtomicI32::new(0) });
-        let h = Handler { deps: Deps::for_test(|d| { d.probe_client = Some(cdn.client()); d.make_stores = Box::new({ let s = store.clone(); move |_| vec![s.clone()] }); }) };
-        let config = crate::config::decode_config(None, &crate::tests::ticket::valid_blob()).expect("validBlob did not decode");
+        let store = Arc::new(TallyStore {
+            svc: DebridService::TorBox,
+            resolve: Box::new(move |_| Ok(format!("{cdn}/tracks.mkv"))),
+            resolves: AtomicI32::new(0),
+            statuses: AtomicI32::new(0),
+            checks: AtomicI32::new(0),
+        });
+        let h = Handler {
+            deps: Deps::for_test(|d| {
+                d.probe_client = Some(cdn.client());
+                d.make_stores = Box::new({
+                    let s = store.clone();
+                    move |_| vec![s.clone()]
+                });
+            }),
+        };
+        let config = crate::config::decode_config(None, &crate::tests::ticket::valid_blob())
+            .expect("validBlob did not decode");
         let hash = "a".repeat(40);
         let target = ResolveTarget { info_hash: hash.clone(), file_idx: Some(0), ..Default::default() };
         let probe_target = ResolveTarget { no_add: true, ..target.clone() };
-        h.probe_behind(&config, vec![probe_job(format!("probe:v1:{hash}:0"), vec![DebridService::TorBox], probe_target)]);
+        h.probe_behind(
+            &config,
+            vec![probe_job(format!("probe:v1:{hash}:0"), vec![DebridService::TorBox], probe_target)],
+        );
 
         let deadline = SystemTime::now() + Duration::from_secs(5);
         while h.links.get(&link_memo_key(&config, &target), SystemTime::now()).is_none() {
@@ -241,8 +371,16 @@ fn probe_behind_fills_the_link_memo_for_play() {
             std::thread::sleep(Duration::from_millis(10));
         }
         let before = store.calls();
-        let rr = h.serve(get(&format!("/{}/play/{}", crate::tests::ticket::valid_blob(), encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() }))));
-        assert!(rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/tracks.mkv"), "play: {} want 302 to the probe's link", rr.status());
+        let rr = h.serve(get(&format!(
+            "/{}/play/{}",
+            crate::tests::ticket::valid_blob(),
+            encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })
+        )));
+        assert!(
+            rr.status() == 302 && rr.headers()["location"] == format!("{cdn}/tracks.mkv"),
+            "play: {} want 302 to the probe's link",
+            rr.status()
+        );
         assert_eq!(store.calls() - before, 0, "play re-asked the store for a link the probe had just minted");
     }
     todo!("pending: linkmemo_test.go:~200 TestProbeBehind_fillsTheLinkMemoForPlay")

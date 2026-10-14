@@ -59,7 +59,11 @@ fn log_requests_setting() {
         for (v, want) in [("", false), ("0", false), ("1", true), ("true", true), ("yes", true)] {
             let s = settings_from_env(|k| if k == "LOG_REQUESTS" { v.to_owned() } else { String::new() });
             let d = build_deps(&s, None, MemoryCache::new(1 << 10));
-            assert!(s.log_requests == want && d.log_requests == want, "LOG_REQUESTS={v:?}: got {}, want {want}", s.log_requests);
+            assert!(
+                s.log_requests == want && d.log_requests == want,
+                "LOG_REQUESTS={v:?}: got {}, want {want}",
+                s.log_requests
+            );
         }
     }
     todo!("pending: reqlog_test.go:~59 TestLogRequestsSetting")
@@ -82,11 +86,21 @@ fn request_log() {
         let deps = Deps::for_test(|d| d.log_requests = true);
         let out = capture_log(|| {
             get(&deps, "/health", &[]);
-            get(&deps, &format!("/{}/play/tok-secret?probe=1&token=query-secret", crate::tests::ticket::valid_blob()), &[]);
+            get(
+                &deps,
+                &format!(
+                    "/{}/play/tok-secret?probe=1&token=query-secret",
+                    crate::tests::ticket::valid_blob()
+                ),
+                &[],
+            );
         });
         // One line per response, in the shape `<METHOD> <redacted path> <status> <ms>ms`.
         assert!(has_line(&out, "GET /health 200 ", "ms"), "no line for /health in:\n{out}");
-        assert!(has_line(&out, "GET /<config>/play/<token> 400 ", "ms"), "no line for the play route in:\n{out}");
+        assert!(
+            has_line(&out, "GET /<config>/play/<token> 400 ", "ms"),
+            "no line for the play route in:\n{out}"
+        );
         for leak in [crate::tests::ticket::valid_blob().as_str(), "tok-secret", "query-secret", "probe"] {
             assert!(!out.contains(leak), "the request log carried {leak:?}:\n{out}");
         }
@@ -111,8 +125,14 @@ fn request_log_carries_the_request_id() {
             get(&deps, "/configure", &[("X-Request-Id", " \n<>")]);
         });
         // The id is cut to [A-Za-z0-9_-] and then to 32 characters.
-        assert!(has_line(&out, "GET /health 200 ", "ms rid=a1B2-c3_d4"), "rid line for /health missing:\n{out}");
-        assert!(out.contains("rid=xyGETconfigplay2000mszzzzzzzzzzz"), "rid line for /manifest.json missing:\n{out}");
+        assert!(
+            has_line(&out, "GET /health 200 ", "ms rid=a1B2-c3_d4"),
+            "rid line for /health missing:\n{out}"
+        );
+        assert!(
+            out.contains("rid=xyGETconfigplay2000mszzzzzzzzzzz"),
+            "rid line for /manifest.json missing:\n{out}"
+        );
         assert!(has_line(&out, "GET /config-key ", "ms"), "config-key line missing:\n{out}");
         assert!(!out.contains("<config>/play"), "a request id forged a line:\n{out}");
     }

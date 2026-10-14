@@ -21,8 +21,8 @@ use tokio::time::{timeout_at, Instant as TokioInstant};
 use crate::cache::CacheClass;
 use crate::config::{Config, DebridService};
 use crate::handler::{
-    err_out, lock, marshal, spawn_background, write_json, Inner, Out, RankOpts, RankedList, Req, LIST_BUILD_SLACK,
-    MAX_SEEDS, NO_STORE,
+    err_out, lock, marshal, spawn_background, write_json, Inner, Out, RankOpts, RankedList, Req,
+    LIST_BUILD_SLACK, MAX_SEEDS, NO_STORE,
 };
 use crate::id::StreamId;
 use crate::metrics::metrics;
@@ -169,7 +169,12 @@ impl Inner {
     /// covers a nonempty scrape whose surviving releases were all removed by the viewer's filters.
     pub(crate) fn record_list_verdict(&self, key: &str, list: &RankedList) {
         if !list.degraded.is_empty() || (list.ranked.is_empty() && !list.complete) {
-            self.deps.cache.put_class(key, VERDICT_UNDETERMINED, AVAILABILITY_RETRY_AFTER, CacheClass::Volatile);
+            self.deps.cache.put_class(
+                key,
+                VERDICT_UNDETERMINED,
+                AVAILABILITY_RETRY_AFTER,
+                CacheClass::Volatile,
+            );
             return;
         }
         self.record_verdict(key, !list.ranked.is_empty());
@@ -205,7 +210,12 @@ impl Inner {
         });
     }
 
-    async fn rank_availability(self: &Arc<Self>, deadline: TokioInstant, config: &Config, sid: &StreamId) -> RankedList {
+    async fn rank_availability(
+        self: &Arc<Self>,
+        deadline: TokioInstant,
+        config: &Config,
+        sid: &StreamId,
+    ) -> RankedList {
         // No rid: this runs detached from any request (checkBehind), well after the one that triggered it has
         // answered. The rank decision line simply omits it, like reqlog.go's own line does when one is absent.
         let opts = || RankOpts { client: None, check_cache: false, rid: "" };
@@ -227,7 +237,10 @@ impl Inner {
             let hashes: Vec<String> = list.ranked[start..end].iter().map(|s| s.info_hash.clone()).collect();
             let (truth, ok) = match timeout_at(deadline, pool.cache_check(&hashes)).await {
                 Ok(answer) => answer,
-                Err(_) => (CacheTruth { holders: Default::default(), known: Default::default(), complete: false }, false),
+                Err(_) => (
+                    CacheTruth { holders: Default::default(), known: Default::default(), complete: false },
+                    false,
+                ),
             };
             for (i, hash) in hashes.iter().enumerate() {
                 if truth.cached(hash) {

@@ -33,29 +33,29 @@ use crate::loglimit::log_limited;
 use crate::metrics::metrics;
 use crate::scrape::{DoError, Doer};
 use crate::season::{
-    ambiguous_episode_guess, is_feature_sized, largest_episode_candidate, largest_playable, pick_episode_file,
-    TorrentFile,
+    ambiguous_episode_guess, is_feature_sized, largest_episode_candidate, largest_playable,
+    pick_episode_file, TorrentFile,
 };
 use crate::stores::refusal::{
     account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, backed_off, batches_failed,
-    cache_or_none, canonical_torbox_identity, clear, is_cancellation, is_torrent_gone, known_cached, live, note_add_attempt,
-    note_unknown_outcome, record_refusal, record_refusal_for, refusal_is_about_the_account, remember_cached,
-    resolve_key, settle_add_attempt, torbox_account_identity, torrent_id_key, torrent_miss_key, transport_error,
-    transport_kind, unknown_outcome, TORRENT_MISS_TTL,
+    cache_or_none, canonical_torbox_identity, clear, is_cancellation, is_torrent_gone, known_cached, live,
+    note_add_attempt, note_unknown_outcome, record_refusal, record_refusal_for, refusal_is_about_the_account,
+    remember_cached, resolve_key, settle_add_attempt, torbox_account_identity, torrent_id_key,
+    torrent_miss_key, transport_error, transport_kind, unknown_outcome, TORRENT_MISS_TTL,
 };
 use crate::util::{go_to_lower, key_hash, Shape, LEAF};
 
-pub(crate) use listing::{decode_listing, ListingFault, TruncationDetector};
 use super::{
-    build_request, dead_link, encode_form, join_all, magnet_for, read_limited,
-    read_store_error, redact_token, short_hash, store_error_text, store_refused_us, torbox_fetch_state as fetch_state,
+    build_request, dead_link, encode_form, join_all, magnet_for, read_limited, read_store_error,
+    redact_token, short_hash, store_error_text, store_refused_us, torbox_fetch_state as fetch_state,
     unavailable,
 };
+use crate::util::{scoped, DetachedFlight};
+pub(crate) use listing::{decode_listing, ListingFault, TruncationDetector};
 use support::{
     envelope, first_value, int_or_zero, lock, no_file_list, opt_bool, opt_float, opt_int, opt_string,
     string_or_empty, torrent_gone, would_add, GaugeGuard,
 };
-use crate::util::{scoped, DetachedFlight};
 
 /// Go `torboxAPI`.
 pub const TORBOX_API: &str = "https://api.torbox.app/v1/api";
@@ -296,7 +296,11 @@ impl Drop for UnwrittenId<'_> {
         }
         if let Some(cache) = &self.store.cache {
             let identity = self.store.account_identity();
-            cache.put(&torrent_id_key(&identity, self.info_hash), &self.torrent_id.to_string(), RESOLVE_CACHE_TTL);
+            cache.put(
+                &torrent_id_key(&identity, self.info_hash),
+                &self.torrent_id.to_string(),
+                RESOLVE_CACHE_TTL,
+            );
             clear_torbox_status(cache.as_ref(), &identity, self.info_hash);
         }
     }
@@ -316,8 +320,13 @@ impl TorBoxStore {
     /// Go `torBoxStore.get`.
     async fn get(&self, u: &str) -> Result<Reply, DoError> {
         let auth = format!("Bearer {}", self.token);
-        let req = build_request(reqwest::Method::GET, u, &[("authorization", &auth), ("accept", "application/json")], None)
-            .map_err(|e| DoError::from(e.to_string()))?;
+        let req = build_request(
+            reqwest::Method::GET,
+            u,
+            &[("authorization", &auth), ("accept", "application/json")],
+            None,
+        )
+        .map_err(|e| DoError::from(e.to_string()))?;
         self.send(req).await
     }
 
@@ -346,7 +355,11 @@ impl TorBoxStore {
 
     /// Go `torBoxStore.fetchCached`: one checkcached round, bounded by the outbound limiter.
     pub(crate) async fn fetch_cached(&self, hashes: &[String]) -> TorboxCheckResult {
-        let u = format!("{}/torrents/checkcached?hash={}&format=object&list_files=false", self.api, hashes.join(","));
+        let u = format!(
+            "{}/torrents/checkcached?hash={}&format=object&list_files=false",
+            self.api,
+            hashes.join(",")
+        );
         let Ok(mut reply) = self.get(&u).await else {
             return TorboxCheckResult::default();
         };
@@ -421,7 +434,11 @@ impl TorBoxStore {
             let batcher = match batchers.get(&key) {
                 Some(b) => Some(b.clone()),
                 None if batchers.len() < MAX_BATCHERS => {
-                    let b = Arc::new(Batcher { store: self.clone(), queue: Mutex::new(Vec::new()), full: Notify::new() });
+                    let b = Arc::new(Batcher {
+                        store: self.clone(),
+                        queue: Mutex::new(Vec::new()),
+                        full: Notify::new(),
+                    });
                     batchers.insert(key.clone(), b.clone());
                     tokio::spawn(b.clone().run(key));
                     Some(b)
@@ -444,7 +461,11 @@ impl TorBoxStore {
     }
 
     /// Go `torBoxStore.requestDownload`: asks TorBox for the playable link of one file of a torrent.
-    pub(crate) async fn request_download(&self, torrent_id: i64, file_id: Option<i64>) -> Result<String, StoreError> {
+    pub(crate) async fn request_download(
+        &self,
+        torrent_id: i64,
+        file_id: Option<i64>,
+    ) -> Result<String, StoreError> {
         let id = torrent_id.to_string();
         let file = file_id.map(|f| f.to_string());
         let mut q = vec![("token", self.token.as_str()), ("torrent_id", id.as_str())];
@@ -490,7 +511,11 @@ impl TorBoxStore {
             // acceptance criterion.
             let detail = reply.detail(&self.token).await;
             if store_refused_us(status) {
-                return Err(unavailable(DebridService::TorBox, format!("requestdl http {status}{detail}"), status));
+                return Err(unavailable(
+                    DebridService::TorBox,
+                    format!("requestdl http {status}{detail}"),
+                    status,
+                ));
             }
             return Err(dead_link(format!("torbox requestdl http {status}{detail}")));
         }
@@ -709,7 +734,11 @@ impl TorBoxStore {
         let status = reply.status();
         if status != 200 {
             let detail = reply.detail(&self.token).await;
-            return Err(unavailable(DebridService::TorBox, format!("getqueued http {status}{detail}"), status));
+            return Err(unavailable(
+                DebridService::TorBox,
+                format!("getqueued http {status}{detail}"),
+                status,
+            ));
         }
         static ENTRY: Shape = Shape::Object(&[("id", &LEAF), ("hash", &LEAF)]);
         static ENTRIES: Shape = Shape::Array(&ENTRY);
@@ -778,7 +807,12 @@ impl TorBoxStore {
     /// bare success flag. Any non-2xx, or a 2xx carrying success:false, is a service refusal (503) — never
     /// silently swallowed, since a cancel the caller believes happened would leave a torrent running against
     /// the account's slot, and the memo cleared under it.
-    async fn control_request(&self, path: &str, metric: &str, form: &[(&str, &str)]) -> Result<(), StoreError> {
+    async fn control_request(
+        &self,
+        path: &str,
+        metric: &str,
+        form: &[(&str, &str)],
+    ) -> Result<(), StoreError> {
         let mut reply = match self.post(path, form).await {
             Ok(r) => r,
             Err(e) => {
@@ -795,12 +829,16 @@ impl TorBoxStore {
         };
         if !(200..300).contains(&status) {
             let detail = redact_token(&store_error_text(&raw), &self.token);
-            return Err(unavailable(DebridService::TorBox, format!("{metric} http {status}{detail}"), status));
+            return Err(unavailable(
+                DebridService::TorBox,
+                format!("{metric} http {status}{detail}"),
+                status,
+            ));
         }
         let refused = serde_json::from_slice::<Value>(&raw).ok().is_some_and(|v| {
-            v.as_object().and_then(|o| o.iter().find(|(k, _)| go_to_lower(k) == "success")).is_some_and(
-                |(_, s)| matches!(s, Value::Bool(false)),
-            )
+            v.as_object()
+                .and_then(|o| o.iter().find(|(k, _)| go_to_lower(k) == "success"))
+                .is_some_and(|(_, s)| matches!(s, Value::Bool(false)))
         });
         if refused {
             let detail = redact_token(&store_error_text(&raw), &self.token);
@@ -860,11 +898,13 @@ impl TorBoxStore {
             let detail = reply.detail(&self.token).await;
             return Err(unavailable(DebridService::TorBox, format!("user/me http {status}{detail}"), status));
         }
-        static DATA: Shape = Shape::Object(&[("plan", &LEAF), ("cooldown_until", &LEAF), ("premium_expires_at", &LEAF)]);
+        static DATA: Shape =
+            Shape::Object(&[("plan", &LEAF), ("cooldown_until", &LEAF), ("premium_expires_at", &LEAF)]);
         static SHAPE: Shape = Shape::Object(&[("success", &LEAF), ("data", &DATA)]);
         let unreadable = || unavailable(DebridService::TorBox, "user/me: unreadable body", 0);
         let body = reply.json(&SHAPE).await.ok_or_else(unreadable)?;
-        let data = body.as_object().and_then(|o| o.get("data")).and_then(Value::as_object).ok_or_else(unreadable)?;
+        let data =
+            body.as_object().and_then(|o| o.get("data")).and_then(Value::as_object).ok_or_else(unreadable)?;
         let plan = opt_int(data.get("plan")).map_err(|()| unreadable())?;
         let cooldown = opt_string(data.get("cooldown_until")).map_err(|()| unreadable())?;
         let expires = opt_string(data.get("premium_expires_at")).map_err(|()| unreadable())?;
@@ -935,7 +975,11 @@ impl TorBoxStore {
         let status = reply.status();
         if status != 200 {
             let detail = reply.detail(&self.token).await;
-            return Err(unavailable(DebridService::TorBox, format!("getqueued http {status}{detail}"), status));
+            return Err(unavailable(
+                DebridService::TorBox,
+                format!("getqueued http {status}{detail}"),
+                status,
+            ));
         }
         static SHAPE: Shape = Shape::Object(&[("success", &LEAF), ("data", &LEAF)]);
         let unreadable = || unavailable(DebridService::TorBox, "getqueued: unreadable body", 0);
@@ -1003,7 +1047,8 @@ impl TorBoxStore {
             }
             return (StoreStatus::default(), StatusAnswer::No);
         }
-        let Ok(mut reply) = self.get(&format!("{}/torrents/mylist?id={torrent_id}&bypass_cache=true", self.api)).await
+        let Ok(mut reply) =
+            self.get(&format!("{}/torrents/mylist?id={torrent_id}&bypass_cache=true", self.api)).await
         else {
             return (StoreStatus::default(), StatusAnswer::Unknown);
         };
@@ -1141,7 +1186,12 @@ impl TorBoxStore {
             // rediscover a queued torrent for the next fifteen seconds, on /play as well as the probe route.
             // The probe now runs on an eight-second budget, so this is easier to hit than it was.
             if authoritative {
-                self.cache().put_class(&torrent_miss_key(&identity, info_hash), "1", TORRENT_MISS_TTL, CacheClass::Volatile);
+                self.cache().put_class(
+                    &torrent_miss_key(&identity, info_hash),
+                    "1",
+                    TORRENT_MISS_TTL,
+                    CacheClass::Volatile,
+                );
             }
             return (0, false, authoritative);
         }
@@ -1248,23 +1298,30 @@ impl TorBoxStore {
         // caller's budget is a timeout around this whole call, which polls the answer before the clock.
         let store = self.clone();
         let memo_key = key.clone();
-        let (answer, _) = LISTING_FLIGHTS
-            .run(&key, move || async move {
-                let (ids, ok, persistent) = match tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing()).await {
-                    Ok(r) => r,
-                    Err(_) => (HashMap::new(), false, false),
-                };
-                if !ok {
-                    if persistent {
-                        store.cache().put_class(&format!("{memo_key}:oversized"), "1", LISTING_TTL, CacheClass::Volatile);
+        let (answer, _) =
+            LISTING_FLIGHTS
+                .run(&key, move || async move {
+                    // A fetch past the shared deadline is no answer: empty, not ok, not a persistent fault.
+                    let (ids, ok, persistent) =
+                        tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing())
+                            .await
+                            .unwrap_or((HashMap::new(), false, false));
+                    if !ok {
+                        if persistent {
+                            store.cache().put_class(
+                                &format!("{memo_key}:oversized"),
+                                "1",
+                                LISTING_TTL,
+                                CacheClass::Volatile,
+                            );
+                        }
+                        return None;
                     }
-                    return None;
-                }
-                let ids = Arc::new(ids);
-                put_cached_listing(store.cache.as_ref(), &memo_key, ids.clone());
-                Some(ids)
-            })
-            .await;
+                    let ids = Arc::new(ids);
+                    put_cached_listing(store.cache.as_ref(), &memo_key, ids.clone());
+                    Some(ids)
+                })
+                .await;
         match answer.flatten() {
             Some(ids) => (ids, true),
             None => unanswered(),
@@ -1303,7 +1360,8 @@ impl TorBoxStore {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
         let decode = tokio::task::spawn_blocking(move || {
             let reader = ChunkReader { rx, current: Vec::new(), pos: 0 };
-            let mut limited = TruncationDetector { r: reader.take(MAX_LISTING_BYTES as u64 + 1), limit: MAX_LISTING_BYTES };
+            let mut limited =
+                TruncationDetector { r: reader.take(MAX_LISTING_BYTES as u64 + 1), limit: MAX_LISTING_BYTES };
             let (ids, ok, fault) = decode_listing(&mut limited);
             (ids, ok, fault, limited.truncated())
         });
@@ -1436,7 +1494,10 @@ impl TorBoxStore {
         let entry = match ListEntry::read(&data) {
             Some(e) => {
                 if e.id != 0 && e.id != torrent_id {
-                    log_limited("mylist-other-id", &format!("torbox mylist {torrent_id}: answer named torrent {}", e.id));
+                    log_limited(
+                        "mylist-other-id",
+                        &format!("torbox mylist {torrent_id}: answer named torrent {}", e.id),
+                    );
                     return Err(no_file_list());
                 }
                 e
@@ -1454,7 +1515,10 @@ impl TorBoxStore {
                     _ => None,
                 };
                 let Some(arr) = arr else {
-                    log_limited("mylist-shape", &format!("torbox mylist {torrent_id}: answer is neither an object nor an array"));
+                    log_limited(
+                        "mylist-shape",
+                        &format!("torbox mylist {torrent_id}: answer is neither an object nor an array"),
+                    );
                     return Err(no_file_list());
                 };
                 if arr.is_empty() {
@@ -1545,7 +1609,11 @@ impl TorBoxStore {
                     // createtorrent had just handed us, so the next poll knew of no torrent and bought another
                     // one.
                     if let Some(cache) = &self.cache {
-                        cache.put(&torrent_id_key(&identity, &t.info_hash), &torrent_id.to_string(), RESOLVE_CACHE_TTL);
+                        cache.put(
+                            &torrent_id_key(&identity, &t.info_hash),
+                            &torrent_id.to_string(),
+                            RESOLVE_CACHE_TTL,
+                        );
                         clear_torbox_status(cache.as_ref(), &identity, &t.info_hash);
                     }
                     record_refusal(self.cache(), DebridService::TorBox, &identity, &t.info_hash, &err);
@@ -2153,7 +2221,8 @@ fn fold_entry_keys(mut data: Value, entry: &Shape, list: &Shape) -> Value {
     data
 }
 
-static LIST_FILES_FILE: Shape = Shape::Object(&[("id", &LEAF), ("name", &LEAF), ("short_name", &LEAF), ("size", &LEAF)]);
+static LIST_FILES_FILE: Shape =
+    Shape::Object(&[("id", &LEAF), ("name", &LEAF), ("short_name", &LEAF), ("size", &LEAF)]);
 static LIST_FILES_FILES: Shape = Shape::Array(&LIST_FILES_FILE);
 static LIST_FILES_ENTRY: Shape = Shape::Object(&[("id", &LEAF), ("files", &LIST_FILES_FILES)]);
 static LIST_FILES_ENTRIES: Shape = Shape::Array(&LIST_FILES_ENTRY);
@@ -2363,7 +2432,12 @@ impl Rfc3339 {
         let year = num(0, 4)? as i32;
         let (month, day) = (num(5, 2)?, num(8, 2)?);
         let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
-        if *b.get(4)? != b'-' || *b.get(7)? != b'-' || *b.get(10)? != b'T' || *b.get(13)? != b':' || *b.get(16)? != b':' {
+        if *b.get(4)? != b'-'
+            || *b.get(7)? != b'-'
+            || *b.get(10)? != b'T'
+            || *b.get(13)? != b':'
+            || *b.get(16)? != b':'
+        {
             return None;
         }
         let mut i = 19;
@@ -2389,7 +2463,11 @@ impl Rfc3339 {
                     return None;
                 }
                 let secs = (h * 3600 + m * 60) as i32;
-                if *sign == b'-' { -secs } else { secs }
+                if *sign == b'-' {
+                    -secs
+                } else {
+                    secs
+                }
             }
             _ => return None,
         };
@@ -2417,7 +2495,7 @@ impl Rfc3339 {
     }
 
     /// Go's `time.Time.MarshalJSON`: RFC 3339 with the fraction trimmed of trailing zeros, and `Z` for UTC.
-    pub(crate) fn to_rfc3339(&self) -> String {
+    pub(crate) fn to_rfc3339(self) -> String {
         let mut out = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
             self.year, self.month, self.day, self.hour, self.minute, self.second
@@ -2524,8 +2602,13 @@ impl Store for TorBoxStore {
         // batches that came back remembered, as Go's `g.Wait()` and `rememberCached` do after its goroutines have
         // all returned on the cancelled context.
         let answered: Mutex<Vec<Option<HashMap<String, bool>>>> = Mutex::new(vec![None; batches]);
-        let mut abandoned =
-            AbandonedCacheCheck { store: self, known: &result, hashes: &hashes, answered: &answered, armed: true };
+        let mut abandoned = AbandonedCacheCheck {
+            store: self,
+            known: &result,
+            hashes: &hashes,
+            answered: &answered,
+            armed: true,
+        };
         join_all(
             hashes
                 .chunks(CACHE_BATCH)
@@ -2816,9 +2899,10 @@ impl Store for TorBoxStore {
                 let _active = GaugeGuard::new(&metrics().torbox_status_active);
                 // Shared work cannot inherit one waiter's cancellation: another viewer may still need the
                 // answer.
-                let (status, answer) = tokio::time::timeout(SHARED_DEADLINE, store.status_answer_uncached(&target))
-                    .await
-                    .unwrap_or((StoreStatus::default(), StatusAnswer::Unknown));
+                let (status, answer) =
+                    tokio::time::timeout(SHARED_DEADLINE, store.status_answer_uncached(&target))
+                        .await
+                        .unwrap_or((StoreStatus::default(), StatusAnswer::Unknown));
                 let ttl = if answer == StatusAnswer::Unknown { UNKNOWN_STATUS_TTL } else { STATUS_TTL };
                 let shared = CachedStatus::new(status, answer);
                 if answer != StatusAnswer::Unknown {
@@ -2861,7 +2945,10 @@ impl Store for TorBoxStore {
     }
 
     fn scout_budget_spent(&self) -> Option<bool> {
-        Some(global_add_budget().remaining(&budget_account(DebridService::TorBox, &self.account_identity())) <= 0)
+        Some(
+            global_add_budget().remaining(&budget_account(DebridService::TorBox, &self.account_identity()))
+                <= 0,
+        )
     }
 
     fn account_refused(&self) -> Option<String> {
@@ -2917,7 +3004,11 @@ impl TorBoxStore {
         let (torrent_id, ok, authoritative) = self.torrent_id(info_hash).await;
         if !ok {
             if !authoritative {
-                return Err(unavailable(DebridService::TorBox, "could not confirm this account's listing", 0));
+                return Err(unavailable(
+                    DebridService::TorBox,
+                    "could not confirm this account's listing",
+                    0,
+                ));
             }
             return Ok(CancelOutcome { reason: "not_queued".to_owned(), ..Default::default() });
         }
@@ -2943,7 +3034,8 @@ impl TorBoxStore {
             // cancel ever reached TorBox, so the stalled torrent outlived every episode that tried the next
             // release instead. A healthy (not stalled) torrent with no marker is still refused — this is not a
             // general ownership override, only a drain for dead weight.
-            let Some(state) = entry.download_state.as_deref().filter(|s| fetch_state(s) == FETCH_STALLED) else {
+            let Some(state) = entry.download_state.as_deref().filter(|s| fetch_state(s) == FETCH_STALLED)
+            else {
                 return Ok(CancelOutcome { reason: "not_ours".to_owned(), ..Default::default() });
             };
             log_limited(

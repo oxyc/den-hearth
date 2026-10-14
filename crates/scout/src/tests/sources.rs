@@ -38,12 +38,12 @@ fn normalize_sources() {
 // every other field there.
 #[test]
 fn decode_config_carries_sources() {
-        use crate::config::decode_config;
-        use crate::tests::core::blob;
+    use crate::config::decode_config;
+    use crate::tests::core::blob;
 
-        let c = decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"sources":["https://mf.example/cfg/manifest.json","http://nope.example"]}"#))
+    let c = decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"sources":["https://mf.example/cfg/manifest.json","http://nope.example"]}"#))
             .expect("config decodes");
-        assert!(c.sources.len() == 1 && c.sources[0] == "https://mf.example/cfg", "config = {c:?}");
+    assert!(c.sources.len() == 1 && c.sources[0] == "https://mf.example/cfg", "config = {c:?}");
 }
 
 #[test]
@@ -128,8 +128,17 @@ fn source_client_refuses_a_non_public_address() {
         // And a scraper asking it reports the refusal once, without spending the budget on retries.
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let sc = StremioScraper::for_test(url, &calls);
-        assert!(sc.scrape(&crate::scrape::ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() }).await.is_err()
-            && calls.load(std::sync::atomic::Ordering::SeqCst) == 1, "want one refused request");
+        assert!(
+            sc.scrape(&crate::scrape::ScrapeQuery {
+                kind: "movie".into(),
+                imdb: "tt1".into(),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+                && calls.load(std::sync::atomic::Ordering::SeqCst) == 1,
+            "want one refused request"
+        );
     }
     todo!("pending: sources_test.go TestSourceClient_refusesANonPublicAddress")
 }
@@ -143,11 +152,18 @@ fn make_scrapers_asks_household_sources_through_the_guarded_client() {
         use crate::scrape::make_scrapers;
 
         // Go: plain, guarded := mockDoer{}, mockDoer{fn: ...200 "{}"}
-        let cfg = Config { indexers: vec![Indexer::Torrentio], sources: vec!["https://mf.example/cfg".into()], ..Default::default() };
+        let cfg = Config {
+            indexers: vec![Indexer::Torrentio],
+            sources: vec!["https://mf.example/cfg".into()],
+            ..Default::default()
+        };
         let got = make_scrapers(&cfg, &plain_doer(), &guarded_doer(), None);
         assert_eq!(got.len(), 2, "scrapers = {}", got.len());
         let own = &got[0];
-        assert!(own.id() == Indexer::OwnSources && own.base_url() == "https://mf.example/cfg", "household source scraper");
+        assert!(
+            own.id() == Indexer::OwnSources && own.base_url() == "https://mf.example/cfg",
+            "household source scraper"
+        );
         assert!(own.uses_guarded_client(), "a household source must be fetched with the guarded client");
         assert_eq!(own.name(), "own source mf.example");
     }
@@ -228,13 +244,17 @@ async fn source_client_refuses_a_name_that_resolves_to_a_non_public_address() {
     use crate::sources::{new_source_client, ERR_NOT_PUBLIC};
 
     // `localhost` resolves to the loopback, and nothing in the config check is what stops it here.
-    let err = new_source_client().do_request(get("https://localhost:1/manifest.json")).await.expect_err("refused");
+    let err =
+        new_source_client().do_request(get("https://localhost:1/manifest.json")).await.expect_err("refused");
     assert_eq!(err.to_string(), ERR_NOT_PUBLIC, "a name resolving to loopback was not refused");
 }
 
 #[test]
 fn source_redirects_are_judged_on_every_hop() {
-    use crate::sources::{redirect_verdict, RedirectVerdict::{Follow, Refuse, Stop}};
+    use crate::sources::{
+        redirect_verdict,
+        RedirectVerdict::{Follow, Refuse, Stop},
+    };
 
     let cases = [
         ("https://example.com/next", 1, Follow, "an ordinary hop"),
@@ -258,10 +278,20 @@ fn source_redirects_are_judged_on_every_hop() {
 
 #[test]
 fn normalize_sources_refuses_what_go_does_not_read_as_a_plain_https_url() {
-    for link in ["https://@host.example/cfg", "https:host.example/cfg", "HTTP://host.example/cfg", "https://", "https:///cfg"] {
+    for link in [
+        "https://@host.example/cfg",
+        "https:host.example/cfg",
+        "HTTP://host.example/cfg",
+        "https://",
+        "https:///cfg",
+    ] {
         let got = crate::sources::normalize_sources(&[link.to_owned()]);
         assert!(got.is_empty(), "{link:?} was kept as {got:?}");
     }
     let got = crate::sources::normalize_sources(&["HTTPS://host.example/cfg".to_owned()]);
-    assert_eq!(got, ["HTTPS://host.example/cfg"], "Go keeps the link as it was written when the scheme is upper-case");
+    assert_eq!(
+        got,
+        ["HTTPS://host.example/cfg"],
+        "Go keeps the link as it was written when the scheme is upper-case"
+    );
 }

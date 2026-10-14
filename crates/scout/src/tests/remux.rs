@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use crate::handler::new_handler;
 use crate::tests::availability::sealed_config;
-use crate::tests::handler::{body_str, first_play_path, get, test_deps, test_iid, ticket_keyring, TICKET_CFG};
+use crate::tests::handler::{
+    body_str, first_play_path, get, test_deps, test_iid, ticket_keyring, TICKET_CFG,
+};
 
 /// Go `TestRemuxTicket_preservesScopedAdmissionAndRevocation`: a scoped config's play tickets keep its admission
 /// (the remux key) and its revocation, with and without an install id.
@@ -45,7 +47,11 @@ async fn remux_ticket_preserves_scoped_admission_and_revocation() {
                 d.require_install_id = true;
             });
             revoked.revoked_installs.insert(iid.to_owned());
-            assert_eq!(get(&new_handler(revoked), &play, &headers).await.status(), 400, "revoked scoped ticket");
+            assert_eq!(
+                get(&new_handler(revoked), &play, &headers).await.status(),
+                400,
+                "revoked scoped ticket"
+            );
         }
     }
 }
@@ -65,8 +71,17 @@ async fn remux_key_lets_a_scoped_config_list_and_play() {
 
     assert_eq!(get(&h, &path, &[]).await.status(), 403, "scoped, no key");
     let rr = get(&h, &path, &with_key).await;
-    assert!(rr.status() == 200 && body_str(&rr).contains("/p/"), "scoped + key: {} {}, want a list of tickets", rr.status(), body_str(&rr));
-    assert_eq!(get(&h, &path, &[]).await.status(), 403, "scoped, no key, after a keyed build: the keyed list is cached apart");
+    assert!(
+        rr.status() == 200 && body_str(&rr).contains("/p/"),
+        "scoped + key: {} {}, want a list of tickets",
+        rr.status(),
+        body_str(&rr)
+    );
+    assert_eq!(
+        get(&h, &path, &[]).await.status(),
+        403,
+        "scoped, no key, after a keyed build: the keyed list is cached apart"
+    );
     assert_eq!(get(&h, &path, &[("X-Den-Remux-Key", "wrong")]).await.status(), 403, "scoped, wrong key");
 }
 
@@ -77,6 +92,14 @@ async fn remux_key_off_by_default() {
     let scoped = sealed_config(&kr, &format!("{TICKET_CFG},\"scope\":\"availability\"}}"));
     let full = sealed_config(&kr, &format!("{TICKET_CFG}}}"));
     let h = new_handler(test_deps(|d| d.seal_keyring = Some(Arc::new(ticket_keyring()))));
-    assert_eq!(get(&h, &format!("/{scoped}/stream/movie/tt7654321.json"), &[("X-Den-Remux-Key", "")]).await.status(), 403, "scoped with REMUX_KEY unset");
-    assert_eq!(get(&h, &format!("/{full}/stream/movie/tt7654321.json"), &[]).await.status(), 200, "full config");
+    assert_eq!(
+        get(&h, &format!("/{scoped}/stream/movie/tt7654321.json"), &[("X-Den-Remux-Key", "")]).await.status(),
+        403,
+        "scoped with REMUX_KEY unset"
+    );
+    assert_eq!(
+        get(&h, &format!("/{full}/stream/movie/tt7654321.json"), &[]).await.status(),
+        200,
+        "full config"
+    );
 }

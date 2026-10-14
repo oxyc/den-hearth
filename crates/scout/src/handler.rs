@@ -48,8 +48,8 @@ use crate::metrics::{cache_persistent_gauge, metrics};
 use crate::play::{decode_play_token, encode_play_token, PlayTarget};
 use crate::playwarm::play_pending_key;
 use crate::probe_fanout::{
-    browser_probe_candidates, hydrate_pack_only_sizes, hydrate_probe_facts, select_probe_jobs, ProbeJob, PROBE_BUDGET,
-    PROBE_TOP_N, PROBE_TTL,
+    browser_probe_candidates, hydrate_pack_only_sizes, hydrate_probe_facts, select_probe_jobs, ProbeJob,
+    PROBE_BUDGET, PROBE_TOP_N, PROBE_TTL,
 };
 use crate::rank::{
     cap_seeds, rank_streams_debug, real_debrid_blocked, title_tokens, RankDebug, RankFilters, RawStream,
@@ -59,7 +59,8 @@ use crate::scrape::{scrape_covered, Doer, ScrapeQuery, Scraper};
 use crate::stores::pool::{has_cache_truth, status_detail_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
 use crate::stores::{
-    CacheTruth, ResolveTarget, Store, StoreError, StoreStatus, StoreUnavailableError, FETCH_DOWNLOADING, FETCH_QUEUED,
+    CacheTruth, ResolveTarget, Store, StoreError, StoreStatus, StoreUnavailableError, FETCH_DOWNLOADING,
+    FETCH_QUEUED,
 };
 use crate::ticket::{TicketError, TicketKeys, TICKET_ROUTE};
 use crate::util::{etag_hex, fold_json_keys, go_to_lower, key_hash, Shape, LEAF};
@@ -145,7 +146,8 @@ pub(crate) const REBUILD_COOLOFF: Duration = Duration::from_secs(60);
 pub(crate) const MAX_CONCURRENT_REBUILDS: usize = 8;
 
 /// What /health says about that state, and what the log line marking the flip says too.
-const INDEXERS_DOWN_DETAIL: &str = "No indexer has answered the last few stream-list builds, so lists are coming back empty.";
+const INDEXERS_DOWN_DETAIL: &str =
+    "No indexer has answered the last few stream-list builds, so lists are coming back empty.";
 
 /// What /health says once a source has missed scrapeFailThreshold builds in a row while others answered.
 const SOURCES_MISSING_DETAIL: &str =
@@ -336,7 +338,7 @@ impl RebuildGate {
         // A cool-off is also why this cannot be derived from the map: it keeps the KEY reserved with no
         // task behind it.
         self.live = self.live.saturating_sub(1);
-        if !self.rebuilds.get(key).is_some_and(|l| l.gen == gen) {
+        if self.rebuilds.get(key).is_none_or(|l| l.gen != gen) {
             return;
         }
         match cooloff_until {
@@ -935,7 +937,8 @@ impl Handler {
         let head_only = req.method() == Method::HEAD;
         // Decided here, once: with the request log off nothing below is paid.
         let log_line = self.inner.deps.log_requests.then(|| {
-            let rid = request_id(req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or(""));
+            let rid =
+                request_id(req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or(""));
             (req.method().clone(), redact_path(&percent_decode(req.uri().path())), rid)
         });
         let inner = self.inner.clone();
@@ -962,7 +965,8 @@ impl Handler {
             out.body.clear();
         }
         let mut res = http::Response::new(out.body);
-        *res.status_mut() = http::StatusCode::from_u16(out.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        *res.status_mut() =
+            http::StatusCode::from_u16(out.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
         *res.headers_mut() = out.headers;
         res
     }
@@ -998,7 +1002,12 @@ impl Handler {
     }
 
     /// Go `hydrateKnownSizes`.
-    pub(crate) fn hydrate_known_sizes(&self, config: &Config, streams: &mut [RawStream], sid: Option<&StreamId>) {
+    pub(crate) fn hydrate_known_sizes(
+        &self,
+        config: &Config,
+        streams: &mut [RawStream],
+        sid: Option<&StreamId>,
+    ) {
         self.inner.hydrate_known_sizes(config, streams, sid);
     }
 
@@ -1227,7 +1236,8 @@ impl Inner {
                 // state so a monitor sees a total-indexer outage instead of just "empty results".
                 let mut status = json!({"status": "ok", "coverage": "complete"});
                 if self.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
-                    status = json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
+                    status =
+                        json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
                 } else if self.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                     // Which source is withheld: naming it says which indexers this install uses.
                     status["coverage"] = json!("partial");
@@ -1267,12 +1277,19 @@ impl Inner {
                 return out;
             }
             "/manifest.json" => {
-                return self.conditional(req, &self.manifest_unconf, &self.manifest_unconf_etag, JSON_TYPE, STATIC_CACHE);
+                return self.conditional(
+                    req,
+                    &self.manifest_unconf,
+                    &self.manifest_unconf_etag,
+                    JSON_TYPE,
+                    STATIC_CACHE,
+                );
             }
             "/config-key" => {
                 // The current X25519 public key (base64) so /configure (or den-app) can seal the config to it.
                 // 404 when sealed configs are disabled (no key configured) — the page then keeps plaintext.
-                let pub_key = self.deps.seal_keyring.as_ref().map(|k| k.current_pub_base64()).unwrap_or_default();
+                let pub_key =
+                    self.deps.seal_keyring.as_ref().map(|k| k.current_pub_base64()).unwrap_or_default();
                 if !pub_key.is_empty() {
                     // ETag over the key JSON so a rotated key isn't masked by a stale cache and If-None-Match
                     // yields 304, consistent with the other cacheable routes.
@@ -1285,13 +1302,17 @@ impl Inner {
                 }
                 // The epoch rides the 404 too: a plaintext link built while CONFIG_EPOCH > 0 must still carry
                 // it, or it would be refused the moment it was made. Matches den-subtitles and den-reel.
-                return write_json(404, &json!({"epoch": self.deps.config_epoch, "error": "no_key"}), NO_STORE);
+                return write_json(
+                    404,
+                    &json!({"epoch": self.deps.config_epoch, "error": "no_key"}),
+                    NO_STORE,
+                );
             }
             _ => {}
         }
 
         let parts = split_path(&req.path); // ["<config>", "stream"|"play"|"manifest.json", ...]
-        // /p/<ticket> exists only while tickets are on; without them it stays the 404 it always was.
+                                           // /p/<ticket> exists only while tickets are on; without them it stays the 404 it always was.
         if parts.len() == 2 && parts[0] == TICKET_ROUTE && self.tickets.is_some() {
             return self.handle_ticket_play(req, &parts[1]).await;
         }
@@ -1322,7 +1343,8 @@ impl Inner {
         let start = Instant::now();
         let origin = self.public_origin(req);
         // audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
-        let mut cache_key = format!("list:{}:{}:{}", key_hash(config_blob), key_hash(&origin), stream_cache_id(sid));
+        let mut cache_key =
+            format!("list:{}:{}:{}", key_hash(config_blob), key_hash(&origin), stream_cache_id(sid));
         // A warm hit serves the list without opening the config, so a list den-remux built for a scoped config
         // must never be what a request without its key hits. Its own key keeps the two apart.
         if self.remux_authorized(req) {
@@ -1398,11 +1420,15 @@ impl Inner {
             let (complete, fresh_until, etag, body) = split_cached(&hit);
             // Past the stale window a complete list is held only as a last resort: rebuild in the foreground, as on
             // a miss, and fall back to it only if no indexer answers.
-            if complete && fresh_until > 0 && now_unix() >= fresh_until + stale_window_for(self.deps.list_ttl).as_secs() as i64 {
+            if complete
+                && fresh_until > 0
+                && now_unix() >= fresh_until + stale_window_for(self.deps.list_ttl).as_secs() as i64
+            {
                 // A useful complete list stays immediately usable throughout its ticket-safe hold. Refresh it
                 // behind the response exactly like ordinary SWR; an empty answer still rebuilds in front because
                 // stale emptiness is not useful and may hide a newly released title.
-                if cached_list_nonempty(body) && SystemTime::now() < unix_time(fresh_until) + self.outage_hold {
+                if cached_list_nonempty(body) && SystemTime::now() < unix_time(fresh_until) + self.outage_hold
+                {
                     metrics().list_cache_hit.fetch_add(1, Ordering::Relaxed);
                     metrics().list_cache_stale.fetch_add(1, Ordering::Relaxed);
                     self.rebuild_behind(req, list_key);
@@ -1413,7 +1439,10 @@ impl Inner {
                     }
                     let mut out = self.conditional(req, &body, &etag, JSON_TYPE, &self.stale_list_cache);
                     out.set("X-Den-Degraded", "stale_list");
-                    out.set("server-timing", &format!("cache;desc=stale_list, total;dur={}", ms_dur(start.elapsed())));
+                    out.set(
+                        "server-timing",
+                        &format!("cache;desc=stale_list, total;dur={}", ms_dur(start.elapsed())),
+                    );
                     return out;
                 }
                 metrics().list_cache_miss.fetch_add(1, Ordering::Relaxed);
@@ -1465,11 +1494,9 @@ impl Inner {
     }
 
     /// The future of one shared build: everything it needs is owned, so it can outlive the request that started it.
-    fn build_task(self: Arc<Self>, job: ListJob, debug: bool) -> impl Future<Output = BuildResult> + Send + 'static {
-        async move {
-            let deadline = Self::deadline_in(self.deps.scrape_timeout + LIST_BUILD_SLACK);
-            self.build_stream_list(deadline, &job, debug).await
-        }
+    async fn build_task(self: Arc<Self>, job: ListJob, debug: bool) -> BuildResult {
+        let deadline = Self::deadline_in(self.deps.scrape_timeout + LIST_BUILD_SLACK);
+        self.build_stream_list(deadline, &job, debug).await
     }
 
     /// Go `sf.Do`: concurrent callers of one key share one run of the build and its result. The build runs on a task
@@ -1512,7 +1539,13 @@ impl Inner {
     ///
     /// Only within outageHold of the list's freshness, which keeps every ticket in it alive for a viewing. After
     /// such a build the key cools off for rebuildCooloff, during which the held list is served without scraping.
-    async fn last_resort(self: &Arc<Self>, req: &Req, start: Instant, key: ListKey<'_>, held: Held<'_>) -> Out {
+    async fn last_resort(
+        self: &Arc<Self>,
+        req: &Req,
+        start: Instant,
+        key: ListKey<'_>,
+        held: Held<'_>,
+    ) -> Out {
         let ListKey { config_blob, sid, cache_key, .. } = key;
         let Held { fresh_until, etag, body } = held;
         let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
@@ -1646,7 +1679,12 @@ impl Inner {
     ///
     /// `debug` is false on every normal request. When it is set, the accounting rides along in the response body and
     /// the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
-    async fn build_stream_list(self: &Arc<Self>, deadline: TokioInstant, job: &ListJob, debug: bool) -> BuildResult {
+    async fn build_stream_list(
+        self: &Arc<Self>,
+        deadline: TokioInstant,
+        job: &ListJob,
+        debug: bool,
+    ) -> BuildResult {
         let mut dbg = debug.then(RankDebug::default);
         let opts = RankOpts { client: job.client.as_ref(), check_cache: true, rid: &job.rid };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
@@ -1681,7 +1719,8 @@ impl Inner {
             rid: rid.to_owned(),
         };
         let mut phase = Instant::now();
-        let scrapers: Vec<Arc<dyn Scraper>> = (self.deps.make_scrapers)(config).into_iter().map(Arc::from).collect();
+        let scrapers: Vec<Arc<dyn Scraper>> =
+            (self.deps.make_scrapers)(config).into_iter().map(Arc::from).collect();
         let scraped = scrape_covered(
             &scrapers,
             &q,
@@ -1730,7 +1769,8 @@ impl Inner {
                 ),
             );
             if has_dbg {
-                *log_dbg.dropped_by.entry("seedCap".to_owned()).or_insert(0) += (seeds.len() - MAX_SEEDS) as i64;
+                *log_dbg.dropped_by.entry("seedCap".to_owned()).or_insert(0) +=
+                    (seeds.len() - MAX_SEEDS) as i64;
             }
             seeds = cap_seeds(&seeds, MAX_SEEDS as i64);
         }
@@ -1744,7 +1784,9 @@ impl Inner {
             (truth, truth_ok) = match timeout_at(deadline, pool.cache_check(&hashes)).await {
                 Ok(answer) => answer,
                 // The build's own clock ran out: every store would have failed, so nobody could be asked.
-                Err(_) => (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false),
+                Err(_) => {
+                    (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false)
+                }
             };
             timing.push_str(&format!(", cache-check;dur={}", ms_dur(phase.elapsed())));
             for s in seeds.iter_mut() {
@@ -1802,7 +1844,8 @@ impl Inner {
             // bdrip, hdrip and dvdrip as substrings, which is most of what indexers return. Attributed, or
             // ?debug=1 reports a list that shrank for no stated reason.
             if has_dbg && before > seeds.len() {
-                *log_dbg.dropped_by.entry("realDebridBlocked".to_owned()).or_insert(0) += (before - seeds.len()) as i64;
+                *log_dbg.dropped_by.entry("realDebridBlocked".to_owned()).or_insert(0) +=
+                    (before - seeds.len()) as i64;
             }
         }
 
@@ -1938,10 +1981,22 @@ impl Inner {
 
     /// finishStreamList probes the top of a ranked list, serialises it and caches it — the half of a build only a
     /// stream list needs.
-    async fn finish_stream_list(self: &Arc<Self>, job: &ListJob, dbg: Option<RankDebug>, list: RankedList) -> BuildResult {
+    async fn finish_stream_list(
+        self: &Arc<Self>,
+        job: &ListJob,
+        dbg: Option<RankDebug>,
+        list: RankedList,
+    ) -> BuildResult {
         let ListJob { config, config_blob, sid, origin, cache_key, .. } = job;
-        let RankedList { ranked, truth, client, degraded: degraded_reason, complete: scrape_complete, coverage, mut timing } =
-            list;
+        let RankedList {
+            ranked,
+            truth,
+            client,
+            degraded: degraded_reason,
+            complete: scrape_complete,
+            coverage,
+            mut timing,
+        } = list;
         let degraded = !degraded_reason.is_empty();
         // Ask the top few releases what they actually contain. After ranking, so the probe follows the order
         // the viewer will see; before serialisation, so a cached probe rides along in this same response.
@@ -1974,7 +2029,9 @@ impl Inner {
             hold = ttl + stale_window_for(ttl).max(self.outage_hold);
         }
         let cached = !degraded && dbg.is_none();
-        let whole_seconds = |t: SystemTime| UNIX_EPOCH + Duration::from_secs(t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+        let whole_seconds = |t: SystemTime| {
+            UNIX_EPOCH + Duration::from_secs(t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+        };
         let env = AnswerEnvelope {
             v: ANSWER_ENVELOPE_VERSION,
             answer_kind: decide_answer_kind(out.len() as i64, scrape_complete, &degraded_reason).to_owned(),
@@ -2017,7 +2074,12 @@ impl Inner {
     ///
     /// Only a list build calls this, and a scoped config is refused before any list is built, so the read-only
     /// config a browser holds never mints a ticket.
-    fn play_urls(self: &Arc<Self>, config: &Config, config_blob: &str, origin: &str) -> Box<dyn Fn(&PlayTarget) -> String + Send> {
+    fn play_urls(
+        self: &Arc<Self>,
+        config: &Config,
+        config_blob: &str,
+        origin: &str,
+    ) -> Box<dyn Fn(&PlayTarget) -> String + Send> {
         let origin = origin.to_owned();
         let Some(_) = &self.tickets else {
             let blob = config_blob.to_owned();
@@ -2054,11 +2116,19 @@ impl Inner {
     ///
     /// Movie-only guard, same reasoning as applyProbedSize: there is no pack for a movie's title size to have
     /// been confused with, so a movie is never given a lookup at all.
-    pub(crate) fn hydrate_known_sizes(&self, config: &Config, streams: &mut [RawStream], sid: Option<&StreamId>) {
+    pub(crate) fn hydrate_known_sizes(
+        &self,
+        config: &Config,
+        streams: &mut [RawStream],
+        sid: Option<&StreamId>,
+    ) {
         let Some(sid) = sid.filter(|sid| sid.has_ep) else { return };
         let mut pool: Option<StorePool> = None;
         for s in streams.iter_mut() {
-            if s.info_hash.is_empty() || s.pack_size_bytes.is_some() || s.probe.as_ref().is_some_and(|p| p.size_bytes > 0) {
+            if s.info_hash.is_empty()
+                || s.pack_size_bytes.is_some()
+                || s.probe.as_ref().is_some_and(|p| p.size_bytes > 0)
+            {
                 // A ranged probe measured what the playback URL actually serves, so it is more authoritative
                 // than an older store file listing even when their difference was too small to name a pack.
                 continue;
@@ -2156,10 +2226,11 @@ impl Inner {
     async fn run_probe_job(&self, deadline: TokioInstant, pool: &StorePool, config: &Config, job: ProbeJob) {
         self.probe_flight
             .run(&format!("probe:{}", job.key), async {
-                let resolved = match timeout_at(deadline, pool.resolve_cached_only(&job.target, &job.holders)).await {
-                    Ok(r) => r,
-                    Err(_) => Err(StoreError::Cancelled),
-                };
+                let resolved =
+                    match timeout_at(deadline, pool.resolve_cached_only(&job.target, &job.holders)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(StoreError::Cancelled),
+                    };
                 let link = match resolved {
                     Ok(link) if !link.is_empty() => link,
                     other => {
@@ -2225,10 +2296,18 @@ impl Inner {
         out
     }
 
-    async fn handle_legacy_play(self: &Arc<Self>, req: &Req, config_blob: &str, parts: &[String], phases: &mut String) -> Out {
+    async fn handle_legacy_play(
+        self: &Arc<Self>,
+        req: &Req,
+        config_blob: &str,
+        parts: &[String],
+        phases: &mut String,
+    ) -> Out {
         // While tickets are on, this route only serves stream lists cached from before them, and a client can
         // hold one for a day on stale-if-error. LEGACY_PLAY_UNTIL is when that allowance ends.
-        if self.tickets.is_some() && self.deps.legacy_play_until.is_some_and(|until| SystemTime::now() >= until) {
+        if self.tickets.is_some()
+            && self.deps.legacy_play_until.is_some_and(|until| SystemTime::now() >= until)
+        {
             return err_out(403, "legacy_play_closed");
         }
         let Some(target) = decode_play_token(at(parts, 2)) else { return err_out(400, "bad_token") };
@@ -2268,7 +2347,13 @@ impl Inner {
     }
 
     /// resolvePlay is the play route's work once a request is admitted, whichever route admitted it.
-    async fn resolve_play(self: &Arc<Self>, req: &Req, config: &Config, target: &PlayTarget, phases: &mut String) -> Out {
+    async fn resolve_play(
+        self: &Arc<Self>,
+        req: &Req,
+        config: &Config,
+        target: &PlayTarget,
+        phases: &mut String,
+    ) -> Out {
         let start = Instant::now();
         let pool = StorePool { stores: (self.deps.make_stores)(config) };
         let resolve_deadline = Self::deadline_in(RESOLVE_BUDGET);
@@ -2334,7 +2419,11 @@ impl Inner {
             // A link /play minted was checked before it was served; one the probe minted was not. So the check
             // runs once per link rather than once per play. A remembered link that fails it is dropped and a
             // fresh one minted below, not answered as dead — it may only be the one that went stale.
-            let verdict = if hit.checked { LinkVerdict::Playable } else { self.verify_link(&pool, &rt, &hit.link).await };
+            let verdict = if hit.checked {
+                LinkVerdict::Playable
+            } else {
+                self.verify_link(&pool, &rt, &hit.link).await
+            };
             if verdict == LinkVerdict::Playable || verdict == LinkVerdict::Unverified {
                 if verdict == LinkVerdict::Playable {
                     self.links.mark_checked(&memo_key, &hit.link);
@@ -2383,7 +2472,8 @@ impl Inner {
             if !holders.is_empty() {
                 let read_only = ResolveTarget { no_add: true, ..rt.clone() };
                 let held_start = Instant::now();
-                let resolved = timeout(self.warm_resolve_budget(), pool.resolve_cached_only(&read_only, &holders)).await;
+                let resolved =
+                    timeout(self.warm_resolve_budget(), pool.resolve_cached_only(&read_only, &holders)).await;
                 *phases = format!("held;dur={}, ", ms_dur(held_start.elapsed()));
                 match resolved {
                     Ok(Ok(link)) => return self.serve_play_link(&pool, &rt, &memo_key, link).await,
@@ -2529,7 +2619,9 @@ impl Inner {
         let mut preferred = pool.holding_services(&rt);
         if config.debrid.len() > 1 {
             let check_deadline = Self::deadline_in(status_budget).min(resolve_deadline);
-            if let Ok((play_truth, _)) = timeout_at(check_deadline, pool.cache_check(&[target.info_hash.clone()])).await {
+            if let Ok((play_truth, _)) =
+                timeout_at(check_deadline, pool.cache_check(std::slice::from_ref(&target.info_hash))).await
+            {
                 preferred.extend(play_truth.held_by(&target.info_hash));
             }
         }
@@ -2688,7 +2780,13 @@ impl Inner {
     /// try mints is served only if it passes its own check. Otherwise the first link is served as it was before
     /// the release size was known — a collection's film, or a store with no file list to pick from, is still
     /// the file that was asked for, and a size alone is not proof enough to refuse it.
-    async fn serve_play_link(&self, pool: &StorePool, rt: &ResolveTarget, memo_key: &str, mut link: String) -> Out {
+    async fn serve_play_link(
+        &self,
+        pool: &StorePool,
+        rt: &ResolveTarget,
+        memo_key: &str,
+        mut link: String,
+    ) -> Out {
         let mut verdict = self.verify_link(pool, rt, &link).await;
         if verdict == LinkVerdict::WrongFile {
             self.links.forget(memo_key);
@@ -2733,7 +2831,12 @@ impl Inner {
         let start = Instant::now();
         let rid = String::new();
         let listed = ResolveTarget { no_add: true, list_files: true, ..rt.clone() };
-        let resolved = match timeout(self.status_budget(), pool.resolve_cached_only(&listed, &pool.holding_services(rt))).await {
+        let resolved = match timeout(
+            self.status_budget(),
+            pool.resolve_cached_only(&listed, &pool.holding_services(rt)),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => Err(StoreError::Cancelled),
         };
@@ -2776,7 +2879,13 @@ impl Inner {
     /// Go `(*handler).verifyLink`: whether a freshly minted link is the file it should be.
     async fn verify_link(&self, pool: &StorePool, rt: &ResolveTarget, link: &str) -> LinkVerdict {
         let doer = self.deps.probe_client.clone().map(ReqwestDoer);
-        crate::linkcheck::verify_link(doer.as_ref().map(|d| d as &dyn Doer), known_file_size(pool, rt), rt, link).await
+        crate::linkcheck::verify_link(
+            doer.as_ref().map(|d| d as &dyn Doer),
+            known_file_size(pool, rt),
+            rt,
+            link,
+        )
+        .await
     }
 
     /// handleProbe answers "can this play yet?" without changing anything. Same vocabulary as /play so the
@@ -2801,7 +2910,9 @@ impl Inner {
         // the claim is settled by a NoAdd resolve — the stores refuse rather than queue — and a cached-but-
         // not-held release correctly falls through to the "nothing queued" answer instead of promising a
         // playback that would start with a download.
-        let (probe_truth, truth_ok) = match timeout_at(deadline, pool.cache_check(&[info_hash.to_owned()])).await {
+        let (probe_truth, truth_ok) = match timeout_at(deadline, pool.cache_check(&[info_hash.to_owned()]))
+            .await
+        {
             Ok(answer) => answer,
             Err(_) => (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false),
         };
@@ -2823,7 +2934,10 @@ impl Inner {
             };
             match resolved {
                 Ok(_) => {
-                    log_limited("probe-ready", &play_decision("probe", "served", "ready", "", start.elapsed(), rid, rt));
+                    log_limited(
+                        "probe-ready",
+                        &play_decision("probe", "served", "ready", "", start.elapsed(), rid, rt),
+                    );
                     return write_json(200, &json!({"state": "ready"}), NO_STORE);
                 }
                 // The probe DOES discover refusals — it just used to throw them away, inspecting only `err ==
@@ -2878,7 +2992,10 @@ impl Inner {
                     rt,
                 ),
             );
-            return write_unavailable(STORE_REFUSAL_WAIT, &json!({"error": "store_unavailable", "service": svc.as_str()}));
+            return write_unavailable(
+                STORE_REFUSAL_WAIT,
+                &json!({"error": "store_unavailable", "service": svc.as_str()}),
+            );
         }
         // A refusal SCOUT made, above the store refusals below because it is ours rather than a service's.
         //
@@ -2898,7 +3015,15 @@ impl Inner {
         if pool.every_add_refused_by_scout() {
             log_limited(
                 "probe-scout-busy",
-                &play_decision("probe", "refused", "scout's hourly add allowance is spent", "", start.elapsed(), rid, rt),
+                &play_decision(
+                    "probe",
+                    "refused",
+                    "scout's hourly add allowance is spent",
+                    "",
+                    start.elapsed(),
+                    rid,
+                    rt,
+                ),
             );
             return write_add_budget_spent(
                 scout_busy_for(pool, false),
@@ -2911,7 +3036,15 @@ impl Inner {
         if let Some(refused) = refused_us {
             log_limited(
                 "probe-refused",
-                &play_decision("probe", "refused", &refused.reason, refused.service.as_str(), start.elapsed(), rid, rt),
+                &play_decision(
+                    "probe",
+                    "refused",
+                    &refused.reason,
+                    refused.service.as_str(),
+                    start.elapsed(),
+                    rid,
+                    rt,
+                ),
             );
             return write_unavailable(
                 STORE_REFUSAL_WAIT,
@@ -2927,7 +3060,10 @@ impl Inner {
                 "probe-refused",
                 &play_decision("probe", "refused", &reason, svc.as_str(), start.elapsed(), rid, rt),
             );
-            return write_unavailable(STORE_REFUSAL_WAIT, &json!({"error": "store_unavailable", "service": svc.as_str()}));
+            return write_unavailable(
+                STORE_REFUSAL_WAIT,
+                &json!({"error": "store_unavailable", "service": svc.as_str()}),
+            );
         }
         // With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
         // claim, not a shrug — the client reads it as a release nobody has. Say the store could not be asked.
@@ -2948,7 +3084,10 @@ impl Inner {
             );
             return write_unavailable(STORE_UNANSWERED_WAIT, &json!({"error": "status_unavailable"}));
         }
-        log_limited("probe-not-queued", &play_decision("probe", "skipped", "not queued", "", start.elapsed(), rid, rt));
+        log_limited(
+            "probe-not-queued",
+            &play_decision("probe", "skipped", "not queued", "", start.elapsed(), rid, rt),
+        );
         err_out(404, "not_queued")
     }
 
@@ -2972,13 +3111,17 @@ impl Inner {
     async fn handle_ticket_cancel(&self, req: &Req, ticket: &str) -> Out {
         match self.tickets.as_ref().map(|t| t.open(ticket, SystemTime::now())) {
             Some(Err(TicketError::Expired)) => err_out(410, "ticket_expired"),
-            Some(Ok((config, target))) if self.admit_install(&config) => self.resolve_cancel(req, &config, &target).await,
+            Some(Ok((config, target))) if self.admit_install(&config) => {
+                self.resolve_cancel(req, &config, &target).await
+            }
             _ => err_out(400, "bad_ticket"),
         }
     }
 
     async fn handle_legacy_cancel(&self, req: &Req, config_blob: &str, token: &str) -> Out {
-        if self.tickets.is_some() && self.deps.legacy_play_until.is_some_and(|until| SystemTime::now() >= until) {
+        if self.tickets.is_some()
+            && self.deps.legacy_play_until.is_some_and(|until| SystemTime::now() >= until)
+        {
             return err_out(403, "legacy_play_closed");
         }
         let Some(target) = decode_play_token(token) else { return err_out(400, "bad_token") };
@@ -3038,7 +3181,15 @@ impl Inner {
                     }
                     log_limited(
                         "cancel-error",
-                        &play_decision("cancel", "degraded", &err.to_string(), "", start.elapsed(), &rid, &rt),
+                        &play_decision(
+                            "cancel",
+                            "degraded",
+                            &err.to_string(),
+                            "",
+                            start.elapsed(),
+                            &rid,
+                            &rt,
+                        ),
                     );
                     return write_unavailable(STORE_REFUSAL_WAIT, &json!({"error": "store_unavailable"}));
                 }
@@ -3052,11 +3203,22 @@ impl Inner {
         if !saw_canceller {
             log_limited(
                 "cancel-unsupported",
-                &play_decision("cancel", "skipped", "no configured account supports it", "", start.elapsed(), &rid, &rt),
+                &play_decision(
+                    "cancel",
+                    "skipped",
+                    "no configured account supports it",
+                    "",
+                    start.elapsed(),
+                    &rid,
+                    &rt,
+                ),
             );
             return err_out(501, "unsupported");
         }
-        log_limited("cancel", &play_decision("cancel", "skipped", "nothing queued", "", start.elapsed(), &rid, &rt));
+        log_limited(
+            "cancel",
+            &play_decision("cancel", "skipped", "nothing queued", "", start.elapsed(), &rid, &rt),
+        );
         err_out(404, "not_queued")
     }
 
@@ -3109,7 +3271,8 @@ impl Inner {
         let (service, token) = (body.service.unwrap_or_default(), body.token.unwrap_or_default());
         // Whitelisted the same way validateConfig does it, and the same length ceiling, so this route cannot
         // be used to send arbitrary strings to an upstream.
-        let Some(svc) = DebridService::parse(&service).filter(|_| !token.is_empty() && token.len() <= 512) else {
+        let Some(svc) = DebridService::parse(&service).filter(|_| !token.is_empty() && token.len() <= 512)
+        else {
             return err_out(400, "bad_request");
         };
 
@@ -3221,7 +3384,10 @@ impl Inner {
         if !config.iid.is_empty() && self.deps.revoked_installs.contains(&config.iid) {
             log_limited(
                 "install-revoked",
-                &format!("config refused: install revoked (iid {}…)", config.iid.chars().take(6).collect::<String>()),
+                &format!(
+                    "config refused: install revoked (iid {}…)",
+                    config.iid.chars().take(6).collect::<String>()
+                ),
             );
             return false;
         }
@@ -3300,20 +3466,34 @@ fn write_play_redirect(link: &str) -> Out {
     out
 }
 
-fn write_cancel_outcome(rt: &ResolveTarget, rid: &str, start: Instant, outcome: &crate::stores::CancelOutcome) -> Out {
+fn write_cancel_outcome(
+    rt: &ResolveTarget,
+    rid: &str,
+    start: Instant,
+    outcome: &crate::stores::CancelOutcome,
+) -> Out {
     match outcome.reason.as_str() {
         "finished" => {
-            log_limited("cancel", &play_decision("cancel", "refused", "finished", "", start.elapsed(), rid, rt));
+            log_limited(
+                "cancel",
+                &play_decision("cancel", "refused", "finished", "", start.elapsed(), rid, rt),
+            );
             return err_out(409, "finished");
         }
         "not_ours" => {
-            log_limited("cancel", &play_decision("cancel", "refused", "not_ours", "", start.elapsed(), rid, rt));
+            log_limited(
+                "cancel",
+                &play_decision("cancel", "refused", "not_ours", "", start.elapsed(), rid, rt),
+            );
             return err_out(409, "not_ours");
         }
         _ => {}
     }
     if outcome.reannounced {
-        log_limited("cancel", &play_decision("cancel", "served", "reannounced", "", start.elapsed(), rid, rt));
+        log_limited(
+            "cancel",
+            &play_decision("cancel", "served", "reannounced", "", start.elapsed(), rid, rt),
+        );
         return write_queued_body(&outcome.status);
     }
     log_limited("cancel", &play_decision("cancel", "served", "cancelled", "", start.elapsed(), rid, rt));
@@ -3336,7 +3516,8 @@ pub(crate) fn write_queued(rt: &ResolveTarget, rid: &str, dur: Duration, status:
     };
     // A waiting client polls every two seconds for the whole fetch, so this is a sample, a line a minute.
     // Progress/rate/eta/swarm are operational, not identity, and stay outside LOG_IDENTITY's gate.
-    let reason = format!("{} {:.1}% at {rate}, eta {eta}{swarm}", queued_state(status), status.progress * 100.0);
+    let reason =
+        format!("{} {:.1}% at {rate}, eta {eta}{swarm}", queued_state(status), status.progress * 100.0);
     log_limited(
         "downloading",
         &play_decision("play", "fallback", &reason, status.service.map_or("", |s| s.as_str()), dur, rid, rt),
@@ -3434,4 +3615,3 @@ async fn account_body(_deadline: TokioInstant, st: &dyn Store) -> serde_json::Va
     let _ = torbox_plan_name;
     json!({"service": st.service().as_str()})
 }
-

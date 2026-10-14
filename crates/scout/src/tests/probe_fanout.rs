@@ -6,11 +6,14 @@
 
 use crate::attributes::with_probe;
 use crate::attributes::StreamAttributes;
-use crate::id::StreamId;
-use crate::probe::Probe;
-use crate::probe_fanout::{apply_probed_size, browser_probe_candidates, hydrate_pack_only_sizes, probe_cache_key, BROWSER_PROBE_FRONTIER};
 use crate::client::ClientPlayable;
 use crate::config::Config;
+use crate::id::StreamId;
+use crate::probe::Probe;
+use crate::probe_fanout::{
+    apply_probed_size, browser_probe_candidates, hydrate_pack_only_sizes, probe_cache_key,
+    BROWSER_PROBE_FRONTIER,
+};
 use crate::rank::RawStream;
 
 use super::rank::intp;
@@ -49,10 +52,16 @@ fn with_probe_overrides_title_guesses() {
             && got.probed,
         "probe did not override the title: {got:?}"
     );
-    assert!(got.audio_languages.len() == 1 && got.audio_languages[0] == "sv", "languages missing: {:?}", got.audio_languages);
+    assert!(
+        got.audio_languages.len() == 1 && got.audio_languages[0] == "sv",
+        "languages missing: {:?}",
+        got.audio_languages
+    );
     let untouched = with_probe(base, None);
     assert!(
-        !untouched.probed && untouched.audio_languages.is_empty() && untouched.codec.as_deref() == Some("h264"),
+        !untouched.probed
+            && untouched.audio_languages.is_empty()
+            && untouched.codec.as_deref() == Some("h264"),
         "unprobed release was altered: {untouched:?}"
     );
 }
@@ -79,7 +88,11 @@ fn probe_cache_key_identifies_the_file() {
     let b = RawStream { info_hash: "h".into(), file_idx: Some(3), ..Default::default() };
     assert_eq!(probe_cache_key(&a, None), probe_cache_key(&b, None), "same file produced different keys");
     let c = RawStream { info_hash: "h".into(), file_idx: Some(4), ..Default::default() };
-    assert_ne!(probe_cache_key(&a, None), probe_cache_key(&c, None), "different files in one torrent share a key");
+    assert_ne!(
+        probe_cache_key(&a, None),
+        probe_cache_key(&c, None),
+        "different files in one torrent share a key"
+    );
 }
 
 // A small, ordinary mismatch between the title's claim and the probe's reading (rounding, a muxer's
@@ -96,7 +109,11 @@ fn apply_probed_size_close_mismatch_is_not_called_a_pack() {
 
     apply_probed_size(&mut s, Some(&sid));
 
-    assert!(s.pack_size_bytes.is_none(), "PackSizeBytes = {:?}, want nil for a close, non-pack mismatch", s.pack_size_bytes);
+    assert!(
+        s.pack_size_bytes.is_none(),
+        "PackSizeBytes = {:?}, want nil for a close, non-pack mismatch",
+        s.pack_size_bytes
+    );
     assert_eq!(s.size_bytes, Some(1_080_000_000), "SizeBytes = {:?}, want the probed 1.08 GB", s.size_bytes);
 }
 
@@ -117,7 +134,11 @@ fn hydrate_pack_only_sizes_never_opened_pack_loses_its_size_as_an_episodes() {
 
     hydrate_pack_only_sizes(&mut streams, Some(&sid));
 
-    assert!(streams[0].size_bytes.is_none(), "SizeBytes = {:?}, want nil (unknown) rather than the pack's own total", streams[0].size_bytes);
+    assert!(
+        streams[0].size_bytes.is_none(),
+        "SizeBytes = {:?}, want nil (unknown) rather than the pack's own total",
+        streams[0].size_bytes
+    );
     assert_eq!(
         streams[0].pack_size_bytes,
         Some(PACK_HINT),
@@ -140,8 +161,17 @@ fn hydrate_pack_only_sizes_a_plain_episode_file_is_left_alone() {
 
     hydrate_pack_only_sizes(&mut streams, Some(&sid));
 
-    assert_eq!(streams[0].size_bytes, Some(1_136_580_921), "SizeBytes = {:?}, want the indexer's own untouched", streams[0].size_bytes);
-    assert!(streams[0].pack_size_bytes.is_none(), "PackSizeBytes = {:?}, want nil — this title names exactly this episode", streams[0].pack_size_bytes);
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(1_136_580_921),
+        "SizeBytes = {:?}, want the indexer's own untouched",
+        streams[0].size_bytes
+    );
+    assert!(
+        streams[0].pack_size_bytes.is_none(),
+        "PackSizeBytes = {:?}, want nil — this title names exactly this episode",
+        streams[0].pack_size_bytes
+    );
 }
 
 // A movie is never subject to this demotion — there is no pack for its title to have named instead.
@@ -156,7 +186,12 @@ fn hydrate_pack_only_sizes_movie_is_skipped() {
 
     hydrate_pack_only_sizes(&mut streams, Some(&sid_movie()));
 
-    assert_eq!(streams[0].size_bytes, Some(18 << 30), "SizeBytes changed for a movie: {:?}", streams[0].size_bytes);
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(18 << 30),
+        "SizeBytes changed for a movie: {:?}",
+        streams[0].size_bytes
+    );
 }
 
 // The frontier is decision-directed: it carries the current winner and what could displace it, never more
@@ -173,9 +208,17 @@ fn browser_probe_frontier_is_decision_directed_and_bounded() {
         });
     }
     let frontier = browser_probe_candidates(&streams, &Config::default(), Some(&client));
-    assert_eq!(frontier.len(), BROWSER_PROBE_FRONTIER, "frontier has {} candidates, want the bound {BROWSER_PROBE_FRONTIER}: {frontier:?}", frontier.len());
+    assert_eq!(
+        frontier.len(),
+        BROWSER_PROBE_FRONTIER,
+        "frontier has {} candidates, want the bound {BROWSER_PROBE_FRONTIER}: {frontier:?}",
+        frontier.len()
+    );
     assert!(frontier.contains(&0), "the unresolved current winner is absent from its own decision frontier");
-    assert!(frontier.contains(&1), "a compatibility-sunk 4K contender that can displace the winner was not selected");
+    assert!(
+        frontier.contains(&1),
+        "a compatibility-sunk 4K contender that can displace the winner was not selected"
+    );
 }
 
 // Probing resolves, and resolving a release the account does not hold ADDS it, so these handler-driven
@@ -203,7 +246,12 @@ fn probe_top_opt_in() {
         });
         let mut streams = vec![RawStream { info_hash: "abc".into(), ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["abc"]));
-        assert!(resolves.get() == 0 && streams[0].probe.is_none(), "probed without a client: resolves={} probe={:?}", resolves.get(), streams[0].probe);
+        assert!(
+            resolves.get() == 0 && streams[0].probe.is_none(),
+            "probed without a client: resolves={} probe={:?}",
+            resolves.get(),
+            streams[0].probe
+        );
     }
     todo!("pending: probe_fanout_test.go TestProbeTop_optIn")
 }
@@ -216,9 +264,16 @@ fn probe_top_caps_at_top_n() {
     fn pending() {
         // Go: 20 cached streams with the same hash; every probe cache key is pre-seeded with {"audioLanguages":["sv"]},
         // so probeTop hydrates all 20 without a resolve. The test asserts that all 20 end up with a Probe.
-        let mut streams: Vec<RawStream> = (0..20).map(|_| RawStream { info_hash: "hash".into(), cached: true, ..Default::default() }).collect();
+        let mut streams: Vec<RawStream> = (0..20)
+            .map(|_| RawStream { info_hash: "hash".into(), cached: true, ..Default::default() })
+            .collect();
         let cache = seeded_cache(&streams, r#"{"audioLanguages":["sv"]}"#);
-        let h = Handler::for_test(Deps { cache, probe_client: Some(http_default_client()), make_stores: Box::new(|_| vec![]), ..Default::default() });
+        let h = Handler::for_test(Deps {
+            cache,
+            probe_client: Some(http_default_client()),
+            make_stores: Box::new(|_| vec![]),
+            ..Default::default()
+        });
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["hash"]));
         let probed = streams.iter().filter(|s| s.probe.is_some()).count();
         assert_eq!(probed, streams.len(), "hydrated {probed} cached probe facts, want all {}", streams.len());
@@ -234,7 +289,8 @@ fn probe_top_cache_hit_skips_resolve() {
     fn pending() {
         // Go: a cached probe for "cached-hash" with audio ["it"] must be applied without building a store pool.
         let s = RawStream { info_hash: "cached-hash".into(), cached: true, ..Default::default() };
-        let cache = seeded_cache(std::slice::from_ref(&s), r#"{"audioLanguages":["it"],"videoCodec":"h264"}"#);
+        let cache =
+            seeded_cache(std::slice::from_ref(&s), r#"{"audioLanguages":["it"],"videoCodec":"h264"}"#);
         let made = std::cell::Cell::new(0);
         let h = Handler::for_test(Deps {
             cache,
@@ -265,13 +321,24 @@ fn hydrate_probe_facts_season_pack_size_corrects_to_the_episode() {
         const PACK_HINT: i64 = 68 << 30; // what "💾 68 GB" in the title parsed to
         const EPISODE_SIZE: i64 = 1_136_580_921; // what den-remux actually served
         let sid = sid_series(1, 3);
-        let s = RawStream { info_hash: "fauda-s1e3".into(), size_bytes: Some(PACK_HINT), ..Default::default() };
+        let s =
+            RawStream { info_hash: "fauda-s1e3".into(), size_bytes: Some(PACK_HINT), ..Default::default() };
         let cache = seeded_cache(std::slice::from_ref(&s), &format!(r#"{{"sizeBytes":{EPISODE_SIZE}}}"#));
         let h = Handler::for_test(Deps { cache, ..Default::default() });
         let mut streams = vec![s];
         h.hydrate_probe_facts(&mut streams, Some(&sid));
-        assert_eq!(streams[0].size_bytes, Some(EPISODE_SIZE), "SizeBytes = {:?}, want the probed episode size", streams[0].size_bytes);
-        assert_eq!(streams[0].pack_size_bytes, Some(PACK_HINT), "PackSizeBytes = {:?}, want the indexer's pack size kept as context", streams[0].pack_size_bytes);
+        assert_eq!(
+            streams[0].size_bytes,
+            Some(EPISODE_SIZE),
+            "SizeBytes = {:?}, want the probed episode size",
+            streams[0].size_bytes
+        );
+        assert_eq!(
+            streams[0].pack_size_bytes,
+            Some(PACK_HINT),
+            "PackSizeBytes = {:?}, want the indexer's pack size kept as context",
+            streams[0].pack_size_bytes
+        );
     }
     todo!("pending: probe_fanout_test.go TestHydrateProbeFacts_seasonPackSizeCorrectsToTheEpisode")
 }
@@ -294,11 +361,25 @@ fn hydrate_known_sizes_corrects_from_a_stores_file_list_with_no_probe() {
             RESOLVE_CACHE_TTL,
         );
         let sid = sid_series(1, 3);
-        let mut streams = vec![RawStream { info_hash: H.into(), size_bytes: Some(PACK_HINT), ..Default::default() }];
-        let h = Handler::for_test(Deps { make_stores: Box::new(move |_| vec![torbox_store("t", cache.clone())]), ..Default::default() });
+        let mut streams =
+            vec![RawStream { info_hash: H.into(), size_bytes: Some(PACK_HINT), ..Default::default() }];
+        let h = Handler::for_test(Deps {
+            make_stores: Box::new(move |_| vec![torbox_store("t", cache.clone())]),
+            ..Default::default()
+        });
         h.hydrate_known_sizes(&Config::default(), &mut streams, Some(&sid));
-        assert_eq!(streams[0].size_bytes, Some(EPISODE_SIZE), "SizeBytes = {:?}, want the store's own {EPISODE_SIZE}", streams[0].size_bytes);
-        assert_eq!(streams[0].pack_size_bytes, Some(PACK_HINT), "PackSizeBytes = {:?}, want the indexer's pack size kept as context", streams[0].pack_size_bytes);
+        assert_eq!(
+            streams[0].size_bytes,
+            Some(EPISODE_SIZE),
+            "SizeBytes = {:?}, want the store's own {EPISODE_SIZE}",
+            streams[0].size_bytes
+        );
+        assert_eq!(
+            streams[0].pack_size_bytes,
+            Some(PACK_HINT),
+            "PackSizeBytes = {:?}, want the indexer's pack size kept as context",
+            streams[0].pack_size_bytes
+        );
     }
     todo!("pending: probe_fanout_test.go TestHydrateKnownSizes_correctsFromAStoresFileListWithNoProbe")
 }
@@ -317,7 +398,11 @@ fn hydrate_known_sizes_does_not_replace_a_probed_size() {
         let sid = sid_series(1, 3);
         let stream = RawStream { info_hash: H.into(), size_bytes: Some(INDEXER_SIZE), ..Default::default() };
         let cache = memory_cache();
-        cache.put(&probe_cache_key(&stream, Some(&sid)), &format!(r#"{{"sizeBytes":{PROBED_SIZE}}}"#), PROBE_TTL);
+        cache.put(
+            &probe_cache_key(&stream, Some(&sid)),
+            &format!(r#"{{"sizeBytes":{PROBED_SIZE}}}"#),
+            PROBE_TTL,
+        );
         cache.put(
             &resolve_key("t", H),
             &format!(r#"{{"torrentId":9,"files":[{{"Index":0,"Name":"Show.S01E03.mkv","SizeBytes":{STALE_STORE_SIZE}}}]}}"#),
@@ -331,8 +416,18 @@ fn hydrate_known_sizes_does_not_replace_a_probed_size() {
         let mut streams = vec![stream];
         h.hydrate_probe_facts(&mut streams, Some(&sid));
         h.hydrate_known_sizes(&Config::default(), &mut streams, Some(&sid));
-        assert_eq!(streams[0].probe.as_ref().map(|p| p.size_bytes), Some(PROBED_SIZE), "Probe = {:?}, want the ranged measurement", streams[0].probe);
-        assert_eq!(streams[0].size_bytes, Some(PROBED_SIZE), "SizeBytes = {:?}, want the probed size to win over cached {STALE_STORE_SIZE}", streams[0].size_bytes);
+        assert_eq!(
+            streams[0].probe.as_ref().map(|p| p.size_bytes),
+            Some(PROBED_SIZE),
+            "Probe = {:?}, want the ranged measurement",
+            streams[0].probe
+        );
+        assert_eq!(
+            streams[0].size_bytes,
+            Some(PROBED_SIZE),
+            "SizeBytes = {:?}, want the probed size to win over cached {STALE_STORE_SIZE}",
+            streams[0].size_bytes
+        );
     }
     todo!("pending: probe_fanout_test.go TestHydrateKnownSizes_doesNotReplaceAProbedSize")
 }
@@ -345,7 +440,8 @@ fn hydrate_known_sizes_movies_are_skipped() {
     #[cfg(any())]
     fn pending() {
         let resolves = std::cell::Cell::new(0);
-        let mut streams = vec![RawStream { info_hash: H.into(), size_bytes: Some(18 << 30), ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: H.into(), size_bytes: Some(18 << 30), ..Default::default() }];
         let h = Handler::for_test(Deps {
             make_stores: Box::new(|_| {
                 resolves.set(resolves.get() + 1);
@@ -374,7 +470,11 @@ fn hydrate_probe_facts_movie_gets_no_pack_size() {
         let h = Handler::for_test(Deps { cache, ..Default::default() });
         let mut streams = vec![s];
         h.hydrate_probe_facts(&mut streams, Some(&sid));
-        assert!(streams[0].pack_size_bytes.is_none(), "PackSizeBytes = {:?}, want nil for a movie", streams[0].pack_size_bytes);
+        assert!(
+            streams[0].pack_size_bytes.is_none(),
+            "PackSizeBytes = {:?}, want nil for a movie",
+            streams[0].pack_size_bytes
+        );
         assert_eq!(streams[0].size_bytes, Some(SIZE), "SizeBytes = {:?}", streams[0].size_bytes);
     }
     todo!("pending: probe_fanout_test.go TestHydrateProbeFacts_movieGetsNoPackSize")
@@ -397,10 +497,14 @@ fn probe_top_uncached_is_never_probed() {
             make_stores: Box::new(move |_| vec![fake_store_recording("torbox", tx.clone(), "")]),
             ..Default::default()
         });
-        let mut streams = vec![RawStream { info_hash: "uncached-hash".into(), cached: false, ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: "uncached-hash".into(), cached: false, ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &CacheTruth::default());
         assert!(streams[0].probe.is_none(), "an uncached release was probed");
-        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "an uncached release was resolved — that adds the torrent and spends the add quota");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "an uncached release was resolved — that adds the torrent and spends the add quota"
+        );
     }
     todo!("pending: probe_fanout_test.go TestProbeTop_uncachedIsNeverProbed")
 }
@@ -421,10 +525,14 @@ fn probe_top_cached_probes_behind_the_response() {
             make_stores: Box::new(move |_| vec![fake_store_recording("torbox", tx.clone(), "")]),
             ..Default::default()
         });
-        let mut streams = vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["held-hash"]));
         assert!(streams[0].probe.is_none(), "a held release was probed inline");
-        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the background probe never ran — the cache would never warm");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the background probe never ran — the cache would never warm"
+        );
     }
     todo!("pending: probe_fanout_test.go TestProbeTop_cachedProbesBehindTheResponse")
 }
@@ -445,7 +553,8 @@ fn probe_behind_logs_a_failed_resolve() {
             make_stores: Box::new(|_| vec![fake_store_failing("torbox", "mylist gave no usable answer")]),
             ..Default::default()
         });
-        let mut streams = vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["held-hash"]));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !out.contents().contains("could not resolve held-hash") {
@@ -471,10 +580,13 @@ fn probe_behind_panic_does_not_kill_the_process() {
         let (tx, rx) = std::sync::mpsc::channel();
         let h = Handler::for_test(Deps {
             probe_client: Some(panicking_client("malformed head")),
-            make_stores: Box::new(move |_| vec![fake_store_recording("torbox", tx.clone(), "https://debrid.example/file.mkv")]),
+            make_stores: Box::new(move |_| {
+                vec![fake_store_recording("torbox", tx.clone(), "https://debrid.example/file.mkv")]
+            }),
             ..Default::default()
         });
-        let mut streams = vec![RawStream { info_hash: "panic-hash".into(), cached: true, ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: "panic-hash".into(), cached: true, ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["panic-hash"]));
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the background probe never ran");
         // The handler is still usable afterwards: a poisoned singleflight would show up as this second call hanging.
@@ -502,7 +614,8 @@ fn probe_behind_panic_building_the_store_pool() {
             }),
             ..Default::default()
         });
-        let mut streams = vec![RawStream { info_hash: "pool-hash".into(), cached: true, ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: "pool-hash".into(), cached: true, ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["pool-hash"]));
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the background probe never ran");
         std::thread::sleep(Duration::from_millis(50));
@@ -544,7 +657,10 @@ fn probe_top_resolves_only_against_a_holding_store() {
         }
         std::thread::sleep(Duration::from_millis(100));
         let got = asked.lock().expect("lock").clone();
-        assert!(!got.contains(&"torbox"), "probed through TorBox, which does not hold this — that ADDS the torrent. asked={got:?}");
+        assert!(
+            !got.contains(&"torbox"),
+            "probed through TorBox, which does not hold this — that ADDS the torrent. asked={got:?}"
+        );
     }
     todo!("pending: probe_fanout_test.go TestProbeTop_resolvesOnlyAgainstAHoldingStore")
 }
@@ -566,10 +682,14 @@ fn probe_top_marks_its_target_no_add() {
             make_stores: Box::new(move |_| vec![capturing_store("torbox", tx.clone())]),
             ..Default::default()
         });
-        let mut streams = vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
+        let mut streams =
+            vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
         h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["held-hash"]));
         match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(target) => assert!(target.no_add, "the probe resolved without NoAdd — the store is free to queue the torrent"),
+            Ok(target) => assert!(
+                target.no_add,
+                "the probe resolved without NoAdd — the store is free to queue the torrent"
+            ),
             Err(_) => panic!("the background probe never ran"),
         }
     }

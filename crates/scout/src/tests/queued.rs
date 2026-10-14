@@ -32,7 +32,10 @@ async fn add_magnet_queued_id_is_not_a_dead_link() {
     let hash = "a".repeat(40);
     let (torrent_id, queued_id) =
         s.add_magnet(&hash, false, false).await.expect("a queued_id answer must not be an error");
-    assert!(torrent_id == 0 && queued_id == 7, "add_magnet returned ({torrent_id}, {queued_id}), want (0, 7)");
+    assert!(
+        torrent_id == 0 && queued_id == 7,
+        "add_magnet returned ({torrent_id}, {queued_id}), want (0, 7)"
+    );
     assert_eq!(s.known_queued_id(&hash), Some(7), "known_queued_id");
     assert!(
         was_added_by_us(&*cache, &s.account_identity(), &hash),
@@ -92,7 +95,10 @@ async fn resolve_queued_add_promoted_to_a_torrent() {
                     Ok(resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false}}"#))
                 } else {
                     // Promoted: the account listing now carries the torrent.
-                    Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":42,"hash":"{promoted_hash}"}}]}}"#)))
+                    Ok(resp(
+                        200,
+                        &format!(r#"{{"success":true,"data":[{{"id":42,"hash":"{promoted_hash}"}}]}}"#),
+                    ))
                 }
             }
             "requestdl" => Ok(resp(200, r#"{"success":true,"data":"https://cdn.torbox/promoted.mkv"}"#)),
@@ -150,15 +156,23 @@ async fn add_magnet_already_queued_is_discovered_via_getqueued() {
         client: Arc::new(MockDoer(move |req| {
             recorder.lock().unwrap().push(base(&req));
             match base(&req).as_str() {
-                "createtorrent" => Ok(resp(400, r#"{"error":"DIFF_ISSUE","detail":"Download already queued."}"#)),
-                "getqueued" => Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":55,"hash":"{listed_hash}"}}]}}"#))),
+                "createtorrent" => {
+                    Ok(resp(400, r#"{"error":"DIFF_ISSUE","detail":"Download already queued."}"#))
+                }
+                "getqueued" => Ok(resp(
+                    200,
+                    &format!(r#"{{"success":true,"data":[{{"id":55,"hash":"{listed_hash}"}}]}}"#),
+                )),
                 _ => Ok(resp(404, "{}")),
             }
         })),
     };
     let (torrent_id, queued_id) =
         s.add_magnet(&hash, false, false).await.expect("already-queued must not be an error");
-    assert!(torrent_id == 0 && queued_id == 55, "add_magnet returned ({torrent_id}, {queued_id}), want (0, 55)");
+    assert!(
+        torrent_id == 0 && queued_id == 55,
+        "add_magnet returned ({torrent_id}, {queued_id}), want (0, 55)"
+    );
     assert_eq!(s.known_queued_id(&hash), Some(55), "known_queued_id");
     assert!(
         was_added_by_us(&*cache, &s.account_identity(), &hash),
@@ -187,7 +201,11 @@ async fn add_magnet_ordinary_400_stays_a_dead_link() {
     };
     let err = s.add_magnet(&hash, false, false).await.expect_err("addMagnet err must be a DeadLinkError");
     assert!(matches!(err, StoreError::DeadLink(_)), "addMagnet err = {err:?}, want a DeadLinkError");
-    assert_eq!(getqueued_calls.load(std::sync::atomic::Ordering::SeqCst), 0, "getqueued called for an ordinary 400");
+    assert_eq!(
+        getqueued_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "getqueued called for an ordinary 400"
+    );
 }
 
 // DIFF_ISSUE is reported, but the hash is not actually in the queue listing (a stale TorBox-side report,
@@ -207,7 +225,11 @@ async fn add_magnet_already_queued_but_hash_missing_from_listing_stays_a_dead_li
     };
     let err = s.add_magnet(&hash, false, false).await.expect_err("addMagnet err must be a DeadLinkError");
     assert!(matches!(err, StoreError::DeadLink(_)), "addMagnet err = {err:?}, want a DeadLinkError");
-    assert_eq!(s.known_queued_id(&hash), None, "no queued marker should be written when the hash was not found in the listing");
+    assert_eq!(
+        s.known_queued_id(&hash),
+        None,
+        "no queued marker should be written when the hash was not found in the listing"
+    );
 }
 
 // /play answers 202 for a release TorBox queued, never 404 — den#204.
@@ -219,22 +241,30 @@ fn play_queued_add_answers_202() {
     // Enable when package 4 lands: move this body up and delete the wrapper.
     #[cfg(any())]
     fn pending() {
-    use crate::tests::handler::{do_req, valid_blob};
-    let hash = "b".repeat(40);
-    let (h, _) = crate::tests::cancel::cancel_torbox_handler(
-        |req| match base(req).as_str() {
-            "createtorrent" => resp(200, r#"{"success":true,"data":{"queued_id":9}}"#),
-            "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
-            _ => resp(404, "{}"),
-        },
-        None,
-    );
-    let rr = do_req(&h, &format!("/{}/play/{}", valid_blob(), crate::play::encode_play_token(&crate::play::PlayTarget {
-        info_hash: hash,
-        file_idx: Some(0),
-        ..Default::default()
-    })), None);
-    assert_eq!(rr.status(), 202, "play on a queued add: {:?}", rr.body());
+        use crate::tests::handler::{do_req, valid_blob};
+        let hash = "b".repeat(40);
+        let (h, _) = crate::tests::cancel::cancel_torbox_handler(
+            |req| match base(req).as_str() {
+                "createtorrent" => resp(200, r#"{"success":true,"data":{"queued_id":9}}"#),
+                "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
+                _ => resp(404, "{}"),
+            },
+            None,
+        );
+        let rr = do_req(
+            &h,
+            &format!(
+                "/{}/play/{}",
+                valid_blob(),
+                crate::play::encode_play_token(&crate::play::PlayTarget {
+                    info_hash: hash,
+                    file_idx: Some(0),
+                    ..Default::default()
+                })
+            ),
+            None,
+        );
+        assert_eq!(rr.status(), 202, "play on a queued add: {:?}", rr.body());
     }
     todo!("pending: queued_test.go:202 TestPlay_queuedAddAnswers202")
 }
@@ -255,15 +285,23 @@ async fn status_answer_queued_release_with_no_marker_is_found_via_getqueued() {
         client: Arc::new(MockDoer(move |req| match base(&req).as_str() {
             // The torrent listing: TorBox has never heard of this hash as a torrent at all.
             "mylist" => Ok(resp(200, r#"{"success":true,"data":[]}"#)),
-            "getqueued" => Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":77,"hash":"{queued_hash}"}}]}}"#))),
+            "getqueued" => {
+                Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":77,"hash":"{queued_hash}"}}]}}"#)))
+            }
             _ => Ok(resp(404, "{}")),
         })),
     };
     let target = ResolveTarget { info_hash: hash.clone(), ..Default::default() };
-    let status = s.status(&target).await.expect("Status ok = false, want true for a release sitting in TorBox's own queue");
+    let status = s
+        .status(&target)
+        .await
+        .expect("Status ok = false, want true for a release sitting in TorBox's own queue");
     assert_eq!(status.state, FETCH_QUEUED, "status.State");
     assert_eq!(status.service, Some(DebridService::TorBox), "status.Service");
-    assert!(s.known_queued_id(&hash).is_some(), "a discovered queue entry should be memoised so the next poll avoids another getqueued call");
+    assert!(
+        s.known_queued_id(&hash).is_some(),
+        "a discovered queue entry should be memoised so the next poll avoids another getqueued call"
+    );
 }
 
 // The probe route (?probe=1) is what Home's progress bar polls, and must answer the same "coming" state
@@ -277,26 +315,36 @@ fn probe_queued_release_answers_202_not_not_queued() {
     // Enable when package 4 lands: move this body up and delete the wrapper.
     #[cfg(any())]
     fn pending() {
-    use crate::tests::handler::{do_req, valid_blob};
-    let hash = "e".repeat(40);
-    let queued_hash = hash.clone();
-    let (h, _) = crate::tests::cancel::cancel_torbox_handler(
-        move |req| match base(req).as_str() {
-            "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
-            "getqueued" => resp(200, &format!(r#"{{"success":true,"data":[{{"id":88,"hash":"{queued_hash}"}}]}}"#)),
-            _ => resp(404, "{}"),
-        },
-        None,
-    );
-    let rr = do_req(&h, &format!("/{}/play/{}?probe=1", valid_blob(), crate::play::encode_play_token(&crate::play::PlayTarget {
-        info_hash: hash,
-        file_idx: Some(0),
-        ..Default::default()
-    })), None);
-    assert_eq!(rr.status(), 202, "probe on a queued release: {:?}", rr.body());
-    let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("probe body did not decode");
-    assert_eq!(body["state"], "queued", "probe state");
-    assert_eq!(body["service"], "torbox", "probe service");
+        use crate::tests::handler::{do_req, valid_blob};
+        let hash = "e".repeat(40);
+        let queued_hash = hash.clone();
+        let (h, _) = crate::tests::cancel::cancel_torbox_handler(
+            move |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
+                "getqueued" => {
+                    resp(200, &format!(r#"{{"success":true,"data":[{{"id":88,"hash":"{queued_hash}"}}]}}"#))
+                }
+                _ => resp(404, "{}"),
+            },
+            None,
+        );
+        let rr = do_req(
+            &h,
+            &format!(
+                "/{}/play/{}?probe=1",
+                valid_blob(),
+                crate::play::encode_play_token(&crate::play::PlayTarget {
+                    info_hash: hash,
+                    file_idx: Some(0),
+                    ..Default::default()
+                })
+            ),
+            None,
+        );
+        assert_eq!(rr.status(), 202, "probe on a queued release: {:?}", rr.body());
+        let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("probe body did not decode");
+        assert_eq!(body["state"], "queued", "probe state");
+        assert_eq!(body["service"], "torbox", "probe service");
     }
     todo!("pending: queued_test.go:255 TestProbe_queuedReleaseAnswers202NotNotQueued")
 }

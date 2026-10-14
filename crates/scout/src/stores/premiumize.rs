@@ -16,16 +16,16 @@ use crate::season::{
 };
 use crate::stores::refusal::{
     account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, already_queued, backed_off,
-    batches_failed, cache_or_none, forget_held, held_recently, is_cancellation, known_cached, note_add_attempt,
-    note_held, note_queued, note_unknown_outcome, pending_too_long, record_refusal,
+    batches_failed, cache_or_none, forget_held, held_recently, is_cancellation, known_cached,
+    note_add_attempt, note_held, note_queued, note_unknown_outcome, pending_too_long, record_refusal,
     remember_cached, scout_budget_spent, settle_add_attempt, settle_queued_transfer, store_error_from_do,
     unknown_outcome,
 };
 use crate::stores::torbox::CACHE_BATCH;
 use crate::stores::{
     build_request, dead_link, decode_all, decode_first, encode_form, go_query_escape, join_all, magnet_for,
-    null_default, read_limited, redact_token, store_error_text, store_refused_us, unavailable, ResolveTarget, Store,
-    StoreError, StoreStatus, ERR_WOULD_ADD, MAX_STORE_BYTES,
+    null_default, read_limited, redact_token, store_error_text, store_refused_us, unavailable, ResolveTarget,
+    Store, StoreError, StoreStatus, ERR_WOULD_ADD, MAX_STORE_BYTES,
 };
 use crate::util::{Shape, LEAF};
 
@@ -90,7 +90,9 @@ impl PremiumizeStore {
             query.push_str("&items%5B%5D=");
             query.push_str(&go_query_escape(h));
         }
-        let req = build_request(reqwest::Method::GET, &format!("{}/cache/check?{query}", self.api), &[], None).ok()?;
+        let req =
+            build_request(reqwest::Method::GET, &format!("{}/cache/check?{query}", self.api), &[], None)
+                .ok()?;
         let mut resp = self.client.do_request(req).await.ok()?;
         if resp.status().as_u16() != 200 {
             return None;
@@ -104,7 +106,11 @@ impl PremiumizeStore {
     }
 
     /// Go `premiumizeStore.pickIndex`.
-    pub(crate) fn pick_index(&self, files: &[TorrentFile], t: &ResolveTarget) -> Result<Option<i64>, StoreError> {
+    pub(crate) fn pick_index(
+        &self,
+        files: &[TorrentFile],
+        t: &ResolveTarget,
+    ) -> Result<Option<i64>, StoreError> {
         if files.is_empty() {
             return Ok(None);
         }
@@ -195,7 +201,9 @@ impl Store for PremiumizeStore {
         // a transfer the probe answered 202 "downloading" until the marker aged past pendingGiveUp and then
         // 404, never 200, while /play answered 302 with a playable link. Measured on a completed transfer:
         // probe 202, /play 302, on the one URL that exists to tell a client its download landed.
-        if t.no_add && !already_queued(cache, &self.token, &t.info_hash) && !held_recently(cache, &self.token, &t.info_hash)
+        if t.no_add
+            && !already_queued(cache, &self.token, &t.info_hash)
+            && !held_recently(cache, &self.token, &t.info_hash)
         {
             return Err(dead_link(ERR_WOULD_ADD));
         }
@@ -373,7 +381,8 @@ impl Store for PremiumizeStore {
                         // This branch was the one left out, and it is the one carrying Premiumize's real
                         // refusals.
                         let msg = redact_token(body.message.trim(), &self.token);
-                        let clipped = String::from_utf8_lossy(&msg.as_bytes()[..msg.len().min(200)]).into_owned();
+                        let clipped =
+                            String::from_utf8_lossy(&msg.as_bytes()[..msg.len().min(200)]).into_owned();
                         dead_link(format!(
                             "premiumize directdl: {}",
                             format!("{} {clipped}", redact_token(&body.status, &self.token)).trim()
@@ -507,7 +516,9 @@ impl Store for PremiumizeStore {
         if backed_off(cache, svc, &self.token, info_hash).is_some() {
             return Some(false);
         }
-        Some(already_queued(cache, &self.token, info_hash) && !pending_too_long(cache, &self.token, info_hash))
+        Some(
+            already_queued(cache, &self.token, info_hash) && !pending_too_long(cache, &self.token, info_hash),
+        )
     }
 
     /// Go `premiumizeStore.HoldsTorrent`. Premiumize's equivalent of "we have an id for this" is the queue

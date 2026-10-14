@@ -1,7 +1,9 @@
 //! Go: `internal/scout/client_test.go` (132 lines). Work package 5.
 
 use crate::attributes::stream_attributes;
-use crate::client::{ClientPlayable, AUDIO_CONVERTED_COST, NEVER_PLAYS_COST, VIDEO_CONVERTED_COST, VIDEO_UNNAMED_COST};
+use crate::client::{
+    ClientPlayable, AUDIO_CONVERTED_COST, NEVER_PLAYS_COST, VIDEO_CONVERTED_COST, VIDEO_UNNAMED_COST,
+};
 use crate::probe::Probe;
 use crate::rank::{rank_streams, RankFilters, RawStream};
 
@@ -26,7 +28,8 @@ pub(crate) fn a_browser(change: impl FnOnce(&mut ClientPlayable)) -> ClientPlaya
 
 #[test]
 fn rank_streams_for_the_browser_that_asked() {
-    let remux = rs("Film.2024.2160p.UHD.BluRay.REMUX.HEVC.HDR.TrueHD.7.1.mkv", |s| s.info_hash = "remux".into());
+    let remux =
+        rs("Film.2024.2160p.UHD.BluRay.REMUX.HEVC.HDR.TrueHD.7.1.mkv", |s| s.info_hash = "remux".into());
     let dv5 = rs("Film.2024.2160p.WEB-DL.DV.HEVC.AAC.mkv", |s| {
         s.info_hash = "dv5".into();
         s.probe = Some(Probe {
@@ -125,8 +128,8 @@ fn client_playable_cost() {
 fn stream_list_ranked_for_the_browser_that_asked() {
     #[cfg(any())]
     fn pending() {
-        use crate::handler::serve;
         use crate::deps::Deps;
+        use crate::handler::serve;
         use crate::rank::RawStream;
 
         // Go: seeds := func(context.Context) ([]RawStream, error) { ... } with repeat("a", 40) etc.

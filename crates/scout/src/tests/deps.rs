@@ -47,7 +47,8 @@ fn settings_from_env() {
             && s.scrape_timeout == Duration::from_secs(5)
             && s.list_ttl == Duration::from_secs(60)
             && s.public_url == "https://scout.example"
-            && s.indexer_urls.get(&indexer("mediafusion")).map(String::as_str) == Some("https://mf.self/CONFIG")
+            && s.indexer_urls.get(&indexer("mediafusion")).map(String::as_str)
+                == Some("https://mf.self/CONFIG")
             && s.cache_bytes == 1 << 20,
         "from env: {s:?}"
     );
@@ -115,35 +116,38 @@ async fn build_deps() {
     // Enable when packages 1, 2 and 5 land: move `pending` up and delete the wrapper.
     #[cfg(any())]
     async fn pending() {
-    use std::sync::Arc;
+        use std::sync::Arc;
 
-    use crate::cache::MemoryCache;
-    use crate::config::{Config, DebridAccount, DebridService, Filters};
-    use crate::scrape::ScrapeQuery;
+        use crate::cache::MemoryCache;
+        use crate::config::{Config, DebridAccount, DebridService, Filters};
+        use crate::scrape::ScrapeQuery;
 
-    let settings = deps::settings_from_env(|_| String::new());
-    let built = deps::build_deps(&settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
-    let cfg = Config {
-        indexers: vec![indexer("torrentio"), indexer("comet")],
-        filters: Filters { exclude_cam: true, ..Filters::default() },
-        debrid: vec![DebridAccount { service: DebridService::TorBox, token: "t".to_owned() }],
-        ..Config::default()
-    };
-    // comet needs a per-install config URL and this environment supplies none, so it is never requested —
-    // asked bare it can only 403. But it stays in the list as a source that CANNOT answer, rather than
-    // disappearing from it: dropping it would take it out of the quorum too, and "an empty result is
-    // authoritative only when every indexer answered" would quietly become "…every indexer we still bother
-    // asking", which is how one 200-empty becomes a confident "this release does not exist".
-    let sc = (built.make_scrapers)(&cfg);
-    assert!(sc.len() == 2 && sc[0].id() == indexer("torrentio") && sc[1].id() == indexer("comet"), "makeScrapers");
-    assert!(
-        sc[1].scrape(&ScrapeQuery::default()).await.is_err(),
-        "an unaskable indexer must fail, so it counts as a source that did not answer"
-    );
-    // The Go test then asserts `sc[1]` is `unaskableScraper` with `transient == false`. That type is
-    // package 5's (scrape.go:433) and is not in this crate yet, so that assertion waits for its port.
-    // NOT transient: the distinction decides whether the operator is told to configure something or told an
-    // upstream is down, and it is read one level up to decide whether an empty list is an outage.
+        let settings = deps::settings_from_env(|_| String::new());
+        let built = deps::build_deps(&settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
+        let cfg = Config {
+            indexers: vec![indexer("torrentio"), indexer("comet")],
+            filters: Filters { exclude_cam: true, ..Filters::default() },
+            debrid: vec![DebridAccount { service: DebridService::TorBox, token: "t".to_owned() }],
+            ..Config::default()
+        };
+        // comet needs a per-install config URL and this environment supplies none, so it is never requested —
+        // asked bare it can only 403. But it stays in the list as a source that CANNOT answer, rather than
+        // disappearing from it: dropping it would take it out of the quorum too, and "an empty result is
+        // authoritative only when every indexer answered" would quietly become "…every indexer we still bother
+        // asking", which is how one 200-empty becomes a confident "this release does not exist".
+        let sc = (built.make_scrapers)(&cfg);
+        assert!(
+            sc.len() == 2 && sc[0].id() == indexer("torrentio") && sc[1].id() == indexer("comet"),
+            "makeScrapers"
+        );
+        assert!(
+            sc[1].scrape(&ScrapeQuery::default()).await.is_err(),
+            "an unaskable indexer must fail, so it counts as a source that did not answer"
+        );
+        // The Go test then asserts `sc[1]` is `unaskableScraper` with `transient == false`. That type is
+        // package 5's (scrape.go:433) and is not in this crate yet, so that assertion waits for its port.
+        // NOT transient: the distinction decides whether the operator is told to configure something or told an
+        // upstream is down, and it is read one level up to decide whether an empty list is an outage.
     }
     todo!("pending: go deps_test.go:TestBuildDeps")
 }

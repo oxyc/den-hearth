@@ -112,7 +112,8 @@ async fn a_resolve_dropped_while_listing_files_keeps_the_id_it_was_just_handed()
             _ => Some(resp(404, "{}")),
         })),
     );
-    let target = ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
+    let target =
+        ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
     let dropped = tokio::time::timeout(Duration::from_secs(1), s.resolve(&target)).await;
     assert!(dropped.is_err(), "the resolve should still have been waiting for the file list");
     assert_eq!(s.known_torrent_id(&hash), (42, true), "the id createtorrent returned must be remembered");
@@ -131,7 +132,9 @@ async fn an_add_dropped_during_the_already_queued_lookup_is_refunded_and_filed()
         "tb-review-diff-issue-drop",
         &cache,
         Arc::new(Stalling(|req| match base(req).as_str() {
-            "createtorrent" => Some(resp(400, r#"{"error":"DIFF_ISSUE","detail":"Download already queued."}"#)),
+            "createtorrent" => {
+                Some(resp(400, r#"{"error":"DIFF_ISSUE","detail":"Download already queued."}"#))
+            }
             // The queue listing never comes back.
             "getqueued" => None,
             _ => Some(resp(404, "{}")),
@@ -141,8 +144,15 @@ async fn an_add_dropped_during_the_already_queued_lookup_is_refunded_and_filed()
     let before = global_add_budget().remaining(&account);
     let dropped = tokio::time::timeout(Duration::from_secs(1), s.add_magnet(&hash, false, false)).await;
     assert!(dropped.is_err(), "the add should still have been waiting for the queue listing");
-    assert_eq!(global_add_budget().remaining(&account), before, "the charge for an add TorBox refused must go back");
-    assert!(!add_outcome_unknown(&*cache, DebridService::TorBox, &s.account_identity(), &hash), "the answer was read");
+    assert_eq!(
+        global_add_budget().remaining(&account),
+        before,
+        "the charge for an add TorBox refused must go back"
+    );
+    assert!(
+        !add_outcome_unknown(&*cache, DebridService::TorBox, &s.account_identity(), &hash),
+        "the answer was read"
+    );
     assert_eq!(
         backed_off(&*cache, DebridService::TorBox, &s.account_identity(), &hash).as_deref(),
         Some("torbox createtorrent http 400 (DIFF_ISSUE: Download already queued.)"),
@@ -194,8 +204,12 @@ struct DelayedBatch {
 #[async_trait]
 impl Doer for DelayedBatch {
     async fn do_request(&self, req: reqwest::Request) -> Result<reqwest::Response, DoError> {
-        let list: String =
-            req.url().query_pairs().find(|(k, _)| k == "hash").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let list: String = req
+            .url()
+            .query_pairs()
+            .find(|(k, _)| k == "hash")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
         if !list.starts_with(&self.first) {
             return pending::<Result<reqwest::Response, DoError>>().await;
         }

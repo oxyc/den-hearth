@@ -16,14 +16,23 @@ fn add_budget_prefetch_stops_at_the_reserve_and_play_spends_to_zero() {
         b.reserve = 3;
         // Seven prefetches, a minute apart: the last one leaves exactly the reserve.
         for i in 0..7 {
-            assert!(b.take_at("acct", true, now), "prefetch {} refused with {} left, above the reserve of 3", i + 1, b.remaining("acct"));
+            assert!(
+                b.take_at("acct", true, now),
+                "prefetch {} refused with {} left, above the reserve of 3",
+                i + 1,
+                b.remaining("acct")
+            );
             now += Duration::from_secs(60);
         }
         assert!(!b.take_at("acct", true, now), "a prefetch spent into the reserve kept for Play");
         assert_eq!(b.remaining("acct"), 3, "a refusal must spend nothing");
         // The first charge (20:00) drains at 21:00, which frees one prefetch.
         assert_eq!(b.frees_in("acct", true), Duration::from_secs(53 * 60), "prefetch freesIn");
-        assert_eq!(b.frees_in("acct", false), Duration::ZERO, "a viewer was told to wait with the reserve still there");
+        assert_eq!(
+            b.frees_in("acct", false),
+            Duration::ZERO,
+            "a viewer was told to wait with the reserve still there"
+        );
         // The viewer spends the reserve, down to zero, and no further.
         for _ in 0..3 {
             assert!(b.take_at("acct", false, now), "Play refused with {} left", b.remaining("acct"));
@@ -54,7 +63,11 @@ fn add_budget_without_the_flag_the_reserve_changes_nothing() {
         let mut b = AddBudget::new(std::time::Duration::from_secs(3600), 5);
         b.reserve = 4;
         for i in 0..5 {
-            assert!(b.take("acct", false), "add {} of 5 refused — the reserve leaked into the default intent", i + 1);
+            assert!(
+                b.take("acct", false),
+                "add {} of 5 refused — the reserve leaked into the default intent",
+                i + 1
+            );
         }
         assert!(!b.take("acct", false), "a sixth add against an allowance of 5");
     }
@@ -72,19 +85,35 @@ fn spend_add_prefetch_refusal_is_the_reserve_not_the_budget() {
         let prev = global_add_budget_swap(AddBudget::new(std::time::Duration::from_secs(3600), 6));
         global_add_budget().reserve = 5;
         let before = metrics().add_refused_prefetch();
-        assert!(spend_add(DebridService::TorBox, "tok", H, true).is_ok(), "the one prefetch add above the reserve was refused");
-        let err = spend_add(DebridService::TorBox, "tok", H, true).expect_err("the reserve refuses the second prefetch");
-        assert!(err.is_play_reserve() && err.is_scout_side(), "want errPlayReserve wrapped as scout-side, got {err:?}");
+        assert!(
+            spend_add(DebridService::TorBox, "tok", H, true).is_ok(),
+            "the one prefetch add above the reserve was refused"
+        );
+        let err = spend_add(DebridService::TorBox, "tok", H, true)
+            .expect_err("the reserve refuses the second prefetch");
+        assert!(
+            err.is_play_reserve() && err.is_scout_side(),
+            "want errPlayReserve wrapped as scout-side, got {err:?}"
+        );
         let cache = MemoryCache::new(1 << 20);
         record_refusal(&cache, DebridService::TorBox, "tok", H, &err);
-        assert!(backed_off(&cache, DebridService::TorBox, "tok", H).is_none(), "the reserve was written into the store's refusal memory");
+        assert!(
+            backed_off(&cache, DebridService::TorBox, "tok", H).is_none(),
+            "the reserve was written into the store's refusal memory"
+        );
         assert_eq!(metrics().add_refused_prefetch() - before, 1, "prefetch refusals counted");
         let play_before = metrics().add_refused_play();
         for i in 0..5 {
-            assert!(spend_add(DebridService::TorBox, "tok", H, false).is_ok(), "Play refused with the reserve left (add {i})");
+            assert!(
+                spend_add(DebridService::TorBox, "tok", H, false).is_ok(),
+                "Play refused with the reserve left (add {i})"
+            );
         }
         let err = spend_add(DebridService::TorBox, "tok", H, false).expect_err("a spent budget refuses Play");
-        assert!(!err.is_play_reserve(), "a spent budget must refuse Play as spent, not as the reserve: {err:?}");
+        assert!(
+            !err.is_play_reserve(),
+            "a spent budget must refuse Play as spent, not as the reserve: {err:?}"
+        );
         assert_eq!(metrics().add_refused_play() - play_before, 1, "play refusals counted");
         global_add_budget_restore(prev);
     }
@@ -104,27 +133,45 @@ async fn handle_play_prefetch_is_held_back_and_play_is_served() {
         let adds = Arc::new(AtomicI32::new(0));
         let cache = Arc::new(MemoryCache::new(1 << 20));
         let a = adds.clone();
-        let store = TorBoxStore::with_client("tok", cache.clone(), MockDoer::new(move |r| {
-            if is_add_endpoint(r) {
-                a.fetch_add(1, Ordering::SeqCst);
-            }
-            resp(200, r#"{"data":[]}"#)
-        }));
+        let store = TorBoxStore::with_client(
+            "tok",
+            cache.clone(),
+            MockDoer::new(move |r| {
+                if is_add_endpoint(r) {
+                    a.fetch_add(1, Ordering::SeqCst);
+                }
+                resp(200, r#"{"data":[]}"#)
+            }),
+        );
         let c = cache.clone();
         let h = new_handler(test_deps(move |d| {
             d.cache = c.clone();
             d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())]);
         }));
-        let path = format!("/{}/play/{}", valid_blob(), crate::play::encode_play_token(&PlayTarget { info_hash: H.to_owned(), ..Default::default() }));
+        let path = format!(
+            "/{}/play/{}",
+            valid_blob(),
+            crate::play::encode_play_token(&PlayTarget { info_hash: H.to_owned(), ..Default::default() })
+        );
         let rec = get(&h, &format!("{path}?prefetch=1"), &[]).await;
         assert_eq!(rec.status(), 503, "prefetch at the reserve");
-        assert!(body_str(&rec).contains("\"reserved_for_play\""), "the reserve must answer reserved_for_play: {}", body_str(&rec));
-        assert!(!body_str(&rec).contains("scout_busy") && !body_str(&rec).contains("store_unavailable"), "the reserve must not read as a spent budget or a refusing store");
+        assert!(
+            body_str(&rec).contains("\"reserved_for_play\""),
+            "the reserve must answer reserved_for_play: {}",
+            body_str(&rec)
+        );
+        assert!(
+            !body_str(&rec).contains("scout_busy") && !body_str(&rec).contains("store_unavailable"),
+            "the reserve must not read as a spent budget or a refusing store"
+        );
         let secs: i64 = hdr(&rec, "retry-after").parse().unwrap_or(0);
         assert!(secs >= 1, "retry-after = {:?}, want a positive number of seconds", hdr(&rec, "retry-after"));
         assert_eq!(adds.load(Ordering::SeqCst), 0, "a held-back prefetch sent adds");
         let rec = get(&h, &path, &[]).await;
-        assert!(!body_str(&rec).contains("reserved_for_play") && !body_str(&rec).contains("scout_busy"), "Play was refused by the budget with the reserve left");
+        assert!(
+            !body_str(&rec).contains("reserved_for_play") && !body_str(&rec).contains("scout_busy"),
+            "Play was refused by the budget with the reserve left"
+        );
         assert_eq!(adds.load(Ordering::SeqCst), 1, "Play sent adds, want 1 — the reserve is for it");
         global_add_budget_restore(prev);
     }

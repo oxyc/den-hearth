@@ -43,14 +43,26 @@ async fn validate_debrid_token_per_service() {
         let doer = MockDoer({
             let seen = Arc::clone(&seen);
             move |req: reqwest::Request| {
-                let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
                 *seen.lock().unwrap() = (req.url().to_string(), auth);
                 Ok(resp(status, body))
             }
         });
         let got = validate_debrid_token(&doer, &limiter, svc, "the-token").await;
-        assert_eq!(got.valid, want_valid, "{name}: valid = {} (reason {:?}), want {want_valid}", got.valid, got.reason);
-        assert!(got.valid || !got.reason.is_empty(), "{name}: an invalid verdict came back with no reason to show anyone");
+        assert_eq!(
+            got.valid, want_valid,
+            "{name}: valid = {} (reason {:?}), want {want_valid}",
+            got.valid, got.reason
+        );
+        assert!(
+            got.valid || !got.reason.is_empty(),
+            "{name}: an invalid verdict came back with no reason to show anyone"
+        );
         let (url, auth) = seen.lock().unwrap().clone();
         if let Some(suffix) = want_url {
             assert!(url.ends_with(suffix), "{name}: asked {url:?}, want a URL ending in {suffix:?}");
@@ -72,11 +84,19 @@ async fn validate_unreachable_is_not_invalid() {
     let doer = MockDoer(|_req: reqwest::Request| Err(DoError::from("dial tcp: connection refused")));
     let got = validate_debrid_token(&doer, &limiter, DebridService::TorBox, "t").await;
     assert!(!got.valid, "an unreachable service reported the token as valid");
-    assert!(got.reason.contains("could not reach"), "reason = {:?}, want it to say the service could not be reached", got.reason);
+    assert!(
+        got.reason.contains("could not reach"),
+        "reason = {:?}, want it to say the service could not be reached",
+        got.reason
+    );
     // The reason is shown to a user and must never carry the token or the upstream URL — they travel
     // together, and this is the one route holding an unsealed token. The Go check compares against torboxAPI
     // (package 1); this asserts the reason carries no URL and no transport text at all.
-    assert!(!got.reason.contains("://") && !got.reason.contains("dial tcp") && !got.reason.contains("refused"), "reason leaked the request: {:?}", got.reason);
+    assert!(
+        !got.reason.contains("://") && !got.reason.contains("dial tcp") && !got.reason.contains("refused"),
+        "reason leaked the request: {:?}",
+        got.reason
+    );
 }
 
 // Needs `handleValidate`, `Deps::for_test` and `postJSON` through the handler (package 4).
@@ -105,9 +125,16 @@ fn validate_route_refuses_rather_than_queues() {
         assert_eq!(rr.status(), 429, "second check");
         // The point of the 429 is that it is immediate — a queued request is the cost being avoided.
         let elapsed = start.elapsed();
-        assert!(elapsed <= Duration::from_secs(1), "the refusal took {elapsed:?} — it queued instead of shedding");
+        assert!(
+            elapsed <= Duration::from_secs(1),
+            "the refusal took {elapsed:?} — it queued instead of shedding"
+        );
         assert!(rr.headers().get("retry-after").is_some(), "429 without a Retry-After");
-        assert_eq!(upstream.load(Ordering::SeqCst), 1, "upstream called more than once — a refused check must not reach the provider");
+        assert_eq!(
+            upstream.load(Ordering::SeqCst),
+            1,
+            "upstream called more than once — a refused check must not reach the provider"
+        );
     }
     todo!("pending: validate_test.go:~91 TestValidateRoute_refusesRatherThanQueues")
 }
@@ -130,7 +157,11 @@ fn validate_route() {
 
         let rr = post_json(&deps, "/validate", r#"{"service":"torbox","token":"tb-secret"}"#);
         assert_eq!(rr.status(), 200, "validate");
-        assert_eq!(rr.headers()["cache-control"], NO_STORE, "cache-control: want no-store, this reply is about a secret");
+        assert_eq!(
+            rr.headers()["cache-control"],
+            NO_STORE,
+            "cache-control: want no-store, this reply is about a secret"
+        );
         let got: ValidateResult = serde_json::from_str(rr.body()).expect("json");
         assert!(got.valid, "valid token reported invalid: {got:?}");
 
@@ -143,7 +174,12 @@ fn validate_route() {
         // upstream call — the route must not become a way to send arbitrary strings to a third party.
         let before = asked.load(Ordering::SeqCst);
         let oversized = format!(r#"{{"service":"torbox","token":"{}"}}"#, "x".repeat(513));
-        for body in [r#"{"service":"nope","token":"x"}"#, r#"{"service":"torbox","token":""}"#, oversized.as_str(), "not json"] {
+        for body in [
+            r#"{"service":"nope","token":"x"}"#,
+            r#"{"service":"torbox","token":""}"#,
+            oversized.as_str(),
+            "not json",
+        ] {
             assert_eq!(post_json(&deps, "/validate", body).status(), 400, "body {body:.40}");
         }
         assert_eq!(asked.load(Ordering::SeqCst), before, "a rejected request still reached the upstream");

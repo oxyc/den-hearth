@@ -521,7 +521,8 @@ fn validate(raw: RawConfig) -> Option<Config> {
         }
     };
 
-    let sources: Vec<String> = raw.sources.unwrap_or_default().into_iter().map(Option::unwrap_or_default).collect();
+    let sources: Vec<String> =
+        raw.sources.unwrap_or_default().into_iter().map(Option::unwrap_or_default).collect();
     Some(Config {
         debrid,
         indexers: idx,

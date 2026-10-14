@@ -147,7 +147,11 @@ pub(crate) fn public_addr(ip: IpAddr) -> bool {
 fn is_global_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => {
-            !(a.is_unspecified() || a.is_loopback() || a.is_multicast() || a.is_link_local() || a == Ipv4Addr::BROADCAST)
+            !(a.is_unspecified()
+                || a.is_loopback()
+                || a.is_multicast()
+                || a.is_link_local()
+                || a == Ipv4Addr::BROADCAST)
         }
         IpAddr::V6(a) => {
             let link_local = a.segments()[0] & 0xffc0 == 0xfe80;

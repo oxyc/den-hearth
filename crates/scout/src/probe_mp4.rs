@@ -3,8 +3,8 @@
 use std::borrow::Cow;
 
 use crate::probe::{
-    append_unique, bit_depth_from_config, channel_count, channel_layout, clean_lang, dovi_profile, hdr_from_transfer,
-    round_rate, video_shape, Probe,
+    append_unique, bit_depth_from_config, channel_count, channel_layout, clean_lang, dovi_profile,
+    hdr_from_transfer, round_rate, video_shape, Probe,
 };
 use crate::probe_avi::codec_from_four_cc;
 
@@ -29,11 +29,11 @@ pub(crate) fn parse_mp4(head: &[u8]) -> (Probe, bool) {
     }
     let Some(moov) = find_box(head, "moov") else { return (Probe::default(), false) };
     let mut p = Probe { container: "mp4".into(), ..Default::default() };
-    for trak in all_boxes(&moov, "trak") {
-        let Some(mdia) = find_box(&trak, "mdia") else { continue };
-        let kind = handler_kind(&mdia);
-        let lang = media_language(&mdia);
-        let codec = sample_codec(&mdia);
+    for trak in all_boxes(moov, "trak") {
+        let Some(mdia) = find_box(trak, "mdia") else { continue };
+        let kind = handler_kind(mdia);
+        let lang = media_language(mdia);
+        let codec = sample_codec(mdia);
         if !codec.is_empty() && kind == "vide" && p.video_codec.is_empty() {
             p.video_codec = codec.to_string();
         }
@@ -41,13 +41,13 @@ pub(crate) fn parse_mp4(head: &[u8]) -> (Probe, bool) {
         // already follows. First-wins reported "5.1" for a remux that lists 5.1 before its 7.1 track, and the
         // probe overrides the correctly-titled value, so the viewer is shown a worse fact than the title had.
         if kind == "soun" {
-            let n = mp4_audio_channels(&mdia);
+            let n = mp4_audio_channels(mdia);
             if n > channel_count(&p.audio_channels) {
                 p.audio_channels = channel_layout(n).to_string();
             }
         }
         if kind == "vide" {
-            mp4_video_config(&mdia, &mut p);
+            mp4_video_config(mdia, &mut p);
         }
         match kind.as_str() {
             "soun" => {
@@ -118,13 +118,13 @@ fn media_language(mdia: &[u8]) -> String {
 /// Go `sampleCodec`: the codec family of the first sample entry in a track's `stsd`.
 fn sample_codec(mdia: &[u8]) -> &'static str {
     let Some(minf) = find_box(mdia, "minf") else { return "" };
-    let Some(stbl) = find_box(&minf, "stbl") else { return "" };
-    let Some(stsd) = find_box(&stbl, "stsd") else { return "" };
+    let Some(stbl) = find_box(minf, "stbl") else { return "" };
+    let Some(stsd) = find_box(stbl, "stsd") else { return "" };
     // stsd: version+flags(4), entry count(4), then boxes whose type IS the codec.
     if stsd.len() < 16 {
         return "";
     }
-    codec_from_four_cc(String::from_utf8_lossy(&stsd[12..16]).trim_end_matches(|c: char| c == '\0' || c == ' '))
+    codec_from_four_cc(String::from_utf8_lossy(&stsd[12..16]).trim_end_matches(['\0', ' ']))
 }
 
 /// Go `findBox`: the payload of the first child box with this type.
@@ -226,22 +226,22 @@ fn mp4_video_config(mdia: &[u8], p: &mut Probe) {
                     _ => "av1",
                 };
                 if p.bit_depth == 0 {
-                    p.bit_depth = bit_depth_from_config(codec, &b.body) as i32;
+                    p.bit_depth = bit_depth_from_config(codec, b.body) as i32;
                 }
                 if first {
-                    (p.video_profile, p.video_level, p.high_tier) = video_shape(codec, &b.body);
+                    (p.video_profile, p.video_level, p.high_tier) = video_shape(codec, b.body);
                 }
             }
-            "colr" => {
+            "colr"
                 // An nclx colour box: its type, then colour primaries, transfer characteristics and matrix, 16 bits each.
-                if first && b.body.len() >= 8 && &b.body[..4] == b"nclx" {
-                    p.hdr_format = hdr_from_transfer(i64::from(u16::from_be_bytes([b.body[6], b.body[7]]))).to_string();
+                if first && b.body.len() >= 8 && &b.body[..4] == b"nclx" => {
+                    p.hdr_format =
+                        hdr_from_transfer(i64::from(u16::from_be_bytes([b.body[6], b.body[7]]))).to_string();
                 }
-            }
             "dvcC" | "dvvC" | "dvwC" => {
                 p.dolby_vision = true;
                 if p.dv_profile == 0 {
-                    p.dv_profile = dovi_profile(&b.body) as i32;
+                    p.dv_profile = dovi_profile(b.body) as i32;
                 }
             }
             _ => {}
@@ -264,13 +264,13 @@ fn mp4_frame_rate(mdia: &[u8]) -> f64 {
     }
     let timescale = u32::from_be_bytes([mdhd[off], mdhd[off + 1], mdhd[off + 2], mdhd[off + 3]]);
     let Some(minf) = find_box(mdia, "minf") else { return 0.0 };
-    let Some(stbl) = find_box(&minf, "stbl") else { return 0.0 };
-    let Some(stts) = find_box(&stbl, "stts") else { return 0.0 };
+    let Some(stbl) = find_box(minf, "stbl") else { return 0.0 };
+    let Some(stts) = find_box(stbl, "stts") else { return 0.0 };
     if stts.len() < 8 || timescale == 0 {
         return 0.0;
     }
     // version+flags(4), entry count(4), then sample count and sample delta, 32 bits each, per entry.
-    let count = be_u32(&stts, 4) as usize;
+    let count = be_u32(stts, 4) as usize;
     // Go's uint64 arithmetic wraps; so does this, rather than panicking on a hostile table.
     let mut samples: u64 = 0;
     let mut ticks: u64 = 0;
@@ -279,9 +279,9 @@ fn mp4_frame_rate(mdia: &[u8]) -> f64 {
         if at + 8 > stts.len() {
             break;
         }
-        let n = u64::from(be_u32(&stts, at));
+        let n = u64::from(be_u32(stts, at));
         samples = samples.wrapping_add(n);
-        ticks = ticks.wrapping_add(n.wrapping_mul(u64::from(be_u32(&stts, at + 4))));
+        ticks = ticks.wrapping_add(n.wrapping_mul(u64::from(be_u32(stts, at + 4))));
         at += 8;
     }
     if ticks == 0 {

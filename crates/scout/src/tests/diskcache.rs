@@ -17,7 +17,7 @@ fn disk_bytes(dir: &Path) -> i64 {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let m = e.metadata().ok()?;
-            m.is_file().then(|| m.len() as i64)
+            m.is_file().then_some(m.len() as i64)
         })
         .sum()
 }
@@ -37,7 +37,11 @@ fn tiered_cache_survives_restart() {
 
     let second = TieredCache::new(1 << 20, dir.path()); // a "restart": nothing in memory
     let got = second.get("tracks:abc");
-    assert_eq!(got.as_deref(), Some(r#"{"audioLanguages":["swe"]}"#), "after restart got {got:?}, want the stored value");
+    assert_eq!(
+        got.as_deref(),
+        Some(r#"{"audioLanguages":["swe"]}"#),
+        "after restart got {got:?}, want the stored value"
+    );
 }
 
 #[test]
@@ -49,7 +53,10 @@ fn tiered_cache_volatile_entries_never_reach_disk() {
     }
     assert_eq!(first.get("status:499").as_deref(), Some("pending"), "volatile entry missing from memory");
     assert_eq!(file_count(dir.path()), 0, "volatile burst wrote disk files, want zero");
-    assert!(TieredCache::new(1 << 20, dir.path()).get("status:499").is_none(), "volatile coordination state survived a restart");
+    assert!(
+        TieredCache::new(1 << 20, dir.path()).get("status:499").is_none(),
+        "volatile coordination state survived a restart"
+    );
 }
 
 // Changing a key from durable to volatile is a state transition, not a second independent cache tier.
@@ -68,7 +75,12 @@ fn tiered_cache_volatile_overwrite_retires_durable_value() {
                 c
             }
             "memory eviction" => {
-                c.put_class("large-enough-to-evict", &"x".repeat(128), Duration::from_secs(3600), CacheClass::Volatile);
+                c.put_class(
+                    "large-enough-to-evict",
+                    &"x".repeat(128),
+                    Duration::from_secs(3600),
+                    CacheClass::Volatile,
+                );
                 c
             }
             _ => TieredCache::new(64, dir.path()),
@@ -173,7 +185,11 @@ fn tiered_cache_hashes_awkward_keys() {
     let c = TieredCache::new(1 << 20, dir.path());
     let key = format!("list:{}/../../etc/passwd?x=1", "\0".repeat(300));
     c.put(&key, "v", Duration::from_secs(3600));
-    assert_eq!(TieredCache::new(1 << 20, dir.path()).get(&key).as_deref(), Some("v"), "awkward key round-trip failed");
+    assert_eq!(
+        TieredCache::new(1 << 20, dir.path()).get(&key).as_deref(),
+        Some("v"),
+        "awkward key round-trip failed"
+    );
 }
 
 // SweepEvery sweeps once at startup — a redeploy is the likeliest moment for a backlog of entries that
@@ -197,7 +213,9 @@ async fn tiered_cache_sweep_every_runs_and_stops() {
     }
     // Cancellation is dropping the future: aborting the task drops it.
     task.abort();
-    let joined = tokio::time::timeout(Duration::from_secs(2), task).await.expect("SweepEvery ignored its cancelled context");
+    let joined = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("SweepEvery ignored its cancelled context");
     assert!(joined.is_err_and(|e| e.is_cancelled()), "SweepEvery was not cancelled");
 
     // A cache with persistence off has nothing to sweep and must return rather than tick forever.
@@ -222,7 +240,11 @@ fn tiered_cache_sweep_survives_a_write_failure() {
     std::thread::sleep(Duration::from_millis(10));
 
     c.disable("write", &"no space left on device");
-    assert_eq!(c.sweep(), 5, "swept after a write failure, want 5 — the store can no longer be reclaimed at all");
+    assert_eq!(
+        c.sweep(),
+        5,
+        "swept after a write failure, want 5 — the store can no longer be reclaimed at all"
+    );
 }
 
 // The volume has a ceiling, not just a schedule.
@@ -248,13 +270,20 @@ fn tiered_cache_sweep_enforces_a_byte_budget() {
     }
     let budget: i64 = 64 << 10;
     let written = disk_bytes(dir.path());
-    assert!(written > budget, "the fixture only wrote {written} bytes — it cannot exercise a {budget} budget");
+    assert!(
+        written > budget,
+        "the fixture only wrote {written} bytes — it cannot exercise a {budget} budget"
+    );
     c.max_bytes = budget;
 
     c.sweep();
 
     let after = disk_bytes(dir.path());
-    assert!(after <= c.max_bytes, "after the sweep the volume holds {after} bytes, over the {} budget", c.max_bytes);
+    assert!(
+        after <= c.max_bytes,
+        "after the sweep the volume holds {after} bytes, over the {} budget",
+        c.max_bytes
+    );
     assert!(after != 0, "the sweep emptied the store rather than trimming it to the budget");
     // The newest entry is the one worth keeping, and it survived.
     assert!(c.get("k39").is_some(), "the most recent entry was evicted before older ones");

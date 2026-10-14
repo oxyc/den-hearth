@@ -69,15 +69,21 @@ async fn host_limiter_respects_cancellation() {
 fn host_limiter_concurrent_callers_queue() {
     let mut b = Bucket { tokens: 2.0, last: Instant::now() };
     let delays: Vec<Duration> = (0..6).map(|_| b.take(Duration::from_millis(20), 2)).collect();
-    assert!(delays[0] == Duration::ZERO && delays[1] == Duration::ZERO, "the burst should pass free: {:?}", &delays[..2]);
+    assert!(
+        delays[0] == Duration::ZERO && delays[1] == Duration::ZERO,
+        "the burst should pass free: {:?}",
+        &delays[..2]
+    );
     // Each overflow caller waits one interval longer than the one before it, so they leave in order
     // instead of arriving at the host together.
-    for i in 2..delays.len() {
+    for (i, &d) in delays.iter().enumerate().skip(2) {
         let want = Duration::from_millis(20) * (i as u32 - 1);
-        let d = delays[i];
         let lo = want.saturating_sub(Duration::from_millis(1));
         let hi = want + Duration::from_millis(1);
-        assert!(d >= lo && d <= hi, "caller {i} waited {d:?}, want ~{want:?} (delays must fan out, not collapse)");
+        assert!(
+            d >= lo && d <= hi,
+            "caller {i} waited {d:?}, want ~{want:?} (delays must fan out, not collapse)"
+        );
     }
 }
 
@@ -112,7 +118,10 @@ async fn host_limiter_cancellation_cannot_mint_tokens() {
     // 400 callers over ~20 waves. Only the burst of 4, plus whatever elapsed time genuinely earned,
     // may pass without waiting; the bug this catches let hundreds through.
     let free = free.load(Ordering::SeqCst);
-    assert!(free <= 25, "{free} of 400 callers passed free under a burst of 4: cancellation is minting tokens");
+    assert!(
+        free <= 25,
+        "{free} of 400 callers passed free under a burst of 4: cancellation is minting tokens"
+    );
 }
 
 // The refill arithmetic itself, asserted exactly rather than through the clock.
@@ -156,7 +165,11 @@ fn bucket_debt_is_exact() {
     for _ in 0..100 {
         b.take(Duration::from_secs(3600), 4); // an hour per token, so elapsed-time refill can't blur the count
     }
-    assert!(b.tokens <= -99.9 && b.tokens >= -100.1, "100 callers should owe 100 tokens, bucket holds {:.2}", b.tokens);
+    assert!(
+        b.tokens <= -99.9 && b.tokens >= -100.1,
+        "100 callers should owe 100 tokens, bucket holds {:.2}",
+        b.tokens
+    );
 }
 
 // A refund can only ever undo a spend. Without the cap it is a way to create tokens: refunds outnumber
@@ -173,7 +186,11 @@ fn bucket_refund_cannot_bank_credit() {
     let mut b = Bucket { tokens: 0.0, last: Instant::now() };
     b.take(Duration::from_secs(3600), 4);
     b.refund(4);
-    assert!(b.tokens >= -0.001 && b.tokens <= 0.001, "a spend followed by its refund should net zero: {:.2}", b.tokens);
+    assert!(
+        b.tokens >= -0.001 && b.tokens <= 0.001,
+        "a spend followed by its refund should net zero: {:.2}",
+        b.tokens
+    );
 }
 
 // The clamps in newHostLimiter, exercised. A zero interval makes the refill +Inf and every delay zero —
@@ -197,7 +214,7 @@ async fn new_host_limiter_clamps_nonsense_settings() {
 async fn host_limiter_cancellation_refunds_the_token() {
     let l = new_host_limiter(Duration::from_secs(10), 1);
     wait(Some(&l), "h").await; // spend the only token
-    // The caller's deadline is the dropped future.
+                               // The caller's deadline is the dropped future.
     let _ = tokio::time::timeout(Duration::from_millis(20), wait(Some(&l), "h")).await; // abandoned — must give the token back
 
     let b = Arc::clone(&l.buckets.lock().unwrap()["h"]);
@@ -231,7 +248,11 @@ fn indexer_limiter_burst_covers_a_season_open() {
         let mut b = Bucket { tokens: lim.burst as f64, last: Instant::now() };
         for i in 0..SEASON {
             let delay = b.take(lim.every, lim.burst);
-            assert!(delay == Duration::ZERO, "episode {} of a season open waited {delay:?}; the tail is never asked within the budget", i + 1);
+            assert!(
+                delay == Duration::ZERO,
+                "episode {} of a season open waited {delay:?}; the tail is never asked within the budget",
+                i + 1
+            );
         }
     }
     todo!("pending: hostlimit_test.go:~251 TestIndexerLimiter_burstCoversASeasonOpen")

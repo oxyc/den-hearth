@@ -13,7 +13,10 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 
 use super::core::blob;
 use super::seal::{bytes_seq, VEC_PRIV_B64};
-use crate::config::{decode_config, Config, DebridAccount, DebridService, INSTALL_ID_BYTES, MAX_CONFIG_BLOB, MAX_CONFIG_EPOCH, MAX_DEBRID_ACCOUNTS};
+use crate::config::{
+    decode_config, Config, DebridAccount, DebridService, INSTALL_ID_BYTES, MAX_CONFIG_BLOB, MAX_CONFIG_EPOCH,
+    MAX_DEBRID_ACCOUNTS,
+};
 use crate::play::{encode_play_token, PlayTarget};
 use crate::seal::{parse_seal_keyring, SealKeyring};
 use crate::ticket::{TicketError, TicketKeys};
@@ -28,7 +31,8 @@ fn other_iid() -> String {
 }
 
 // Unterminated, so a test can append iid/ep/scope before closing it.
-const TICKET_CFG: &str = r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"cachedOnly":true"#;
+const TICKET_CFG: &str =
+    r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"cachedOnly":true"#;
 
 pub(crate) fn ticket_keyring() -> SealKeyring {
     parse_seal_keyring(VEC_PRIV_B64, "").expect("keyring").expect("sealing on")
@@ -46,7 +50,9 @@ pub(crate) fn ticket_keys(kr: &SealKeyring) -> TicketKeys {
 
 /// Go `validBlob` (handler_test.go:18): the config every handler test starts from.
 pub(crate) fn valid_blob() -> String {
-    blob(r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#)
+    blob(
+        r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#,
+    )
 }
 
 fn unix_secs(t: SystemTime) -> i64 {
@@ -155,7 +161,10 @@ fn play_ticket_carries_title_and_imdb_for_logging() {
     });
     let ticket = legacy_ticket(&tk.keys[0], &serde_json::to_vec(&old).expect("json"));
     let (_, got) = tk.open(&ticket, SystemTime::now()).expect("a ticket minted before title/imdb existed");
-    assert!(got.title.is_empty() && got.imdb.is_empty(), "a ticket minted before title/imdb existed should open with both empty: {got:?}");
+    assert!(
+        got.title.is_empty() && got.imdb.is_empty(),
+        "a ticket minted before title/imdb existed should open with both empty: {got:?}"
+    );
 }
 
 // Anything that is not a ticket this addon minted, unaltered, is refused.
@@ -209,7 +218,10 @@ fn play_ticket_opens_with_a_prior_key() {
         panic!("a ticket from the prior key: {e:?}");
     }
     let r = ticket_keys(&other_keyring("")).open(&ticket, SystemTime::now());
-    assert!(matches!(&r, Err(TicketError::Bad)), "with the prior key dropped: err = {r:?}, want errTicketBad");
+    assert!(
+        matches!(&r, Err(TicketError::Bad)),
+        "with the prior key dropped: err = {r:?}, want errTicketBad"
+    );
 }
 
 // The largest config the field caps admit still mints a ticket under the size cap open() enforces.
@@ -233,7 +245,10 @@ fn play_ticket_the_largest_config_fits() {
         SystemTime::now() + Duration::from_secs(3600),
     );
     if let Err(e) = tk.open(&ticket, SystemTime::now()) {
-        panic!("the largest legitimate ticket ({} bytes) does not open under the {MAX_CONFIG_BLOB} cap: {e:?}", ticket.len());
+        panic!(
+            "the largest legitimate ticket ({} bytes) does not open under the {MAX_CONFIG_BLOB} cap: {e:?}",
+            ticket.len()
+        );
     }
     eprintln!("largest legitimate ticket: {} bytes, against a {MAX_CONFIG_BLOB} cap", ticket.len());
 }
@@ -319,7 +334,8 @@ mod pending_handler {
 
     /// Go `availabilityOf` (availability_test.go:15): the verdict for one id through `/<config>/availability`.
     pub(super) fn availability_of(deps: &Deps, config: &str, id: &str) -> String {
-        let rr = do_method(deps, "POST", &format!("/{config}/availability"), &format!(r#"{{"ids":["{id}"]}}"#));
+        let rr =
+            do_method(deps, "POST", &format!("/{config}/availability"), &format!(r#"{{"ids":["{id}"]}}"#));
         assert_eq!(rr.status(), 200, "availability: {}", rr.body());
         let body: serde_json::Value = serde_json::from_str(rr.body()).expect("json");
         body["availability"][id].as_str().unwrap_or_default().to_owned()
@@ -333,11 +349,12 @@ fn play_ticket_an_expired_ticket_is_gone() {
     // Enable when package 4 lands: move this body up and delete the wrapper.
     #[cfg(any())]
     fn pending() {
-        use super::pending_handler::{sealed_config, get};
+        use super::pending_handler::{get, sealed_config};
         use crate::deps::Deps;
         let kr = ticket_keyring();
         let tk = ticket_keys(&kr);
-        let config = decode_config(Some(&kr), &sealed_config(&kr, &format!("{TICKET_CFG}}}"))).unwrap_or_default();
+        let config =
+            decode_config(Some(&kr), &sealed_config(&kr, &format!("{TICKET_CFG}}}"))).unwrap_or_default();
         let expired = tk.mint(
             &config,
             &PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() },
@@ -370,14 +387,21 @@ fn play_ticket_a_stream_list_names_tickets_that_play() {
         for u in &urls {
             let p = path_of(u);
             assert!(
-                p.starts_with("/p/") && p.matches('/').count() == 2 && !u.contains(&seg) && !u.contains("tb-secret"),
+                p.starts_with("/p/")
+                    && p.matches('/').count() == 2
+                    && !u.contains(&seg)
+                    && !u.contains("tb-secret"),
                 "play url: {u}"
             );
         }
         let play = path_of(&urls[0]);
         let rr = get(&deps, &play);
         let location = rr.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default();
-        assert!(rr.status() == 302 && location.starts_with("https://cdn.torbox/"), "GET /p/<ticket>: {} location={location:?}", rr.status());
+        assert!(
+            rr.status() == 302 && location.starts_with("https://cdn.torbox/"),
+            "GET /p/<ticket>: {} location={location:?}",
+            rr.status()
+        );
         let head = super::pending_handler::do_method(&deps, "HEAD", &play, "");
         assert_eq!(head.status(), 405, "HEAD /p/<ticket>: want 405");
     }
@@ -398,7 +422,10 @@ fn play_ticket_no_config_key_keeps_the_legacy_url() {
         assert!(play.starts_with(&format!("/{}/play/", valid_blob())), "play url without a key: {play}");
         assert_eq!(get(&deps, &play).status(), 302, "legacy play");
         let ticket = ticket_keys(&ticket_keyring()).mint(
-            &Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "tb".to_owned() }], ..Default::default() },
+            &Config {
+                debrid: vec![DebridAccount { service: DebridService::TorBox, token: "tb".to_owned() }],
+                ..Default::default()
+            },
             &PlayTarget { info_hash: "a".repeat(40), ..Default::default() },
             SystemTime::now() + Duration::from_secs(3600),
         );
@@ -477,7 +504,12 @@ fn revoked_install_is_refused_everywhere() {
                 let rr = get(&deps, &path);
                 assert_eq!(rr.status(), want, "{path}");
             }
-            let rr = super::pending_handler::do_method(&deps, "POST", &format!("/{revoked}/availability"), r#"{"ids":[]}"#);
+            let rr = super::pending_handler::do_method(
+                &deps,
+                "POST",
+                &format!("/{revoked}/availability"),
+                r#"{"ids":[]}"#,
+            );
             assert_eq!(rr.status(), 400, "revoked availability");
         });
         assert!(
@@ -582,9 +614,15 @@ fn require_install_id_refuses_only_links_without_one() {
             assert_eq!(get(&deps, &path).status(), want, "{path}");
         }
         let strict = Handler { deps: Deps::for_test(|d| d.require_install_id = true) };
-        assert!(strict.admit_install(&Config { scope: "availability".to_owned(), ..Default::default() }), "a scoped config was refused for having no install id");
+        assert!(
+            strict.admit_install(&Config { scope: "availability".to_owned(), ..Default::default() }),
+            "a scoped config was refused for having no install id"
+        );
         let lax = Handler { deps: Deps::for_test(|_| {}) };
-        assert!(lax.admit_install(&Config::default()), "off by default: a config without an id must still be admitted");
+        assert!(
+            lax.admit_install(&Config::default()),
+            "off by default: a config without an id must still be admitted"
+        );
     }
     todo!("pending: ticket_test.go:~300 TestRequireInstallID_refusesOnlyLinksWithoutOne")
 }
@@ -601,13 +639,23 @@ fn verdict_prefix_ignores_scope_install_and_epoch() {
         use crate::handler::verdict_prefix;
         let kr = ticket_keyring();
         let tv_seg = sealed_config(&kr, &format!(r#"{TICKET_CFG},"iid":"{}","ep":3}}"#, test_iid()));
-        let browser_seg = sealed_config(&kr, &format!(r#"{TICKET_CFG},"scope":"availability","iid":"{}"}}"#, other_iid()));
+        let browser_seg =
+            sealed_config(&kr, &format!(r#"{TICKET_CFG},"scope":"availability","iid":"{}"}}"#, other_iid()));
         let tv = decode_config(Some(&kr), &tv_seg).unwrap_or_default();
         let browser = decode_config(Some(&kr), &browser_seg).unwrap_or_default();
-        assert_eq!(verdict_prefix(&tv), verdict_prefix(&browser), "the TV's and the browser's configs key their verdicts apart");
-        let another_seg = sealed_config(&kr, &format!("{}}}", TICKET_CFG.replacen("tb-secret", "another", 1)));
+        assert_eq!(
+            verdict_prefix(&tv),
+            verdict_prefix(&browser),
+            "the TV's and the browser's configs key their verdicts apart"
+        );
+        let another_seg =
+            sealed_config(&kr, &format!("{}}}", TICKET_CFG.replacen("tb-secret", "another", 1)));
         let another = decode_config(Some(&kr), &another_seg).unwrap_or_default();
-        assert_ne!(verdict_prefix(&another), verdict_prefix(&tv), "the prefix no longer tells accounts apart");
+        assert_ne!(
+            verdict_prefix(&another),
+            verdict_prefix(&tv),
+            "the prefix no longer tells accounts apart"
+        );
 
         let deps = Deps::for_test(|d| d.seal_keyring = Some(kr.clone()));
         stream_urls(&deps, &tv_seg);
@@ -627,14 +675,26 @@ fn legacy_play_closes_at_legacy_play_until() {
         use super::pending_handler::{do_method, sealed_config, valid_blob};
         use crate::deps::Deps;
         let kr = ticket_keyring();
-        let token = format!("/play/{}", encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let token = format!(
+            "/play/{}",
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
         // With a keyring only a sealed config is an install; without one the plaintext blob is.
         let sealed_path = format!("/{}{token}", sealed_config(&kr, &format!("{TICKET_CFG}}}")));
         let plain_path = format!("/{}{token}", valid_blob());
         // `None` is Go's zero time.Time: no deadline.
         let cases: [(&str, Option<SealKeyring>, Option<SystemTime>, u16); 4] = [
             ("no deadline", Some(kr.clone()), None, 302),
-            ("before the deadline", Some(kr.clone()), Some(SystemTime::now() + Duration::from_secs(3600)), 302),
+            (
+                "before the deadline",
+                Some(kr.clone()),
+                Some(SystemTime::now() + Duration::from_secs(3600)),
+                302,
+            ),
             ("after the deadline", Some(kr.clone()), Some(SystemTime::now() - Duration::from_secs(1)), 403),
             ("a passed deadline, no ticket", None, Some(SystemTime::now() - Duration::from_secs(1)), 302),
         ];
@@ -662,7 +722,14 @@ fn legacy_play_is_logged_once_while_tickets_are_on() {
         use crate::deps::Deps;
         use crate::tests::reqlog::capture_log;
         let kr = ticket_keyring();
-        let token = format!("/play/{}", encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() }));
+        let token = format!(
+            "/play/{}",
+            encode_play_token(&PlayTarget {
+                info_hash: "a".repeat(40),
+                file_idx: Some(0),
+                ..Default::default()
+            })
+        );
         let logs = capture_log(|| {
             do_method(&Deps::for_test(|_| {}), "GET", &format!("/{}{token}", valid_blob()), "");
             let deps = Deps::for_test(|d| d.seal_keyring = Some(kr.clone()));
@@ -706,32 +773,53 @@ fn settings_revocation_and_tickets() {
             assert!(line.contains(" revoked=2 epoch=3 "), "startup line: {line}");
             let d = build_deps(&s, None, crate::cache::MemoryCache::new(1 << 10));
             assert!(
-                d.revoked_installs.len() == 2 && d.config_epoch == 3 && d.play_ticket_ttl == Duration::from_secs(7200),
+                d.revoked_installs.len() == 2
+                    && d.config_epoch == 3
+                    && d.play_ticket_ttl == Duration::from_secs(7200),
                 "deps: {d:?}"
             );
         });
-        assert!(logs.contains("skipping a malformed REVOKED_INSTALLS entry") && !logs.contains("not-an-id"), "the malformed entry: {logs}");
+        assert!(
+            logs.contains("skipping a malformed REVOKED_INSTALLS entry") && !logs.contains("not-an-id"),
+            "the malformed entry: {logs}"
+        );
 
         let defaults = settings_from_env(|_| String::new());
         assert!(
-            defaults.revoked_installs.is_empty() && defaults.config_epoch == 0 && defaults.legacy_play_until.is_none(),
+            defaults.revoked_installs.is_empty()
+                && defaults.config_epoch == 0
+                && defaults.legacy_play_until.is_none(),
             "defaults: {defaults:?}"
         );
 
         let malformed: HashMap<&str, &str> =
-            [("CONFIG_KEY", VEC_PRIV_B64), ("CONFIG_EPOCH", "two"), ("LEGACY_PLAY_UNTIL", "next tuesday")].into_iter().collect();
+            [("CONFIG_KEY", VEC_PRIV_B64), ("CONFIG_EPOCH", "two"), ("LEGACY_PLAY_UNTIL", "next tuesday")]
+                .into_iter()
+                .collect();
         let m = settings_from_env(|k| malformed.get(k).copied().unwrap_or_default().to_owned());
         assert_eq!(m.config_epoch, 0, "a malformed CONFIG_EPOCH");
-        assert!(m.legacy_play_until.is_some_and(|u| u < SystemTime::now()), "a malformed LEGACY_PLAY_UNTIL must read as passed: {:?}", m.legacy_play_until);
+        assert!(
+            m.legacy_play_until.is_some_and(|u| u < SystemTime::now()),
+            "a malformed LEGACY_PLAY_UNTIL must read as passed: {:?}",
+            m.legacy_play_until
+        );
 
-        let no_key: HashMap<&str, &str> = [("LEGACY_PLAY_UNTIL", "2020-01-01T00:00:00Z")].into_iter().collect();
-        let u = settings_from_env(|k| no_key.get(k).copied().unwrap_or_default().to_owned()).legacy_play_until;
+        let no_key: HashMap<&str, &str> =
+            [("LEGACY_PLAY_UNTIL", "2020-01-01T00:00:00Z")].into_iter().collect();
+        let u =
+            settings_from_env(|k| no_key.get(k).copied().unwrap_or_default().to_owned()).legacy_play_until;
         assert!(u.is_none(), "LEGACY_PLAY_UNTIL without a key: {u:?}, want unset");
 
         let short: HashMap<&str, &str> =
-            [("CONFIG_KEY", VEC_PRIV_B64), ("PLAY_TICKET_TTL_SECS", "900"), ("LIST_TTL_SECS", "300")].into_iter().collect();
+            [("CONFIG_KEY", VEC_PRIV_B64), ("PLAY_TICKET_TTL_SECS", "900"), ("LIST_TTL_SECS", "300")]
+                .into_iter()
+                .collect();
         let warn = capture_log(|| {
-            build_deps(&settings_from_env(|k| short.get(k).copied().unwrap_or_default().to_owned()), None, crate::cache::MemoryCache::new(1 << 10));
+            build_deps(
+                &settings_from_env(|k| short.get(k).copied().unwrap_or_default().to_owned()),
+                None,
+                crate::cache::MemoryCache::new(1 << 10),
+            );
         });
         assert!(
             warn.contains("PLAY_TICKET_TTL_SECS (15m0s) is not above 3×LIST_TTL_SECS (15m0s)"),

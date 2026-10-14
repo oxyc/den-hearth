@@ -62,7 +62,8 @@ fn startup_summary() {
             ("METRICS_TOKEN", "metrics-secret"),
             ("CACHE_DIR", "/cache"),
         ];
-        let lookup = |k: &str| env.iter().find(|(name, _)| *name == k).map(|(_, v)| v.to_string()).unwrap_or_default();
+        let lookup =
+            |k: &str| env.iter().find(|(name, _)| *name == k).map(|(_, v)| v.to_string()).unwrap_or_default();
         let s = settings_from_env(lookup);
         let line = startup_summary(&s, true);
         let wanted = [
@@ -83,7 +84,10 @@ fn startup_summary() {
             assert!(!line.contains(leak), "startup line carries {leak:?}: {line}");
         }
         let unwritable = startup_summary(&s, false);
-        assert!(unwritable.contains("cache_persistent=off"), "an unwritable cache should say so: {unwritable}");
+        assert!(
+            unwritable.contains("cache_persistent=off"),
+            "an unwritable cache should say so: {unwritable}"
+        );
     }
     todo!("pending: loglimit_test.go:~59 TestStartupSummary")
 }

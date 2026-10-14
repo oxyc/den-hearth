@@ -132,8 +132,10 @@ impl AddBudget {
         let spent = self.lock();
         let now = (self.now)();
         let cutoff = self.cutoff(now);
-        let live: Vec<SystemTime> =
-            spent.get(account).map(|v| v.iter().copied().filter(|t| *t > cutoff).collect()).unwrap_or_default();
+        let live: Vec<SystemTime> = spent
+            .get(account)
+            .map(|v| v.iter().copied().filter(|t| *t > cutoff).collect())
+            .unwrap_or_default();
         let ceiling = self.ceiling(prefetch);
         if ceiling <= 0 {
             return self.window; // no allowance ever frees; a window is the honest "not soon"

@@ -141,7 +141,10 @@ impl<D: Doer> Doer for PausingDoer<D> {
                 let pause = self.refused(&key, wait, true);
                 log_limited(
                     "upstream-exhausted",
-                    &format!("{hostname} says its allowance is spent — leaving it alone for {}", go_round_secs(pause)),
+                    &format!(
+                        "{hostname} says its allowance is spent — leaving it alone for {}",
+                        go_round_secs(pause)
+                    ),
                 );
             } else {
                 self.answered(&key);
@@ -184,7 +187,9 @@ pub fn exhausted_for(h: &HeaderMap, now: SystemTime) -> (Duration, bool) {
             return (wait(param("t").unwrap_or(0)), true);
         }
     }
-    for (remaining, reset) in [("ratelimit-remaining", "ratelimit-reset"), ("x-ratelimit-remaining", "x-ratelimit-reset")] {
+    for (remaining, reset) in
+        [("ratelimit-remaining", "ratelimit-reset"), ("x-ratelimit-remaining", "x-ratelimit-reset")]
+    {
         if number(get(remaining)) == Some(0) {
             return (wait(number(get(reset)).unwrap_or(0)), true);
         }
@@ -204,12 +209,8 @@ fn pause_key(req: &reqwest::Request) -> String {
         (Some(h), None) => h.to_owned(),
         (None, _) => String::new(),
     };
-    let mut credential = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
+    let mut credential =
+        req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
     if credential.is_empty() {
         for name in ["apikey", "api_key", "token", "key"] {
             if let Some((_, v)) = url.query_pairs().find(|(k, _)| k == name) {

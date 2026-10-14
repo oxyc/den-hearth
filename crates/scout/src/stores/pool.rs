@@ -29,7 +29,11 @@ pub struct StorePool {
 }
 
 /// Go `buildStores`: one store per configured account, in service-priority order (TorBox first).
-pub fn build_stores(config: &Config, client: Arc<dyn Doer>, cache: Option<Arc<dyn Cache>>) -> Vec<Box<dyn Store>> {
+pub fn build_stores(
+    config: &Config,
+    client: Arc<dyn Doer>,
+    cache: Option<Arc<dyn Cache>>,
+) -> Vec<Box<dyn Store>> {
     let mut by_service: HashMap<DebridService, &str> = HashMap::new();
     for d in &config.debrid {
         by_service.insert(d.service, d.token.as_str());
@@ -230,7 +234,12 @@ impl StorePool {
             };
             log_limited(
                 &format!("resolve-failed:{}", st.service().as_str()),
-                &format!("{} could not resolve {}: {}", st.service().as_str(), short_hash(&t.info_hash), describe(&err)),
+                &format!(
+                    "{} could not resolve {}: {}",
+                    st.service().as_str(),
+                    short_hash(&t.info_hash),
+                    describe(&err)
+                ),
             );
             cancelled |= matches!(err, StoreError::Cancelled);
             // An add of ours already out for this release outranks any refusal, whichever store said what and

@@ -38,8 +38,7 @@ pub const MAX_STREAM_ID_LEN: usize = 64;
 /// transport limit is one number in one file, and this is the one that holds if it is ever raised or if a
 /// caller reaches parseStreamID by some other route.
 fn is_imdb_id(s: &str) -> bool {
-    s.strip_prefix("tt")
-        .is_some_and(|d| (1..=10).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
+    s.strip_prefix("tt").is_some_and(|d| (1..=10).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Go `parseStreamID`: the `<type>` + `<id>.json` route segments, or `None` (the route answers 400).
@@ -66,7 +65,13 @@ pub fn parse_stream_id(kind: &str, raw_id: &str) -> Option<StreamId> {
         if season < 0 || episode < 0 {
             return None;
         }
-        return Some(StreamId { kind: kind.to_owned(), imdb: imdb.to_owned(), season, episode, has_ep: true });
+        return Some(StreamId {
+            kind: kind.to_owned(),
+            imdb: imdb.to_owned(),
+            season,
+            episode,
+            has_ep: true,
+        });
     }
     Some(StreamId { kind: kind.to_owned(), imdb: imdb.to_owned(), season: 0, episode: 0, has_ep: false })
 }
