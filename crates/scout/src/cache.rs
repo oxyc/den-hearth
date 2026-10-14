@@ -5,7 +5,7 @@
 //! resultCap × many titles blow the heap and OOM the container). Thread-safe.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 /// FROZEN. Go `Cache`. Thread-safe. `get` returns `None` for a missing or expired key.
@@ -48,10 +48,11 @@ pub struct MemoryCache {
 #[derive(Default)]
 struct CacheState {
     /// Go `items`: key -> entry.
-    items: HashMap<String, CacheEntry>,
+    items: HashMap<Arc<str>, CacheEntry>,
     /// Go `ll`, as a map from a recency tick to the key holding it. The smallest tick is the least recently
-    /// used, so Go's `ll.Back()` is `first_key_value`.
-    order: BTreeMap<u64, String>,
+    /// used, so Go's `ll.Back()` is `first_key_value`. The key is shared with `items`, so a touch moves it to a
+    /// new tick without copying it.
+    order: BTreeMap<u64, Arc<str>>,
     next_tick: u64,
     /// Go `bytes`: the summed key + value sizes of every entry.
     bytes: usize,
@@ -77,9 +78,10 @@ impl CacheState {
     fn touch(&mut self, key: &str) {
         let tick = self.new_tick();
         if let Some(entry) = self.items.get_mut(key) {
-            self.order.remove(&entry.tick);
+            if let Some(shared) = self.order.remove(&entry.tick) {
+                self.order.insert(tick, shared);
+            }
             entry.tick = tick;
-            self.order.insert(tick, key.to_owned());
         }
     }
 
@@ -136,13 +138,14 @@ impl Cache for MemoryCache {
             st.touch(key);
         } else {
             let tick = st.new_tick();
-            st.order.insert(tick, key.to_owned());
-            st.items.insert(key.to_owned(), CacheEntry { value: value.to_owned(), expires, size, tick });
+            let shared: Arc<str> = Arc::from(key);
+            st.order.insert(tick, Arc::clone(&shared));
+            st.items.insert(shared, CacheEntry { value: value.to_owned(), expires, size, tick });
             st.bytes += size;
         }
         while st.bytes > self.max_bytes {
             let Some((_, oldest)) = st.order.pop_first() else { break };
-            if let Some(entry) = st.items.remove(&oldest) {
+            if let Some(entry) = st.items.remove(&*oldest) {
                 st.bytes -= entry.size;
             }
         }
