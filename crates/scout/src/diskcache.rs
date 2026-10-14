@@ -55,6 +55,49 @@ pub struct TieredCache {
     /// persistence off for the life of the process, so one flood permanently costs the 30-day probe cache this
     /// tier exists for.
     pub(crate) max_bytes: i64,
+    stats: Arc<DiskStats>,
+    /// The wall clock disk expiry reads; a replay swaps it for one it can move.
+    clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+}
+
+/// What the disk tier asked of the filesystem, counted at the call sites: the numbers behind "how much does
+/// this cache write". `fsyncs` is always 0 today (a write is create, write, rename; nothing is synced).
+#[derive(Default)]
+struct DiskStats {
+    writes: AtomicU64,
+    bytes_written: AtomicU64,
+    fsyncs: AtomicU64,
+    reads: AtomicU64,
+    bytes_read: AtomicU64,
+    unlinks: AtomicU64,
+    readdirs: AtomicU64,
+}
+
+/// A snapshot of [`TieredCache::disk_counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskCounts {
+    /// Entry files created (each one a temp file plus a rename).
+    pub writes: u64,
+    pub bytes_written: u64,
+    pub fsyncs: u64,
+    /// `open` + `read` attempts, including the 32-byte expiry peek a sweep makes and reads that found nothing.
+    pub reads: u64,
+    pub bytes_read: u64,
+    /// `unlink` attempts, including ones that found no file.
+    pub unlinks: u64,
+    /// Directory scans.
+    pub readdirs: u64,
+}
+
+impl DiskStats {
+    fn read(&self, bytes: usize) {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn unlink(&self) {
+        self.unlinks.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -85,6 +128,30 @@ impl TieredCache {
             once: Once::new(),
             state: Arc::new(Mutex::new(DiskState { off, written: 0 })),
             max_bytes: DEFAULT_DISK_BUDGET,
+            stats: Arc::new(DiskStats::default()),
+            clock: Arc::new(SystemTime::now),
+        }
+    }
+
+    /// Reads time from `clock` in both tiers, so a replay can run days of traffic in seconds.
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> TieredCache {
+        let mem_clock = Arc::clone(&clock);
+        self.mem.now = Box::new(move || mem_clock());
+        self.clock = clock;
+        self
+    }
+
+    /// What the disk tier has asked of the filesystem since it was built.
+    pub fn disk_counts(&self) -> DiskCounts {
+        let s = &self.stats;
+        DiskCounts {
+            writes: s.writes.load(Ordering::Relaxed),
+            bytes_written: s.bytes_written.load(Ordering::Relaxed),
+            fsyncs: s.fsyncs.load(Ordering::Relaxed),
+            reads: s.reads.load(Ordering::Relaxed),
+            bytes_read: s.bytes_read.load(Ordering::Relaxed),
+            unlinks: s.unlinks.load(Ordering::Relaxed),
+            readdirs: s.readdirs.load(Ordering::Relaxed),
         }
     }
 
@@ -101,7 +168,7 @@ impl TieredCache {
     /// to turn off BOTH ways an entry is ever reclaimed. The directory may still be readable when it is not
     /// writable, and reaping is exactly what helps if the problem was space.
     pub fn sweep(&self) -> i64 {
-        sweep_files(&self.dir, self.max_bytes, || reset_written(&self.state))
+        sweep_files(&self.dir, self.max_bytes, (self.clock)(), &self.stats, || reset_written(&self.state))
     }
 
     /// Go `SweepEvery`: sweeps once at startup, then on `every`, until dropped. Returns at once when
@@ -175,13 +242,16 @@ impl Cache for TieredCache {
         if self.disabled() {
             return None;
         }
-        let raw = fs::read(self.path(key)).ok()?;
+        let raw = fs::read(self.path(key));
+        self.stats.read(raw.as_ref().map_or(0, Vec::len));
+        let raw = raw.ok()?;
         // "<unix-expiry>\n<value>". Wall-clock on disk on purpose: a monotonic deadline means nothing to the
         // process that reads the file after a restart.
         let nl = raw.iter().position(|&b| b == b'\n').filter(|&nl| nl > 0)?;
         let expires: i64 = std::str::from_utf8(&raw[..nl]).ok()?.parse().ok()?;
-        let now = SystemTime::now();
+        let now = (self.clock)();
         if unix_secs(now) >= expires {
+            self.stats.unlink();
             let _ = fs::remove_file(self.path(key));
             return None;
         }
@@ -208,6 +278,7 @@ impl Cache for TieredCache {
             // needed here. os.Remove is also deliberately used rather than an expired tombstone, so ordinary
             // volatile coordination never creates disk entries of its own.
             if !self.dir.as_os_str().is_empty() {
+                self.stats.unlink();
                 match fs::remove_file(self.path(key)) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -221,12 +292,15 @@ impl Cache for TieredCache {
         if self.disabled() {
             return;
         }
-        let expires = unix_secs_after(SystemTime::now(), ttl);
+        let expires = unix_secs_after((self.clock)(), ttl);
         let body = format!("{expires}\n{value}");
+        self.stats.unlink(); // write_entry's temp-file cleanup, an unlink that finds nothing after a good rename
         if let Err((op, e)) = write_entry(&self.dir, &self.path(key), &body) {
             self.disable(op, &e);
             return;
         }
+        self.stats.writes.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_written.fetch_add(body.len() as u64, Ordering::Relaxed);
         // A burst is what the hourly sweep cannot answer on its own, so it brings the sweep forward rather
         // than waiting out the interval. The sweep runs on its own thread so the write that tripped it does
         // not wait for the directory scan.
@@ -234,8 +308,10 @@ impl Cache for TieredCache {
             let dir = self.dir.clone();
             let max_bytes = self.max_bytes;
             let state = Arc::clone(&self.state);
+            let stats = Arc::clone(&self.stats);
+            let now = (self.clock)();
             std::thread::spawn(move || {
-                let n = sweep_files(&dir, max_bytes, || reset_written(&state));
+                let n = sweep_files(&dir, max_bytes, now, &stats, || reset_written(&state));
                 if n > 0 {
                     emit(&format!("swept {n} cache entries after a write burst"));
                 }
@@ -256,12 +332,18 @@ fn reset_written(state: &Mutex<DiskState>) {
 /// The directory half of Go `Sweep`, without the cache itself, so a write burst can run it on a thread.
 /// `reset_written` is Go's `c.resetWritten()`: it runs once the directory scan is done, so what was written
 /// while the scan ran is forgotten with the rest, as in Go.
-fn sweep_files(dir: &Path, max_bytes: i64, reset_written: impl FnOnce()) -> i64 {
+fn sweep_files(
+    dir: &Path,
+    max_bytes: i64,
+    now: SystemTime,
+    stats: &DiskStats,
+    reset_written: impl FnOnce(),
+) -> i64 {
     if dir.as_os_str().is_empty() {
         return 0;
     }
+    stats.readdirs.fetch_add(1, Ordering::Relaxed);
     let Ok(entries) = fs::read_dir(dir) else { return 0 };
-    let now = SystemTime::now();
     let now_unix = unix_secs(now);
     let mut removed = 0;
     // Survivors, so the budget pass below does not re-stat the directory.
@@ -280,7 +362,7 @@ fn sweep_files(dir: &Path, max_bytes: i64, reset_written: impl FnOnce()) -> i64 
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.ends_with(".ent") {
-            if !entry_expired(&path, now_unix) {
+            if !entry_expired(&path, now_unix, stats) {
                 if let Ok(info) = entry.metadata() {
                     let size = info.len() as i64;
                     live_bytes += size;
@@ -303,6 +385,7 @@ fn sweep_files(dir: &Path, max_bytes: i64, reset_written: impl FnOnce()) -> i64 
         } else {
             continue; // not ours
         }
+        stats.unlink();
         if fs::remove_file(&path).is_ok() {
             removed += 1;
         }
@@ -320,6 +403,7 @@ fn sweep_files(dir: &Path, max_bytes: i64, reset_written: impl FnOnce()) -> i64 
         if live_bytes <= max_bytes {
             break;
         }
+        stats.unlink();
         if fs::remove_file(&k.path).is_ok() {
             live_bytes -= k.size;
             removed += 1;
@@ -331,13 +415,14 @@ fn sweep_files(dir: &Path, max_bytes: i64, reset_written: impl FnOnce()) -> i64 
 
 /// Go `entryExpired`: reads just the expiry line. A file that cannot be read or parsed counts as expired, because
 /// Get cannot serve it either way, so keeping it only keeps a file nothing can ever use.
-fn entry_expired(path: &Path, now: i64) -> bool {
+fn entry_expired(path: &Path, now: i64, stats: &DiskStats) -> bool {
     // It may already be gone; don't claim a deletion we didn't make.
     let Ok(mut f) = File::open(path) else { return false };
     // The expiry is a unix timestamp on the first line; 32 bytes is more than enough to reach the newline.
     let mut head = [0u8; 32];
     // Go ignores the read error too: a head that cannot be read has no newline and counts as expired.
     let n = f.read(&mut head).unwrap_or(0);
+    stats.read(n);
     let Some(nl) = head[..n].iter().position(|&b| b == b'\n').filter(|&nl| nl > 0) else { return true };
     match std::str::from_utf8(&head[..nl]).ok().and_then(|s| s.parse::<i64>().ok()) {
         Some(expires) => now >= expires,

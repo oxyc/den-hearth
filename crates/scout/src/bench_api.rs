@@ -67,6 +67,26 @@ pub fn pick_episode_file(files: &[TorrentFile], season: i64, episode: i64) -> Op
     season::pick_episode_file(files, season, episode).ok().flatten()
 }
 
+/// The cache a replay drives: production settings, time read from `clock` so days of traffic run in seconds.
+/// The replay reaches the cache's housekeeping only through the functions below, so the same replay file
+/// measures the cache before and after its policy changes.
+pub fn replay_cache(
+    memory_bytes: usize,
+    dir: &Path,
+    clock: std::sync::Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+) -> TieredCache {
+    TieredCache::new(memory_bytes, dir).with_clock(clock)
+}
+
+/// What the process does once an hour (hearth's `sweep_every`). Returns entries removed.
+pub fn replay_hourly(cache: &TieredCache) -> i64 {
+    cache.sweep()
+}
+
+/// What the process does between requests and at shutdown. Nothing is deferred yet.
+pub fn replay_tick(_cache: &TieredCache) {}
+pub fn replay_shutdown(_cache: &TieredCache) {}
+
 /// A tiered cache with the disk budget off, so a long write benchmark measures the write and not the sweep a
 /// burst past the budget starts (the Go benchmark does the same).
 pub fn tiered_cache_without_disk_budget(memory_bytes: usize, dir: &Path) -> TieredCache {

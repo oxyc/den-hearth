@@ -60,6 +60,11 @@ name = "scout"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "cache_replay"
+harness = false
+required-features = ["bench"]
+
 [dev-dependencies]
 # Benchmarks, with an allocation-counting global allocator (benches/*.rs; `bench/micro.sh`).
 divan = "0.1"
