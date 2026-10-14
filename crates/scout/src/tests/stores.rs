@@ -14,11 +14,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cache::{Cache, MemoryCache};
+use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
+use crate::stores::refusal::{resolve_key, torrent_id_key};
+use crate::stores::torbox::support::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
 use crate::stores::torbox::{
     decode_listing, ListingFault, TorBoxStore, TruncationDetector, CACHE_BATCH, MAX_LISTING_ENTRIES,
     MAX_TORBOX_OUTBOUND, TORBOX_API,
 };
+use crate::util::key_hash;
 use crate::stores::{
     rd_fetch_state, torbox_fetch_state, ResolveTarget, Store, StatusAnswer, FETCH_DOWNLOADING, FETCH_FAILED,
     FETCH_FETCHING, FETCH_QUEUED, FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
@@ -1274,238 +1278,215 @@ fn has_cache_truth_and_rd_only() {
     todo!("pending: stores_test.go:625 TestHasCacheTruthAndRDOnly")
 }
 
-#[test]
-#[ignore = "needs torrent_id_key and resolve_key from refusal.rs (package 2) and KnownFileSize (unplaced in the split)"]
-fn torbox_account_state_is_isolated_by_api_and_token() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Account state is keyed by API endpoint and token: two endpoints sharing a token must not share facts.
-        const TOKEN: &str = "shared-token";
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
-        let client = mock(move |req| {
-            c.fetch_add(1, Ordering::SeqCst);
-            let id = if req.url().host_str().unwrap_or("").contains("torbox-b") { 22 } else { 11 };
-            Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":{id},"hash":"{H}"}}]}}"#)))
-        });
-        let a = tb(TOKEN, "https://torbox-a.invalid/v1", Some(cache.clone()), client.clone());
-        let b = tb(TOKEN, "https://torbox-b.invalid/v1", Some(cache.clone()), client);
+#[tokio::test]
+async fn torbox_account_state_is_isolated_by_api_and_token() {
+    // Account state is keyed by API endpoint and token: two endpoints sharing a token must not share facts.
+    const TOKEN: &str = "shared-token";
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let client = mock(move |req| {
+        c.fetch_add(1, Ordering::SeqCst);
+        let id = if req.url().host_str().unwrap_or("").contains("torbox-b") { 22 } else { 11 };
+        Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":{id},"hash":"{H}"}}]}}"#)))
+    });
+    let a = tb(TOKEN, "https://torbox-a.invalid/v1", Some(cache.clone()), client.clone());
+    let b = tb(TOKEN, "https://torbox-b.invalid/v1", Some(cache.clone()), client);
 
-        // The whole-account listing memo and its singleflight must not hand endpoint B endpoint A's ids.
-        let (ids_a, ok_a) = a.account_listing().await;
-        let (ids_b, ok_b) = b.account_listing().await;
-        assert!(ok_a && ok_b && id_of(&ids_a, H) == 11 && id_of(&ids_b, H) == 22, "cross-API listings");
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "two API accounts made listing calls, want 2");
+    // The whole-account listing memo and its singleflight must not hand endpoint B endpoint A's ids.
+    let (ids_a, ok_a) = a.account_listing().await;
+    let (ids_b, ok_b) = b.account_listing().await;
+    assert!(ok_a && ok_b && id_of(&ids_a, H) == 11 && id_of(&ids_b, H) == 22, "cross-API listings");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "two API accounts made listing calls, want 2");
 
-        // Per-hash ids and resolve/file facts are account data, not facts about the token string itself.
-        cache.put(&torrent_id_key(&a.account_identity(), H), "11", Duration::from_secs(3600));
-        let (id, held_b, _) = b.known_torrent_id(H);
-        assert!(!held_b, "endpoint B accepted endpoint A's torrent id {id}");
-        cache.put(
-            &resolve_key(&a.account_identity(), H),
-            r#"{"torrentId":11,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":123}]}"#,
-            Duration::from_secs(3600),
-        );
-        assert!(b.known_file_size(&target_hash(H)).is_none(), "endpoint B accepted endpoint A's resolve/file fact");
+    // Per-hash ids and resolve/file facts are account data, not facts about the token string itself.
+    cache.put(&torrent_id_key(&a.account_identity(), H), "11", Duration::from_secs(3600));
+    let (id, held_b) = b.known_torrent_id(H);
+    assert!(!held_b, "endpoint B accepted endpoint A's torrent id {id}");
+    cache.put(
+        &resolve_key(&a.account_identity(), H),
+        r#"{"torrentId":11,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":123}]}"#,
+        Duration::from_secs(3600),
+    );
+    assert!(b.known_file_size(&target_hash(H)).is_none(), "endpoint B accepted endpoint A's resolve/file fact");
 
-        // A positive cache check is scoped the same way.
-        cache.put(&cached_key(DebridService::TorBox, &a.account_identity(), H), "1", CACHED_TTL);
-        let (known, ask) = known_cached(&*cache, DebridService::TorBox, &b.account_identity(), &[H.to_owned()]);
-        assert!(!held(&known, H) && ask.len() == 1, "endpoint B reused endpoint A's positive");
+    // A positive cache check is scoped the same way.
+    cache.put(&cached_key(DebridService::TorBox, &a.account_identity(), H), "1", CACHED_TTL);
+    let (known, ask) = known_cached(Some(&*cache), DebridService::TorBox, &b.account_identity(), &[H.to_owned()]);
+    assert!(!held(&known, H) && ask.len() == 1, "endpoint B reused endpoint A's positive");
 
-        // Migration is fail-cold: a pre-v2 token-only file is never accepted under either arbitrary API.
-        cache.put(&format!("torbox:torrent:{}:{H}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
-        assert!(a.known_torrent_id(H).1, "endpoint A lost its canonical torrent id");
-        let other_hash = "b".repeat(40);
-        cache.put(&format!("torbox:torrent:{}:{other_hash}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
-        assert!(!a.known_torrent_id(&other_hash).1, "accepted a legacy token-only TorBox fact");
-    }
-    todo!("pending: stores_test.go:99 TestTorBoxAccountStateIsIsolatedByAPIAndToken")
+    // Migration is fail-cold: a pre-v2 token-only file is never accepted under either arbitrary API.
+    cache.put(&format!("torbox:torrent:{}:{H}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
+    assert!(a.known_torrent_id(H).1, "endpoint A lost its canonical torrent id");
+    let other_hash = "b".repeat(40);
+    cache.put(&format!("torbox:torrent:{}:{other_hash}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
+    assert!(!a.known_torrent_id(&other_hash).1, "accepted a legacy token-only TorBox fact");
 }
 
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
-        for (name, body, want_ok, want_prog) in [
-            ("downloading", r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#, true, 0.42),
-            ("array payload", r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#, true, 0.1),
-            ("finished but unresolvable", r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#, false, 0.0),
-            ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
-            ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
-            ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
-        ] {
-            let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-            cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
-            let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
-            let got = s.status(&target_hash(H)).await;
-            assert_eq!(got.is_some(), want_ok, "{name}: ok");
-            if let (true, Some(g)) = (want_ok, got) {
-                assert_eq!(g.progress, want_prog, "{name}: progress");
-            }
-        }
-        // No torrent id remembered, and the account doesn't hold it either → nothing to report.
-        let empty = tb("t", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 16))), mock(|_| Ok(resp(200, r#"{"data":[]}"#))));
-        assert!(empty.status(&target_hash(H)).await.is_none(), "an unknown infohash must not report a download");
-    }
-    todo!("pending: stores_test.go:644 TestTorBoxStatus")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_carries_state_and_swarm() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Status carries TorBox's state and swarm through, rather than reducing every wait to a percentage.
-        for (name, body, want_state, want_seeds, want_peers) in [
-            (
-                "stalled, empty swarm",
-                r#"{"data":{"progress":0,"download_finished":false,"eta":8640000,"download_speed":0,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#,
-                FETCH_STALLED,
-                Some(0),
-                Some(0),
-            ),
-            ("failed", r#"{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}"#, FETCH_FAILED, None, None),
-            ("metadata", r#"{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}"#, FETCH_FETCHING, Some(4), None),
-            ("no state named", r#"{"data":{"progress":0.4,"download_finished":false}}"#, "", None, None),
-        ] {
-            let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-            cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
-            let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
-            let got = s.status(&target_hash(H)).await.expect("a download TorBox reports on must be a wait");
-            assert_eq!(got.state, want_state, "{name}: state");
-            assert!(same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers), "{name}: seeds/peers");
-        }
-    }
-    todo!("pending: stores_test.go:731 TestTorBoxStatusCarriesStateAndSwarm")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_rediscovers_lost_torrent_id() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Losing the cached torrent id is not losing the download: the id is rediscovered from the account's
-        // own list, and remembered, so the next poll is a single-id lookup again.
-        let list_calls = Arc::new(AtomicUsize::new(0));
-        let lc = list_calls.clone();
-        // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
-        let target = H.to_uppercase();
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
-        let s = tb("t", TORBOX_API, Some(cache.clone()), mock(move |req| {
-            if req.url().query().unwrap_or("").contains("id=") {
-                return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
-            }
-            lc.fetch_add(1, Ordering::SeqCst);
-            Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
-        }));
-        let got = s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
-        assert_eq!(got.progress, 0.25, "progress");
-        assert_eq!(cache.get(&torrent_id_key("t", &target)).as_deref(), Some("7"), "the rediscovered id must be remembered");
-        // Second call must reuse the cache rather than list the whole account again.
-        assert!(s.status(&target_hash(&target)).await.is_some(), "second status");
-        assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
-    }
-    todo!("pending: stores_test.go:797 TestTorBoxStatusRediscoversLostTorrentID")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_remembers_torrent_id_for_queued_episode() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // The series path: Resolve refuses to cache an entry whose file list is empty, and a just-queued torrent
-        // has no files yet. The id must survive that anyway.
+#[tokio::test]
+async fn torbox_status() {
+    // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
+    for (name, body, want_ok, want_prog) in [
+        ("downloading", r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#, true, 0.42),
+        ("array payload", r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#, true, 0.1),
+        ("finished but unresolvable", r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#, false, 0.0),
+        ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
+        ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
+        ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
+    ] {
         let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-        let s = tb("t", TORBOX_API, Some(cache.clone()), mock(|req| {
-            let p = req.url().path().to_owned();
-            if p.contains("createtorrent") {
-                return Ok(resp(200, r#"{"data":{"torrent_id":7}}"#));
-            }
-            if p.contains("mylist") {
-                return Ok(resp(200, r#"{"success":true,"data":{"files":[]}}"#)); // queued: no files yet
-            }
-            Ok(resp(200, r#"{"success":false}"#)) // link not ready
+        cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
+        let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
+        let got = s.status(&target_hash(H)).await;
+        assert_eq!(got.is_some(), want_ok, "{name}: ok");
+        if let (true, Some(g)) = (want_ok, got) {
+            assert_eq!(g.progress, want_prog, "{name}: progress");
+        }
+    }
+    // No torrent id remembered, and the account doesn't hold it either → nothing to report.
+    let empty = tb("t", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 16))), mock(|_| Ok(resp(200, r#"{"data":[]}"#))));
+    assert!(empty.status(&target_hash(H)).await.is_none(), "an unknown infohash must not report a download");
+}
+
+#[tokio::test]
+async fn torbox_status_carries_state_and_swarm() {
+    // Status carries TorBox's state and swarm through, rather than reducing every wait to a percentage.
+    for (name, body, want_state, want_seeds, want_peers) in [
+        (
+            "stalled, empty swarm",
+            r#"{"data":{"progress":0,"download_finished":false,"eta":8640000,"download_speed":0,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#,
+            FETCH_STALLED,
+            Some(0),
+            Some(0),
+        ),
+        ("failed", r#"{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}"#, FETCH_FAILED, None, None),
+        ("metadata", r#"{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}"#, FETCH_FETCHING, Some(4), None),
+        ("no state named", r#"{"data":{"progress":0.4,"download_finished":false}}"#, "", None, None),
+    ] {
+        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
+        cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
+        let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
+        let got = s.status(&target_hash(H)).await.expect("a download TorBox reports on must be a wait");
+        assert_eq!(got.state, want_state, "{name}: state");
+        assert!(same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers), "{name}: seeds/peers");
+    }
+}
+
+/// Go `sameCount`: two optional counts are the same when both are absent or both are present and equal.
+fn same_count(a: Option<i64>, b: Option<i64>) -> bool {
+    a == b
+}
+
+#[tokio::test]
+async fn torbox_status_rediscovers_lost_torrent_id() {
+    // Losing the cached torrent id is not losing the download: the id is rediscovered from the account's
+    // own list, and remembered, so the next poll is a single-id lookup again.
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let lc = list_calls.clone();
+    // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
+    let target = H.to_uppercase();
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
+    let s = tb("t", TORBOX_API, Some(cache.clone()), mock(move |req| {
+        if req.url().query().unwrap_or("").contains("id=") {
+            return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
+        }
+        lc.fetch_add(1, Ordering::SeqCst);
+        Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
+    }));
+    let got = s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
+    assert_eq!(got.progress, 0.25, "progress");
+    assert_eq!(cache.get(&torrent_id_key("t", &target)).as_deref(), Some("7"), "the rediscovered id must be remembered");
+    // Second call must reuse the cache rather than list the whole account again.
+    assert!(s.status(&target_hash(&target)).await.is_some(), "second status");
+    assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
+}
+
+#[tokio::test]
+async fn torbox_remembers_torrent_id_for_queued_episode() {
+    // The series path: Resolve refuses to cache an entry whose file list is empty, and a just-queued torrent
+    // has no files yet. The id must survive that anyway.
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
+    let s = tb("t", TORBOX_API, Some(cache.clone()), mock(|req| {
+        let p = req.url().path().to_owned();
+        if p.contains("createtorrent") {
+            return Ok(resp(200, r#"{"data":{"torrent_id":7}}"#));
+        }
+        if p.contains("mylist") {
+            return Ok(resp(200, r#"{"success":true,"data":{"files":[]}}"#)); // queued: no files yet
+        }
+        Ok(resp(200, r#"{"success":false}"#)) // link not ready
+    }));
+    let target = target_episode(H, 1, 3);
+    assert!(s.resolve(&target).await.is_err(), "expected the link request to fail while the torrent is still queued");
+    assert!(cache.get(&torrent_id_key("t", H)).is_some(), "the torrent id must be remembered so Status can report the download");
+}
+
+/// Go's status test doer: every call takes 20 ms, counts itself and reports a download at half way.
+struct SlowStatusDoer {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Doer for SlowStatusDoer {
+    async fn do_request(&self, _req: reqwest::Request) -> Result<reqwest::Response, DoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#))
+    }
+}
+
+#[tokio::test]
+async fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
+    // 20 concurrent viewers of one download make one status call; a warm snapshot makes no further call.
+    const TOKEN: &str = "status-coordination-test";
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    cache.put(&torrent_id_key(TOKEN, H), "77", Duration::from_secs(3600));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let store = Arc::new(tb(TOKEN, TORBOX_API, Some(cache), Arc::new(SlowStatusDoer { calls: c })));
+    let barrier = Arc::new(tokio::sync::Barrier::new(21));
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let (store, barrier) = (store.clone(), barrier.clone());
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
+            assert_eq!(answer, StatusAnswer::Downloading, "answer");
         }));
-        let target = target_episode(H, 1, 3);
-        assert!(s.resolve(&target).await.is_err(), "expected the link request to fail while the torrent is still queued");
-        assert!(cache.get(&torrent_id_key("t", H)).is_some(), "the torrent id must be remembered so Status can report the download");
     }
-    todo!("pending: stores_test.go:832 TestTorBoxRemembersTorrentIDForQueuedEpisode")
+    barrier.wait().await;
+    for t in tasks {
+        t.await.expect("task");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "20 concurrent viewers made status calls, want 1");
+    let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
+    assert_eq!(answer, StatusAnswer::Downloading, "snapshot answer");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "warm snapshot made another call");
 }
 
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // 20 concurrent viewers of one download make one status call; a warm snapshot makes no further call.
-        const TOKEN: &str = "status-coordination-test";
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        cache.put(&torrent_id_key(TOKEN, H), "77", Duration::from_secs(3600));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
-        let store = Arc::new(tb(TOKEN, TORBOX_API, Some(cache), Arc::new(SlowStatusDoer { calls: c })));
-        let barrier = Arc::new(tokio::sync::Barrier::new(21));
-        let mut tasks = Vec::new();
-        for _ in 0..20 {
-            let (store, barrier) = (store.clone(), barrier.clone());
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-                assert_eq!(answer, StatusAnswer::Downloading, "answer");
-            }));
-        }
-        barrier.wait().await;
-        for t in tasks {
-            t.await.expect("task");
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "20 concurrent viewers made status calls, want 1");
-        let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-        assert_eq!(answer, StatusAnswer::Downloading, "snapshot answer");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "warm snapshot made another call");
+#[tokio::test]
+async fn torbox_status_answer_coordination_includes_api_identity() {
+    // Two API identities sharing one token must not share status coordination.
+    const TOKEN: &str = "same-status-token-different-api";
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for api in ["https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"] {
+        cache.put(&torrent_id_key(&torbox_account_identity(api, TOKEN), H), "77", Duration::from_secs(3600));
+        let store = tb(TOKEN, api, Some(cache.clone()), Arc::new(SlowStatusDoer { calls: calls.clone() }));
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
+            assert_eq!(answer, StatusAnswer::Downloading, "{api} answer");
+        }));
     }
-    todo!("pending: stores_test.go:1329 TestTorBoxStatusAnswer_coalescesViewersAndReusesSnapshot")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_answer_coordination_includes_api_identity() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Two API identities sharing one token must not share status coordination.
-        const TOKEN: &str = "same-status-token-different-api";
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
-        let mut tasks = Vec::new();
-        for api in ["https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"] {
-            cache.put(&torrent_id_key(&torbox_account_identity(api, TOKEN), H), "77", Duration::from_secs(3600));
-            let store = tb(TOKEN, api, Some(cache.clone()), Arc::new(SlowStatusDoer { calls: calls.clone() }));
-            let barrier = barrier.clone();
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-                assert_eq!(answer, StatusAnswer::Downloading, "{api} answer");
-            }));
-        }
-        barrier.wait().await;
-        for t in tasks {
-            t.await.expect("task");
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "two API identities shared status coordination");
+    barrier.wait().await;
+    for t in tasks {
+        t.await.expect("task");
     }
-    todo!("pending: stores_test.go:1365 TestTorBoxStatusAnswer_coordinationIncludesAPIIdentity")
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "two API identities shared status coordination");
 }
 
 #[test]
@@ -1607,30 +1588,24 @@ fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
     todo!("pending: stores_test.go:935 TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut")
 }
 
-#[test]
-#[ignore = "needs metrics.backgroundPanic from package 6"]
-fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
-    // Enable when package 6 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A panic inside the listing fetch is abandoned, not fatal.
-        let before = metrics::background_panic();
-        let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
-        let s = Arc::new(s);
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let s = s.clone();
-            tasks.push(tokio::spawn(async move {
-                let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
-                ok || !ids.is_empty()
-            }));
-        }
-        for t in tasks {
-            assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
-        }
-        assert!(metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
+#[tokio::test]
+async fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
+    // A panic inside the listing fetch is abandoned, not fatal.
+    let before = crate::metrics::background_panic();
+    let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
+    let s = Arc::new(s);
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
+            ok || !ids.is_empty()
+        }));
     }
-    todo!("pending: stores_test.go:1231 TestAccountListing_aPanicInTheFetchIsAbandonedNotFatal")
+    for t in tasks {
+        assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
+    }
+    assert!(crate::metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
 }
 
 #[test]

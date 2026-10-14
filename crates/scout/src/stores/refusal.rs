@@ -174,19 +174,80 @@ pub(crate) fn batches_failed(batch_ok: &[bool]) -> Result<(), StoreError> {
 /// Go `resolveKey` (stores.go:782): the cached torrent id and file list for a hash on this account. Scoped
 /// by the canonical TorBox identity, because the value is an account-scoped torrent id.
 pub(crate) fn resolve_key(identity: &str, info_hash: &str) -> String {
-    todo!("stores.go resolveKey")
+    let identity = crate::stores::torbox::canonical_torbox_identity(identity);
+    format!("torbox:resolve:{}:{}", crate::util::key_hash(&identity), info_hash)
 }
 
 /// Go `torrentIDKey` (stores.go:786): the torrent id alone, kept apart from the resolve entry so a queued
 /// torrent with no file list is still addressable by `Status`.
 pub(crate) fn torrent_id_key(identity: &str, info_hash: &str) -> String {
-    todo!("stores.go torrentIDKey")
+    let identity = crate::stores::torbox::canonical_torbox_identity(identity);
+    format!("torbox:torrent:{}:{}", crate::util::key_hash(&identity), info_hash)
 }
 
 /// Go `transportKind` (stores.go:1060): a transport failure described WITHOUT its URL, which for TorBox
 /// carries the account token in its query string.
+///
+/// Go reads the cause off a `*url.Error`. The errors a `Doer` returns are boxed, and either a `reqwest::Error`
+/// (whose `Display` embeds the URL) or a plain message of the same shape, so the URL is cut out of the text
+/// and only the cause is kept.
 pub(crate) fn transport_kind(err: Option<&(dyn std::error::Error + Send + Sync + 'static)>) -> String {
-    todo!("stores.go transportKind")
+    let Some(err) = err else {
+        return "unknown".to_owned();
+    };
+    // The messages of the whole chain: a reqwest error names the URL in its own text and the cause in its sources.
+    let mut chain = Vec::new();
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = link {
+        chain.push(e.to_string());
+        link = e.source();
+    }
+    if err.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) {
+        return "timeout".to_owned();
+    }
+    for message in &chain {
+        let lower = message.to_lowercase();
+        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline exceeded") {
+            return "timeout".to_owned();
+        }
+    }
+    for message in &chain {
+        let lower = message.to_lowercase();
+        if lower.contains("cancel") {
+            return "cancelled".to_owned();
+        }
+    }
+    // The deepest link is the cause itself ("connection refused"); a chain of one is the text with its URL cut.
+    let deepest = chain.last().map(String::as_str).unwrap_or_default();
+    without_url(deepest)
+}
+
+/// Cuts the `for url (<url>)` clause out of a transport error's text, and the generic lead-in with it, leaving the
+/// cause (Go's `urlErr.Err.Error()`).
+fn without_url(message: &str) -> String {
+    let Some(start) = message.find(" for url (") else {
+        return message.to_owned();
+    };
+    let after = &message[start + " for url (".len()..];
+    // The URL ends at the first ")" that closes the clause: followed by ": ", or the end of the text.
+    let mut end = None;
+    for (i, c) in after.char_indices() {
+        if c == ')' {
+            let rest = &after[i + 1..];
+            if rest.is_empty() || rest.starts_with(": ") {
+                end = Some(i);
+                break;
+            }
+        }
+    }
+    match end {
+        Some(i) => {
+            let rest = after[i + 1..].trim_start_matches(": ");
+            if rest.is_empty() { message[..start].to_owned() } else { rest.to_owned() }
+        }
+        // An unterminated clause cannot be told from the URL itself, so nothing after the lead-in is kept.
+        None => message[..start].to_owned(),
+    }
 }
 
 /// Go `torrentMissKey` (stores.go:802): the account has NO torrent for this hash, briefly.

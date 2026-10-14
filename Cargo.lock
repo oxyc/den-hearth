@@ -440,6 +440,7 @@ dependencies = [
  "crypto_box",
  "fancy-regex",
  "fastrand",
+ "futures-util",
  "hkdf",
  "http",
  "httpdate",
