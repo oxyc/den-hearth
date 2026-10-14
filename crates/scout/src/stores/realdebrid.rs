@@ -1,5 +1,4 @@
-//! Port of the Real-Debrid half of `internal/scout/stores.go` (lines 3770-4316): `realDebridStore`.
-//! Owned by the "Stores II" work package.
+//! The Real-Debrid store (Go `realDebridStore`).
 
 use std::collections::HashMap;
 use std::sync::Arc;

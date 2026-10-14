@@ -1,4 +1,4 @@
-//! Port of `internal/scout/probe_mp4.go`. Work package 5.
+//! Port of `internal/scout/probe_mp4.go`.
 
 use std::borrow::Cow;
 

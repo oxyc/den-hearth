@@ -1,9 +1,7 @@
-//! Go: `internal/scout/core_test.go` (639 lines). Work package 6.
+//! Go: `internal/scout/core_test.go` (639 lines).
 //!
-//! A grab bag: config, stream ids, play tokens and the memory cache are this package's own modules, but
-//! `TestPickEpisodeFile`, `TestSelectFileIDTorBox`, `TestPickFileIDPrefersEpisodeMatch`, `TestCleanLabel*`
-//! and `TestStreamAttributes` exercise modules owned by work packages 1 and 5. Port the whole file here;
-//! those tests stay red until the module they exercise lands.
+//! A grab bag: config, stream ids, play tokens, the memory cache, episode-file picking, release labels and
+//! stream attributes.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,12 +12,8 @@ use crate::config::{DebridService, Indexer, MAX_CONFIG_BLOB, MAX_DEBRID_ACCOUNTS
 use crate::id::MAX_STREAM_ID_LEN;
 use crate::play::{decode_play_token, encode_play_token, PlayTarget};
 use crate::seal::{parse_seal_keyring, seal, SEALED_VERSION};
+use crate::sources::{MAX_SOURCES, MAX_SOURCE_URL};
 use crate::util::{b64url_decode, b64url_encode};
-
-/// Go `maxSources` and `maxSourceURL` (sources.go:34-35). Owned by work package 5; they are copied here so
-/// the bounds test can run now. Replace with a `use` once `sources.rs` exports them.
-const MAX_SOURCES: usize = 3;
-const MAX_SOURCE_URL: usize = 2048;
 
 /// Go `blob` (core_test.go:11): a JSON string as an unpadded base64url config path segment.
 pub(crate) fn blob(json_str: &str) -> String {
@@ -30,13 +24,6 @@ pub(crate) fn blob(json_str: &str) -> String {
 /// of backslashes and braces reaches the decoder exactly as a client would have sent it.
 fn json_string(s: &str) -> String {
     serde_json::to_string(s).expect("a string always serializes")
-}
-
-/// Go `compiledInsts` (core_test.go:586): the instruction count of a pattern's compiled program, or -1 if
-/// it will not compile. Go gets this from `regexp/syntax`; Rust's `regex` crates expose no program size, so
-/// the owner decides what bound to assert instead (see the ignored test below).
-fn compiled_insts(_pat: &str) -> i64 {
-    todo!("core_test.go compiledInsts: no Rust equivalent of regexp/syntax Prog.Inst")
 }
 
 #[test]
@@ -437,8 +424,6 @@ fn clean_label_unknown_episode_size_names_the_pack_in_the_headline() {
     assert_eq!(clean_label(&s), "1080p • WEB-DL • 68 GB pack", "cleanLabel");
 }
 
-// Needs `streamAttributes` and `StreamAttributes` from attributes.go (work package 5). The body is ported and
-// compiled out until it lands.
 #[test]
 fn stream_attributes() {
     use crate::attributes::stream_attributes;
@@ -752,79 +737,5 @@ fn decode_config_keeps_every_account_up_to_the_ceiling() {
     );
     for (i, svc) in want.iter().enumerate() {
         assert_eq!(cfg.debrid[i].service, *svc, "account {i} order is the preference order the pool asks in");
-    }
-}
-
-// maxCompiledInsts bounds the compiled PROGRAM of a pattern that survives validation.
-//
-// Instructions, not megabytes, because megabytes could not be measured honestly here. Two earlier
-// versions of this test sampled `runtime.MemStats.TotalAlloc` around the compile — and TotalAlloc is
-// process-wide and cumulative, so every byte any other goroutine allocated inside that window was
-// charged to the regex. It reported 250 literal `k`s as 23.6 MiB, and under contention 1,545 MiB for the
-// same pattern that measures 0.03 MiB in a quiet process. That made the suite fail roughly one run in
-// three under `-race -count=2`, and it meant the bound itself had been calibrated with a broken
-// instrument.
-//
-// The instruction count is exactly what the guard controls, and it is deterministic: a counted
-// repetition is EXPANDED into the program, which is the whole mechanism. Measured, all patterns at the
-// 256-character cap:
-//
-//	bomb  `(?:x*240){1000}`   240,002 instructions   (dropped by the guard)
-//	worst survivor                252 instructions   (250 literal characters, or 62 starred groups)
-//
-// 4096 sits three orders of magnitude below the bomb and sixteen times above the worst survivor.
-//
-// The other dimension, rune-table entries, is deliberately NOT asserted: `\pC` repeated 83 times is
-// 118,192 runes (~0.47 MiB), and regexp/syntax caps that itself at 128 Ki runes — so an assertion here
-// could never fail and would be the kind of forever-green check this file has already had to fix once.
-const MAX_COMPILED_INSTS: i64 = 4096;
-
-// The guard exists for a memory bound, so the bound is what gets asserted — not just which patterns the
-// matcher happens to flag.
-//
-// A user pattern is up to 256 characters, compiled fresh on every list build, from a caller whose debrid
-// token is never verified. The BOMB IS IN THE TABLE deliberately: it is the only entry containing a
-// brace, so it is the only thing coupling this test to the guard. Without it, disabling
-// hasCountedRepeat entirely left this test green — every flagged pattern hits the `continue` below and
-// asserts nothing, so the test claimed a bound it could not have noticed being broken.
-#[test]
-#[ignore = "the instruction-count bound needs a Rust equivalent of regexp/syntax Prog.Inst (see compiled_insts)"]
-fn exclude_regex_compiled_size_is_bounded() {
-    let worst = [
-        // The bomb. Dropped by the guard; if the guard ever stops dropping it, it lands at ~53 MiB and
-        // this test is what says so.
-        format!("(?:{}){{1000}}", "x".repeat(240)),
-        // Unicode categories — the worst shapes that legitimately SURVIVE, at 1.7-3.1 MiB.
-        format!("{}a", r"\pC|".repeat(62)),
-        format!("{}a", r"\pL|".repeat(62)),
-        r"\pC".repeat(83),
-        // And the cheap shapes, all under 0.05 MiB.
-        "ab|".repeat(84),
-        format!("{}a{}", "(".repeat(60), ")".repeat(60)) + "*",
-        "k".repeat(250),
-        "[a-zA-Z0-9]".repeat(23),
-        r"\p{Latin}".repeat(28),
-        "(a*)".repeat(62),
-    ];
-    for pat in worst {
-        let pat = if pat.len() > 256 { &pat[..256] } else { &pat[..] };
-        let Some(cfg) = crate::config::decode_config(
-            None,
-            &blob(&format!(
-                r#"{{"debrid":[{{"service":"torbox","token":"t"}}],"filters":{{"excludeRegex":{}}}}}"#,
-                json_string(pat)
-            )),
-        ) else {
-            panic!("rejected outright: {pat:.40}");
-        };
-        if cfg.filters.exclude_regex.is_empty() {
-            continue; // the guard dropped it, so it is bounded by construction
-        }
-        let insts = compiled_insts(&cfg.filters.exclude_regex);
-        assert!(
-            insts <= MAX_COMPILED_INSTS,
-            "a {}-char pattern that survived validation compiled to {insts} instructions (max {MAX_COMPILED_INSTS}): {pat:.40}",
-            pat.len()
-        );
     }
 }

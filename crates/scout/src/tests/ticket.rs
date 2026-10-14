@@ -1,4 +1,4 @@
-//! Go: `internal/scout/ticket_test.go` (541 lines). Work package 6.
+//! Go: `internal/scout/ticket_test.go` (541 lines).
 //!
 //! Pins the play-ticket wire format: the legacy payloads built below are the byte shape older tickets carry,
 //! and must keep opening. The route tests drive the handler; the settings test drives `settings_from_env` and

@@ -1,4 +1,4 @@
-//! Go: `internal/scout/linkcheck_test.go` (353 lines). Work package 6.
+//! Go: `internal/scout/linkcheck_test.go` (353 lines).
 //!
 //! The Go tests run the check against `httptest` servers. The verdict table below runs it through a mocked
 //! `Doer` instead, which sees the same request and answers with the same headers. The `/play` tests drive the

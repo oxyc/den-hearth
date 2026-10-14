@@ -1,4 +1,4 @@
-//! Go: `internal/scout/rank_show_test.go` (66 lines). Work package 5.
+//! Go: `internal/scout/rank_show_test.go` (66 lines).
 
 use crate::rank::{rank_streams, title_overlap, title_tokens, RankFilters, RawStream};
 

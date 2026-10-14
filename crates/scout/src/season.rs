@@ -1,6 +1,5 @@
 //! Port of `internal/scout/season.go`: picking the right file out of a season pack (SxxExx, 1x02,
-//! "season 1 episode 2", absolute numbering). `TorrentFile` is FROZEN (see PORTING.md): every store lists
-//! files in this shape.
+//! "season 1 episode 2", absolute numbering). Every store lists files as `TorrentFile`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -34,7 +33,7 @@ fn net_word_boundary() -> String {
 /// .NET's `$` without the multiline option: the end of the text, or just before a final newline.
 const NET_END: &str = r"(?=\n?\z)";
 
-/// FROZEN. Go `TorrentFile`.
+/// Go `TorrentFile`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TorrentFile {
     pub index: i64,

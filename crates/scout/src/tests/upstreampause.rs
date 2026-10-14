@@ -1,4 +1,4 @@
-//! Go: `internal/scout/upstreampause_test.go` (180 lines). Work package 6.
+//! Go: `internal/scout/upstreampause_test.go` (180 lines).
 //!
 //! The Go `http.RoundTripper` double is a `Doer` here. Every pause test is live. The add-budget test belongs to
 //! package 3, so it is ignored with its body compiled out.

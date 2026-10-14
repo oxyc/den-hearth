@@ -1,6 +1,6 @@
 //! Port of `internal/scout/scrape.go`: the indexer scrapers (Stremio-addon `/stream` endpoints), the
-//! shared parse, scrape quorum and the per-provider answer cache. `Doer`, `Scraper` and `ScrapeQuery` are
-//! FROZEN (see PORTING.md): stores, probes and the handler all take them.
+//! shared parse, scrape quorum and the per-provider answer cache. Stores, probes and the handler all take
+//! `Doer`, `Scraper` and `ScrapeQuery`.
 //!
 //! Indexer scrapers (ported from src/scrape/*). One shared Stremio-protocol client; fan-out with a
 //! per-indexer timeout, gather-what-responded, dedupe by infohash.
@@ -41,7 +41,7 @@ use crate::util::{fold_json_keys, go_url_parse, key_hash, DetachedFlight, Shape,
 /// What a `Doer` can fail with. Go returns `error`; a mock in a test returns whichever it likes.
 pub type DoError = Box<dyn std::error::Error + Send + Sync>;
 
-/// FROZEN. Go `doer`: the one HTTP seam, `Do(*http.Request) (*http.Response, error)`. A production impl
+/// Go `doer`: the one HTTP seam, `Do(*http.Request) (*http.Response, error)`. A production impl
 /// wraps a `reqwest::Client`; a test builds responses from `http::Response` (reqwest converts them), the
 /// way the Go tests use `mockDoer`.
 #[async_trait]
@@ -49,7 +49,7 @@ pub trait Doer: Send + Sync {
     async fn do_request(&self, req: reqwest::Request) -> Result<reqwest::Response, DoError>;
 }
 
-/// FROZEN. Go `scrapeQuery`.
+/// Go `scrapeQuery`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrapeQuery {
     /// "movie" | "series"
@@ -63,7 +63,7 @@ pub struct ScrapeQuery {
     pub rid: String,
 }
 
-/// FROZEN. Go `scraper`.
+/// Go `scraper`.
 #[async_trait]
 pub trait Scraper: Send + Sync {
     fn id(&self) -> Indexer;
@@ -794,6 +794,7 @@ fn base_url_for(id: &Indexer, urls: &HashMap<Indexer, String>) -> String {
 /// Returns the releases, whether an EMPTY result may be trusted, and whether every askable indexer
 /// answered. The last is not the same question as the second: a partial non-empty list is worth serving
 /// and worth caching, just for less time.
+#[cfg(test)]
 pub(crate) async fn scrape_all(
     scrapers: &[Arc<dyn Scraper>],
     q: &ScrapeQuery,
@@ -1025,6 +1026,7 @@ async fn scrape_one_cached(
 
 /// Go `scrapeAllCached` is scrapeAll answering from each indexer's kept answer where there is one, and keeping
 /// each new one for ttl.
+#[cfg(test)]
 pub(crate) async fn scrape_all_cached(
     scrapers: &[Arc<dyn Scraper>],
     q: &ScrapeQuery,

@@ -1,10 +1,5 @@
-//! den-scout, ported from `internal/scout` in the Go repository. A skeleton: one module per Go source
-//! file, the shared types the tests need, and no logic. See `PORTING.md`.
-//!
-//! den-hearth serves it (`crates/hearth`): `handler::new_handler` over `deps::build_deps`.
-
-// Every module is a stub until its work package lands, so unused items are expected for now.
-#![allow(dead_code, unused_variables)]
+//! den-scout: the stream-list and play addon. den-hearth serves it (`crates/hearth`): `handler::new_handler` over
+//! `deps::build_deps`.
 
 pub mod addbudget;
 pub mod attributes;

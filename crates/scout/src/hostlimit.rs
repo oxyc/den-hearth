@@ -1,4 +1,4 @@
-//! Port of `internal/scout/hostlimit.go`. Work package 6.
+//! Port of `internal/scout/hostlimit.go`.
 //!
 //! Outbound pacing, per upstream host.
 //!

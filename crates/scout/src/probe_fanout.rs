@@ -1,4 +1,4 @@
-//! Port of `internal/scout/probe_fanout.go`. Work package 5.
+//! Port of `internal/scout/probe_fanout.go`.
 //!
 //! The pure half: what a probe's facts change about a stream, which releases are worth probing, and the cache key a
 //! probed file lives under. Go also hangs `hydrateKnownSizes`, `probeTop` and `probeBehind` on the handler (they read

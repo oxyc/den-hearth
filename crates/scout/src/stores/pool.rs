@@ -1,7 +1,6 @@
-//! Port of the pool half of `internal/scout/stores.go` (lines 4722-end): `StorePool`, `buildStores`,
-//! `CacheCheck`/`Resolve`/`ResolvePreferring`/`ResolveCachedOnly`/`Status` across stores. Owned by the
-//! "Stores II" work package. The reporters (`recent_refusal`, `account_refusal`, `holding_services` and
-//! friends) are in `refusal.rs`, beside the markers they read.
+//! The store pool: `StorePool`, `buildStores`, and `CacheCheck`/`Resolve`/`ResolvePreferring`/
+//! `ResolveCachedOnly`/`Status` across stores. The reporters (`recent_refusal`, `account_refusal`,
+//! `holding_services` and friends) are in `refusal.rs`, beside the markers they read.
 
 use std::collections::HashMap;
 use std::sync::Arc;

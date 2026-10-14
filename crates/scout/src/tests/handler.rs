@@ -1,4 +1,4 @@
-//! Go: `internal/scout/handler_test.go` (2429 lines). Work package 4.
+//! Go: `internal/scout/handler_test.go` (2429 lines).
 //!
 //! Also home to the test doubles and request helpers the other package-4 test modules share (Go keeps them
 //! in `handler_test.go`, `scrape_test.go` and `stores_test.go`): `FakeScraper` (scrape_test.go's `fakeScraper`),
@@ -2375,42 +2375,6 @@ fn split_cached_treats_every_unknown_form_the_same_way() {
 }
 
 #[tokio::test]
-#[ignore = "Go's deadlineStore reads the deadline each Status call arrives with (ctx.Deadline()); a Rust store takes no deadline, so a prompt read cannot report its budget. See handle_play_a_status_read_that_cannot_answer_is_bounded_by_the_status_budget for the half that can be measured"]
-async fn handle_play_poll_reads_use_the_status_budget() {
-    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
-    #[cfg(any())]
-    async fn pending() {
-        // Go TestHandlePlay_pollReadsUseTheStatusBudget: a poll-route status read never takes the resolve budget,
-        // and only the escalation may take double the status budget.
-        for route in ["", "?probe=1"] {
-            for unknown in [false, true] {
-                let store = DeadlineStore::new(DebridService::TorBox, unknown);
-                let seen = store.status_at.clone();
-                let h = new_handler(test_deps(move |d| {
-                    d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])
-                }));
-                let tok = crate::play::encode_play_token(&crate::play::PlayTarget {
-                    info_hash: "a".repeat(40),
-                    ..Default::default()
-                });
-                get(&h, &format!("/{}/play/{tok}{route}", valid_blob()), &[]).await;
-                let reads = seen.lock().expect("the lock").clone();
-                assert!(!reads.is_empty(), "the status read never happened");
-                let ceiling = 2 * crate::handler::STATUS_BUDGET;
-                let doubled = reads.iter().filter(|l| **l > crate::handler::STATUS_BUDGET).count();
-                assert!(
-                    reads.iter().all(|l| *l <= ceiling),
-                    "a status read exceeded the 2x ceiling: {reads:?}"
-                );
-                let want = usize::from(unknown && route.is_empty());
-                assert_eq!(doubled, want, "reads exceeding the ordinary status budget: {reads:?}");
-            }
-        }
-    }
-    todo!("pending: handler_test.go:TestHandlePlay_pollReadsUseTheStatusBudget")
-}
-
-#[tokio::test]
 async fn handle_play_the_escalation_re_asks_only_the_store_that_could_not_answer() {
     // Go TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer: the escalation re-asks only the store
     // that could not answer. Three reads happen: poll, escalation, post-failure. Only the escalation is narrowed.
@@ -2704,102 +2668,6 @@ async fn handle_probe_reports_a_refusal_it_discovers_itself() {
             body_str(&rec).trim()
         );
     }
-}
-
-#[tokio::test]
-#[ignore = "Go's recordingCheckStore reads the deadline its CacheCheck arrives with (ctx.Deadline()); a Rust store takes no deadline. See play_the_preference_cache_check_lives_no_longer_than_the_status_budget for the same property measured as how long the check lived"]
-async fn play_the_preference_cache_check_is_budgeted() {
-    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
-    #[cfg(any())]
-    async fn pending() {
-        // Go TestPlay_thePreferenceCacheCheckIsBudgeted: /play's preference cache check gets a slice of the resolve
-        // clock, never the whole thing. Asserted on the deadline the store is handed.
-        let _budget = crate::handler::set_status_budget(Duration::from_millis(150));
-        let store = RecordingCheckStore::new(DebridService::TorBox);
-        let budgets = store.budgets.clone();
-        let h =
-            new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
-        // TWO accounts: the preference check is gated on more than one being configured.
-        let two = blob(
-            r#"{"debrid":[{"service":"torbox","token":"tb"},{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}"#,
-        );
-        let tok = crate::play::encode_play_token(&crate::play::PlayTarget {
-            info_hash: "c".repeat(40),
-            ..Default::default()
-        });
-        assert_eq!(get(&h, &format!("/{two}/play/{tok}"), &[]).await.status(), 302, "play");
-        let got = budgets.recv_timeout(Duration::from_secs(1)).expect("no cache check was made");
-        assert!(
-            got <= crate::handler::STATUS_BUDGET,
-            "the preference cache check was given {got:?} of budget, want about the status budget"
-        );
-    }
-    todo!("pending: handler_test.go:TestPlay_thePreferenceCacheCheckIsBudgeted")
-}
-
-#[tokio::test]
-#[ignore = "Go resolves with an already-cancelled context and asserts nothing was charged or sent; a Rust store takes no context, a spent clock is a dropped future, and a future dropped before its first poll has no result to assert on"]
-async fn resolve_a_spent_clock_does_not_buy_an_add() {
-    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
-    #[cfg(any())]
-    async fn pending() {
-        // Go TestResolve_aSpentClockDoesNotBuyAnAdd: a resolve on a spent clock must not charge an add, and issues
-        // no upstream request.
-        let token = "spent-clock-resolve".to_owned();
-        let hash = "d".repeat(40);
-        let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
-        let upstream = Arc::new(AtomicI32::new(0));
-        let u = upstream.clone();
-        let s = TorBoxStore::with_client(
-            &token,
-            Arc::new(MemoryCache::new(1 << 20)),
-            MockDoer::new(move |_| {
-                u.fetch_add(1, Ordering::SeqCst);
-                resp(200, r#"{"data":{}}"#)
-            }),
-        );
-        let ctx = CancelledCtx::new();
-        assert!(
-            s.resolve_in(&ctx, &ResolveTarget { info_hash: hash, ..Default::default() }).await.is_err(),
-            "a resolve on a spent clock should not succeed"
-        );
-        assert_eq!(
-            global_add_budget().remaining(&budget_account(DebridService::TorBox, &token)),
-            before,
-            "the hourly add budget moved on a spent clock"
-        );
-        assert_eq!(upstream.load(Ordering::SeqCst), 0, "upstream requests were issued on an expired context");
-    }
-    todo!("pending: handler_test.go:TestResolve_aSpentClockDoesNotBuyAnAdd")
-}
-
-#[tokio::test]
-#[ignore = "Go calls ResolvePreferring with an already-cancelled context so that the first store fails before it charges; ResolvePreferring takes no context here and no store can be told the clock is spent, so the first store would be asked (and charged) for real"]
-async fn resolve_preferring_a_spent_clock_still_surfaces_an_in_flight_add() {
-    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
-    #[cfg(any())]
-    async fn pending() {
-        // Go TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd: a spent clock still reports an add scout
-        // already has out, which is a pure cache read ahead of the charge, so it costs nothing.
-        let token = "inflight-resolve-preferring".to_owned();
-        let hash = "e".repeat(40);
-        let cache = Arc::new(MemoryCache::new(1 << 20));
-        note_add_attempt(&cache, DebridService::RealDebrid, &token, &hash);
-        let quiet = MockDoer::new(|_| resp(200, r#"{"data":{}}"#));
-        let pool = StorePool::new(vec![
-            Box::new(TorBoxStore::with_client(&token, cache.clone(), quiet.clone())),
-            Box::new(RealDebridStore::with_client(&token, cache.clone(), quiet)),
-        ]);
-        let ctx = CancelledCtx::new();
-        let err = pool
-            .resolve_preferring(&ctx, &ResolveTarget { info_hash: hash, ..Default::default() }, None)
-            .await;
-        assert!(
-            matches!(err, Err(StoreError::AddInFlight)),
-            "a spent clock reported {err:?}, want AddInFlight"
-        );
-    }
-    todo!("pending: handler_test.go:TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd")
 }
 
 #[tokio::test]

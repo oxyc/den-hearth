@@ -1,4 +1,4 @@
-//! Port of `internal/scout/loglimit.go`. Work package 6.
+//! Port of `internal/scout/loglimit.go`.
 //!
 //! The log records changes of state, not events. A request-path line fires on every request for as long
 //! as its cause lasts — an indexer that is down is down for every scrape, a client waiting on a download

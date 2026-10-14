@@ -1,9 +1,8 @@
-//! Go: `internal/scout/stores_pick_test.go` (1211 lines). Work package 2.
+//! Go: `internal/scout/stores_pick_test.go` (1211 lines).
 //!
-//! File and episode selection per store. The episode matchers (`pickEpisodeFile`, `namesEpisode`, ...) are
-//! `season.go`, work package 5, and TorBox's `selectFileID` is work package 1; those tests are ignored
-//! stubs until their modules land. Three run against this package: the Real-Debrid position mapping, the
-//! status and service-name checks, and the dead-link message.
+//! File and episode selection per store: the episode matchers (`pickEpisodeFile`, `namesEpisode`, ...), TorBox's
+//! `selectFileID`, the Real-Debrid position mapping, the status and service-name checks, and the dead-link
+//! message.
 //!
 //! Picking a file out of a season pack is the step where a mistake is invisible until playback: the
 //! stream plays, it is simply the wrong episode. Each store picks differently when the name match fails

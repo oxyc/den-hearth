@@ -1,4 +1,4 @@
-//! Port of `internal/scout/metrics.go`. Work package 6.
+//! Port of `internal/scout/metrics.go`.
 //!
 //! Counters for the questions this package used to answer only by grepping logs: which indexer is earning
 //! its slice of the scrape budget, how often a list is served from cache, how many builds come back

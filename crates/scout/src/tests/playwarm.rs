@@ -1,4 +1,4 @@
-//! Go: `internal/scout/playwarm_test.go` (169 lines). Work package 4.
+//! Go: `internal/scout/playwarm_test.go` (169 lines).
 //!
 //! Every test here drives `/play` through a real TorBox store. Also home to `held_torbox_play` and `same_calls`, which
 //! `linkcheck_test.go` shares.

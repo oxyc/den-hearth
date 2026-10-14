@@ -1,6 +1,5 @@
-//! Port of the TorBox half of `internal/scout/stores.go` (lines 446-3770 less the refusal helpers in
-//! `refusal.rs`): `torBoxStore`, its check-cached batcher, account listing, status, cancel and file
-//! selection. Owned by the "Stores I" work package.
+//! The TorBox store (Go `torBoxStore`): its check-cached batcher, account listing, status, cancel and file
+//! selection.
 //!
 //! Context: Go threads a `context.Context` through every call. Here a call's deadline is the caller's
 //! `tokio::time::timeout` and its cancellation is dropping the future. Work that Go runs detached from the
@@ -1360,8 +1359,7 @@ impl TorBoxStore {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
         let decode = tokio::task::spawn_blocking(move || {
             let reader = ChunkReader { rx, current: Vec::new(), pos: 0 };
-            let mut limited =
-                TruncationDetector { r: reader.take(MAX_LISTING_BYTES as u64 + 1), limit: MAX_LISTING_BYTES };
+            let mut limited = TruncationDetector { r: reader.take(MAX_LISTING_BYTES as u64 + 1) };
             let (ids, ok, fault) = decode_listing(&mut limited);
             (ids, ok, fault, limited.truncated())
         });

@@ -353,11 +353,13 @@ impl RebuildGate {
     }
 
     /// Whether a lease is held for the key at all, expired or not.
+    #[cfg(test)]
     pub(crate) fn holds(&self, key: &str) -> bool {
         self.rebuilds.contains_key(key)
     }
 
     /// How many background rebuilds are in flight.
+    #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live
     }
@@ -830,8 +832,6 @@ pub(crate) struct Inner {
     list_cache: String,
     partial_list_cache: String,
     stale_list_cache: String,
-    /// staleIfErrorFor(ListTTL, PlayTicketTTL), fixed once both are known.
-    stale_if_error: Duration,
     /// outageHoldFor(ListTTL, PlayTicketTTL): how long a complete list is kept for the stale_list fallback.
     outage_hold: Duration,
     status_budget_ms: AtomicU64,
@@ -906,7 +906,11 @@ impl Handler {
         }
         resp
     }
+}
 
+/// What the tests reach the handler's internals through.
+#[cfg(test)]
+impl Handler {
     /// Shortens the status budget, for a test (see `DEFAULT_STATUS_BUDGET`).
     pub(crate) fn set_status_budget(&self, d: Duration) {
         self.inner.status_budget_ms.store(d.as_millis() as u64, Ordering::Relaxed);
@@ -1127,7 +1131,6 @@ impl Inner {
             list_cache,
             partial_list_cache,
             stale_list_cache,
-            stale_if_error,
             outage_hold,
             status_budget_ms: AtomicU64::new(DEFAULT_STATUS_BUDGET.as_millis() as u64),
             debug_limiter: Mutex::new(Arc::new(new_host_limiter(Duration::from_secs(10), 3))),

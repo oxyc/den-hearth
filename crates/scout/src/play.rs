@@ -3,7 +3,7 @@
 use crate::config::is_finite;
 use crate::util::{b64url_decode, b64url_encode, fold_json_keys, Shape, LEAF};
 
-/// FROZEN. Go `PlayTarget`: an infohash plus either the exact file or series coordinates to pick from a
+/// Go `PlayTarget`: an infohash plus either the exact file or series coordinates to pick from a
 /// pack. The debrid token is NOT here; it rides in the config blob on the URL path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayTarget {

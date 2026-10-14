@@ -1,4 +1,4 @@
-//! Go: `internal/scout/validate_test.go` (188 lines). Work package 6.
+//! Go: `internal/scout/validate_test.go` (188 lines).
 //!
 //! The per-service verdicts and the unreachable case run against a mocked `Doer`. The route tests drive
 //! `handleValidate` through the handler, with the mock set as `Deps::probe_doer` (Go swaps the `*http.Client`'s

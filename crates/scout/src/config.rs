@@ -1,6 +1,5 @@
 //! Port of `internal/scout/config.go`: the per-install config carried in the URL path segment, and its
-//! validation. The types here are shared by almost every other module and are FROZEN (see PORTING.md);
-//! the functions are owned by the work package that owns this file.
+//! validation. The types here are shared by almost every other module.
 
 use std::collections::HashSet;
 
@@ -11,7 +10,7 @@ use crate::sources::normalize_sources;
 use crate::util::{fold_json_keys, Shape, LEAF};
 use den_seal::{open_segment, InstallId, Rejected, MAX_EPOCH};
 
-/// FROZEN. Go `DebridService` (a string type); the three services, in resolve priority order.
+/// Go `DebridService` (a string type); the three services, in resolve priority order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DebridService {
     /// "torbox"
@@ -42,7 +41,7 @@ impl DebridService {
 pub const DEBRID_SERVICES: [DebridService; 3] =
     [DebridService::TorBox, DebridService::RealDebrid, DebridService::Premiumize];
 
-/// FROZEN. Go `Indexer` (a string type): "torrentio", "comet", "mediafusion" or "torz".
+/// Go `Indexer` (a string type): "torrentio", "comet", "mediafusion" or "torz".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Indexer(pub String);
 
@@ -110,14 +109,14 @@ pub const SCOPE_AVAILABILITY: &str = "availability";
 /// as an `i64` for `Config::epoch`).
 pub const MAX_CONFIG_EPOCH: i64 = MAX_EPOCH as i64;
 
-/// FROZEN. Go `DebridAccount`.
+/// Go `DebridAccount`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebridAccount {
     pub service: DebridService,
     pub token: String,
 }
 
-/// FROZEN. Go `Filters`. Go's `*int` is `Option<i64>`; `""` for a string means unset, as in Go.
+/// Go `Filters`. Go's `*int` is `Option<i64>`; `""` for a string means unset, as in Go.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filters {
     pub exclude_cam: bool,
@@ -136,7 +135,7 @@ pub struct Filters {
     pub exclude_regex: String,
 }
 
-/// FROZEN. Go `Config`: a validated install config.
+/// Go `Config`: a validated install config.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub debrid: Vec<DebridAccount>,

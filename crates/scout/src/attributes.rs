@@ -1,4 +1,4 @@
-//! Port of `internal/scout/attributes.go`. Work package 5.
+//! Port of `internal/scout/attributes.go`.
 
 use std::sync::LazyLock;
 

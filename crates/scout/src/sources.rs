@@ -1,4 +1,4 @@
-//! Port of `internal/scout/sources.go`. Work package 5.
+//! Port of `internal/scout/sources.go`.
 //!
 //! A household's own sources: Stremio stream addons it configured itself — its own MediaFusion, Comet, or
 //! Torrentio with its debrid account — named in the install config and scraped beside the indexers.

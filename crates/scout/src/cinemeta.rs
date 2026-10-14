@@ -1,4 +1,4 @@
-//! Port of `internal/scout/cinemeta.go`. Work package 5.
+//! Port of `internal/scout/cinemeta.go`.
 //!
 //! Cinemeta (the public Stremio metadata addon) maps an IMDb id → title/year. den-scout uses those to drop
 //! torrents a tracker mistagged with another title's id. It's a best-effort side lookup: any failure

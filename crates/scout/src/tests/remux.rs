@@ -1,4 +1,4 @@
-//! Go: `internal/scout/remux_test.go` (89 lines). Work package 4.
+//! Go: `internal/scout/remux_test.go` (89 lines).
 //!
 //! Scoped configs (availability-only) and the den-remux key, through the handler.
 

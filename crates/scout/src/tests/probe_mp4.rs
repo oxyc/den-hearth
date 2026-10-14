@@ -1,6 +1,6 @@
-//! Go: `internal/scout/probe_mp4_test.go` (368 lines). Work package 5.
+//! Go: `internal/scout/probe_mp4_test.go` (368 lines).
 //!
-//! Reads the sample files in Go's `internal/scout/testdata/`; see PORTING.md for where they go.
+//! Reads the sample files in `crates/scout/testdata/`.
 
 use crate::probe::{channel_count, channel_layout};
 use crate::probe_avi::codec_from_four_cc;

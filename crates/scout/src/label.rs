@@ -1,4 +1,4 @@
-//! Port of `internal/scout/label.go`. Work package 5.
+//! Port of `internal/scout/label.go`.
 
 use std::sync::{LazyLock, OnceLock};
 
@@ -141,6 +141,7 @@ pub(crate) fn release_group(title: &str) -> String {
 }
 
 /// Go `cleanLabel` is the bullet-joined quality summary shown as attributes.label.
+#[cfg(test)]
 pub(crate) fn clean_label(s: &RawStream) -> String {
     clean_label_lower(&str::to_lowercase(&s.title), s)
 }

@@ -1,4 +1,4 @@
-//! Go: `internal/scout/reqlog_test.go` (132 lines). Work package 6.
+//! Go: `internal/scout/reqlog_test.go` (132 lines).
 //!
 //! `capture_log` and `LogCapture` are the Go `captureLog` helper over the crate's thread-local log sink.
 

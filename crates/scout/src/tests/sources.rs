@@ -1,4 +1,4 @@
-//! Go: `internal/scout/sources_test.go` (172 lines). Work package 5.
+//! Go: `internal/scout/sources_test.go` (172 lines).
 
 use std::net::IpAddr;
 

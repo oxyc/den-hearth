@@ -1,4 +1,4 @@
-//! Go: `internal/scout/scrape_test.go` (267 lines). Work package 5.
+//! Go: `internal/scout/scrape_test.go` (267 lines).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

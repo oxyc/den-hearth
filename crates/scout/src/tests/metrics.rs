@@ -1,4 +1,4 @@
-//! Go: `internal/scout/metrics_test.go` (218 lines). Work package 6.
+//! Go: `internal/scout/metrics_test.go` (218 lines).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -206,9 +206,8 @@ fn metrics_debrid_series_have_fixed_cardinality() {
 // redeploy". Three states, because "the backend does not report" is not the same as "it is off".
 #[test]
 fn metrics_cache_persistence_gauge() {
-    // Go's optional `persistenceReporter`: a memory cache does not report, so the gauge is -1. The frozen
-    // `Cache::persistent` defaults to `false`, which reads as 0 here; this assertion stays red until that
-    // method can answer "not reporting" (see the report).
+    // Go's optional `persistenceReporter`: a memory cache does not report (`Cache::persistent` is `None`), so
+    // the gauge is -1.
     assert_eq!(cache_persistent_gauge(&MemoryCache::new(1 << 20)), -1, "a backend with no durable tier");
     let dir = TempDir::new().unwrap();
     let working = TieredCache::new(1 << 20, dir.path());

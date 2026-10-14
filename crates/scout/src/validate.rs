@@ -1,4 +1,4 @@
-//! Port of `internal/scout/validate.go`. Work package 6.
+//! Port of `internal/scout/validate.go`.
 //!
 //! Checks a debrid token at the moment it is pasted: one unauthenticated read per service, judged from the right
 //! place for that service. A provider being down is never reported as a wrong token.

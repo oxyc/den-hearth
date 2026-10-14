@@ -1,4 +1,4 @@
-//! Port of `internal/scout/coverage.go`. Work package 4.
+//! Port of `internal/scout/coverage.go`.
 //!
 //! A stream list's account of itself, carried in the body beside `streams` as `den`.
 //!
@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::config::Config;
-use crate::scrape::{classify_outcome, DoError, Scraper};
 
 pub(crate) const ANSWER_ENVELOPE_VERSION: i64 = 1;
 
@@ -141,8 +140,12 @@ pub(crate) fn excused_from_quorum(outcome: &str) -> bool {
 /// Go type-switches on `unaskableScraper` and `*httpStatusError`; here the scraper's own failure says what it is
 /// (`UnaskableError`, `HttpStatusError`), and `scrape::classify_outcome` reads it back, so the scraper argument
 /// is not consulted.
-pub(crate) fn classify_scrape(_sc: &dyn Scraper, err: Option<&DoError>) -> &'static str {
-    classify_outcome(err.map(|e| &**e as &(dyn std::error::Error + 'static)))
+#[cfg(test)]
+pub(crate) fn classify_scrape(
+    _sc: &dyn crate::scrape::Scraper,
+    err: Option<&crate::scrape::DoError>,
+) -> &'static str {
+    crate::scrape::classify_outcome(err.map(|e| &**e as &(dyn std::error::Error + 'static)))
 }
 
 /// quarantinedReports lists the indexers a config names that this build has disabled.

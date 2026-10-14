@@ -1,6 +1,6 @@
-//! Go: `internal/scout/probe_containers_test.go` (101 lines). Work package 5.
+//! Go: `internal/scout/probe_containers_test.go` (101 lines).
 //!
-//! Reads the sample files in Go's `internal/scout/testdata/`; see PORTING.md for where they go.
+//! Reads the sample files in `crates/scout/testdata/`.
 
 use crate::probe::parse_head;
 use crate::probe_avi::{parse_avi, MAX_AVI_DEPTH};

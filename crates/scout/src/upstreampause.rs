@@ -1,4 +1,4 @@
-//! Port of `internal/scout/upstreampause.go`. Work package 6.
+//! Port of `internal/scout/upstreampause.go`.
 //!
 //! An upstream that says to stop is left alone by every request, not only the one it answered.
 //!

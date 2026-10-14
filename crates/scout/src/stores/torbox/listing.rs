@@ -116,12 +116,10 @@ impl From<Stop> for Skip {
 /// only way to tell "the body ended" from "the cap cut it off" — and those two must not look alike.
 ///
 /// It is given a reader that stops at `limit + 1` bytes, so reading exactly the cap and being cut off at it
-/// are different counts. Go counts the bytes itself (`n > limit`). The count is the reader's own here: a
-/// `Take` knows how many bytes it has left, and it has none left exactly when `limit + 1` went through. That is
-/// the same observation, and it leaves the struct a plain `{ r, limit }`.
+/// are different counts. The count is the reader's own: a `Take` knows how many bytes it has left, and it has
+/// none left exactly when `limit + 1` went through.
 pub(crate) struct TruncationDetector<R> {
     pub(crate) r: R,
-    pub(crate) limit: usize,
 }
 
 /// How many bytes a limiting reader will still hand out.

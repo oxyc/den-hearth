@@ -1,4 +1,4 @@
-//! Port of `internal/scout/playwarm.go`. Work package 4.
+//! Port of `internal/scout/playwarm.go`.
 
 use std::time::Duration;
 

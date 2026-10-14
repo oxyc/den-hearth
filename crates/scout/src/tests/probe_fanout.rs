@@ -1,4 +1,4 @@
-//! Go: `internal/scout/probe_fanout_test.go` (618 lines). Work package 5.
+//! Go: `internal/scout/probe_fanout_test.go` (618 lines).
 //!
 //! The handler-driven tests call `Handler::probe_top`, `hydrate_probe_facts` and `hydrate_known_sizes` directly, as
 //! Go's do on a `*handler`. The probe runs behind the response on a background task, so those are async tests on a

@@ -1,4 +1,4 @@
-//! Go: `internal/scout/shape_test.go` (212 lines). Work package 5.
+//! Go: `internal/scout/shape_test.go` (212 lines).
 
 use crate::attributes::stream_attributes;
 use crate::client::{AUDIO_CONVERTED_COST, NEVER_PLAYS_COST, VIDEO_CONVERTED_COST};

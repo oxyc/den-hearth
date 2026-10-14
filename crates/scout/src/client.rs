@@ -1,4 +1,4 @@
-//! Port of `internal/scout/client.go`. Work package 5.
+//! Port of `internal/scout/client.go`.
 
 use serde::{Deserialize, Serialize};
 
@@ -164,8 +164,7 @@ fn remux_opens(s: &RawStream) -> bool {
     !REMUX_REFUSED_EXT.iter().any(|ext| name.ends_with(ext))
 }
 
-/// Go `webReady` (defined in `handler.go`, line 2190; placed here per PORTING.md's assignment of
-/// `webready_test.go`).
+/// Go `webReady`: whether a browser can play the release as it is served (an https MP4).
 pub(crate) fn web_ready(s: &RawStream, url: &str) -> bool {
     url.starts_with("https://") && container_of(s.clone()) == "mp4"
 }

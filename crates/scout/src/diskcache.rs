@@ -1,4 +1,4 @@
-//! Port of `internal/scout/diskcache.go`. Work package 6.
+//! Port of `internal/scout/diskcache.go`.
 //!
 //! The disk tier is for facts worth keeping across a restart, and it is written sparingly (SSD wear): see
 //! `TieredCache` for what is and is not written.
@@ -184,6 +184,7 @@ impl TieredCache {
     }
 
     /// Reads time from `clock` in both tiers, so a replay can run days of traffic in seconds.
+    #[cfg(feature = "bench")]
     pub(crate) fn with_clock(mut self, clock: Arc<dyn Fn() -> SystemTime + Send + Sync>) -> TieredCache {
         let mem_clock = Arc::clone(&clock);
         self.mem.now = Box::new(move || mem_clock());
@@ -286,6 +287,7 @@ impl TieredCache {
     }
 
     /// Go `path`: hashes the key. Cache keys carry config blobs and ids, which are neither filename-safe nor short.
+    #[cfg(test)]
     pub(crate) fn path(&self, key: &str) -> PathBuf {
         self.dir.join(file_name(key))
     }
@@ -436,7 +438,7 @@ impl Cache for TieredCache {
         let now = unix_secs((self.clock)());
         // Skipping the rewrite keeps the file's older expiry: after a restart the entry can lapse up to a quarter
         // of `ttl` early. Refreshing only the expiry would still mean rewriting the file (`<expiry>\n<value>`),
-        // and saving that write is the point of the rule. Deliberate; see PORTING.md.
+        // and saving that write is the point of the rule. Deliberate.
         if self.on_disk_is_current(&name, value, ttl, now) {
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
             return;

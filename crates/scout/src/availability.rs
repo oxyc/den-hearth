@@ -1,4 +1,4 @@
-//! Port of `internal/scout/availability.go`. Work package 4.
+//! Port of `internal/scout/availability.go`.
 //!
 //! Stream availability for a page of titles at once: the question Den's poster rows ask — does this movie
 //! have anything to play? — answered in one request instead of a probe per poster, for the TV and for a

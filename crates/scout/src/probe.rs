@@ -1,7 +1,6 @@
 //! Port of `internal/scout/probe.go`: reading the head of a resolved link to learn what the file itself
 //! says (container, codecs, audio layout, HDR, Dolby Vision, languages), Matroska first; MP4 and AVI are
-//! in `probe_mp4.rs` and `probe_avi.rs`. `Probe` is FROZEN (see PORTING.md): `RawStream` carries it and
-//! the cache stores it as JSON.
+//! in `probe_mp4.rs` and `probe_avi.rs`. `RawStream` carries a `Probe`, and the cache stores it as JSON.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +20,7 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
-/// FROZEN. Go `Probe`. The serde attributes reproduce the Go JSON tags (`omitempty` is
+/// Go `Probe`. The serde attributes reproduce the Go JSON tags (`omitempty` is
 /// `skip_serializing_if`); `audioLanguages` and `subtitleLanguages` carry no `omitempty` in Go, and
 /// absent decodes as empty.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -74,8 +73,7 @@ pub struct Probe {
 /// Go `probeBytes`: how much of a file's head a probe reads.
 pub(crate) const PROBE_BYTES: usize = 1 << 20;
 
-/// Go `ErrNoTracks`: a head with no Tracks element. A reason constant, per PORTING.md's convention for
-/// sentinel errors.
+/// Go `ErrNoTracks`: a head with no Tracks element, as the error string callers compare against.
 pub(crate) const ERR_NO_TRACKS: &str = "no track information in the file head";
 
 /// Go `idTrackType`: the Matroska TrackType element id.

@@ -1,5 +1,5 @@
-//! Port of `internal/scout/rank.go`: release-title parsing, filtering and ranking. `RawStream` is FROZEN
-//! (see PORTING.md): scrapers produce it and the handler and probes consume it.
+//! Port of `internal/scout/rank.go`: release-title parsing, filtering and ranking. Scrapers produce
+//! `RawStream`, and the handler and probes consume it.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
@@ -14,7 +14,7 @@ use crate::label::MIB;
 use crate::probe::Probe;
 use crate::season::{declares_episode, names_episode};
 
-/// FROZEN. Go `RawStream`: one release from one indexer.
+/// Go `RawStream`: one release from one indexer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RawStream {
     pub info_hash: String,
@@ -187,6 +187,7 @@ pub(crate) fn junk_class_of(t: &str) -> &'static str {
 }
 
 /// Go `junkClass`: "" if the title is a legit source.
+#[cfg(test)]
 pub(crate) fn junk_class(title: &str) -> &'static str {
     junk_class_of(&str::to_lowercase(title))
 }
@@ -645,6 +646,7 @@ fn drop_n(debug: &mut Option<&mut RankDebug>, reason: &str, n: i64) {
 }
 
 /// Go `rankStreams`: filters, then sorts by `qualityScore` (seeders break ties, then input order), then caps.
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn rank_streams(streams: &[RawStream], f: RankFilters) -> Vec<RawStream> {
     rank_streams_debug(streams, f, None)
 }

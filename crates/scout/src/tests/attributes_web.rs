@@ -1,4 +1,4 @@
-//! Go: `internal/scout/attributes_web_test.go` (305 lines). Work package 5.
+//! Go: `internal/scout/attributes_web_test.go` (305 lines).
 //!
 //! Also holds the EBML and `hvcC` builders the shape tests share (`ebml`, `hvc_c`, `avc_c`), the way the Go
 //! file holds them for `shape_test.go`.

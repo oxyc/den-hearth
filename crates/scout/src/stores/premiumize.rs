@@ -1,5 +1,4 @@
-//! Port of the Premiumize half of `internal/scout/stores.go` (lines 4316-4722): `premiumizeStore`.
-//! Owned by the "Stores II" work package.
+//! The Premiumize store (Go `premiumizeStore`).
 
 use std::collections::HashMap;
 use std::sync::Arc;

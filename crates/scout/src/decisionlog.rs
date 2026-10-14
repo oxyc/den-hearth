@@ -1,4 +1,4 @@
-//! Port of `internal/scout/decisionlog.go`. Work package 6.
+//! Port of `internal/scout/decisionlog.go`.
 //!
 //! Decision logging: every decision line shares one shape, so a line read from the journal alone explains and
 //! reproduces a reported problem.

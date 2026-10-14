@@ -1,4 +1,4 @@
-//! Go: `internal/scout/stores_preference_test.go` (294 lines). Work package 2.
+//! Go: `internal/scout/stores_preference_test.go` (294 lines).
 //!
 //! With more than one debrid, WHICH service resolves a release decides whether it plays now or downloads
 //! first. CacheCheck already learns that and the union threw it away, so the fixed store order could send

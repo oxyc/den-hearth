@@ -1,7 +1,4 @@
-//! Go: `internal/scout/answercache_test.go` (191 lines). Work package 5.
-//!
-//! The last test needs a caller that arrives already cancelled, which a dropped future cannot be, so it keeps its
-//! full Go body in a `cfg(any())` item.
+//! Go: `internal/scout/answercache_test.go` (191 lines).
 
 // The scraper fixtures.
 mod pending_fixtures {
@@ -289,36 +286,4 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
     let got = stayed.await.expect("join");
     assert_eq!(got.len(), 1, "the caller that stayed got {} releases, want 1", got.len());
     assert_eq!(calls.load(Ordering::SeqCst), 1, "leaving restarted the shared provider request");
-}
-
-// A caller that arrives already canceled starts no work at all.
-#[test]
-#[ignore = "Go cancels the caller's context before calling and asserts the empty return values; in Rust a caller that has gone is a future dropped before it is polled, which runs nothing and returns nothing to assert on (the mid-flight departure is scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_question)"]
-fn scrape_all_cached_does_not_start_detached_work_for_a_canceled_caller() {
-    #[cfg(any())]
-    async fn pending() {
-        use crate::scrape::{scrape_all_cached, ScrapeQuery};
-        use crate::tests::answercache::pending_fixtures::AskCountingScraper;
-        use std::sync::atomic::{AtomicI32, Ordering};
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let calls = Arc::new(AtomicI32::new(0));
-        let up = AskCountingScraper {
-            base: "https://configured.example/canceled".into(),
-            calls: Arc::clone(&calls),
-            fail: false,
-        };
-        let canceled = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await;
-        assert!(canceled.is_err());
-        let query = ScrapeQuery { kind: "movie".into(), imdb: "tt-canceled".into(), ..Default::default() };
-        let (out, ok, complete) =
-            scrape_all_cached(&[Arc::new(up)], &query, Duration::from_secs(1), None, Duration::from_secs(60))
-                .await;
-        assert!(
-            out.is_empty() && !ok && !complete && calls.load(Ordering::SeqCst) == 0,
-            "canceled scrape started work"
-        );
-    }
-    todo!("pending: answercache_test.go TestScrapeAllCached_doesNotStartDetachedWorkForACanceledCaller")
 }
