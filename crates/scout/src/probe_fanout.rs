@@ -5,6 +5,7 @@
 //! its singleflight, link memo and store factory); those belong to handler.rs, and take these as their parts.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::cache::Cache;
@@ -12,8 +13,9 @@ use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::id::StreamId;
 use crate::probe::Probe;
-use crate::rank::{detect_resolution_lower, junk_class_of, quality_score_lower, RawStream};
+use crate::rank::{detect_resolution_lower, junk_class_of, quality_score_lower, RawStream, PREFERENCE_SINK};
 use crate::attributes::stream_attributes;
+use crate::metrics::metrics;
 use crate::stores::{CacheTruth, ResolveTarget};
 use crate::util::go_to_lower;
 
@@ -37,10 +39,6 @@ pub(crate) const PROBE_TTL: Duration = Duration::from_secs(720 * 60 * 60);
 /// a season pack's differs by the other ninety percent of the torrent.
 pub(crate) const PACK_SIZE_RATIO: f64 = 1.3;
 
-/// Go `preferenceSink` (rank.go): what a release outside the preferred resolution loses. Private to rank.rs, whose
-/// copy this must equal.
-const PREFERENCE_SINK: i64 = 5000;
-
 /// Go `(*handler).hydrateProbeFacts`: attaches the track details already known for these releases. Only the CACHE is
 /// consulted on the request path — a map lookup, no network.
 pub(crate) fn hydrate_probe_facts(cache: Option<&dyn Cache>, streams: &mut [RawStream], sid: Option<&StreamId>) {
@@ -53,6 +51,7 @@ pub(crate) fn hydrate_probe_facts(cache: Option<&dyn Cache>, streams: &mut [RawS
             if let Ok(probe) = serde_json::from_str::<Probe>(&raw) {
                 s.probe = Some(probe);
                 apply_probed_size(s, sid);
+                metrics().probe_cache_hit.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -140,7 +139,13 @@ pub(crate) fn select_probe_jobs(
     };
     let mut pending = Vec::new();
     for (i, s) in streams.iter().enumerate() {
-        if !frontier.contains(&i) || s.probe.is_some() {
+        if !frontier.contains(&i) {
+            if s.cached && s.probe.is_none() {
+                metrics().torbox_avoid("probe_frontier");
+            }
+            continue;
+        }
+        if s.probe.is_some() {
             continue;
         }
         // Only probe what the store ALREADY holds. Probing resolves, and resolving a release the account
@@ -160,12 +165,14 @@ pub(crate) fn select_probe_jobs(
         // two-account install a release only the second holds still reads as cached here — and resolving
         // it through the pool would reach the first account, which adds it. Carrying the holders lets the
         // probe resolve read-only.
+        let key = probe_cache_key(s, sid);
+        metrics().probe_cache_miss.fetch_add(1, Ordering::Relaxed);
         let holders = truth.held_by(&s.info_hash);
         if holders.is_empty() {
             continue;
         }
         pending.push(ProbeJob {
-            key: probe_cache_key(s, sid),
+            key,
             holders,
             target: ResolveTarget {
                 info_hash: s.info_hash.clone(),

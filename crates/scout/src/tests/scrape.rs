@@ -465,7 +465,7 @@ mod beyond_the_go_suite {
     // untagged struct writes its field names as they are, a nil slice as `null`.
     #[tokio::test]
     async fn answers_cached_by_the_go_build_are_read_and_ours_read_in_go() {
-        let cache = MemoryCache::new(1 << 20);
+        let cache = Arc::new(MemoryCache::new(1 << 20));
         let (client, seen) = recording_doer();
         let sc = StremioScraper { indexer: Indexer("torrentio".into()), base_url: "https://go-compat.example/".into(), client };
         let key = |id: &str| format!("answer:v1:{}:movie:{id}", key_hash("https://go-compat.example"));
@@ -485,18 +485,18 @@ mod beyond_the_go_suite {
             client: Arc::clone(&sc.client),
         })];
         let (out, ok, complete) =
-            scrape_all_cached(&one, &movie("tt1"), Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+            scrape_all_cached(&one, &movie("tt1"), Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
         assert!(ok && complete && out.len() == 1, "{out:?}");
         assert!(out[0].info_hash == hash && out[0].size_bytes == Some(1234) && out[0].seeders == Some(5) && out[0].file_idx.is_none());
         let (out, ok, complete) =
-            scrape_all_cached(&one, &movie("tt2"), Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+            scrape_all_cached(&one, &movie("tt2"), Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
         assert!(out.is_empty() && ok && complete, "a nil slice cached by Go is an answer, not a miss");
         assert!(seen.lock().expect("lock").is_empty(), "both were served from the cache");
 
-        keep_answer(Some(&cache), Duration::from_secs(60), &sc, &movie("tt3"), &out_streams(&hash));
+        keep_answer(Some(&*cache), Duration::from_secs(60), &sc, &movie("tt3"), &out_streams(&hash));
         let raw = cache.get(&key("tt3")).expect("kept");
         assert!(raw.contains(r#""InfoHash":""#) && raw.contains(r#""Probe":null"#), "not Go's spelling: {raw}");
-        assert_eq!(kept_answer(Some(&cache), &sc, &movie("tt3")).expect("read back")[0].info_hash, hash);
+        assert_eq!(kept_answer(Some(&*cache), &sc, &movie("tt3")).expect("read back")[0].info_hash, hash);
     }
 
     fn out_streams(hash: &str) -> Vec<RawStream> {

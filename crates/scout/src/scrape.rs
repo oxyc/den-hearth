@@ -8,11 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
-use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
-use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -23,7 +20,7 @@ use serde_json::{Map, Value};
 use crate::cache::Cache;
 use crate::config::{Config, Indexer, CONFIG_PATH_INDEXERS};
 use crate::coverage::{
-    SourceReport, OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_QUARANTINED, OUTCOME_REFUSED, OUTCOME_TIMEOUT,
+    excused_from_quorum, SourceReport, OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_REFUSED, OUTCOME_TIMEOUT,
     OUTCOME_UNREACHABLE,
 };
 use crate::decisionlog::{decision_line, scrape_identity};
@@ -33,9 +30,11 @@ use crate::label::MIB;
 use crate::loglimit::{emit, log_limited};
 use crate::probe::Probe;
 use crate::rank::{re2, RawStream, GIB};
+use crate::stores::join_all;
 use crate::sources::{new_source_client, source_host, ERR_NOT_PUBLIC, OWN_SOURCES, SOURCE_LIMITER};
 use crate::upstreampause::pause_on_refusal;
-use crate::util::{fold_json_keys, go_to_lower, key_hash, Shape, LEAF};
+use crate::metrics::metrics;
+use crate::util::{fold_json_keys, go_to_lower, go_url_parse, key_hash, DetachedFlight, Shape, LEAF};
 
 /// What a `Doer` can fail with. Go returns `error`; a mock in a test returns whichever it likes.
 pub type DoError = Box<dyn std::error::Error + Send + Sync>;
@@ -73,6 +72,18 @@ pub trait Scraper: Send + Sync {
     fn answer_key(&self) -> Option<String> {
         None
     }
+
+    /// Go `reportFor`: names a household source in the coverage report by its host (they share one indexer id).
+    /// Empty for every other scraper.
+    fn label(&self) -> String {
+        String::new()
+    }
+
+    /// Slow setup a scraper must finish BEFORE its scrape budget starts. Go builds its scrapers (minting an indexer's
+    /// config included) in `makeScrapers`, ahead of and outside the per-indexer budget; here scrapers are built by a
+    /// plain function, so a scraper that has to mint does it in this hook instead, which `scrape_covered` awaits
+    /// before it starts the clock. A later `scrape` finds the work done (indexerconfig.rs keeps the answer).
+    async fn prepare(&self) {}
 }
 
 /// Go `maxScrapeBytes`: the cap on an addon response body (a stream list is far smaller).
@@ -180,12 +191,6 @@ pub(crate) fn classify_outcome(err: Option<&(dyn Error + 'static)>) -> &'static 
     OUTCOME_UNREACHABLE
 }
 
-/// Go `excusedFromQuorum` (coverage.go): whether a source's failure to answer leaves the list complete, only
-/// when it can never be asked, so waiting on it would make completeness unreachable.
-fn excused_from_quorum(outcome: &str) -> bool {
-    outcome == OUTCOME_MISCONFIGURED || outcome == OUTCOME_QUARANTINED
-}
-
 // --- shared parse ---
 
 /// Go `sizeRe`. RE2's `\s` is `[\t\n\f\r ]`, spelled out because the regex crate's ASCII `\s` adds the vertical tab.
@@ -225,61 +230,10 @@ fn normalize_hash(h: &str) -> Option<String> {
     well_formed.then_some(h)
 }
 
-/// Go `url.Parse(link)` then `u.Path`, as far as a hash search needs it: the decoded path, or `None` where Go
-/// refuses the link, where the link is opaque (`mailto:x`), or where it has no path. The host is not validated.
+/// Go `url.Parse(link)` then `u.Path`: the decoded path, or `None` where Go refuses the link or the link is opaque
+/// (`mailto:x`, which has no path).
 fn go_url_path(link: &str) -> Option<Vec<u8>> {
-    if link.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return None;
-    }
-    let (rest, fragment) = link.split_once('#').unwrap_or((link, ""));
-    percent_decode(fragment)?;
-    // A scheme is letters, digits, `+`, `-` and `.`, opened by a letter and closed by `:`.
-    let scheme_end = rest.find(':').filter(|&i| {
-        let s = &rest[..i];
-        s.starts_with(|c: char| c.is_ascii_alphabetic())
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    });
-    if rest.starts_with(':') {
-        return None; // missing protocol scheme
-    }
-    let has_scheme = scheme_end.is_some();
-    let rest = scheme_end.map_or(rest, |i| &rest[i + 1..]);
-    let rest = rest.split_once('?').map_or(rest, |(path, _)| path);
-    if !rest.starts_with('/') {
-        if has_scheme {
-            return None; // opaque
-        }
-        // A relative path whose first segment holds a colon would have read as a scheme.
-        if rest.split('/').next().is_some_and(|seg| seg.contains(':')) {
-            return None;
-        }
-    }
-    let path = match rest.strip_prefix("//") {
-        Some(after) if has_scheme || !rest.starts_with("///") => after.find('/').map_or("", |i| &after[i..]),
-        _ => rest,
-    };
-    percent_decode(path)
-}
-
-/// Go's `unescape` in path mode: `%XX` to its byte, `None` for a `%` not followed by two hex digits.
-fn percent_decode(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = b.get(i + 1..i + 3)?;
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    Some(out)
+    go_url_parse(link).filter(|u| !u.opaque).map(|u| u.path)
 }
 
 /// Go `hashInPath` finds the infohash in a debrid playback link. An addon configured with a debrid account
@@ -500,14 +454,10 @@ fn jitter(max: Duration) -> Duration {
     Duration::from_nanos(std::collections::hash_map::RandomState::new().build_hasher().finish() % max)
 }
 
-/// The host a limiter paces a base URL by (Go `url.URL.Host`: the host and, when written, the port).
+/// The host a limiter paces a base URL by: Go's `url.Parse(strings.TrimRight(baseURL, "/")).Host`, as written (not
+/// lower-cased, a written port kept). `None` where Go cannot parse the URL, which is not paced at all.
 fn limiter_host(base: &str) -> Option<String> {
-    let u = reqwest::Url::parse(base.trim_end_matches('/')).ok()?;
-    let host = u.host_str()?;
-    Some(match u.port() {
-        Some(p) => format!("{host}:{p}"),
-        None => host.to_owned(),
-    })
+    go_url_parse(base.trim_end_matches('/')).map(|u| u.host)
 }
 
 impl StremioScraper {
@@ -677,15 +627,21 @@ impl Scraper for SourceScraper {
     fn answer_key(&self) -> Option<String> {
         self.stremio.answer_key()
     }
+
+    fn label(&self) -> String {
+        self.label.clone()
+    }
 }
 
 /// An indexer that needs a per-install config segment, with minting on: the segment is minted from the household's
 /// debrid account when the scraper is first asked, then the indexer is asked like any other.
 ///
-/// Go mints inside `makeScrapers`, before the scrape and on its own thread of control. `Deps::make_scrapers` is a
-/// plain function here, so the mint happens at the head of the scrape instead (indexerconfig.rs coalesces and caches
-/// it either way). A mint that fails leaves the scraper unaskable for this scrape, which is what Go's
-/// `unaskableScraper` is: `UnaskableError`, with the same transient/misconfigured split.
+/// Go mints inside `makeScrapers`, before the scrape and outside its 8 s budget. `Deps::make_scrapers` is a plain
+/// function here, so the mint is deferred to `prepare`, which `scrape_covered` awaits BEFORE it starts the scrape's
+/// clock: the mint's own ceiling (`MINT_TIMEOUT`, 3 s) is all it can cost, and the budget is left intact exactly as
+/// the comment on that constant requires. indexerconfig.rs keeps the result (and a failure, for two minutes), so the
+/// `scrape` that follows finds the mint done. A mint that fails leaves the scraper unaskable for this scrape,
+/// which is what Go's `unaskableScraper` is: `UnaskableError`, with the same transient/misconfigured split.
 pub(crate) struct MintingScraper {
     pub(crate) indexer: Indexer,
     /// Only the debrid accounts are read, to mint from.
@@ -698,6 +654,10 @@ pub(crate) struct MintingScraper {
 impl Scraper for MintingScraper {
     fn id(&self) -> Indexer {
         self.indexer.clone()
+    }
+
+    async fn prepare(&self) {
+        let _ = indexer_base_with_config(&self.indexer, &self.config, Some(&*self.client)).await;
     }
 
     async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
@@ -949,8 +909,13 @@ fn millis(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// The request itself, under its own timeout. A timeout drops the scrape, which is how a deadline cancels it.
+/// The request itself, under its own timeout, and counted (Go's `metrics.indexerResult` beside `sc.scrape`: once per
+/// question asked of the indexer, whoever is waiting on it). A timeout drops the scrape, which is how a deadline
+/// cancels it.
+///
+/// `prepare` runs first and OUTSIDE the timeout: Go builds its scrapers, minting included, before this budget starts.
 async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, timeout: Duration) -> ScrapeAttempt {
+    sc.prepare().await;
     let start = Instant::now();
     let answer = tokio::time::timeout(timeout, sc.scrape(q)).await;
     let (streams, err) = match answer {
@@ -958,6 +923,7 @@ async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, timeout: Duration) -> ScrapeAtte
         Ok(Err(err)) => (Vec::new(), Some(SharedError::from(err))),
         Err(_) => (Vec::new(), Some(Arc::new(DeadlineExceeded) as SharedError)),
     };
+    metrics().indexer_result(&sc.id().0, err.is_none(), i64::try_from(streams.len()).unwrap_or(i64::MAX));
     ScrapeAttempt { streams, err, cached: false, latency_ms: millis(start.elapsed()), observed_at: Some(now_millis()) }
 }
 
@@ -965,42 +931,27 @@ async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, timeout: Duration) -> ScrapeAtte
 ///
 /// One upstream question per provider identity and title at a time. The settled-answer cache collapses later
 /// requests, but without this gate every list variant that missed it concurrently still reached the indexer.
-type Flight = tokio::sync::watch::Receiver<Option<ScrapeAttempt>>;
-static ANSWER_FLIGHTS: LazyLock<Mutex<HashMap<String, Flight>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static ANSWER_FLIGHTS: DetachedFlight<ScrapeAttempt> = DetachedFlight::new("indexer answer");
 
-/// Forgets a flight when its task ends, however it ends: a task that panicked must not leave every later caller
-/// joining a question nobody is asking.
-struct ForgetFlight(String);
-
-impl Drop for ForgetFlight {
-    fn drop(&mut self) {
-        lock(&ANSWER_FLIGHTS).remove(&self.0);
+/// The shared question: the request under its own timeout, detached from every caller. A page leaving stops
+/// waiting, but does not cancel useful work for another page, and the answer warms the cache whoever is still there
+/// (Go's `ask(detached)` with `context.WithoutCancel`): the task owns the cache and the scraper.
+async fn ask_shared(
+    sc: Arc<dyn Scraper>,
+    q: ScrapeQuery,
+    timeout: Duration,
+    cache: Option<Arc<dyn Cache>>,
+    ttl: Duration,
+) -> ScrapeAttempt {
+    // A request may have filled the cache between the first caller's read and its turn in the flight.
+    if let Some(streams) = kept_answer(cache.as_deref(), &*sc, &q) {
+        return ScrapeAttempt { streams, err: None, cached: true, latency_ms: 0, observed_at: None };
     }
-}
-
-/// Joins the question already in flight under `key`, or starts it.
-///
-/// The request has its own task and its own timeout: a page leaving stops waiting, but does not cancel useful work
-/// for another page. (Go also lets it warm the cache after every caller has left. The cache here is borrowed for the
-/// call, so it cannot move into the task; whichever caller is still waiting keeps the answer.)
-fn join_or_start(key: &str, sc: &Arc<dyn Scraper>, q: &ScrapeQuery, timeout: Duration) -> Flight {
-    let (tx, rx) = {
-        let mut flights = lock(&ANSWER_FLIGHTS);
-        if let Some(rx) = flights.get(key) {
-            return rx.clone();
-        }
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        flights.insert(key.to_owned(), rx.clone());
-        (tx, rx)
-    };
-    // The guard is taken only now, with the map unlocked: it locks the map when it drops.
-    let (sc, q, forget) = (Arc::clone(sc), q.clone(), ForgetFlight(key.to_owned()));
-    tokio::spawn(async move {
-        let attempt = ask(&*sc, &q, timeout).await;
-        drop(forget);
-        let _ = tx.send(Some(attempt));
-    });
-    rx
+    let attempt = ask(&*sc, &q, timeout).await;
+    if attempt.err.is_none() {
+        keep_answer(cache.as_deref(), ttl, &*sc, &q, &attempt.streams);
+    }
+    attempt
 }
 
 /// Go `scrapeOneCached` answers one provider question from the settled cache or the one identical request already in
@@ -1009,65 +960,34 @@ async fn scrape_one_cached(
     sc: &Arc<dyn Scraper>,
     q: &ScrapeQuery,
     timeout: Duration,
-    cache: Option<&dyn Cache>,
+    cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> ScrapeAttempt {
-    if let Some(streams) = kept_answer(cache, &**sc, q) {
+    if let Some(streams) = kept_answer(cache.as_deref(), &**sc, q) {
         return ScrapeAttempt { streams, err: None, cached: true, latency_ms: 0, observed_at: None };
     }
     let Some(key) = answer_cache_key(&**sc, q) else {
         let attempt = ask(&**sc, q, timeout).await;
         if attempt.err.is_none() {
-            keep_answer(cache, ttl, &**sc, q, &attempt.streams);
+            keep_answer(cache.as_deref(), ttl, &**sc, q, &attempt.streams);
         }
         return attempt;
     };
     let waiting = Instant::now();
-    let mut flight = join_or_start(&key, sc, q, timeout);
+    let (task_sc, task_q) = (Arc::clone(sc), q.clone());
     // Cached answers are decoded for each caller. Preserve that ownership for a shared live answer too: later
-    // phases annotate RawStream values with cache and probe facts.
-    let shared = match flight.wait_for(Option::is_some).await {
-        Ok(done) => done.clone(),
-        // The task ended without answering: it panicked.
-        Err(_) => None,
-    };
-    let Some(mut attempt) = shared else {
+    // phases annotate RawStream values with cache and probe facts (the flight hands each waiter its own clone).
+    let (answer, _shared) =
+        ANSWER_FLIGHTS.run(&key, move || ask_shared(task_sc, task_q, timeout, cache, ttl)).await;
+    let Some(mut attempt) = answer else {
+        // The task panicked.
         return ScrapeAttempt::failed(Arc::new(std::io::Error::other("the scrape ended without an answer")));
     };
-    attempt.latency_ms = millis(waiting.elapsed());
-    attempt.observed_at = Some(now_millis());
-    if attempt.err.is_none() {
-        keep_answer(cache, ttl, &**sc, q, &attempt.streams);
+    if !attempt.cached {
+        attempt.latency_ms = millis(waiting.elapsed());
+        attempt.observed_at = Some(now_millis());
     }
     attempt
-}
-
-/// `futures::future::join_all`, for the one place a fan-out is needed: polls every future on each wake-up and keeps
-/// the answers in order.
-async fn join_all<'a, T>(futures: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>) -> Vec<T> {
-    let mut pending: Vec<Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>> = futures.into_iter().map(Some).collect();
-    let mut done: Vec<Option<T>> = pending.iter().map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut waiting = false;
-        for (slot, future) in done.iter_mut().zip(pending.iter_mut()) {
-            if let Some(f) = future {
-                match f.as_mut().poll(cx) {
-                    Poll::Ready(v) => {
-                        *slot = Some(v);
-                        *future = None;
-                    }
-                    Poll::Pending => waiting = true,
-                }
-            }
-        }
-        if waiting {
-            Poll::Pending
-        } else {
-            Poll::Ready(())
-        }
-    })
-    .await;
-    done.into_iter().flatten().collect()
 }
 
 /// Go `scrapeAllCached` is scrapeAll answering from each indexer's kept answer where there is one, and keeping
@@ -1076,7 +996,7 @@ pub(crate) async fn scrape_all_cached(
     scrapers: &[Arc<dyn Scraper>],
     q: &ScrapeQuery,
     timeout: Duration,
-    cache: Option<&dyn Cache>,
+    cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> (Vec<RawStream>, bool, bool) {
     let res = scrape_covered(scrapers, q, timeout, cache, ttl).await;
@@ -1097,27 +1017,21 @@ pub(crate) async fn scrape_covered(
     scrapers: &[Arc<dyn Scraper>],
     q: &ScrapeQuery,
     timeout: Duration,
-    cache: Option<&dyn Cache>,
+    cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> ScrapeResult {
-    let attempts = join_all(
-        scrapers
-            .iter()
-            .map(|sc| Box::pin(scrape_one_cached(sc, q, timeout, cache, ttl)) as Pin<Box<dyn Future<Output = ScrapeAttempt> + Send + '_>>)
-            .collect(),
-    )
-    .await;
+    let attempts =
+        join_all(scrapers.iter().map(|sc| scrape_one_cached(sc, q, timeout, cache.clone(), ttl)).collect()).await;
     let mut all: Vec<RawStream> = Vec::new();
     let mut reports: Vec<SourceReport> = Vec::with_capacity(scrapers.len());
     for (sc, attempt) in scrapers.iter().zip(attempts) {
         let err = attempt.err.as_deref().map(|e| e as &(dyn Error + 'static));
         let outcome = classify_outcome(err);
         let unasked = err.is_some_and(|e| e.is::<UnaskableError>());
-        // The report is the scraper's own id. Go also names a household source by its host (`reportFor`); the
-        // `Scraper` trait has no label to read it from, so that is left to a trait method.
+        // The report is the scraper's own id, and a household source's host as its label (Go `reportFor`).
         let mut report = SourceReport {
             id: sc.id().0,
-            label: String::new(),
+            label: sc.label(),
             outcome: outcome.to_owned(),
             items: 0,
             latency_ms: None,

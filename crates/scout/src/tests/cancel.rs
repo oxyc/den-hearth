@@ -349,3 +349,235 @@ fn cancel_reannounce() {
     }
     todo!("pending: cancel_test.go:240 TestCancel_reannounce")
 }
+
+// ---- The store's Cancel, without the handler --------------------------------------------------------------------
+//
+// The tests above reach Cancel through DELETE /<config>/play/<token> and wait for the handler. These drive the
+// store directly, with the same upstream replies, so the safety rules (never a torrent scout did not add, never a
+// finished one) are pinned where they are enforced.
+
+mod store {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::cache::{Cache, MemoryCache};
+    use crate::stores::refusal::torrent_id_key;
+    use crate::stores::torbox::{mark_added_by_us, TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
+    use crate::stores::{Store, StoreError, FETCH_QUEUED, FETCH_STALLED};
+    use crate::tests::mock::{resp, MockDoer};
+
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn base(req: &reqwest::Request) -> String {
+        req.url().path().rsplit('/').next().unwrap_or("").to_owned()
+    }
+
+    fn has_id(req: &reqwest::Request) -> bool {
+        req.url().query_pairs().any(|(k, _)| k == "id")
+    }
+
+    /// A TorBox store answering through `reply`, whose cache `prime` has seen before any request is made, and the
+    /// upstream calls it makes.
+    fn store(
+        reply: impl Fn(&reqwest::Request) -> reqwest::Response + Send + Sync + 'static,
+        prime: impl FnOnce(&dyn Cache),
+    ) -> (TorBoxStore, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cache = Arc::new(MemoryCache::new(1 << 20));
+        prime(&*cache);
+        let recorder = calls.clone();
+        let s = TorBoxStore {
+            token: "tb-secret".to_owned(),
+            cache: Some(cache),
+            api: TORBOX_API.to_owned(),
+            client: Arc::new(MockDoer(move |req| {
+                recorder.lock().unwrap().push(base(&req));
+                Ok(reply(&req))
+            })),
+        };
+        (s, calls)
+    }
+
+    fn ours(cache: &dyn Cache) {
+        cache.put(&torrent_id_key("tb-secret", HASH), "42", RESOLVE_CACHE_TTL);
+        mark_added_by_us(cache, "tb-secret", HASH);
+    }
+
+    fn not_ours(cache: &dyn Cache) {
+        cache.put(&torrent_id_key("tb-secret", HASH), "42", RESOLVE_CACHE_TTL);
+    }
+
+    // The memo and marker a successful cancel leaves behind are gone afterwards, so a second cancel of the same hash
+    // finds nothing left to cancel.
+    #[tokio::test]
+    async fn cancel_ours_and_unfinished() {
+        let (s, calls) = store(
+            |req| match (base(req).as_str(), has_id(req)) {
+                ("mylist", true) => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading"}}"#),
+                // The account listing: empty, as it is once the delete has taken effect.
+                ("mylist", false) => resp(200, r#"{"success":true,"data":[]}"#),
+                ("controltorrent", _) => resp(200, r#"{"success":true}"#),
+                _ => resp(404, "{}"),
+            },
+            ours,
+        );
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(out.done && !out.reannounced && out.reason.is_empty(), "outcome = {out:?}");
+        assert_eq!(*calls.lock().unwrap(), vec!["mylist", "controltorrent"], "upstream calls");
+        let again = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(!again.done && again.reason == "not_queued", "cancelling again: {again:?} (the memo should be cleared)");
+    }
+
+    // A completed download holds no slot and is kept, never deleted.
+    #[tokio::test]
+    async fn cancel_finished() {
+        let (s, calls) = store(
+            |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":true}}"#),
+                _ => resp(404, "{}"),
+            },
+            ours,
+        );
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(!out.done && out.reason == "finished", "outcome = {out:?}");
+        assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a finished torrent must never be deleted");
+    }
+
+    // The account held this hash before scout ever added it (no marker), and it is healthy.
+    #[tokio::test]
+    async fn cancel_not_ours() {
+        let (s, calls) = store(
+            |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":5,"peers":3}}"#),
+                _ => resp(404, "{}"),
+            },
+            not_ours,
+        );
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(!out.done && out.reason == "not_ours", "outcome = {out:?}");
+        assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a healthy torrent scout did not add must never be deleted");
+    }
+
+    // The narrow exception: a torrent with no marker that is stalled dead and not finished IS cancelled — dead weight
+    // the client's fallback had already abandoned.
+    #[tokio::test]
+    async fn cancel_not_ours_but_stalled_is_cancelled() {
+        let (s, calls) = store(
+            |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#),
+                "controltorrent" => resp(200, r#"{"success":true}"#),
+                _ => resp(404, "{}"),
+            },
+            not_ours,
+        );
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(out.done, "outcome = {out:?}");
+        assert_eq!(*calls.lock().unwrap(), vec!["mylist", "controltorrent"], "upstream calls");
+    }
+
+    // "Finished" outranks the stalled exception the same way it outranks "ours".
+    #[tokio::test]
+    async fn cancel_not_ours_and_finished_is_refused() {
+        let (s, calls) = store(
+            |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":true,"download_state":"completed"}}"#),
+                _ => resp(404, "{}"),
+            },
+            not_ours,
+        );
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(!out.done && out.reason == "finished", "outcome = {out:?}");
+        assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a finished torrent must never be deleted");
+    }
+
+    // Nothing of ours to cancel: no known torrent id, and TorBox's own listing agrees.
+    #[tokio::test]
+    async fn cancel_not_queued() {
+        let (s, _) = store(|_| resp(200, r#"{"success":true,"data":[]}"#), |_| {});
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(!out.done && out.reason == "not_queued", "outcome = {out:?}");
+    }
+
+    // A listing that could not be read is not the account saying it holds nothing.
+    #[tokio::test]
+    async fn cancel_an_unreadable_listing_is_not_an_absence() {
+        let (s, _) = store(|_| resp(503, "down"), |_| {});
+        let err = s.cancel(HASH, false).await.expect("TorBox can cancel").expect_err("an unreadable listing is no answer");
+        assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
+    }
+
+    // TorBox refusing the delete itself is a service refusal, not a verdict about the release.
+    #[tokio::test]
+    async fn cancel_refused() {
+        let (s, _) = store(
+            |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false}}"#),
+                "controltorrent" => resp(500, r#"{"error":"server_error"}"#),
+                _ => resp(404, "{}"),
+            },
+            ours,
+        );
+        let err = s.cancel(HASH, false).await.expect("TorBox can cancel").expect_err("a refused delete is an error");
+        assert!(matches!(&err, StoreError::Unavailable(u) if u.status == 500), "{err:?}");
+    }
+
+    // ?op=reannounce: the same safety rules, but TorBox is asked to reannounce rather than delete, and the memo is NOT
+    // cleared — the torrent is still ours and still in flight.
+    #[tokio::test]
+    async fn cancel_reannounce() {
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = deleted.clone();
+        let (s, calls) = store(
+            move |req| match base(req).as_str() {
+                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0}}"#),
+                "controltorrent" => {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    resp(200, r#"{"success":true}"#)
+                }
+                _ => resp(404, "{}"),
+            },
+            ours,
+        );
+        let out = s.cancel(HASH, true).await.expect("TorBox can cancel").expect("cancel");
+        assert!(out.done && out.reannounced, "outcome = {out:?}");
+        assert_eq!(out.status.state, FETCH_STALLED, "the swarm TorBox reports now");
+        assert_eq!(*calls.lock().unwrap(), vec!["mylist", "controltorrent"], "upstream calls");
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst), "controltorrent was never called");
+        // The memo must survive a reannounce: a later plain cancel still finds the torrent ours.
+        let later = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(later.done && !later.reannounced, "cancel after reannounce: {later:?}");
+    }
+
+    // A parked add has no torrent id: it is cancelled through TorBox's queue, and only if scout put it there.
+    #[tokio::test]
+    async fn cancel_a_parked_add_goes_through_the_queue() {
+        let queue_key = crate::stores::torbox::torbox_queued_key("tb-secret", HASH);
+        let (s, calls) = store(
+            |req| match base(req).as_str() {
+                "controlqueued" => resp(200, r#"{"success":true}"#),
+                _ => resp(404, "{}"),
+            },
+            |cache| {
+                cache.put(&queue_key, "7", Duration::from_secs(3600));
+                mark_added_by_us(cache, "tb-secret", HASH);
+            },
+        );
+        // A reannounce has nothing to retry yet: reported as still queued.
+        let held = s.cancel(HASH, true).await.expect("TorBox can cancel").expect("cancel");
+        assert!(held.done && held.reannounced && held.status.state == FETCH_QUEUED, "outcome = {held:?}");
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(out.done, "outcome = {out:?}");
+        assert_eq!(*calls.lock().unwrap(), vec!["controlqueued"], "upstream calls");
+        assert_eq!(s.known_queued_id(HASH), None, "the queue marker must go with the entry");
+    }
+
+    // The same parked add, not scout's: the account's owner may still want it.
+    #[tokio::test]
+    async fn cancel_a_parked_add_that_is_not_ours_is_left_alone() {
+        let queue_key = crate::stores::torbox::torbox_queued_key("tb-secret", HASH);
+        let (s, calls) = store(|_| resp(404, "{}"), |cache| cache.put(&queue_key, "7", Duration::from_secs(3600)));
+        let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
+        assert!(!out.done && out.reason == "not_ours", "outcome = {out:?}");
+        assert!(calls.lock().unwrap().is_empty(), "nothing is sent for a queue entry that is not ours");
+    }
+}

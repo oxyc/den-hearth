@@ -10,6 +10,7 @@ use crate::season::TorrentFile;
 use crate::stores::refusal::transport_kind;
 use crate::stores::realdebrid::rd_torrent_key;
 use crate::stores::{short_hash, ResolveTarget};
+use crate::util::go_url_parse;
 
 /// How long /play waits on the check of a link it just minted. One ranged GET for a single byte; a CDN
 /// that cannot answer that in three seconds is slow, not proof of anything, and the link goes out anyway.
@@ -58,8 +59,20 @@ pub enum LinkVerdict {
 /// report, while the failure this exists for is a sample or an .nfo — kilobytes against gigabytes.
 pub async fn check_link(doer: &dyn Doer, link: &str, want_size: i64, release_size: i64) -> (LinkVerdict, String) {
     let deadline = Instant::now() + LINK_CHECK_TIMEOUT;
-    let Ok(url) = reqwest::Url::parse(link) else {
+    // Go's `http.NewRequest` refuses only what `url.Parse` refuses; that is "not a usable URL". The WHATWG parser
+    // behind `reqwest::Url` disagrees both ways (it takes a control byte and a bad escape, and refuses a relative
+    // reference), so Go's verdict on the text is asked first. A link Go takes but this parser cannot reaches
+    // `client.Do` in Go and fails THERE, which is the check not getting an answer: "its own failure does not condemn
+    // the link".
+    let Some(go_url) = go_url_parse(link) else {
         return (LinkVerdict::Broken, "not a usable URL".to_owned());
+    };
+    let Ok(url) = reqwest::Url::parse(link) else {
+        return if go_url.scheme == "http" || go_url.scheme == "https" {
+            (LinkVerdict::Unverified, "invalid address".to_owned())
+        } else {
+            (LinkVerdict::Unverified, format!("unsupported protocol scheme {:?}", go_url.scheme))
+        };
     };
     let mut req = reqwest::Request::new(reqwest::Method::GET, url);
     req.headers_mut().insert("range", reqwest::header::HeaderValue::from_static("bytes=0-0"));

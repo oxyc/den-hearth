@@ -231,6 +231,18 @@ pub trait Store: Send + Sync {
     fn account_refused(&self) -> Option<String> {
         None
     }
+
+    /// Go's `interface{ budgetAccount() string }`: the key this store's account is charged under in the add
+    /// budget (`addbudget::budget_account`). `None` for a store that does not spend adds.
+    fn budget_account(&self) -> Option<String> {
+        None
+    }
+
+    /// Go `fileSizer.KnownFileSize` (linkcheck.go): the size of the target file from what the store already
+    /// holds, cache-only. `None` when it is not known.
+    fn known_file_size(&self, _t: &ResolveTarget) -> Option<i64> {
+        None
+    }
 }
 
 /// FROZEN. Go `CacheTruth`: what the pool actually learned about a batch of hashes. Not a bare map of
@@ -352,16 +364,47 @@ pub(crate) fn error_chain_text(err: &(dyn std::error::Error + 'static)) -> Strin
     text
 }
 
-/// Go `isCancellation` for an error that arrived as text: the caller went away, or its deadline ran out,
-/// rather than the store saying no. Go's two sentinels render as these strings, and a client timeout wraps the
-/// second.
-pub(crate) fn is_cancellation_text(text: &str) -> bool {
-    text.contains("context canceled") || text.contains("context deadline exceeded") || text.contains("operation cancelled")
+/// Go `context.Canceled`: the caller went away. A `Doer` that is told to stop (or a test that stands in for one)
+/// fails with this, and `is_cancellation_error` reads it back by type.
+#[derive(Debug)]
+pub(crate) struct CancelledError;
+
+impl fmt::Display for CancelledError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("context canceled")
+    }
+}
+
+impl std::error::Error for CancelledError {}
+
+/// Go `isCancellation` (`errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)`) over a
+/// chain of causes: the caller went away, or its deadline ran out, rather than the store saying no. Nothing about
+/// the store or the release can be concluded from it.
+///
+/// Read by type first: `CancelledError`, the scrape budget's `DeadlineExceeded`, tokio's `Elapsed`, a `reqwest`
+/// timeout and an `io::ErrorKind::TimedOut`. The text is the last resort, for the errors that reach a `Doer` as
+/// bare messages (a mock, or a wrapper that only kept a string): Go's two sentinels render as these words, and
+/// there is nothing else to go on for such an error.
+pub(crate) fn is_cancellation_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |&e| e.source()).any(|e| {
+        e.is::<CancelledError>()
+            || e.is::<crate::scrape::DeadlineExceeded>()
+            || e.is::<tokio::time::error::Elapsed>()
+            || e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+            || e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+            || {
+                let text = e.to_string();
+                text.contains("context canceled")
+                    || text.contains("context deadline exceeded")
+                    || text.contains("operation cancelled")
+                    || text.contains("operation was canceled")
+            }
+    })
 }
 
 /// Go's `readStoreError` over a response: the service's own explanation of a failure, as " (detail)".
 /// Empty when the body cannot be read.
-pub(crate) async fn read_store_error(resp: reqwest::Response) -> String {
+pub(crate) async fn read_store_error(resp: &mut reqwest::Response) -> String {
     match read_limited(resp, 2048).await {
         Ok(raw) => store_error_text(&raw),
         Err(_) => String::new(),
@@ -369,7 +412,7 @@ pub(crate) async fn read_store_error(resp: reqwest::Response) -> String {
 }
 
 /// Go `io.ReadAll(io.LimitReader(body, limit))`: the body up to `limit` bytes, the rest unread.
-pub(crate) async fn read_limited(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, reqwest::Error> {
+pub(crate) async fn read_limited(resp: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>, reqwest::Error> {
     let mut out = Vec::new();
     while out.len() < limit {
         match resp.chunk().await? {

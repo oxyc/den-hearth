@@ -11,6 +11,7 @@ use crate::config::DebridService;
 use crate::hostlimit::HostLimiter;
 use crate::metrics::metrics;
 use crate::scrape::Doer;
+use crate::stores::go_query_escape;
 use crate::stores::premiumize::PREMIUMIZE_API;
 use crate::stores::realdebrid::REAL_DEBRID_API;
 use crate::stores::torbox::TORBOX_API;
@@ -116,8 +117,9 @@ fn validate_request(svc: DebridService, token: &str) -> Option<reqwest::Request>
         DebridService::TorBox => reqwest::Url::parse(&format!("{TORBOX_API}/user/me")).ok()?,
         DebridService::RealDebrid => reqwest::Url::parse(&format!("{REAL_DEBRID_API}/user")).ok()?,
         // Premiumize authenticates in the query string, so it sends no bearer header.
+        // Go `url.QueryEscape`, not the form encoder's: it keeps `~` and escapes `*`, which the form encoder does not.
         DebridService::Premiumize => {
-            reqwest::Url::parse_with_params(&format!("{PREMIUMIZE_API}/account/info"), &[("apikey", token)]).ok()?
+            reqwest::Url::parse(&format!("{PREMIUMIZE_API}/account/info?apikey={}", go_query_escape(token))).ok()?
         }
     };
     let mut req = reqwest::Request::new(reqwest::Method::GET, url);

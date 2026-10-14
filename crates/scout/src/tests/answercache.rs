@@ -69,34 +69,34 @@ mod pending_fixtures {
 // never kept, so the next build asks again.
 #[tokio::test]
 async fn scrape_all_cached_keeps_answers_not_failures() {
-    use crate::cache::MemoryCache;
+    use crate::cache::{Cache, MemoryCache};
     use crate::scrape::{scrape_all_cached, ScrapeQuery};
     use crate::tests::answercache::pending_fixtures::AskCountingScraper;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    let cache = MemoryCache::new(1 << 20);
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
     let movie = ScrapeQuery { kind: "movie".into(), imdb: "tt1".into(), ..Default::default() };
 
     let calls = Arc::new(AtomicI32::new(0));
     let up = AskCountingScraper { base: "https://torrentio.example".into(), calls: Arc::clone(&calls), fail: false };
     for _ in 0..2 {
         let (out, ok, complete) =
-            scrape_all_cached(&[Arc::new(up.clone())], &movie, Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+            scrape_all_cached(&[Arc::new(up.clone())], &movie, Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
         assert!(out.len() == 1 && ok && complete, "got {} releases, ok={ok} complete={complete}", out.len());
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "asked for one title more than once");
 
     let episode = ScrapeQuery { kind: "series".into(), imdb: "tt1".into(), season: 1, episode: 2, has_ep: true, ..Default::default() };
-    scrape_all_cached(&[Arc::new(up.clone())], &episode, Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+    scrape_all_cached(&[Arc::new(up.clone())], &episode, Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 2, "asked after another title: want 2");
 
     let failures = Arc::new(AtomicI32::new(0));
     let down = AskCountingScraper { base: "https://down.example".into(), calls: Arc::clone(&failures), fail: true };
     for _ in 0..2 {
         let (_, ok, _) =
-            scrape_all_cached(&[Arc::new(down.clone())], &movie, Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+            scrape_all_cached(&[Arc::new(down.clone())], &movie, Duration::from_secs(1), Some(cache.clone()), Duration::from_secs(60)).await;
         assert!(!ok, "a failed indexer reported an answer");
     }
     assert_eq!(failures.load(Ordering::SeqCst), 2, "a failing indexer must not have its failure kept");
@@ -177,8 +177,8 @@ async fn scrape_all_cached_keeps_provider_identities_apart() {
     for up in [one, two] {
         let query = query.clone();
         handles.push(tokio::spawn(async move {
-            let cache = MemoryCache::new(1 << 20);
-            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+            let cache: Arc<dyn crate::cache::Cache> = Arc::new(MemoryCache::new(1 << 20));
+            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60)).await;
         }));
     }
     started_rx.recv().await;
@@ -193,14 +193,14 @@ async fn scrape_all_cached_keeps_provider_identities_apart() {
 // A caller that leaves does not cancel the question other callers are still waiting on.
 #[tokio::test]
 async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_question() {
-    use crate::cache::MemoryCache;
+    use crate::cache::{Cache, MemoryCache};
     use crate::scrape::{scrape_all_cached, ScrapeQuery};
     use crate::tests::answercache::pending_fixtures::HeldAnswerScraper;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    let cache = Arc::new(MemoryCache::new(1 << 20));
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
     let query = ScrapeQuery { kind: "movie".into(), imdb: "tt-leaving".into(), ..Default::default() };
     let release = Arc::new(tokio::sync::Notify::new());
     let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -217,7 +217,7 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
         tokio::spawn(async move {
             tokio::time::timeout(
                 Duration::from_millis(50),
-                scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(&*cache), Duration::from_secs(60)),
+                scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60)),
             )
             .await
             .ok()
@@ -230,7 +230,7 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
     let stayed = {
         let (up, query, cache) = (Arc::clone(&up), query.clone(), Arc::clone(&cache));
         tokio::spawn(async move {
-            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(&*cache), Duration::from_secs(60)).await.0
+            scrape_all_cached(&[up], &query, Duration::from_secs(1), Some(cache), Duration::from_secs(60)).await.0
         })
     };
     release.notify_waiters();

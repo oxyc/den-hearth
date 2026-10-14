@@ -78,6 +78,25 @@ async fn check_link_its_own_failure_does_not_condemn_the_link() {
     assert_eq!(got, LinkVerdict::Unverified, "a timed-out check gave verdict {got:?}, want unverified");
 }
 
+// Not in the Go suite. Go's `http.NewRequest` refuses only what `url.Parse` refuses (a control byte, a bad escape, a
+// space in the host); a link it takes but cannot dial is a failure of the check, which never condemns the link.
+#[tokio::test]
+async fn check_link_condemns_only_what_go_cannot_parse() {
+    let unreached = MockDoer(|_req: reqwest::Request| -> Result<reqwest::Response, DoError> { panic!("no request expected") });
+    for (link, want) in [
+        ("/relative/f.mkv", LinkVerdict::Unverified),
+        ("ftp-less-host/f.mkv", LinkVerdict::Unverified),
+        ("http://cdn.test:99999/f.mkv", LinkVerdict::Unverified),
+        ("http://cdn.test/f\u{7f}.mkv", LinkVerdict::Broken),
+        ("http://cdn test/f.mkv", LinkVerdict::Broken),
+        ("http://cdn.test/%zz", LinkVerdict::Broken),
+        ("://cdn.test/f.mkv", LinkVerdict::Broken),
+    ] {
+        let (got, reason) = check_link(&unreached, link, 0, 0).await;
+        assert_eq!(got, want, "{link:?}: {got:?} ({reason})");
+    }
+}
+
 // Handler- and store-level helpers for the `/play` tests below. They need `handler::serve`, `Deps::for_test`,
 // the stores (packages 1, 2 and 4) and a loopback CDN, so they stay compiled out until those land. Names follow
 // the assumptions in the coordinator's note; package 4 reconciles them.
@@ -248,34 +267,48 @@ fn play_a_checked_link_is_not_checked_again() {
 
 // Needs the TorBox and Real-Debrid stores' `KnownFileSize`, `rememberFileSize` and `rdTorrentKey` (packages
 // 1 and 2).
-#[test]
-#[ignore = "needs torBoxStore / realDebridStore KnownFileSize from stores/torbox.rs and realdebrid.rs (packages 1, 2)"]
-fn known_file_size_from_what_the_stores_already_hold() {
-    // Enable when packages 1 and 2 land: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
+#[tokio::test]
+async fn known_file_size_from_what_the_stores_already_hold() {
+        use std::sync::Arc;
+
         use crate::cache::{Cache, MemoryCache};
-        use crate::stores::realdebrid::RealDebridStore;
-        use crate::stores::torbox::TorBoxStore;
-        use crate::stores::{rd_torrent_key, resolve_key, ResolveTarget, FileSizer};
+        use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
+        use crate::stores::refusal::resolve_key;
+        use crate::stores::torbox::{TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
+        use crate::stores::{ResolveTarget, Store};
+        use crate::tests::mock::{resp, MockDoer};
         let h = "b".repeat(40);
-        let cache = std::sync::Arc::new(MemoryCache::new(1 << 20));
-        let tb = TorBoxStore::new("t", cache.clone());
-        cache.put(&resolve_key("t", &h), r#"{"torrentId":9,"files":[{"Index":0,"Name":"S01E01.mkv","SizeBytes":10},{"Index":1,"Name":"S01E02.mkv","SizeBytes":20}]}"#, crate::stores::RESOLVE_CACHE_TTL);
+        let cache = Arc::new(MemoryCache::new(1 << 20));
+        let tb = TorBoxStore {
+            token: "t".into(),
+            client: Arc::new(MockDoer(|_| Ok(resp(404, "{}")))),
+            cache: Some(cache.clone()),
+            api: TORBOX_API.into(),
+        };
+        cache.put(&resolve_key("t", &h), r#"{"torrentId":9,"files":[{"Index":0,"Name":"S01E01.mkv","SizeBytes":10},{"Index":1,"Name":"S01E02.mkv","SizeBytes":20}]}"#, RESOLVE_CACHE_TTL);
         assert_eq!(tb.known_file_size(&ResolveTarget { info_hash: h.clone(), season: Some(1), episode: Some(2), ..Default::default() }), Some(20), "torbox size");
         assert_eq!(tb.known_file_size(&ResolveTarget { info_hash: "f".repeat(40), ..Default::default() }), None, "torbox claimed a size for a release it has no entry for");
 
         let target = ResolveTarget { info_hash: h.clone(), ..Default::default() };
-        let rd_cache = std::sync::Arc::new(MemoryCache::new(1 << 20));
-        rd_cache.put(&rd_torrent_key("k", &h, &target), "abc", crate::stores::RESOLVE_CACHE_TTL);
-        let rd = RealDebridStore::new_for_test("k", rd_cache.clone(), routed_routes([
-            ("torrents/info", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Movie.mkv","bytes":900,"selected":1}]}"#),
-            ("unrestrict", r#"{"download":"https://rd/final.mkv"}"#),
-        ]));
+        let rd_cache = Arc::new(MemoryCache::new(1 << 20));
+        rd_cache.put(&rd_torrent_key("k", &h, &target), "abc", RESOLVE_CACHE_TTL);
+        let rd = RealDebridStore {
+            token: "k".into(),
+            api: REAL_DEBRID_API.into(),
+            cache: Some(rd_cache.clone()),
+            client: Arc::new(MockDoer(|req| {
+                let path = req.url().path();
+                if path.contains("torrents/info") {
+                    return Ok(resp(200, r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Movie.mkv","bytes":900,"selected":1}]}"#));
+                }
+                if path.contains("unrestrict") {
+                    return Ok(resp(200, r#"{"download":"https://rd/final.mkv"}"#));
+                }
+                Ok(resp(404, "{}"))
+            })),
+        };
         rd.resolve(&target).await.expect("resolve");
         assert_eq!(rd.known_file_size(&target), Some(900), "realdebrid size");
-    }
-    todo!("pending: linkcheck_test.go:~195 TestKnownFileSize_fromWhatTheStoresAlreadyHold")
 }
 
 // The release size condemns a link only where nothing better is known: a movie, whose file size no store

@@ -12,13 +12,17 @@
 
 use std::sync::Arc;
 
+use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
 use crate::season::{
-    bare_episode_patterns, base_name, cached_episode_patterns, matches_episode, names_episode, pick_episode_file,
-    err_episode_not_in_torrent, season_only_pattern, EPISODE_PATTERN_CAP, TorrentFile,
+    ambiguous_episode_guess, bare_episode_patterns, base_name, cached_episode_patterns, episode_patterns,
+    matches_episode, names_episode, pick_episode_file, err_episode_not_in_torrent, season_only_pattern,
+    EPISODE_PATTERN_CAP, TorrentFile,
 };
+use crate::stores::pool::is_cache_truth_service;
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
+use crate::stores::torbox::{select_file_id, TorBoxStore, TORBOX_API};
 use crate::stores::{DeadLinkError, ResolveTarget, Store, StoreError};
 
 use super::mock::{resp, MockDoer};
@@ -151,10 +155,7 @@ fn pick_episode_file_videos_first_then_anything() {
 // TorBox: name match first, then the caller's index, and an out-of-range index is handed back untouched
 // (it is the debrid's own id space, not a slice offset).
 #[test]
-#[ignore = "needs stores/torbox.rs selectFileID (package 1)"]
 fn select_file_id_torbox() {
-    #[cfg(any())]
-    fn pending() {
         // TorBox: name match first, then the caller's index, and an out-of-range index is handed back untouched
         // (it is the debrid's own id space, not a slice offset).
         let files = [file(0, "a.mkv", 10), file(1, "b.mkv", 20)];
@@ -173,8 +174,6 @@ fn select_file_id_torbox() {
         // S02E09 is not here, so an in-range index must not smuggle S02E05 back in.
         let with_idx = ResolveTarget { season: Some(2), episode: Some(9), file_idx: Some(0), ..target_none() };
         want_not_in_torrent(select_file_id(&named, &with_idx), "a fileIdx cannot override a proven mismatch");
-    }
-    todo!("pending: stores_pick_test.go:117")
 }
 
 // Real-Debrid: same name-match precedence, but an unusable index falls back to the FIRST file rather
@@ -224,10 +223,7 @@ fn pick_index_premiumize() {
 
 // A negative index is untrusted input from an addon, not an offset — it must never index backwards.
 #[test]
-#[ignore = "needs stores/torbox.rs selectFileID (package 1)"]
 fn pickers_reject_negative_index() {
-    #[cfg(any())]
-    fn pending() {
         // A negative index is untrusted input from an addon, not an offset — it must never index backwards.
         let files = [file(0, "a.mkv", 10), file(1, "b.mkv", 20)];
         let neg = target_idx(-1);
@@ -235,8 +231,6 @@ fn pickers_reject_negative_index() {
         want_pick(select_file_id(&files, &neg), -1, "TorBox hands a negative back as an id, never as an offset");
         want_pick(idle_real_debrid().pick_file_id(&files, &neg), 1, "RD falls back to the largest");
         want_pick(idle_premiumize().pick_index(&files, &neg), 1, "Premiumize falls back to the largest");
-    }
-    todo!("pending: stores_pick_test.go:199")
 }
 
 // The two stores with no status API must say so — and be honest that they are saying nothing, so the
@@ -254,12 +248,16 @@ async fn stores_without_status_report_nothing() {
     }
 }
 
+/// A TorBox store that is never asked anything, for the tests that call a picker directly.
+fn torbox_store() -> TorBoxStore {
+    let client: Arc<dyn Doer> =
+        Arc::new(MockDoer(|_r: reqwest::Request| -> Answer { Ok(resp(200, "{}")) }));
+    TorBoxStore { token: String::new(), client, cache: None, api: TORBOX_API.into() }
+}
+
 // Each store names itself — the pool's ordering and the cache-truth rule both key on this.
 #[test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
 fn stores_identify_themselves() {
-    #[cfg(any())]
-    fn pending() {
         // Each store names itself — the pool's ordering and the cache-truth rule both key on this.
         assert_eq!(torbox_store().service(), DebridService::TorBox);
         assert_eq!(idle_real_debrid().service(), DebridService::RealDebrid);
@@ -269,8 +267,6 @@ fn stores_identify_themselves() {
         assert!(is_cache_truth_service(DebridService::TorBox) && is_cache_truth_service(DebridService::Premiumize),
             "TorBox and Premiumize are the cache-truth services");
         assert!(!is_cache_truth_service(DebridService::RealDebrid), "RD has no cache API — it must never count as cache truth");
-    }
-    todo!("pending: stores_pick_test.go:222")
 }
 
 // The error a dead link raises is matched by string in places; keep its shape asserted.
@@ -285,10 +281,7 @@ fn dead_link_error_message() {
 // pack — and the moment it stopped, a pack whose biggest entry is an .iso resolved to that: a 302, no
 // error, no video.
 #[test]
-#[ignore = "needs stores/torbox.rs (package 1) and season.rs (package 5)"]
 fn stores_the_fallback_never_picks_a_non_video() {
-    #[cfg(any())]
-    fn pending() {
         // The per-store fallbacks pick from the VIDEOS, the same pool pickEpisodeFile uses. RD's and Premiumize's
         // tails picked over every file, which was unreachable while pickEpisodeFile answered for an unlabelled
         // pack — and the moment it stopped, a pack whose biggest entry is an .iso resolved to that: a 302, no
@@ -318,8 +311,6 @@ fn stores_the_fallback_never_picks_a_non_video() {
         // A pool with no video at all still has to answer with something rather than nothing.
         let only_other = [file(0, "Show.iso", 10), file(1, "Show.big.iso", 9000)];
         want_pick(idle_real_debrid().pick_file_id(&only_other, &ep(1, 3)), 1, "with no video anywhere, the largest is all there is");
-    }
-    todo!("pending: stores_pick_test.go:258")
 }
 
 // A pack numbered the way most anime and much TV is packed: the episode is found by its own number.
@@ -390,10 +381,7 @@ fn episode_patterns_bare_number_boundaries() {
 
 // The two failures the boundaries above prevent, driven through the real pickers.
 #[test]
-#[ignore = "needs season.rs pickEpisodeFile (package 5)"]
 fn pick_episode_file_modern_pack_names_are_not_all_episode_one() {
-    #[cfg(any())]
-    fn pending() {
         // The two failures the boundaries above prevent, driven through the real pickers.
         //
         // A plain WEB-DL season pack. Every file carries DDP5.1 and H.264.
@@ -419,8 +407,6 @@ fn pick_episode_file_modern_pack_names_are_not_all_episode_one() {
             file(1, "Show.1080p.WEB-DL.DDP5.1.H.264-NTb-sample.mkv", 2),
         ];
         want_pick(select_file_id(&sampled, &ep(1, 3)), 0, "a feature plus a sample is not a pack that lacks your episode");
-    }
-    todo!("pending: stores_pick_test.go:355")
 }
 
 // The precedence between the two kinds of evidence, which a union got wrong.
@@ -479,10 +465,7 @@ fn pick_file_id_real_debrid_maps_position_to_its_own_id() {
 // A movie's fileIdx that lands on something other than the feature — TorBox listing the torrent in another
 // order — gives way to the largest video. A collection's films are alike in size, so there it still decides.
 #[test]
-#[ignore = "needs stores/torbox.rs selectFileID (package 1)"]
 fn select_file_id_torbox_movie_position_on_an_extra() {
-    #[cfg(any())]
-    fn pending() {
         // A movie's fileIdx that lands on something other than the feature — TorBox listing the torrent in another
         // order — gives way to the largest video. A collection's films are alike in size, so there it still decides.
         let remux = [
@@ -499,24 +482,17 @@ fn select_file_id_torbox_movie_position_on_an_extra() {
             file(52, "Trilogy/Part.3.mkv", 11_000),
         ];
         want_pick(select_file_id(&trilogy, &target_idx(0)), 50, "in a collection the position still picks the film");
-    }
-    todo!("pending: stores_pick_test.go:432")
 }
 
 // The same gap on the other two, so the three are pinned alike.
 #[test]
-#[ignore = "needs stores/torbox.rs selectFileID (package 1)"]
 fn pickers_map_position_to_the_stores_own_id() {
-    #[cfg(any())]
-    fn pending() {
         // The same gap on the other two, so the three are pinned alike.
         let files = [file(11, "a.mkv", 10), file(22, "b.mkv", 20), file(33, "c.mkv", 15)];
         want_pick(select_file_id(&files, &target_idx(1)), 22, "TorBox: position 1 is its file id 22");
         // Premiumize indexes its own content array, so there the position IS the answer — asserted with ids
         // that differ from positions so the two cannot be confused.
         want_pick(idle_premiumize().pick_index(&files, &target_idx(1)), 1, "Premiumize: the position is the answer, and it is not the id");
-    }
-    todo!("pending: stores_pick_test.go:453")
 }
 
 // All three stores hand back PATHS, so the torrent's root directory is part of every file's name — and
@@ -688,10 +664,7 @@ fn base_name_only_splits_where_a_directory_really_ends() {
 // and because the error short-circuits every store's picker the indexer's correct fileIdx is never read:
 // a release that plays, answered 404 and recorded dead by the client.
 #[test]
-#[ignore = "needs season.rs (package 5) and stores/torbox.rs selectFileID (package 1)"]
 fn pick_episode_file_labelled_extras_do_not_condemn_a_numbered_batch() {
-    #[cfg(any())]
-    fn pending() {
         // An anime batch numbered absolutely, with a couple of labelled OVAs alongside — the shape the refusal
         // must never fire on. The bare tier cannot match S02E01 against `- 13`, so control reaches the refusal,
         // and because the error short-circuits every store's picker the indexer's correct fileIdx is never read:
@@ -719,18 +692,13 @@ fn pick_episode_file_labelled_extras_do_not_condemn_a_numbered_batch() {
             file(3, "Sample/show-sample.mkv", 20),
         ];
         want_not_in_torrent(pick_episode_file(&pack, 2, 1), "three labelled episodes and one sample is still a labelled pack");
-    }
-    todo!("pending: stores_pick_test.go:632")
 }
 
 // A number naming several files does not tell them apart — but on a dual-quality pack those several ARE
 // the episode, and the better copy is the answer. Discarding the match sent all three stores to "largest
 // video anywhere in the pack", which is a different episode.
 #[test]
-#[ignore = "needs season.rs (package 5) and stores/torbox.rs selectFileID (package 1)"]
 fn pickers_a_duplicate_number_is_still_the_episode() {
-    #[cfg(any())]
-    fn pending() {
         // A number naming several files does not tell them apart — but on a dual-quality pack those several ARE
         // the episode, and the better copy is the answer. Discarding the match sent all three stores to "largest
         // video anywhere in the pack", which is a different episode.
@@ -754,8 +722,6 @@ fn pickers_a_duplicate_number_is_still_the_episode() {
         // TorBox id is 5, where the guess would have said 2.
         let with_idx = ResolveTarget { file_idx: Some(3), ..target };
         want_pick(select_file_id(&dual, &with_idx), 5, "a position in this torrent beats a number that named several files");
-    }
-    todo!("pending: stores_pick_test.go:665")
 }
 
 // A file that names an episode has named a DIFFERENT one by the time any guess is reached, so it can
@@ -764,10 +730,7 @@ fn pickers_a_duplicate_number_is_still_the_episode() {
 // "the largest video anywhere", pick a file whose filename says S01E02, and serve it for a request for
 // S03E09 with a 302 and no error.
 #[test]
-#[ignore = "needs season.rs (package 5) and stores/torbox.rs selectFileID (package 1)"]
 fn pickers_never_serve_a_file_that_names_a_different_episode() {
-    #[cfg(any())]
-    fn pending() {
         // A file that names an episode has named a DIFFERENT one by the time any guess is reached, so it can
         // never be the answer, whatever its size. Counting rules decide whether a pack is condemned and there is
         // always a band they miss — labelled files present but not a majority — where control used to reach
@@ -806,18 +769,13 @@ fn pickers_never_serve_a_file_that_names_a_different_episode() {
                 assert!(served.contains("featurette"), "{name} {labelled}/{unlabelled} labelled/unlabelled: served {served:?} for a request for S03E09");
             }
         }
-    }
-    todo!("pending: stores_pick_test.go:700")
 }
 
 // The demoted bare tier must weigh the same candidates the tier it continues weighs. Over the whole pool
 // it admitted a file naming its own, different episode — and since the guess outranks the last-resort
 // largest, that file won over both copies of the episode actually asked for.
 #[test]
-#[ignore = "needs season.rs ambiguousEpisodeGuess (package 5) and stores/torbox.rs (package 1)"]
 fn ambiguous_episode_guess_ignores_files_that_name_their_own_episode() {
-    #[cfg(any())]
-    fn pending() {
         // The demoted bare tier must weigh the same candidates the tier it continues weighs. Over the whole pool
         // it admitted a file naming its own, different episode — and since the guess outranks the last-resort
         // largest, that file won over both copies of the episode actually asked for.
@@ -831,8 +789,6 @@ fn ambiguous_episode_guess_ignores_files_that_name_their_own_episode() {
         want_pick(select_file_id(&files, &target), 1, "torbox serves episode 5, not the file that says S01E12");
         want_pick(idle_real_debrid().pick_file_id(&files, &target), 1, "realdebrid likewise");
         want_pick(idle_premiumize().pick_index(&files, &target), 1, "premiumize likewise");
-    }
-    todo!("pending: stores_pick_test.go:745")
 }
 
 // The bare tier's own candidate restriction, asserted where it can fail: over the whole pool the labelled
@@ -872,10 +828,7 @@ fn pick_episode_file_equal_counts_defer_rather_than_condemn() {
 // — and because the file DOES declare an episode it then ruled itself out of every guess below, so a
 // pack of them answered 404 for half the season while the sample beside them was served for the rest.
 #[test]
-#[ignore = "needs season.rs (package 5) and stores/torbox.rs selectFileID (package 1)"]
 fn pick_episode_file_double_episodes_name_both_of_them() {
-    #[cfg(any())]
-    fn pending() {
         // A double episode names TWO, and only the first was ever matched. Asked for the second, nothing matched
         // — and because the file DOES declare an episode it then ruled itself out of every guess below, so a
         // pack of them answered 404 for half the season while the sample beside them was served for the rest.
@@ -909,8 +862,6 @@ fn pick_episode_file_double_episodes_name_both_of_them() {
         // The first number stays free: a single episode must not match its neighbours.
         assert!(!matches_episode("Show.S01E05.1080p.mkv", &episode_patterns(1, 6)), "a single episode must not match the episode after it");
         assert!(!matches_episode("Show.S01E10-E12.1080p.mkv", &episode_patterns(1, 1)), "E10-E12 must not match episode 1");
-    }
-    todo!("pending: stores_pick_test.go:796")
 }
 
 // An episode number with no season anywhere: the strong patterns cannot fire and labelledEpisodeRe does
@@ -1105,10 +1056,7 @@ fn names_episode_a_range_holds_every_episode_in_it() {
 // far end read those as ending at the SECOND number, so the third episode matched nothing — and since
 // the file is labelled, that miss became a hard refusal: a third of a playing release answered 404.
 #[test]
-#[ignore = "needs season.rs (package 5) and stores/torbox.rs selectFileID (package 1)"]
 fn names_episode_reads_every_episode_in_a_chain() {
-    #[cfg(any())]
-    fn pending() {
         // Sonarr writes six multi-episode styles and three of them chain past two numbers. Capturing exactly one
         // far end read those as ending at the SECOND number, so the third episode matched nothing — and since
         // the file is labelled, that miss became a hard refusal: a third of a playing release answered 404.
@@ -1148,8 +1096,6 @@ fn names_episode_reads_every_episode_in_a_chain() {
             want_pick(idle_premiumize().pick_index(&pack, &target), want, "premiumize");
         }
         want_not_in_torrent(pick_episode_file(&pack, 1, 20), "episode 20 is not in a pack of E01-E12");
-    }
-    todo!("pending: stores_pick_test.go:1081")
 }
 
 // The compiled pattern set is shared across picks, and the thing to prove about any cache is not that

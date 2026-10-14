@@ -5,7 +5,7 @@ Source: `internal/scout` in the Go repository `den-scout` (`origin/main`), 16,74
 shared types the tests need, and no logic. The port is **tests first**: port a Go test file, watch it
 fail against the `todo!()` stubs, then write the module until it passes.
 
-Read the Go with `git -C ~/Projects/Personal/den-scout show origin/main:internal/scout/<file>`.
+Read the Go from a checkout of [oxyc/den-scout](https://github.com/oxyc/den-scout): `git -C <den-scout> show origin/main:internal/scout/<file>`.
 
 ## Rules for porters
 

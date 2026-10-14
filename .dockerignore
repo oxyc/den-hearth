@@ -1,0 +1,7 @@
+.git
+.github
+target
+**/target
+crates/*/Dockerfile
+crates/*/.github
+crates/*/docker-bake.hcl

@@ -5,16 +5,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::time::Instant;
 
+use crate::addbudget::global_add_budget;
 use crate::cache::Cache;
 use crate::config::{Config, DebridService, DEBRID_SERVICES};
 use crate::loglimit::log_limited;
 use crate::scrape::Doer;
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
-use crate::stores::refusal::{as_unavailable, describe};
+use crate::stores::refusal::{describe, wraps_unavailable};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
     dead_link, join_all, short_hash, CacheTruth, ResolveTarget, StatusAnswer, Store, StoreError, StoreStatus,
@@ -154,6 +156,29 @@ impl StorePool {
         (truth, truth_ok)
     }
 
+    /// Go `StorePool.KnownFileSize` (linkcheck.go:118) is the first size any store knows for this file. Stores
+    /// that hold the same torrent describe the same file, so which one answers does not matter.
+    pub fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
+        self.stores.iter().find_map(|st| st.known_file_size(t))
+    }
+
+    /// Go `StorePool.ScoutBusyFor` is how long until any of the pool's accounts may add again for this intent, for
+    /// the Retry-After of a scout_busy or reserved_for_play answer; zero when one already may, or none reports a
+    /// budget.
+    pub fn scout_busy_for(&self, prefetch: bool) -> Duration {
+        let mut soonest = Duration::ZERO;
+        for account in self.stores.iter().filter_map(|st| st.budget_account()) {
+            let wait = global_add_budget().frees_in(&account, prefetch);
+            if wait.is_zero() {
+                return Duration::ZERO;
+            }
+            if soonest.is_zero() || wait < soonest {
+                soonest = wait;
+            }
+        }
+        soonest
+    }
+
     /// Go `StorePool.Resolve` (stores.go:4865), in configured order.
     pub async fn resolve(&self, t: &ResolveTarget) -> Result<String, StoreError> {
         self.resolve_preferring(t, &[]).await
@@ -227,7 +252,7 @@ impl StorePool {
             }
             // A service refusing US outranks a dead link as an explanation: if even one store was throttled
             // or faulting, "this release is dead" is not a conclusion the evidence supports.
-            if as_unavailable(&err).is_some() && refused.is_none() {
+            if wraps_unavailable(&err) && refused.is_none() {
                 refused = Some(err);
             }
         }
@@ -313,7 +338,7 @@ impl StorePool {
             match st.resolve(t).await {
                 Ok(link) => return Ok(link),
                 Err(err) => {
-                    if as_unavailable(&err).is_some() && refused.is_none() {
+                    if wraps_unavailable(&err) && refused.is_none() {
                         refused = Some(err);
                     }
                 }
