@@ -441,6 +441,25 @@ fn cacheable(body: impl Into<Bytes>, etag: &str, content_type: &'static str, cac
     resp
 }
 
+/// The body a cached list entry serves. A body taken as it is from the entry is shared with the cache rather than
+/// copied out of it: on a warm hit, the request that pays nothing else should not pay for a copy of the list.
+fn entry_body(entry: &Arc<str>, body: Cow<'_, str>) -> Bytes {
+    struct Shared(Arc<str>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_bytes()
+        }
+    }
+    match body {
+        Cow::Borrowed(part) => {
+            // `part` is a slice of `entry` (split_cached), so its offset in the entry is its address less the entry's.
+            let start = part.as_ptr() as usize - entry.as_ptr() as usize;
+            Bytes::from_owner(Shared(Arc::clone(entry))).slice(start..start + part.len())
+        }
+        Cow::Owned(relabelled) => Bytes::from(relabelled),
+    }
+}
+
 /// A value as JSON text. Every type serialized here has string keys, so this cannot fail; "null" stands in if it
 /// ever does.
 pub(crate) fn to_json<T: Serialize + ?Sized>(v: &T) -> String {
@@ -1426,7 +1445,8 @@ impl Inner {
                         etag = Cow::Owned(etag_for(&relabelled));
                         body = Cow::Owned(relabelled);
                     }
-                    let mut resp = cacheable(body.into_owned(), &etag, JSON_TYPE, &self.stale_list_cache);
+                    let body = entry_body(&hit, body);
+                    let mut resp = cacheable(body, &etag, JSON_TYPE, &self.stale_list_cache);
                     mark_degraded(&mut resp, "stale_list");
                     return with_timing(resp, "cache;desc=stale_list", start);
                 }
@@ -1452,7 +1472,8 @@ impl Inner {
                     body = Cow::Owned(relabelled);
                 }
             }
-            return with_timing(cacheable(body.into_owned(), &etag, JSON_TYPE, header), served, start);
+            let body = entry_body(&hit, body);
+            return with_timing(cacheable(body, &etag, JSON_TYPE, header), served, start);
         }
 
         // Miss: decode now (#16 — a warm hit never pays decode/validate).
