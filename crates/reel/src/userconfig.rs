@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use base64::alphabet::URL_SAFE;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use serde::Deserialize;
 
@@ -165,9 +167,26 @@ pub fn decode_checked(
 
 /// Does `blob` decode to a plaintext (unsealed) segment?
 fn is_plaintext(blob: &str) -> bool {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(blob)
-        .is_ok_and(|d| d.first().is_some_and(|b| *b != crate::seal::SEALED_VERSION))
+    b64url_decode(blob).is_some_and(|d| d.first().is_some_and(|b| *b != crate::seal::SEALED_VERSION))
+}
+
+/// The config segment's base64url, read exactly as den-scout reads it (`util::b64url_decode` there), so a
+/// link opens on all three addons or on none: padding is trimmed, carriage returns and newlines are skipped
+/// anywhere, and non-zero trailing bits are accepted. Install ids stay strict (`is_install_id`).
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(false)
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+    let trimmed = s.trim_end_matches('=');
+    if !trimmed.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+        return LENIENT.decode(trimmed).ok();
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    LENIENT.decode(cleaned).ok()
 }
 
 /// Decode the config path segment into a validated config, or `None` (→ 400). The decoded bytes are
@@ -178,7 +197,7 @@ fn is_plaintext(blob: &str) -> bool {
 /// sealing hides the keys, and this is what makes an install one we issued. Mirrors den-scout/den-subtitles
 /// (den-scout/docs/SEALED-CONFIG.md).
 pub fn decode(keyring: Option<&crate::seal::Keyring>, blob: &str) -> Option<UserConfig> {
-    let data = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(blob).ok()?;
+    let data = b64url_decode(blob)?;
     let data = if data.first() == Some(&crate::seal::SEALED_VERSION) {
         keyring?.open(&data[1..])? // sealed but no key, or decrypt fail → None
     } else if keyring.is_some() {
@@ -254,6 +273,30 @@ mod tests {
         let open = Revocation::default();
         assert_eq!(decode_checked(Some(&kr), &open, &plain).unwrap_err(), Rejected::Plaintext);
         assert_eq!(decode_checked(Some(&kr), &open, "not base64!!").unwrap_err(), Rejected::Undecodable);
+    }
+
+    /// A segment copied from a mail or a terminal arrives padded, hand-wrapped, or with a stray trailing bit,
+    /// and opens on Scout; it opens here too. (`{"tmdbKey":"abc123"}` is 20 bytes: one `=` of padding, and
+    /// the last character carries two spare bits.)
+    #[test]
+    fn a_padded_or_wrapped_segment_opens_like_it_does_on_scout() {
+        let seg = encode(r#"{"tmdbKey":"abc123"}"#);
+        let (head, last) = seg.split_at(seg.len() - 1);
+        let alphabet = base64::alphabet::URL_SAFE.as_str();
+        let idx = alphabet.find(last).unwrap();
+        let loose = format!("{head}{}", &alphabet[idx | 1..(idx | 1) + 1]);
+        assert_ne!(loose, seg, "the fixture must differ in a trailing bit");
+        let wrapped = format!("{}\r\n{}\n", &seg[..10], &seg[10..]);
+        for (what, blob) in [
+            ("padded", format!("{seg}=")),
+            ("wrapped", wrapped),
+            ("non-zero trailing bits", loose),
+        ] {
+            let cfg = decode(None, &blob).unwrap_or_else(|| panic!("a {what} segment did not open"));
+            assert_eq!(cfg.tmdb_key, "abc123", "{what}");
+        }
+        // Still not base64url at all.
+        assert!(decode(None, "AAECAwQFBgcICQoLDA0O+w").is_none(), "standard base64 opened");
     }
 
     /// Bytes 0..16 as an install id, and a second one that uses both url-safe characters.
