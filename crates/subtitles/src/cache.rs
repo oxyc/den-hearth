@@ -161,7 +161,7 @@ impl Cache {
         // its bytes against the budget until something else needs the room.
         {
             let mut g = crate::lock(&self.inner);
-            let now = Instant::now();
+            let now = mono_now();
             let dead: Vec<String> =
                 g.map.iter().filter(|(_, e)| e.expires <= now).map(|(k, _)| k.clone()).collect();
             for key in dead {
@@ -320,7 +320,7 @@ impl Cache {
     pub fn ttl(&self, key: &str) -> Option<Duration> {
         {
             let g = crate::lock(&self.inner);
-            if let Some(left) = g.map.get(key).and_then(|e| e.expires.checked_duration_since(Instant::now()))
+            if let Some(left) = g.map.get(key).and_then(|e| e.expires.checked_duration_since(mono_now()))
             {
                 return Some(left);
             }
@@ -389,7 +389,7 @@ impl Cache {
         g.tick += 1;
         let tick = g.tick;
         match g.map.get_mut(key) {
-            Some(e) if e.expires > Instant::now() => {
+            Some(e) if e.expires > mono_now() => {
                 e.used = tick;
                 Some(e.value.clone())
             }
@@ -412,7 +412,7 @@ impl Cache {
         if let Some(old) = g.map.remove(&key) {
             g.bytes -= old.size;
         }
-        let entry = Entry { value, size, expires: Instant::now() + ttl, used: g.tick };
+        let entry = Entry { value, size, expires: mono_now() + ttl, used: g.tick };
         g.bytes += size;
         g.map.insert(key, entry);
         // Evict least-recently-used until under budget.
@@ -518,6 +518,11 @@ impl Cache {
         // memory and served for the whole TTL. ENOSPC, a kill mid-write, and two writers on one key
         // all produce that. The temp name is unique so concurrent writers don't share one.
         let tmp = path.with_extension(format!("t{}", next_temp_id()));
+        #[cfg(feature = "bench")]
+        {
+            sim::WRITES.fetch_add(1, Ordering::Relaxed);
+            sim::BYTES.fetch_add(body.len() as u64, Ordering::Relaxed);
+        }
         let wrote = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(e) = wrote {
             // Once per process: a full or read-only volume degrades the cache to memory-only, which
@@ -531,7 +536,40 @@ impl Cache {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) + sim::offset()
+}
+
+fn mono_now() -> Instant {
+    Instant::now() + Duration::from_secs(sim::offset())
+}
+
+/// Measurement hooks for `benches/cache_replay.rs`: a clock the replay moves, and a count of what the disk tier
+/// was asked to write. Zero and inert unless the `bench` feature is on.
+pub mod sim {
+    #[cfg(feature = "bench")]
+    pub(super) static OFFSET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "bench")]
+    pub(super) static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "bench")]
+    pub(super) static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(feature = "bench")]
+    pub fn set_offset(secs: u64) {
+        OFFSET.store(secs, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(feature = "bench")]
+    pub fn disk_writes() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (WRITES.load(Relaxed), BYTES.load(Relaxed))
+    }
+    #[cfg(feature = "bench")]
+    pub(super) fn offset() -> u64 {
+        OFFSET.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "bench"))]
+    pub(super) fn offset() -> u64 {
+        0
+    }
 }
 
 fn modified_secs(meta: &std::fs::Metadata) -> Option<u64> {
