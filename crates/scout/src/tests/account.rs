@@ -1,1 +1,151 @@
 //! Go: `internal/scout/account_test.go` (157 lines). Work package 1.
+//!
+//! Every test here goes through the handler (`NewHandler`, `testDeps`, `do`, `validBlob`, all package 4), so
+//! each is cfg-gated until that lands. The bodies are ported as written, with the handler helpers named the
+//! way package 4's `tests/handler.rs` is expected to name them (`new_handler`, `test_deps`, `do_req`,
+//! `valid_blob`); the owner of the handler adjusts those names when it un-gates these tests.
+
+#[cfg(any())]
+mod gated {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use serde_json::Value;
+
+    use crate::cache::MemoryCache;
+    use crate::handler::{new_handler, Handler};
+    use crate::stores::realdebrid::RealDebridStore;
+    use crate::stores::torbox::{TorBoxStore, TORBOX_API};
+    use crate::stores::Store;
+    use crate::tests::handler::{do_req, test_deps, valid_blob};
+    use crate::tests::mock::{resp, MockDoer};
+
+    /// accountTorBoxHandler is a handler whose one store is a real TorBox store answering /<config>/account's
+    /// three upstream reads (user/me, mylist, getqueued) through `reply`.
+    fn account_torbox_handler(
+        token: &str,
+        reply: impl Fn(&reqwest::Request) -> reqwest::Response + Send + Sync + 'static,
+    ) -> (Handler, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let store: Arc<dyn Store> = Arc::new(TorBoxStore {
+            token: token.to_owned(),
+            api: TORBOX_API.to_owned(),
+            cache: Some(Arc::new(MemoryCache::new(1 << 20))),
+            client: Arc::new(MockDoer(move |req| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(reply(&req))
+            })),
+        });
+        let h = new_handler(test_deps(move |d| {
+            let store = store.clone();
+            d.make_stores = Box::new(move |_| vec![store.clone()]);
+        }));
+        (h, calls)
+    }
+
+    fn decode_account_body(body: &[u8]) -> Vec<serde_json::Map<String, Value>> {
+        match serde_json::from_slice::<Vec<serde_json::Map<String, Value>>>(body) {
+            Ok(out) => out,
+            Err(e) => panic!("account body did not decode as an array: {e} ({})", String::from_utf8_lossy(body)),
+        }
+    }
+
+    fn base(req: &reqwest::Request) -> String {
+        req.url().path().rsplit('/').next().unwrap_or("").to_owned()
+    }
+
+    // A known plan code maps to its name, active/finished entries are told apart, and the queue length is
+    // the account's own queued-torrents list — not scout's add budget.
+    #[test]
+    fn account_known_plan() {
+        let (h, calls) = account_torbox_handler("tb-account-known-plan", |req| match base(req).as_str() {
+            "me" => resp(
+                200,
+                r#"{"success":true,"data":{"plan":2,"cooldown_until":null,"premium_expires_at":"2027-01-02T00:00:00Z"}}"#,
+            ),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":[{"active":true,"download_finished":false},{"active":true,"download_finished":true},{"active":false,"download_finished":false}]}"#,
+            ),
+            "getqueued" => resp(200, r#"{"success":true,"data":[{"id":1},{"id":2}]}"#),
+            _ => resp(404, "{}"),
+        });
+        let rr = do_req(&h, &format!("/{}/account", valid_blob()), None);
+        assert_eq!(rr.status(), 200, "account");
+        let out = decode_account_body(rr.body());
+        assert!(out.len() == 1 && out[0]["service"] == "torbox" && out[0]["plan"] == "pro", "account body = {out:?}");
+        // "active" counts the active, unfinished entries only.
+        assert_eq!(out[0]["slots"]["active"], 1, "slots = {:?}, want active=1", out[0]["slots"]);
+        assert_eq!(out[0]["queued"], 2, "queued = {:?}, want 2", out[0]["queued"]);
+        assert_eq!(out[0]["expiresAt"], "2027-01-02T00:00:00Z");
+        assert!(!out[0].contains_key("cooldownUntil"), "cooldownUntil should be omitted when null");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "upstream calls (user/me, mylist, getqueued)");
+    }
+
+    // A plan code this package does not know still answers — "unknown" rather than a guess, and no slot
+    // limit anywhere: den#204's owner decision is to show "N active" alone.
+    #[test]
+    fn account_unknown_plan() {
+        let (h, _) = account_torbox_handler("tb-account-unknown-plan", |req| match base(req).as_str() {
+            "me" => resp(200, r#"{"success":true,"data":{"plan":99}}"#),
+            "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
+            "getqueued" => resp(200, r#"{"success":true,"data":[]}"#),
+            _ => resp(404, "{}"),
+        });
+        let rr = do_req(&h, &format!("/{}/account", valid_blob()), None);
+        let out = decode_account_body(rr.body());
+        assert!(out.len() == 1 && out[0]["plan"] == "unknown", "account body = {out:?}, want plan=unknown");
+        assert!(!out[0]["slots"].as_object().is_some_and(|s| s.contains_key("limit")), "slots.limit must never be present");
+    }
+
+    // A refused upstream degrades to the bare service name rather than failing the whole route: the Downloads
+    // shelf still has something to show (scout's own budget is reported from a separate, always-answerable
+    // source — see account_known_plan).
+    #[test]
+    fn account_refused_upstream() {
+        let (h, _) = account_torbox_handler("tb-account-refused", |_| resp(500, r#"{"error":"server_error"}"#));
+        let rr = do_req(&h, &format!("/{}/account", valid_blob()), None);
+        assert_eq!(rr.status(), 200, "account: degraded per-account, not a route failure");
+        let out = decode_account_body(rr.body());
+        assert!(out.len() == 1 && out[0]["service"] == "torbox", "account body = {out:?}");
+        assert!(!out[0].contains_key("plan"), "a refused read must not report a plan: {:?}", out[0]);
+    }
+
+    // Cached for 30s per account: a second request within the window costs no further upstream reads.
+    #[test]
+    fn account_cache_reuse_within_30s() {
+        let (h, calls) = account_torbox_handler("tb-account-cache-reuse", |req| match base(req).as_str() {
+            "me" => resp(200, r#"{"success":true,"data":{"plan":1}}"#),
+            "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
+            "getqueued" => resp(200, r#"{"success":true,"data":[]}"#),
+            _ => resp(404, "{}"),
+        });
+        do_req(&h, &format!("/{}/account", valid_blob()), None);
+        let first = calls.load(Ordering::SeqCst);
+        do_req(&h, &format!("/{}/account", valid_blob()), None);
+        let second = calls.load(Ordering::SeqCst);
+        assert_eq!(second, first, "a second read within 30s made {} more upstream calls, want 0", second - first);
+    }
+
+    // A non-TorBox account answers with only its service name — Real-Debrid and Premiumize publish nothing
+    // comparable.
+    #[test]
+    fn account_non_torbox_service() {
+        let store: Arc<dyn Store> = Arc::new(RealDebridStore {
+            token: "rd-account".to_owned(),
+            api: String::new(),
+            client: Arc::new(MockDoer(|_| Ok(resp(404, "{}")))),
+        });
+        let h = new_handler(test_deps(move |d| {
+            let store = store.clone();
+            d.make_stores = Box::new(move |_| vec![store.clone()]);
+        }));
+        let rr = do_req(&h, &format!("/{}/account", valid_blob()), None);
+        let out = decode_account_body(rr.body());
+        assert!(
+            out.len() == 1 && out[0]["service"] == "realdebrid" && out[0].len() == 1,
+            "account body = {out:?}, want only {{service: realdebrid}}"
+        );
+    }
+}

@@ -12,6 +12,9 @@ async-trait = "0.1"
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
+# Go's `encoding/json` decoder: the TorBox account listing is decoded as a stream (`decodeListing`), and the
+# handler tests decode response bodies.
+serde_json = "1"
 
 [dev-dependencies]
 http = "1"
