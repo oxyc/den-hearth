@@ -180,10 +180,7 @@ fn select_file_id_torbox() {
 // Real-Debrid: same name-match precedence, but an unusable index falls back to the FIRST file rather
 // than to nothing — RD always needs a concrete file id to unrestrict.
 #[test]
-#[ignore = "needs season.rs errEpisodeNotInTorrent (package 5)"]
 fn pick_file_id_real_debrid() {
-    #[cfg(any())]
-    fn pending() {
         // Real-Debrid: same name-match precedence, but an unusable index falls back to the FIRST file rather
         // than to nothing — RD always needs a concrete file id to unrestrict.
         let s = idle_real_debrid();
@@ -201,17 +198,12 @@ fn pick_file_id_real_debrid() {
 
         // Without the refusal, RD's own fallback ("first file") hands back S01E04 for a request for S01E09.
         want_not_in_torrent(s.pick_file_id(&named, &ep(1, 9)), "RD refuses rather than falling back to the first file");
-    }
-    todo!("pending: stores_pick_test.go:148")
 }
 
 // Premiumize: an unusable index falls back to the LARGEST file — with no id space of its own, the
 // biggest file in a pack is the best guess at the feature.
 #[test]
-#[ignore = "needs season.rs errEpisodeNotInTorrent (package 5)"]
 fn pick_index_premiumize() {
-    #[cfg(any())]
-    fn pending() {
         // Premiumize: an unusable index falls back to the LARGEST file — with no id space of its own, the
         // biggest file in a pack is the best guess at the feature.
         let s = idle_premiumize();
@@ -228,8 +220,6 @@ fn pick_index_premiumize() {
         // Premiumize's largest-file fallback is the most dangerous of the three: it reliably returns the
         // biggest episode in the pack, which looks entirely plausible right up until it plays.
         want_not_in_torrent(s.pick_index(&named, &ep(3, 9)), "Premiumize refuses rather than serving the largest episode");
-    }
-    todo!("pending: stores_pick_test.go:174")
 }
 
 // A negative index is untrusted input from an addon, not an offset — it must never index backwards.

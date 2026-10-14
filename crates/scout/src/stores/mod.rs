@@ -16,10 +16,18 @@ pub mod refusal;
 pub mod torbox;
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::config::DebridService;
+use crate::util::go_to_lower;
+
+/// Go `resolveCacheTTL` (stores.go:449): how long a remembered torrent id, file list or held mark lives.
+pub(crate) const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Go `maxStoreBytes`: caps a debrid API response body.
 pub const MAX_STORE_BYTES: usize = 4 << 20;
@@ -143,6 +151,23 @@ pub enum StoreError {
     Other(String),
 }
 
+/// Go's `err.Error()` for the errors a store call returns, which is what a log line and a remembered refusal
+/// reason print. Go's `fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{...})` also names the
+/// wrapped refusal; `AddInFlight` here carries no payload, so only its own sentence is printed.
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::DeadLink(d) => d.fmt(f),
+            StoreError::Unavailable(u) => u.fmt(f),
+            StoreError::ScoutSide(u) => write!(f, "{}: {u}", crate::stores::refusal::ERR_SCOUT_SIDE),
+            StoreError::AddInFlight => f.write_str("an add for this release is already in flight"),
+            StoreError::AddQueued => f.write_str("torbox queued this add behind the account's slot limit"),
+            StoreError::Cancelled => f.write_str("context canceled"),
+            StoreError::Other(text) => f.write_str(text),
+        }
+    }
+}
+
 /// FROZEN. Go `Store`: a debrid backend.
 ///
 /// `cache_check` returns ONLY what it learned: a hash it could not check is ABSENT from the map, which
@@ -221,46 +246,321 @@ pub struct CacheTruth {
 impl CacheTruth {
     /// At least one store confirmed it holds this.
     pub fn cached(&self, hash: &str) -> bool {
-        todo!("stores.go CacheTruth.Cached")
+        self.holders.get(hash).is_some_and(|h| !h.is_empty())
     }
 
     /// At least one cache-truth store gave an answer for this hash, either way.
     pub fn known(&self, hash: &str) -> bool {
-        todo!("stores.go CacheTruth.Known")
+        self.known.get(hash).copied().unwrap_or(false)
     }
 
     /// Every cache-truth store answered.
     pub fn complete(&self) -> bool {
-        todo!("stores.go CacheTruth.Complete")
+        self.complete
     }
 
     /// The services that confirmed they hold it, in configured priority order.
     pub fn held_by(&self, hash: &str) -> Vec<DebridService> {
-        todo!("stores.go CacheTruth.HeldBy")
+        self.holders.get(hash).cloned().unwrap_or_default()
     }
 }
 
 /// Go `torboxFetchState`: TorBox's `download_state` onto the stable `FETCH_*` set.
 pub fn torbox_fetch_state(raw: &str) -> &'static str {
-    todo!("stores.go torboxFetchState")
+    let s = go_to_lower(raw.trim());
+    if s.starts_with("failed")
+        || s.starts_with("error")
+        || s.starts_with("expired")
+        || s.contains("missing")
+        || s.starts_with("incomplete")
+    {
+        FETCH_FAILED
+    } else if s.starts_with("stalled") || s.starts_with("paused") {
+        FETCH_STALLED
+    } else if s.starts_with("metadl") || s.starts_with("checking") {
+        FETCH_FETCHING
+    } else if s.starts_with("queued") {
+        FETCH_QUEUED
+    } else {
+        FETCH_DOWNLOADING
+    }
 }
 
 /// Go `rdFetchState`: a Real-Debrid status already accepted as fetching onto the stable set.
 pub fn rd_fetch_state(status: &str) -> &'static str {
-    todo!("stores.go rdFetchState")
+    match status {
+        "queued" => FETCH_QUEUED,
+        "magnet_conversion" => FETCH_FETCHING,
+        _ => FETCH_DOWNLOADING,
+    }
 }
 
 /// Go `magnetFor`.
 pub fn magnet_for(info_hash: &str) -> String {
-    todo!("stores.go magnetFor")
+    format!("magnet:?xt=urn:btih:{info_hash}")
 }
 
-/// Go `redactToken`.
+/// Go `redactToken` removes a credential from text that is about to be logged. The empty check is not
+/// defensive tidiness: strings.ReplaceAll with an empty needle splices the replacement between every
+/// character, so an unconfigured store would turn a short error into an unreadable one.
 pub fn redact_token(text: &str, token: &str) -> String {
-    todo!("stores.go redactToken")
+    if token.is_empty() {
+        return text.to_owned();
+    }
+    text.replace(token, "<token>")
 }
 
-/// Go `shortHash`.
+/// Go `shortHash` trims an infohash for logs: enough to correlate with the client's line, not the whole thing.
 pub fn short_hash(h: &str) -> String {
-    todo!("stores.go shortHash")
+    if h.len() <= 12 {
+        return h.to_owned();
+    }
+    // Go slices bytes; a hash is ASCII, and anything else is cut at the byte as Go would.
+    String::from_utf8_lossy(&h.as_bytes()[..12]).into_owned()
+}
+
+/// Go `storeRefusedUs` reports whether an HTTP status is the service declining to serve this account right
+/// now, a throttle or a fault on their side, rather than a verdict about the torrent.
+pub(crate) fn store_refused_us(status: u16) -> bool {
+    // 401/403 belong here too: an expired or wrong API key is the service declining to serve THIS ACCOUNT,
+    // which says nothing about the release. Left out, a stale token produced a plain dead link, so no
+    // backoff was recorded, every poll paid another add against scout's own allowance, and the eventual
+    // refusals read as scout being busy rather than as a key that needs replacing.
+    status == 401 || status == 403 || status == 429 || status >= 500
+}
+
+/// A `DeadLinkError` as the error a store call returns.
+pub(crate) fn dead_link(reason: impl Into<String>) -> StoreError {
+    StoreError::DeadLink(DeadLinkError { reason: reason.into() })
+}
+
+/// A `StoreUnavailableError` as the error a store call returns.
+pub(crate) fn unavailable(service: DebridService, reason: impl Into<String>, status: u16) -> StoreError {
+    StoreError::Unavailable(StoreUnavailableError { service, reason: reason.into(), status })
+}
+
+/// The text of an error and everything it wraps, which is where a body-read failure keeps its cause: a
+/// `reqwest::Error` says only "error decoding response body" and carries the reason as its source.
+pub(crate) fn error_chain_text(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
+}
+
+/// Go `isCancellation` for an error that arrived as text: the caller went away, or its deadline ran out,
+/// rather than the store saying no. Go's two sentinels render as these strings, and a client timeout wraps the
+/// second.
+pub(crate) fn is_cancellation_text(text: &str) -> bool {
+    text.contains("context canceled") || text.contains("context deadline exceeded") || text.contains("operation cancelled")
+}
+
+/// Go's `readStoreError` over a response: the service's own explanation of a failure, as " (detail)".
+/// Empty when the body cannot be read.
+pub(crate) async fn read_store_error(resp: reqwest::Response) -> String {
+    match read_limited(resp, 2048).await {
+        Ok(raw) => store_error_text(&raw),
+        Err(_) => String::new(),
+    }
+}
+
+/// Go `io.ReadAll(io.LimitReader(body, limit))`: the body up to `limit` bytes, the rest unread.
+pub(crate) async fn read_limited(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, reqwest::Error> {
+    let mut out = Vec::new();
+    while out.len() < limit {
+        match resp.chunk().await? {
+            Some(chunk) => {
+                let room = limit - out.len();
+                out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The two fields of a store's error body. A key matches case-insensitively, as Go's decoder matches it.
+static STORE_ERROR_SHAPE: crate::util::Shape = crate::util::Shape::Object(&[
+    ("error", &crate::util::LEAF),
+    ("detail", &crate::util::LEAF),
+]);
+
+/// Go's `fmt.Sprintf("%v", v)` for a decoded JSON value, which is how `storeErrorText` prints `error`.
+fn go_v(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Null => "<nil>".to_owned(),
+        Value::Bool(b) => b.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => match n.as_f64() {
+            // encoding/json hands `any` a float64, and %v prints it with %g: integers without a point, a
+            // large or tiny magnitude in exponent form.
+            Some(f) if f.fract() == 0.0 && f.abs() < 1e21 => format!("{f:.0}"),
+            Some(f) if f != 0.0 && (f.abs() < 1e-4 || f.abs() >= 1e21) => {
+                let s = format!("{f:e}");
+                match s.split_once('e') {
+                    Some((m, e)) => {
+                        let (sign, digits) = match e.strip_prefix('-') {
+                            Some(d) => ('-', d),
+                            None => ('+', e),
+                        };
+                        format!("{m}e{sign}{digits:0>2}")
+                    }
+                    None => s,
+                }
+            }
+            Some(f) => format!("{f}"),
+            None => n.to_string(),
+        },
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(go_v).collect();
+            format!("[{}]", parts.join(" "))
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys.iter().map(|k| format!("{k}:{}", go_v(&map[*k]))).collect();
+            format!("map[{}]", parts.join(" "))
+        }
+    }
+}
+
+/// Go `storeErrorText` reads the service's own explanation out of a failed body, as " (detail)" ready to
+/// append to a message. TorBox answers `{"error":"ACTIVE_LIMIT","detail":"..."}`; anything unparseable
+/// falls back to a clipped snippet of the raw body, because a truncated reason still beats none.
+pub(crate) fn store_error_text(raw: &[u8]) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let raw = &raw[..raw.len().min(2048)];
+    if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(raw) {
+        crate::util::fold_json_keys(&mut value, &STORE_ERROR_SHAPE);
+        let (error, detail) = match &value {
+            serde_json::Value::Object(map) => (map.get("error"), map.get("detail")),
+            _ => (None, None),
+        };
+        // Go's struct has `Detail string`: a detail of another type is a decode error, which sends the
+        // whole body down the snippet path below.
+        let detail_text = match detail {
+            None | Some(serde_json::Value::Null) => Some(None),
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(Some(s.as_str())),
+            Some(serde_json::Value::String(_)) => Some(None),
+            Some(_) => None,
+        };
+        let error = error.filter(|e| !e.is_null());
+        if let Some(detail) = detail_text {
+            match (detail, error) {
+                (Some(d), Some(e)) => return format!(" ({}: {d})", go_v(e)),
+                (Some(d), None) => return format!(" ({d})"),
+                (None, Some(e)) => return format!(" ({})", go_v(e)),
+                (None, None) => {}
+            }
+        }
+    }
+    let clipped = &raw[..raw.len().min(200)];
+    format!(" ({})", String::from_utf8_lossy(clipped).trim())
+}
+
+/// Go `url.QueryEscape`: everything but the unreserved characters is escaped, and a space is a plus.
+pub(crate) fn go_query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(char::from(b)),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Go `url.Values.Encode`: keys in sorted order, each key's values in the order they were added.
+pub(crate) fn encode_form(pairs: &[(&str, &str)]) -> String {
+    let mut sorted: Vec<&(&str, &str)> = pairs.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted
+        .iter()
+        .map(|(k, v)| format!("{}={}", go_query_escape(k), go_query_escape(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Go `http.NewRequestWithContext` plus the headers a store sets. The error never quotes the URL: for some
+/// services it carries the account key.
+pub(crate) fn build_request(
+    method: reqwest::Method,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<String>,
+) -> Result<reqwest::Request, StoreError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| StoreError::Other("invalid request URL".to_owned()))?;
+    let mut req = reqwest::Request::new(method, parsed);
+    for (name, value) in headers {
+        let name = http::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| StoreError::Other("invalid header name".to_owned()))?;
+        let value = http::header::HeaderValue::from_str(value)
+            .map_err(|_| StoreError::Other("net/http: invalid header field value".to_owned()))?;
+        req.headers_mut().insert(name, value);
+    }
+    if let Some(body) = body {
+        *req.body_mut() = Some(reqwest::Body::from(body));
+    }
+    Ok(req)
+}
+
+/// Go's `json.NewDecoder(r).Decode(&v)` over bytes already in hand: the first JSON value, whatever follows
+/// it ignored, with keys matched to `shape`'s fields case-insensitively. `None` where Go returns an error.
+pub(crate) fn decode_first<T: serde::de::DeserializeOwned>(raw: &[u8], shape: &crate::util::Shape) -> Option<T> {
+    let mut stream = serde_json::Deserializer::from_slice(raw).into_iter::<serde_json::Value>();
+    let mut value = stream.next()?.ok()?;
+    crate::util::fold_json_keys(&mut value, shape);
+    serde_json::from_value(value).ok()
+}
+
+/// Go's `json.Unmarshal(raw, &v)`: the whole document must be valid JSON, then it is decoded the same way.
+pub(crate) fn decode_all<T: serde::de::DeserializeOwned>(raw: &[u8], shape: &crate::util::Shape) -> Option<T> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    crate::util::fold_json_keys(&mut value, shape);
+    serde_json::from_value(value).ok()
+}
+
+/// A JSON null (or an absent key) leaves a Go field at its zero value; serde would call it a type error.
+pub(crate) fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(<Option<T> as serde::Deserialize>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Go `errgroup.Group` with every goroutine returning nil: runs the futures together and returns their
+/// outputs in order. They are polled on the caller's task, so none of them needs to be `'static`.
+pub(crate) async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut pending: Vec<Option<Pin<Box<F>>>> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut outputs: Vec<Option<F::Output>> = pending.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for (slot, out) in pending.iter_mut().zip(outputs.iter_mut()) {
+            if let Some(fut) = slot {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(v) => {
+                        *out = Some(v);
+                        *slot = None;
+                    }
+                    Poll::Pending => done = false,
+                }
+            }
+        }
+        if done {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }

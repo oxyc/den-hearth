@@ -8,14 +8,18 @@
 //! The TorBox tests and the ones that need `resolveCacheTTL` or `realDebridBlocked` are ignored until
 //! their modules land.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
+use crate::cache::{Cache, MemoryCache};
+use crate::rank::real_debrid_blocked;
 use crate::scrape::{DoError, Doer};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
-use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
-use crate::stores::{ResolveTarget, Store, StoreError};
+use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
+use crate::stores::{ResolveTarget, Store, StoreError, RESOLVE_CACHE_TTL};
 
 use super::mock::resp;
 
@@ -78,6 +82,14 @@ fn want_dead(what: &str, got: Result<String, StoreError>) {
 
 fn target(hash: &str) -> ResolveTarget {
     ResolveTarget { info_hash: hash.to_owned(), ..Default::default() }
+}
+
+/// Go `blockedName`: a name RD's matcher rejects, asserted to actually be one so the test and the block list
+/// can't drift apart into a test that passes for the wrong reason.
+fn blocked_name() -> &'static str {
+    const NAME: &str = "Show.S01E01.WEB-DL.x264.mkv";
+    assert!(real_debrid_blocked(NAME), "{NAME:?} is no longer a blocked name — pick one from rdBlockSubstrings");
+    NAME
 }
 
 // Every way a debrid can fail to hand over a link: the Real-Debrid flow fails at each step in turn.
@@ -168,83 +180,79 @@ async fn real_debrid_resolve_happy_path_returns_the_unrestricted_link() {
 // link is in the first info, so re-POSTing the selection and re-reading info learns nothing. Anything
 // short of that — not finished, or finished for a different selection — keeps the full four-call chain.
 #[tokio::test]
-#[ignore = "needs resolveCacheTTL (stores/torbox.rs, package 1)"]
 async fn real_debrid_resolve_downloaded_and_selected_skips_select_files() {
-    #[cfg(any())]
-    async fn pending() {
-        let cases = [
-            // already bought: the held path
-            ("downloaded, file selected", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#, 0, 1),
-            ("downloaded, file not selected", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":0}]}"#, 1, 2),
-            ("still waiting for a selection", r#"{"status":"waiting_files_selection","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#, 1, 2),
-        ];
-        for (name, info, want_select, want_info) in cases {
-            let calls: Arc<Mutex<HashMap<&'static str, usize>>> = Arc::default();
-            let count = |name: &'static str, body: &'static str| {
-                let calls = calls.clone();
-                routed_fn(move || {
-                    *calls.lock().unwrap().entry(name).or_default() += 1;
-                    Ok(resp(200, body))
-                })
-            };
-            let target = ResolveTarget { info_hash: H.into(), ..Default::default() };
-            let cache = Arc::new(MemoryCache::new(1 << 20));
-            cache.put(&rd_torrent_key("k", H, &target), "abc", RESOLVE_CACHE_TTL);
-            let s = RealDebridStore {
-                token: "k".into(),
-                api: REAL_DEBRID_API.into(),
-                cache: Some(cache),
-                client: routed(vec![
-                    ("addMagnet", count("add", r#"{"id":"abc"}"#)),
-                    ("torrents/info", count("info", info)),
-                    ("selectFiles", count("select", "{}")),
-                    ("unrestrict", count("unrestrict", r#"{"download":"https://rd/final.mkv"}"#)),
-                ]),
-            };
-            let link = s.resolve(&target).await;
-            assert!(matches!(&link, Ok(l) if l == "https://rd/final.mkv"), "{name}: link/err: {link:?}");
-            let calls = calls.lock().unwrap().clone();
-            assert!(
-                calls.get("select").copied().unwrap_or(0) == want_select
-                    && calls.get("info").copied().unwrap_or(0) == want_info
-                    && calls.get("unrestrict").copied().unwrap_or(0) == 1,
-                "{name}: calls = {calls:?}, want select={want_select} info={want_info} unrestrict=1"
-            );
-            assert_eq!(calls.get("add").copied().unwrap_or(0), 0, "{name}: a held torrent was added again: {calls:?}");
-        }
+    let cases = [
+        // already bought: the held path
+        ("downloaded, file selected", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#, 0, 1),
+        ("downloaded, file not selected", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":0}]}"#, 1, 2),
+        ("still waiting for a selection", r#"{"status":"waiting_files_selection","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#, 1, 2),
+    ];
+    for (name, info, want_select, want_info) in cases {
+        let calls: Arc<Mutex<HashMap<&'static str, usize>>> = Arc::default();
+        let count = |name: &'static str, body: &'static str| -> Route {
+            let calls = calls.clone();
+            Box::new(move || -> Answer {
+                *calls.lock().unwrap().entry(name).or_default() += 1;
+                Ok(resp(200, body))
+            })
+        };
+        let target = ResolveTarget { info_hash: H.into(), ..Default::default() };
+        let cache = Arc::new(MemoryCache::new(1 << 20));
+        cache.put(&rd_torrent_key("k", H, &target), "abc", RESOLVE_CACHE_TTL);
+        let s = RealDebridStore {
+            token: "k".into(),
+            api: REAL_DEBRID_API.into(),
+            cache: Some(cache),
+            client: routed(vec![
+                ("addMagnet", count("add", r#"{"id":"abc"}"#)),
+                ("torrents/info", count("info", info)),
+                ("selectFiles", count("select", "{}")),
+                ("unrestrict", count("unrestrict", r#"{"download":"https://rd/final.mkv"}"#)),
+            ]),
+        };
+        let link = s.resolve(&target).await;
+        assert!(matches!(&link, Ok(l) if l == "https://rd/final.mkv"), "{name}: link/err: {link:?}");
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            calls.get("select").copied().unwrap_or(0) == want_select
+                && calls.get("info").copied().unwrap_or(0) == want_info
+                && calls.get("unrestrict").copied().unwrap_or(0) == 1,
+            "{name}: calls = {calls:?}, want select={want_select} info={want_info} unrestrict=1"
+        );
+        assert_eq!(calls.get("add").copied().unwrap_or(0), 0, "{name}: a held torrent was added again: {calls:?}");
     }
-    todo!("pending: stores_failure_test.go:122")
 }
 
 // RD refuses certain release SOURCE tags outright (web-dl, webrip, bdrip and friends). Failing fast on
 // those is the point: the pool then tries another service, instead of spending an unrestrict call to
 // surface a link that will not play.
 #[tokio::test]
-#[ignore = "needs realDebridBlocked (rank.rs, package 5)"]
 async fn real_debrid_resolve_blocked_filename_fails_fast() {
-    #[cfg(any())]
-    async fn pending() {
-        // RD refuses certain release SOURCE tags outright, so the probe never reaches unrestrict.
-        let unrestricted = Arc::new(AtomicBool::new(false));
-        let u = unrestricted.clone();
-        let s = RealDebridStore {
-            token: "k".into(),
-            api: REAL_DEBRID_API.into(),
-            cache: None,
-            client: routed(vec![
-                ("addMagnet", ok(r#"{"id":"abc"}"#)),
-                ("torrents/info", ok(&format!(r#"{{"files":[{{"id":1,"path":"{}","bytes":900}}],"links":["x"]}}"#, blocked_name()))),
-                ("unrestrict", routed_fn(move || {
+    // RD refuses certain release SOURCE tags outright, so the probe never reaches unrestrict.
+    let unrestricted = Arc::new(AtomicBool::new(false));
+    let u = unrestricted.clone();
+    let info: &'static str = Box::leak(
+        format!(r#"{{"files":[{{"id":1,"path":"{}","bytes":900}}],"links":["x"]}}"#, blocked_name()).into_boxed_str(),
+    );
+    let s = RealDebridStore {
+        token: "k".into(),
+        api: REAL_DEBRID_API.into(),
+        cache: None,
+        client: routed(vec![
+            ("addMagnet", ok(r#"{"id":"abc"}"#)),
+            ("torrents/info", ok(info)),
+            (
+                "unrestrict",
+                Box::new(move || -> Answer {
                     u.store(true, Ordering::SeqCst);
                     Ok(resp(200, r#"{"download":"nope"}"#))
-                })),
-            ]),
-        };
-        let link = s.resolve(&target(H)).await;
-        assert!(link.is_err(), "a blocked filename must not resolve");
-        assert!(!unrestricted.load(Ordering::SeqCst), "it reached unrestrict — the point is to give up before spending that call");
-    }
-    todo!("pending: stores_failure_test.go:168")
+                }),
+            ),
+        ]),
+    };
+    let link = s.resolve(&target(H)).await;
+    assert!(link.is_err(), "a blocked filename must not resolve");
+    assert!(!unrestricted.load(Ordering::SeqCst), "it reached unrestrict — the point is to give up before spending that call");
 }
 
 #[tokio::test]
