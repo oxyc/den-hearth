@@ -162,7 +162,7 @@ struct TtlCache {
 }
 
 impl crate::cache::Cache for TtlCache {
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Option<std::sync::Arc<str>> {
         self.inner.get(key)
     }
 

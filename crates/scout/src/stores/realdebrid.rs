@@ -183,7 +183,7 @@ impl RealDebridStore {
         match cache.get(&rd_torrent_key(&self.token, &t.info_hash, t)) {
             Some(id) => {
                 let held = !id.is_empty();
-                (id, held)
+                (id.to_string(), held)
             }
             None => (String::new(), false),
         }

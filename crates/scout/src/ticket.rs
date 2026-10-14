@@ -6,9 +6,10 @@
 //! K_play = HKDF-SHA256(ikm = the CONFIG_KEY private key, info = "den-scout/play/v1")
 //! ```
 
+use std::borrow::Cow;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -48,10 +49,13 @@ pub enum TicketError {
 /// Nothing else of the config goes in: no filters, no indexers. Scope records the admission provenance;
 /// availability configs may legitimately lack an install id, including when den-remux is authorized to mint
 /// tickets for them.
+///
+/// The text fields are `Cow`s so that minting writes the config's and target's strings as they lie, where opening
+/// (which always builds owned values) takes them by value.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
-struct TicketWire {
-    h: String,
+struct TicketWire<'a> {
+    h: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     f: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,15 +63,15 @@ struct TicketWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     e: Option<i64>,
     /// [service, token] per account, in config order.
-    d: Vec<(String, String)>,
+    d: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     /// Expiry, unix seconds.
     x: i64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    i: String,
+    #[serde(skip_serializing_if = "is_empty")]
+    i: Cow<'a, str>,
     #[serde(skip_serializing_if = "is_zero")]
     p: i64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    scope: String,
+    #[serde(skip_serializing_if = "is_empty")]
+    scope: Cow<'a, str>,
     /// The indexer's release size in bytes. Absent from tickets minted before it existed, and from releases
     /// whose size no indexer stated; both open with a size of 0, which the link check reads as unknown.
     #[serde(skip_serializing_if = "is_zero")]
@@ -75,14 +79,75 @@ struct TicketWire {
     /// Rt (release title) and Tt (the title id, IMDb) ride along for the play/probe/cancel decision lines
     /// (decisionlog.go) that resolve this ticket later. Never read by `open`'s caller for anything else, and
     /// never the install id (that's `I`, config.IID, a different field already).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    rt: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    tt: String,
+    #[serde(skip_serializing_if = "is_empty")]
+    rt: Cow<'a, str>,
+    #[serde(skip_serializing_if = "is_empty")]
+    tt: Cow<'a, str>,
 }
 
 fn is_zero(v: &i64) -> bool {
     *v == 0
+}
+
+fn is_empty(v: &str) -> bool {
+    v.is_empty()
+}
+
+/// `TicketWire`'s field names, as the JSON spells them.
+const WIRE_KEYS: [&str; 12] = ["h", "f", "s", "e", "d", "x", "i", "p", "scope", "z", "rt", "tt"];
+
+/// Whether `json` is an object whose every key is one of `WIRE_KEYS`, spelled exactly, and none repeats. Anything
+/// else (another spelling, an unknown key, a duplicate, not an object, not JSON) answers false and is left to the
+/// folding path.
+fn has_exact_keys(json: &[u8]) -> bool {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+
+    /// A key, as the bit of `WIRE_KEYS` it names, or 0 when it names none.
+    struct Key(u16);
+    impl<'de> Deserialize<'de> for Key {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl Visitor<'_> for KeyVisitor {
+                type Value = Key;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a string key")
+                }
+                fn visit_str<E>(self, s: &str) -> Result<Key, E> {
+                    Ok(Key(WIRE_KEYS.iter().position(|k| *k == s).map_or(0, |i| 1 << i)))
+                }
+            }
+            d.deserialize_str(KeyVisitor)
+        }
+    }
+
+    struct Exact(bool);
+    impl<'de> Deserialize<'de> for Exact {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct ExactVisitor;
+            impl<'de> Visitor<'de> for ExactVisitor {
+                type Value = Exact;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("an object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Exact, A::Error> {
+                    let mut seen = 0u16;
+                    while let Some(Key(bit)) = map.next_key()? {
+                        if bit == 0 || seen & bit != 0 {
+                            return Ok(Exact(false));
+                        }
+                        seen |= bit;
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                    Ok(Exact(true))
+                }
+            }
+            d.deserialize_map(ExactVisitor)
+        }
+    }
+
+    // Stopping at the first odd key leaves the rest of the object unread, which the parser reports as an error;
+    // that is "not exact" as well.
+    matches!(serde_json::from_slice::<Exact>(json), Ok(Exact(true)))
 }
 
 /// Go `t.Unix()`: whole seconds since the epoch, floored for times before it.
@@ -135,28 +200,37 @@ impl TicketKeys {
     /// Go `mint`: seals a ticket for one release of this config, good until `exp`.
     pub fn mint(&self, config: &Config, target: &PlayTarget, exp: SystemTime) -> String {
         let w = TicketWire {
-            h: target.info_hash.clone(),
+            h: Cow::Borrowed(&target.info_hash),
             f: target.file_idx,
             s: target.season,
             e: target.episode,
-            d: config.debrid.iter().map(|d| (d.service.as_str().to_owned(), d.token.clone())).collect(),
+            d: config
+                .debrid
+                .iter()
+                .map(|d| (Cow::Borrowed(d.service.as_str()), Cow::Borrowed(d.token.as_str())))
+                .collect(),
             x: unix_secs(exp),
-            i: config.iid.clone(),
+            i: Cow::Borrowed(&config.iid),
             p: config.epoch,
-            scope: config.scope.clone(),
+            scope: Cow::Borrowed(&config.scope),
             z: target.release_size,
-            rt: target.title.clone(),
-            tt: target.imdb.clone(),
+            rt: Cow::Borrowed(&target.title),
+            tt: Cow::Borrowed(&target.imdb),
         };
-        // Go ignores the marshal error too; this struct always serialises.
-        let pt = serde_json::to_vec(&w).unwrap_or_default();
         // Tickets are minted with the first key, as Go's aeads[0].
         let aead = XChaCha20Poly1305::new(&self.keys[0].into());
         // OsRng panics rather than returning an error, as Go's crypto/rand.Read crashes the process.
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ct = aead.encrypt(&nonce, pt.as_slice()).expect("XChaCha20-Poly1305 seals any payload");
-        let mut out = nonce.to_vec();
-        out.extend_from_slice(&ct);
+        // nonce || payload || tag in one buffer: the payload is written after the nonce and sealed where it lies.
+        // A ticket is a few hundred bytes, so this capacity holds it without growing.
+        let mut out = Vec::with_capacity(512);
+        out.extend_from_slice(&nonce);
+        // Go ignores the marshal error too; this struct always serialises.
+        let _ = serde_json::to_writer(&mut out, &w);
+        let tag = aead
+            .encrypt_in_place_detached(&nonce, &[], &mut out[NONCE_SIZE..])
+            .expect("XChaCha20-Poly1305 seals any payload");
+        out.extend_from_slice(&tag);
         b64url_encode(&out)
     }
 
@@ -193,9 +267,15 @@ impl TicketKeys {
             ("rt", &LEAF),
             ("tt", &LEAF),
         ]);
-        let mut value: serde_json::Value = serde_json::from_slice(&pt).map_err(|_| TicketError::Bad)?;
-        fold_json_keys(&mut value, &SHAPE);
-        let w: TicketWire = serde_json::from_value(value).map_err(|_| TicketError::Bad)?;
+        // A ticket this process minted spells every key exactly, once, and then folding changes nothing: it reads
+        // straight into the struct, where the folding path builds a `Value` of 20-odd allocations first.
+        let w: TicketWire = if has_exact_keys(&pt) {
+            serde_json::from_slice(&pt).map_err(|_| TicketError::Bad)?
+        } else {
+            let mut value: serde_json::Value = serde_json::from_slice(&pt).map_err(|_| TicketError::Bad)?;
+            fold_json_keys(&mut value, &SHAPE);
+            serde_json::from_value(value).map_err(|_| TicketError::Bad)?
+        };
         if unix_secs(now) >= w.x {
             return Err(TicketError::Expired);
         }
@@ -209,10 +289,10 @@ impl TicketKeys {
             return Err(TicketError::Bad);
         }
         let mut debrid = Vec::with_capacity(w.d.len());
-        for (service, token) in &w.d {
-            match DebridService::parse(service) {
+        for (service, token) in w.d {
+            match DebridService::parse(&service) {
                 Some(service) if !token.is_empty() => {
-                    debrid.push(DebridAccount { service, token: token.clone() })
+                    debrid.push(DebridAccount { service, token: token.into_owned() })
                 }
                 _ => return Err(TicketError::Bad),
             }
@@ -220,15 +300,21 @@ impl TicketKeys {
         if debrid.is_empty() {
             return Err(TicketError::Bad);
         }
-        let config = Config { debrid, iid: w.i, epoch: w.p, scope: w.scope, ..Default::default() };
+        let config = Config {
+            debrid,
+            iid: w.i.into_owned(),
+            epoch: w.p,
+            scope: w.scope.into_owned(),
+            ..Default::default()
+        };
         let target = PlayTarget {
             info_hash: h,
             file_idx: w.f,
             season: w.s,
             episode: w.e,
             release_size: w.z.max(0),
-            title: w.rt,
-            imdb: w.tt,
+            title: w.rt.into_owned(),
+            imdb: w.tt.into_owned(),
         };
         Ok((config, target))
     }

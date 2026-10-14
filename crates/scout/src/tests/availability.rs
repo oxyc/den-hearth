@@ -278,7 +278,7 @@ async fn availability_partial_filtered_list_stays_unknown() {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(verdict) = cache.get(&key) {
-                assert_eq!(verdict, VERDICT_UNDETERMINED, "partial filtered list verdict");
+                assert_eq!(&*verdict, VERDICT_UNDETERMINED, "partial filtered list verdict");
                 break;
             }
             assert!(Instant::now() < deadline, "background check never recorded its result");

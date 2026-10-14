@@ -52,7 +52,23 @@ pub(crate) fn err_episode_not_in_torrent() -> StoreError {
 }
 
 /// Go `episodePatterns`' result: the matchers for one season and episode, in the order Go builds them.
-pub(crate) type EpisodePatterns = Vec<FancyRegex>;
+pub(crate) type EpisodePatterns = Vec<EpisodePattern>;
+
+/// One matcher, with the text a name must contain for it to have a chance. The `\b` patterns open with two
+/// lookarounds that the backtracking engine tries at every position of every name (about 3.3 µs a name, 80% of a
+/// pick), and each of them needs a literal that most names lack, so that literal is looked for first.
+pub(crate) struct EpisodePattern {
+    /// A substring every match contains, or `None` for a pattern with no such cheap test.
+    needs: Option<String>,
+    re: FancyRegex,
+}
+
+impl EpisodePattern {
+    fn is_match(&self, name: &str) -> bool {
+        self.needs.as_deref().is_none_or(|needle| name.contains(needle))
+            && matches!(self.re.is_match(name), Ok(true))
+    }
+}
 
 static VIDEO_EXT_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| re2(r"\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$"));
@@ -95,13 +111,13 @@ struct ChainedEpisode {
 pub(crate) fn episode_patterns(season: i64, episode: i64) -> EpisodePatterns {
     let b = net_word_boundary();
     let specs = [
-        format!(r"s0*{season}[ ._-]*e0*{episode}(?!\d)"),
-        format!(r"{b}0*{season}x0*{episode}(?!\d)"),
-        format!(r"season[ ._-]*0*{season}[ ._-]*episode[ ._-]*0*{episode}(?!\d)"),
+        (None, format!(r"s0*{season}[ ._-]*e0*{episode}(?!\d)")),
+        (Some("x".to_owned()), format!(r"{b}0*{season}x0*{episode}(?!\d)")),
+        (None, format!(r"season[ ._-]*0*{season}[ ._-]*episode[ ._-]*0*{episode}(?!\d)")),
         // Bare concatenated forms (102 = S1E02) must not swallow a resolution token: a trailing p/i
         // makes "720" (S7E20) match "720p", so exclude those as well as a following digit.
-        format!(r"{b}{season}{episode:02}(?![\dpi])"),
-        format!(r"{b}{season:02}{episode:02}(?![\dpi])"),
+        (Some(format!("{season}{episode:02}")), format!(r"{b}{season}{episode:02}(?![\dpi])")),
+        (Some(format!("{season:02}{episode:02}")), format!(r"{b}{season:02}{episode:02}(?![\dpi])")),
         // A double episode names TWO of them, and only the first was ever matched: `Show.S01E05-E06.mkv`,
         // `S01E05E06`, `S01E05-06`, `S01E05.E06`. Asked for the second, nothing matched — and because such
         // a file DOES declare an episode it then ruled itself out of every guess below it, so a pack of
@@ -119,7 +135,7 @@ pub(crate) fn episode_patterns(season: i64, episode: i64) -> EpisodePatterns {
         //
         // So the second number must carry its own `e` — an explicit marker nothing else in a release name
         // wears.
-        format!(r"s0*{season}[ ._-]*e\d{{1,3}}(?!\d)[ ._-]*e0*{episode}(?!\d)"),
+        (None, format!(r"s0*{season}[ ._-]*e\d{{1,3}}(?!\d)[ ._-]*e0*{episode}(?!\d)")),
     ];
     // `S01E05-06` writes the far end without an `e`, and a tight dash was tried as the thing that made it
     // safe. It is not: `Show.S01E01-7.Minutes.mkv`, `Show.S01E08-4K.HDR.mkv` and `Show - S02E01-014 -
@@ -161,7 +177,7 @@ pub(crate) fn episode_patterns(season: i64, episode: i64) -> EpisodePatterns {
 /// did name the episode — the strong evidence losing to the weak, on the largest file.
 pub(crate) fn bare_episode_patterns(episode: i64) -> EpisodePatterns {
     compile_all(&[
-        format!(r"(?:^|[ _\-\[\]()])0*{episode}(?:[ _\-\[\]()]|\.(?!\d)|{NET_END})"),
+        (None, format!(r"(?:^|[ _\-\[\]()])0*{episode}(?:[ _\-\[\]()]|\.(?!\d)|{NET_END})")),
         // `Show - E05 [1080p].mkv` and `Show.E05.1080p.mkv`: an episode number with no season anywhere, so
         // the strong patterns cannot fire and labelledEpisodeRe (which needs the `s`) does not see it
         // either. Every file then looked identical to every other and the largest was served for all
@@ -170,12 +186,17 @@ pub(crate) fn bare_episode_patterns(episode: i64) -> EpisodePatterns {
         // The `e` is what makes this safe where the bare token is not: it is why a dot may open the token
         // and why the trailing rule can relax to any separator. `DDP5.1`, `H.264` and `AAC.2.0` have no
         // `e` against their digits, and a file that names a season is excluded from this tier already.
-        format!(r"(?:^|[ ._\-\[\]()])e0*{episode}(?:[ ._\-\[\]()]|{NET_END})"),
+        (None, format!(r"(?:^|[ ._\-\[\]()])e0*{episode}(?:[ ._\-\[\]()]|{NET_END})")),
     ])
 }
 
-fn compile_all(specs: &[String]) -> EpisodePatterns {
-    specs.iter().filter_map(|s| fancy(s).ok()).collect()
+fn compile_all(specs: &[(Option<String>, String)]) -> EpisodePatterns {
+    specs
+        .iter()
+        .filter_map(|(needs, pattern)| {
+            Some(EpisodePattern { needs: needs.clone(), re: fancy(pattern).ok()? })
+        })
+        .collect()
 }
 
 /// Go `episodeNamer` holds the compiled patterns for ONE (season, episode) so a pick pays for them once
@@ -272,7 +293,7 @@ pub(crate) fn cached_episode_patterns(season: i64, episode: i64) -> Arc<EpisodeP
 /// Go `matchesEpisode`: whether a release title names the episode `patterns` was built for.
 pub(crate) fn matches_episode(name: &str, patterns: &EpisodePatterns) -> bool {
     let n = go_to_lower(base_name(name));
-    patterns.iter().any(|re| matches!(re.is_match(&n), Ok(true)))
+    patterns.iter().any(|p| p.is_match(&n))
 }
 
 /// Go `rangeHoldsEpisode` reports whether a multi-episode label covers this episode.

@@ -543,14 +543,18 @@ fn memory_cache_ttl_and_eviction() {
     *clock.lock().unwrap() += Duration::from_secs(11);
     assert!(c.get("k").is_none(), "should expire past TTL");
 
-    // byte-budget LRU eviction (audit #1): a small budget evicts the least-recently-used.
-    let mut c2 = MemoryCache::new(20); // ~ room for 2 small entries
+    // byte-budget eviction (audit #1): the resident bytes stay within the budget however much is written, and
+    // an entry that keeps being read outlives a stream of one-shot writes.
+    let mut c2 = MemoryCache::new(1000);
     c2.now = clock_fn(&clock);
-    c2.put("a", "1", Duration::from_secs(3600)); // 2 bytes
-    c2.put("b", "2", Duration::from_secs(3600));
-    let _ = c2.get("a"); // touch a → b is LRU
-    c2.put("cccccccccc", "3333333333", Duration::from_secs(3600)); // 20 bytes → forces eviction
-    assert!(c2.get("b").is_none(), "b should have been evicted (LRU) under the byte budget");
+    c2.put("hot", "0123456789", Duration::from_secs(3600));
+    let scan: Vec<String> = (0..200).map(|i| format!("scan{i:03}")).collect();
+    for key in &scan {
+        c2.put(key, &"x".repeat(40), Duration::from_secs(3600));
+        assert!(c2.get("hot").is_some(), "the entry read on every write was evicted at {key}");
+    }
+    let resident: usize = scan.iter().filter(|k| c2.get(k).is_some()).map(|k| k.len() + 40).sum();
+    assert!(resident > 0 && resident <= 1000, "{resident} scan bytes resident, want 1..=1000");
 }
 
 /// The Go test's `c.now = func() time.Time { return now }`: a clock the test can move.
