@@ -65,3 +65,51 @@ pub struct Probe {
     #[serde(rename = "sizeBytes", default, skip_serializing_if = "is_zero_i64")]
     pub size_bytes: i64,
 }
+
+/// Go `probeBytes`: how much of a file's head a probe reads.
+pub(crate) const PROBE_BYTES: usize = 1 << 20;
+
+/// Go `ErrNoTracks`: a head with no Tracks element. A reason constant, per PORTING.md's convention for
+/// sentinel errors.
+pub(crate) const ERR_NO_TRACKS: &str = "no track information in the file head";
+
+/// Go `idTrackType`: the Matroska TrackType element id.
+pub(crate) const ID_TRACK_TYPE: u8 = 0x83;
+/// Go `trackTypeAudio`.
+pub(crate) const TRACK_TYPE_AUDIO: u8 = 2;
+
+/// Go `ProbeTracks`: reads the head of a resolved link and parses it. The size comes from the response's
+/// total, not from the bytes read.
+pub(crate) async fn probe_tracks(_client: &reqwest::Client, _url: &str) -> Result<Probe, String> {
+    todo!()
+}
+
+/// Go `ParseHead`: detects the container from the head and dispatches to the matching parser.
+pub(crate) fn parse_head(_head: &[u8]) -> Result<Probe, &'static str> {
+    todo!()
+}
+
+/// Go `ParseMatroskaTracks`.
+pub(crate) fn parse_matroska_tracks(_head: &[u8]) -> Result<Probe, &'static str> {
+    todo!()
+}
+
+/// Go `parseTrackEntry`: the track's type and its normalized language ("" when none).
+pub(crate) fn parse_track_entry(_entry: &[u8]) -> (u8, String) {
+    todo!()
+}
+
+/// Go `cleanLang`: normalizes a language tag to a two-letter code, "" when it names none.
+pub(crate) fn clean_lang(_b: &[u8]) -> String {
+    todo!()
+}
+
+/// Go `channelLayout`: "7.1", "5.1", "2.0", ... for a channel count, "" when there is no layout for it.
+pub(crate) fn channel_layout(_n: i64) -> &'static str {
+    todo!()
+}
+
+/// Go `channelCount`: the inverse of `channel_layout`; 0 for a layout it does not know.
+pub(crate) fn channel_count(_layout: &str) -> i64 {
+    todo!()
+}
