@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
+#[cfg(not(test))]
 use std::sync::LazyLock;
 
 use crate::addbudget::global_add_budget;
@@ -164,11 +165,28 @@ pub fn new_metric_set() -> MetricSet {
     }
 }
 
+#[cfg(not(test))]
 static METRICS: LazyLock<MetricSet> = LazyLock::new(new_metric_set);
+
+// A TEST build keeps the counters per thread, as the add budget does (addbudget.rs). Go's tests run one at a time
+// and assert on DELTAS of the process-wide counters, which holds only when nothing else is counting meanwhile;
+// cargo runs ours in parallel. Each test runs on its own thread (and a `#[tokio::test]` keeps all its tasks
+// there), so the counters it reads are the ones it fed.
+#[cfg(test)]
+thread_local! {
+    static METRICS: &'static MetricSet = Box::leak(Box::new(new_metric_set()));
+}
 
 /// Go's package-level `metrics`.
 pub fn metrics() -> &'static MetricSet {
-    &METRICS
+    #[cfg(not(test))]
+    {
+        &METRICS
+    }
+    #[cfg(test)]
+    {
+        METRICS.with(|m| *m)
+    }
 }
 
 /// Panics recovered on a background task, for a test to compare before and after.

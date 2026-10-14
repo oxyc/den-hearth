@@ -1,12 +1,17 @@
 //! Go: `internal/scout/loglimit_test.go` (104 lines). Work package 6.
 //!
-//! `log_limited` is live, but its output comes through `capture_log`, which is not ported yet, so it fails at that
-//! `todo!()` for now. The health-flip and startup-summary tests drive the handler and deps (packages 4 and 6), so
-//! they are ignored with their bodies compiled out.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use crate::deps::{settings_from_env, startup_summary as startup_line};
+use crate::handler::{new_handler, INDEXERS_DOWN_DETAIL, SCRAPE_FAIL_THRESHOLD};
 use crate::loglimit::{LIMITED_LOG, LOG_INTERVAL};
+use crate::manifest::manifest_version;
+use crate::scrape::DoError;
 
-use super::reqlog::capture_log;
+use super::handler::{fake_scraper, get, test_deps, test_seeds, valid_blob};
+use super::reqlog::{capture_log, LogCapture};
 
 /// Go `ageLogLimit`: pushes a condition's last-seen time back a full interval, so a test that checks for its exact
 /// line is not silenced by unrelated coverage of the same condition moments earlier in this run.
@@ -19,73 +24,77 @@ pub(crate) fn age_log_limit(key: &str) {
 
 // /health's flip is logged as a change of state: one line going degraded however many builds keep
 // failing, and one coming back however many succeed.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test and capture_log (packages 4, 6)"]
-fn health_flip_is_logged_once_each_way() {
-    // Enable when packages 4 and 6 land: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::scrape::SCRAPE_FAIL_THRESHOLD;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let healthy = Arc::new(AtomicBool::new(false));
-        let out = capture_log(|| {
-            let h = handler_with_scrapers(Arc::clone(&healthy));
-            for i in 0..SCRAPE_FAIL_THRESHOLD + 3 {
-                // distinct titles, so each one builds
-                get(&h, &format!("/{}/stream/movie/tt9{i}.json", crate::tests::ticket::valid_blob()));
-            }
-            let n = out_count("health: ok → degraded (indexers): ");
-            assert_eq!(n, 1, "going degraded logged {n} times, want 1");
-            healthy.store(true, Ordering::SeqCst);
-            get(&h, &format!("/{}/stream/movie/tt980.json", crate::tests::ticket::valid_blob()));
-            get(&h, &format!("/{}/stream/movie/tt981.json", crate::tests::ticket::valid_blob()));
+#[tokio::test]
+async fn health_flip_is_logged_once_each_way() {
+    let out = LogCapture::start();
+    let healthy = Arc::new(AtomicBool::new(false));
+    let flag = healthy.clone();
+    let h = new_handler(test_deps(move |d| {
+        let flag = flag.clone();
+        d.make_scrapers = Arc::new(move |_| {
+            let flag = flag.clone();
+            vec![fake_scraper("torrentio", move || {
+                let flag = flag.clone();
+                Box::pin(async move {
+                    if flag.load(Ordering::SeqCst) {
+                        Ok(test_seeds())
+                    } else {
+                        Err(Box::new(std::io::Error::other("context canceled")) as DoError)
+                    }
+                })
+            })]
         });
-        let n = out.matches("health: degraded → ok").count();
-        assert_eq!(n, 1, "recovering logged {n} times, want 1:\n{out}");
+    }));
+    let build = |i: i32| {
+        let h = &h;
+        async move {
+            get(h, &format!("/{}/stream/movie/tt9{i}.json", valid_blob()), &[]).await;
+        }
+    };
+    for i in 0..SCRAPE_FAIL_THRESHOLD + 3 {
+        build(i).await; // distinct titles, so each one builds
     }
-    todo!("pending: loglimit_test.go:~22 TestHealthFlipIsLoggedOnceEachWay")
+    let want = format!("health: ok → degraded (indexers): {INDEXERS_DOWN_DETAIL}");
+    let n = out.text().matches(&want).count();
+    assert_eq!(n, 1, "going degraded logged {n} times, want 1:\n{}", out.text());
+    healthy.store(true, Ordering::SeqCst);
+    build(80).await;
+    build(81).await;
+    let n = out.text().matches("health: degraded → ok").count();
+    assert_eq!(n, 1, "recovering logged {n} times, want 1:\n{}", out.text());
 }
 
 // The startup line says what is running without saying anything secret.
 #[test]
-#[ignore = "needs settings_from_env / startup_summary from deps.rs (package 4)"]
 fn startup_summary() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::{settings_from_env, startup_summary};
-        use crate::manifest::MANIFEST_VERSION;
-        let env = [
-            ("MEDIAFUSION_URL", "https://mf.self/SECRET-CONFIG"),
-            ("CONFIG_KEY", "key-secret"),
-            ("METRICS_TOKEN", "metrics-secret"),
-            ("CACHE_DIR", "/cache"),
-        ];
-        let lookup = |k: &str| env.iter().find(|(name, _)| *name == k).map(|(_, v)| v.to_string()).unwrap_or_default();
-        let s = settings_from_env(lookup);
-        let line = startup_summary(&s, true);
-        let wanted = [
-            format!("den-scout {MANIFEST_VERSION} listening on :8080 — "),
-            "indexers=torrentio,mediafusion".to_owned(),
-            "overrides=mediafusion".to_owned(),
-            "disabled=torz".to_owned(),
-            "minting=off".to_owned(),
-            "cache=/cache cache_persistent=on".to_owned(),
-            "sealed=on".to_owned(),
-            "metrics=on".to_owned(),
-            "log_requests=off".to_owned(),
-        ];
-        for want in wanted {
-            assert!(line.contains(&want), "startup line lacks {want:?}: {line}");
-        }
-        for leak in ["SECRET-CONFIG", "mf.self", "key-secret", "metrics-secret"] {
-            assert!(!line.contains(leak), "startup line carries {leak:?}: {line}");
-        }
-        let unwritable = startup_summary(&s, false);
-        assert!(unwritable.contains("cache_persistent=off"), "an unwritable cache should say so: {unwritable}");
+    let env = [
+        ("MEDIAFUSION_URL", "https://mf.self/SECRET-CONFIG"),
+        ("CONFIG_KEY", "key-secret"),
+        ("METRICS_TOKEN", "metrics-secret"),
+        ("CACHE_DIR", "/cache"),
+    ];
+    let lookup = |k: &str| env.iter().find(|(name, _)| *name == k).map(|(_, v)| (*v).to_owned()).unwrap_or_default();
+    let s = settings_from_env(lookup);
+    let line = startup_line(&s, true);
+    let first = format!("den-scout {} listening on :8080 — ", manifest_version());
+    for want in [
+        first.as_str(),
+        "indexers=torrentio,mediafusion",
+        "overrides=mediafusion",
+        "disabled=torz",
+        "minting=off",
+        "cache=/cache cache_persistent=on",
+        "sealed=on",
+        "metrics=on",
+        "log_requests=off",
+    ] {
+        assert!(line.contains(want), "startup line lacks {want:?}: {line}");
     }
-    todo!("pending: loglimit_test.go:~59 TestStartupSummary")
+    for leak in ["SECRET-CONFIG", "mf.self", "key-secret", "metrics-secret"] {
+        assert!(!line.contains(leak), "startup line carries {leak:?}: {line}");
+    }
+    let unwritable = startup_line(&s, false);
+    assert!(unwritable.contains("cache_persistent=off"), "an unwritable cache should say so: {unwritable}");
 }
 
 // One condition, many occurrences: one line a minute, and the next line admits what it held back.

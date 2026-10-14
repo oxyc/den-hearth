@@ -53,6 +53,31 @@ pub(crate) fn capture(f: impl FnOnce()) -> String {
     CAPTURED.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
+/// Go `captureLog(t)` as a value: collects this thread's log lines from `start` until it is dropped, readable at any
+/// point in between with `text`. An async test on a current-thread runtime keeps every task it spawns on this thread,
+/// so the lines a route logs from its own task land here too.
+#[cfg(test)]
+pub(crate) struct Capture;
+
+#[cfg(test)]
+impl Capture {
+    pub(crate) fn start() -> Capture {
+        CAPTURED.with(|c| *c.borrow_mut() = Some(String::new()));
+        Capture
+    }
+
+    pub(crate) fn text(&self) -> String {
+        CAPTURED.with(|c| c.borrow().clone().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+impl Drop for Capture {
+    fn drop(&mut self) {
+        CAPTURED.with(|c| *c.borrow_mut() = None);
+    }
+}
+
 /// Go `logLimited` writes the line unless the same condition already wrote one inside `LOG_INTERVAL`; the next
 /// line of that condition to get through says how many were held back in between. There is no timer — a
 /// held-back count is reported by the condition's own next line, whenever that comes, or not at all if it

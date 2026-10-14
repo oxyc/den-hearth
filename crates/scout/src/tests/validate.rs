@@ -1,16 +1,22 @@
 //! Go: `internal/scout/validate_test.go` (188 lines). Work package 6.
 //!
-//! The per-service verdicts and the unreachable case are live against a mocked `Doer`. The two route tests drive
-//! `handleValidate` through the handler (package 4), so they are ignored with their bodies compiled out.
+//! The per-service verdicts and the unreachable case run against a mocked `Doer`. The route tests drive
+//! `handleValidate` through the handler, with the mock set as `Deps::probe_doer` (Go swaps the `*http.Client`'s
+//! transport) and the pacing replaced through `Handler::set_validate_limiter` (Go swaps the package global).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::handler::{get, post_json, test_deps};
 use super::mock::{resp, MockDoer};
 use crate::config::DebridService;
+use crate::handler::{new_handler, Handler, NO_STORE};
 use crate::hostlimit::new_host_limiter;
 use crate::scrape::DoError;
-use crate::validate::validate_debrid_token;
+use crate::stores::realdebrid::REAL_DEBRID_API;
+use crate::stores::torbox::TORBOX_API;
+use crate::validate::{validate_debrid_token, ValidateResult};
 
 /// The limiter paces per upstream host and would otherwise make a test that checks several tokens sit through its
 /// cooldown. The Go test swaps the package global for a generous one; here it is passed in.
@@ -23,15 +29,14 @@ fn unthrottled() -> crate::hostlimit::HostLimiter {
 #[tokio::test]
 async fn validate_debrid_token_per_service() {
     let limiter = unthrottled();
-    // (name, service, upstream status, upstream body, want valid, want URL suffix, want bearer header)
-    //
-    // The Go test compares the full URL against `torboxAPI`/`realDebridAPI` (package 1). Until those constants
-    // land, the path suffix is what is asserted.
+    // (name, service, upstream status, upstream body, want valid, want URL, want bearer header)
+    let torbox_me = format!("{TORBOX_API}/user/me");
+    let rd_user = format!("{REAL_DEBRID_API}/user");
     let cases: [(&str, DebridService, u16, &str, bool, Option<&str>, bool); 7] = [
-        ("torbox ok", DebridService::TorBox, 200, r#"{"data":{}}"#, true, Some("/user/me"), true),
+        ("torbox ok", DebridService::TorBox, 200, r#"{"data":{}}"#, true, Some(torbox_me.as_str()), true),
         ("torbox rejected", DebridService::TorBox, 401, "{}", false, None, true),
         ("torbox down", DebridService::TorBox, 500, "{}", false, None, true),
-        ("realdebrid ok", DebridService::RealDebrid, 200, r#"{"id":1}"#, true, Some("/user"), true),
+        ("realdebrid ok", DebridService::RealDebrid, 200, r#"{"id":1}"#, true, Some(rd_user.as_str()), true),
         ("realdebrid rejected", DebridService::RealDebrid, 403, "{}", false, None, true),
         // Premiumize answers 200 for a bad key and puts the verdict in the body, so the status alone is
         // not the answer for every service.
@@ -52,8 +57,8 @@ async fn validate_debrid_token_per_service() {
         assert_eq!(got.valid, want_valid, "{name}: valid = {} (reason {:?}), want {want_valid}", got.valid, got.reason);
         assert!(got.valid || !got.reason.is_empty(), "{name}: an invalid verdict came back with no reason to show anyone");
         let (url, auth) = seen.lock().unwrap().clone();
-        if let Some(suffix) = want_url {
-            assert!(url.ends_with(suffix), "{name}: asked {url:?}, want a URL ending in {suffix:?}");
+        if let Some(want_url) = want_url {
+            assert_eq!(url, want_url, "{name}: asked {url:?}, want {want_url:?}");
         }
         if want_auth {
             assert_eq!(auth, "Bearer the-token", "{name}: authorization");
@@ -79,74 +84,70 @@ async fn validate_unreachable_is_not_invalid() {
     assert!(!got.reason.contains("://") && !got.reason.contains("dial tcp") && !got.reason.contains("refused"), "reason leaked the request: {:?}", got.reason);
 }
 
-// Needs `handleValidate`, `Deps::for_test` and `postJSON` through the handler (package 4).
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test / the /validate route (package 4)"]
-fn validate_route_refuses_rather_than_queues() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::serve;
-        use crate::hostlimit::new_host_limiter;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        // One allowed, then the allowance is gone for an hour.
-        let limiter = new_host_limiter(Duration::from_secs(3600), 1);
-        let upstream = Arc::new(AtomicUsize::new(0));
-        let deps = Deps::for_test(|d| {
-            d.validate_limiter = limiter;
-            d.probe_client = Some(counting_client(Arc::clone(&upstream), resp(200, r#"{"data":{}}"#)));
-        });
-        let body = r#"{"service":"torbox","token":"tb-secret"}"#;
+/// Go's `roundTripperFunc`-driven `Deps.ProbeClient`: a handler whose link check and token validation go through a
+/// `Doer` that counts the requests it is asked and answers `{"data":{}}`.
+fn counting_handler(asked: Arc<AtomicUsize>, limiter: crate::hostlimit::HostLimiter) -> Handler {
+    let h = new_handler(test_deps(move |d| {
+        d.probe_doer = Some(Arc::new(MockDoer(move |_req: reqwest::Request| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, r#"{"data":{}}"#))
+        })));
+    }));
+    h.set_validate_limiter(limiter);
+    h
+}
 
-        assert_eq!(post_json(&deps, "/validate", body).status(), 200, "first check");
-        let start = std::time::Instant::now();
-        let rr = post_json(&deps, "/validate", body);
-        assert_eq!(rr.status(), 429, "second check");
-        // The point of the 429 is that it is immediate — a queued request is the cost being avoided.
-        let elapsed = start.elapsed();
-        assert!(elapsed <= Duration::from_secs(1), "the refusal took {elapsed:?} — it queued instead of shedding");
-        assert!(rr.headers().get("retry-after").is_some(), "429 without a Retry-After");
-        assert_eq!(upstream.load(Ordering::SeqCst), 1, "upstream called more than once — a refused check must not reach the provider");
-    }
-    todo!("pending: validate_test.go:~91 TestValidateRoute_refusesRatherThanQueues")
+// Refused, not queued. The route is an unauthenticated credential-testing oracle pointed at three third
+// parties, and the first version made it WAIT for its token — so a flood did not slow down, it parked a
+// goroutine and a connection per request for the whole budget, inside a 230 MiB heap. 429 costs nothing.
+#[tokio::test]
+async fn validate_route_refuses_rather_than_queues() {
+    // One allowed, then the allowance is gone for an hour.
+    let limiter = new_host_limiter(Duration::from_secs(3600), 1);
+    let upstream = Arc::new(AtomicUsize::new(0));
+    let h = counting_handler(Arc::clone(&upstream), limiter);
+    let body = r#"{"service":"torbox","token":"tb-secret"}"#;
+
+    let first = post_json(&h, "/validate", body).await;
+    assert_eq!(first.status(), 200, "first check: {}, want 200", first.status());
+    let start = std::time::Instant::now();
+    let rr = post_json(&h, "/validate", body).await;
+    assert_eq!(rr.status(), 429, "second check: {}, want 429", rr.status());
+    // The point of the 429 is that it is immediate — a queued request is the cost being avoided.
+    let elapsed = start.elapsed();
+    assert!(elapsed <= Duration::from_secs(1), "the refusal took {elapsed:?} — it queued instead of shedding");
+    assert!(rr.headers().get("retry-after").is_some_and(|v| !v.is_empty()), "429 without a Retry-After");
+    let n = upstream.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "upstream called {n} times, want 1 — a refused check must not reach the provider");
 }
 
 // The route: POST only, strict about what it accepts, and never cached.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test / the /validate route (package 4)"]
-fn validate_route() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::serve;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let asked = Arc::new(AtomicUsize::new(0));
-        let deps = Deps::for_test(|d| {
-            d.validate_limiter = unthrottled();
-            d.probe_client = Some(counting_client(Arc::clone(&asked), resp(200, r#"{"data":{}}"#)));
-        });
+#[tokio::test]
+async fn validate_route() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let h = counting_handler(Arc::clone(&asked), unthrottled());
 
-        let rr = post_json(&deps, "/validate", r#"{"service":"torbox","token":"tb-secret"}"#);
-        assert_eq!(rr.status(), 200, "validate");
-        assert_eq!(rr.headers()["cache-control"], NO_STORE, "cache-control: want no-store, this reply is about a secret");
-        let got: ValidateResult = serde_json::from_str(rr.body()).expect("json");
-        assert!(got.valid, "valid token reported invalid: {got:?}");
+    let rr = post_json(&h, "/validate", r#"{"service":"torbox","token":"tb-secret"}"#).await;
+    assert_eq!(rr.status(), 200, "validate: {}", rr.status());
+    let cc = rr.headers().get("cache-control").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    assert_eq!(cc, NO_STORE, "cache-control = {cc:?}, want no-store — this reply is about a secret");
+    let got: ValidateResult = serde_json::from_slice(rr.body()).expect("json");
+    assert!(got.valid, "valid token reported invalid: {got:?}");
 
-        // A GET must not reach the upstream — this route exists to spend one read, on purpose, per press.
-        let before = asked.load(Ordering::SeqCst);
-        assert_eq!(get(&deps, "/validate", &[]).status(), 405, "GET /validate");
-        assert_eq!(asked.load(Ordering::SeqCst), before, "a GET reached the debrid service");
+    // A GET must not reach the upstream — this route exists to spend one read, on purpose, per press.
+    let before = asked.load(Ordering::SeqCst);
+    let rr = get(&h, "/validate", &[]).await;
+    assert_eq!(rr.status(), 405, "GET /validate: {}, want 405", rr.status());
+    assert_eq!(asked.load(Ordering::SeqCst), before, "a GET reached the debrid service");
 
-        // Unknown service, empty token, oversized token and malformed JSON are all refused before any
-        // upstream call — the route must not become a way to send arbitrary strings to a third party.
-        let before = asked.load(Ordering::SeqCst);
-        let oversized = format!(r#"{{"service":"torbox","token":"{}"}}"#, "x".repeat(513));
-        for body in [r#"{"service":"nope","token":"x"}"#, r#"{"service":"torbox","token":""}"#, oversized.as_str(), "not json"] {
-            assert_eq!(post_json(&deps, "/validate", body).status(), 400, "body {body:.40}");
-        }
-        assert_eq!(asked.load(Ordering::SeqCst), before, "a rejected request still reached the upstream");
+    // Unknown service, empty token, oversized token and malformed JSON are all refused before any
+    // upstream call — the route must not become a way to send arbitrary strings to a third party.
+    let before = asked.load(Ordering::SeqCst);
+    let oversized = format!(r#"{{"service":"torbox","token":"{}"}}"#, "x".repeat(513));
+    for body in [r#"{"service":"nope","token":"x"}"#, r#"{"service":"torbox","token":""}"#, oversized.as_str(), "not json"] {
+        let rr = post_json(&h, "/validate", body).await;
+        assert_eq!(rr.status(), 400, "body {body:.40}: {}, want 400", rr.status());
     }
-    todo!("pending: validate_test.go:~133 TestValidateRoute")
+    let n = asked.load(Ordering::SeqCst) - before;
+    assert_eq!(n, 0, "a rejected request still reached the upstream ({n} calls)");
 }

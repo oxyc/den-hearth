@@ -1,15 +1,29 @@
 //! Go: `internal/scout/metrics_test.go` (218 lines). Work package 6.
-//!
-//! The fixed-cardinality and persistence-gauge tests are live. The `/metrics` route tests drive the handler
-//! (package 4), so they are ignored and their bodies are ported and compiled out until it lands.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
-use crate::cache::MemoryCache;
+use crate::cache::{Cache, MemoryCache};
+use crate::config::{DebridService, ALL_INDEXERS};
 use crate::diskcache::{write_file, TieredCache};
+use crate::handler::{join_cached, new_handler, split_cached, NO_STORE};
+use crate::manifest::manifest_version;
 use crate::metrics::{cache_persistent_gauge, new_metric_set, METRIC_TORBOX_AVOIDED, METRIC_TORBOX_ENDPOINTS, METRIC_TORBOX_OUTCOMES};
+use crate::tests::handler::{body_str, get, test_deps, valid_blob, RecordingCache};
 
 const METRICS_TOKEN: &str = "metrics-shared-secret";
+
+fn metrics_auth() -> [(&'static str, String); 1] {
+    [("authorization", format!("Bearer {METRICS_TOKEN}"))]
+}
+
+/// handler_test.go's `do(h, path, headers)` with owned header values.
+async fn get_with(h: &crate::handler::Handler, path: &str, headers: &[(&str, String)]) -> http::Response<Vec<u8>> {
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    get(h, path, &borrowed).await
+}
 
 /// Go `sampleValue`: one series' value out of the exposition text, so a test can assert on the NUMBER rather
 /// than on the series existing. `render()` emits every series unconditionally, so presence proves only that
@@ -26,176 +40,143 @@ fn sample_value(body: &str, series: &str) -> i64 {
         .unwrap_or_else(|_| panic!("unparseable sample {line:?}"))
 }
 
-// The counters are process-wide and every other test in this package feeds them too, so the route tests assert
-// deltas. The route is gated and OFF entirely when no token is configured: 404, not an empty 200.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test (package 4)"]
-fn metrics_is_gated() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::serve;
-        // The counters say when this install is being watched and which indexers it uses, so the route is gated
-        // and OFF entirely when no token is configured — 404, not an empty 200, so an unconfigured deployment
-        // does not advertise that there is something here.
-        let off = Deps::for_test(|_| {});
-        assert_eq!(get(&off, "/metrics", &[]).status(), 404, "no token configured");
+// The counters say when this install is being watched and which indexers it uses, so the route is gated
+// and OFF entirely when no token is configured — 404, not an empty 200, so an unconfigured deployment
+// does not advertise that there is something here.
+#[tokio::test]
+async fn metrics_is_gated() {
+    let off = new_handler(test_deps(|_| {}));
+    let rr = get(&off, "/metrics", &[]).await;
+    assert_eq!(rr.status(), 404, "no token configured: {}, want 404", rr.status());
 
-        let on = Deps::for_test(|d| d.metrics_token = Some(METRICS_TOKEN.to_owned()));
-        let cases: [(&str, Vec<(&str, &str)>, u16); 5] = [
-            ("no header", vec![], 404),
-            ("wrong token", vec![("authorization", "Bearer nope")], 404),
-            ("no bearer prefix", vec![("authorization", METRICS_TOKEN)], 404),
-            ("padded token", vec![("authorization", &format!("Bearer  {METRICS_TOKEN} "))], 200),
-            ("correct", vec![("authorization", &format!("Bearer {METRICS_TOKEN}"))], 200),
-        ];
-        for (name, headers, want) in cases {
-            let rr = get(&on, "/metrics", &headers);
-            assert_eq!(rr.status(), want, "{name}");
-        }
+    let on = new_handler(test_deps(|d| d.metrics_token = METRICS_TOKEN.to_owned()));
+    let padded = format!("Bearer  {METRICS_TOKEN} ");
+    let correct = format!("Bearer {METRICS_TOKEN}");
+    let cases: [(&str, Vec<(&str, &str)>, u16); 5] = [
+        ("no header", vec![], 404),
+        ("wrong token", vec![("authorization", "Bearer nope")], 404),
+        ("no bearer prefix", vec![("authorization", METRICS_TOKEN)], 404),
+        ("padded token", vec![("authorization", padded.as_str())], 200),
+        ("correct", vec![("authorization", correct.as_str())], 200),
+    ];
+    for (name, headers, want) in cases {
+        let rr = get(&on, "/metrics", &headers).await;
+        assert_eq!(rr.status(), want, "{name}: {}, want {want}", rr.status());
     }
-    todo!("pending: metrics_test.go:~24 TestMetrics_isGated")
 }
 
-// The route answers in the exposition format, and the numbers actually move — asserted as DELTAS, because
-// the counters are process-wide and every other test in this package feeds them too.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test (package 4)"]
-fn metrics_reports_what_was_previously_log_only() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::{manifest_version, NO_STORE};
-        let deps = Deps::for_test(|d| d.metrics_token = Some(METRICS_TOKEN.to_owned()));
-        let auth = [("authorization", &format!("Bearer {METRICS_TOKEN}") as &str)];
-        let before = get(&deps, "/metrics", &auth).body().clone();
+// The route answers in the exposition format, and the numbers actually move — asserted as DELTAS,
+// because the counters are process-wide and every other test in this package feeds them too.
+#[tokio::test]
+async fn metrics_reports_what_was_previously_log_only() {
+    let h = new_handler(test_deps(|d| d.metrics_token = METRICS_TOKEN.to_owned()));
+    let before = body_str(&get_with(&h, "/metrics", &metrics_auth()).await);
 
-        // One cold build (a miss) then a warm hit, so each counter has a known increment.
-        let path = format!("/{}/stream/movie/tt1234567.json", crate::tests::ticket::valid_blob());
-        get(&deps, &path, &[]);
-        get(&deps, &path, &[]);
+    // One cold build (a miss) then a warm hit, so each counter has a known increment.
+    let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+    get(&h, &path, &[]).await;
+    get(&h, &path, &[]).await;
 
-        let rr = get(&deps, "/metrics", &auth);
-        assert_eq!(rr.status(), 200, "/metrics");
-        let after = rr.body().clone();
-        let deltas: [(&str, i64); 5] = [
-            (r#"scout_list_cache_total{result="miss"}"#, 1),
-            (r#"scout_list_cache_total{result="hit"}"#, 1),
-            (r#"scout_list_builds_total{result="ok"}"#, 1),
-            (r#"scout_indexer_requests_total{indexer="torrentio"}"#, 1),
-            (r#"scout_source_coverage_total{indexer="torrentio",outcome="answered"}"#, 1),
-        ];
-        for (series, want) in deltas {
-            let got = sample_value(&after, series) - sample_value(&before, series);
-            assert_eq!(got, want, "{series} moved by {got}, want {want}");
-        }
-        // A counter for something that did NOT happen must stay put.
-        let degraded = r#"scout_list_builds_total{result="degraded"}"#;
-        let d = sample_value(&after, degraded) - sample_value(&before, degraded);
-        assert_eq!(d, 0, "a healthy build counted as degraded (delta {d})");
-        let ct = rr.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
-        assert!(ct.starts_with("text/plain"), "content-type = {ct:?}");
-        let cc = rr.headers().get("cache-control").and_then(|v| v.to_str().ok()).unwrap_or_default();
-        assert_eq!(cc, NO_STORE, "cache-control = {cc:?}, want no-store");
-        let body = rr.body();
-        for want in [
-            r#"scout_list_cache_total{result="hit"}"#,
-            r#"scout_list_cache_total{result="miss"}"#,
-            r#"scout_list_builds_total{result="ok"}"#,
-            r#"scout_indexer_requests_total{indexer="torrentio"}"#,
-            r#"scout_indexer_failures_total{indexer="torrentio"}"#,
-            r#"scout_probe_cache_total{result="hit"}"#,
-            "scout_add_budget_remaining",
-            "scout_cache_persistent",
-            "# TYPE scout_list_cache_total counter",
-            "# TYPE scout_build_info gauge",
-        ] {
-            assert!(body.contains(want), "missing series {want:?}");
-        }
-        let build_info = format!(r#"scout_build_info{{version="{}"}} 1"#, manifest_version());
-        assert!(body.contains(&build_info), "missing series {build_info:?}");
-        // Every indexer is present from the start — a series that only appears after the first failure is one
-        // nobody can alert on.
-        for id in ALL_INDEXERS {
-            let series = format!(r#"scout_indexer_requests_total{{indexer="{id}"}}"#);
-            assert!(body.contains(&series), "indexer {id} has no series before it is used");
-        }
+    let rr = get_with(&h, "/metrics", &metrics_auth()).await;
+    assert_eq!(rr.status(), 200, "/metrics: {}", rr.status());
+    let after = body_str(&rr);
+    let deltas: [(&str, i64); 5] = [
+        (r#"scout_list_cache_total{result="miss"}"#, 1),
+        (r#"scout_list_cache_total{result="hit"}"#, 1),
+        (r#"scout_list_builds_total{result="ok"}"#, 1),
+        (r#"scout_indexer_requests_total{indexer="torrentio"}"#, 1),
+        (r#"scout_source_coverage_total{indexer="torrentio",outcome="answered"}"#, 1),
+    ];
+    for (series, want) in deltas {
+        let got = sample_value(&after, series) - sample_value(&before, series);
+        assert_eq!(got, want, "{series} moved by {got}, want {want}");
     }
-    todo!("pending: metrics_test.go:~54 TestMetrics_reportsWhatWasPreviouslyLogOnly")
+    // A counter for something that did NOT happen must stay put.
+    let degraded = r#"scout_list_builds_total{result="degraded"}"#;
+    let d = sample_value(&after, degraded) - sample_value(&before, degraded);
+    assert_eq!(d, 0, "a healthy build counted as degraded (delta {d})");
+    let ct = rr.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    assert!(ct.starts_with("text/plain"), "content-type = {ct:?}");
+    let cc = rr.headers().get("cache-control").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    assert_eq!(cc, NO_STORE, "cache-control = {cc:?}, want no-store");
+    let body = after;
+    let build_info = format!(r#"scout_build_info{{version="{}"}} 1"#, manifest_version());
+    for want in [
+        r#"scout_list_cache_total{result="hit"}"#,
+        r#"scout_list_cache_total{result="miss"}"#,
+        r#"scout_list_builds_total{result="ok"}"#,
+        r#"scout_indexer_requests_total{indexer="torrentio"}"#,
+        r#"scout_indexer_failures_total{indexer="torrentio"}"#,
+        r#"scout_probe_cache_total{result="hit"}"#,
+        "scout_add_budget_remaining",
+        "scout_cache_persistent",
+        "# TYPE scout_list_cache_total counter",
+        "# TYPE scout_build_info gauge",
+        build_info.as_str(),
+    ] {
+        assert!(body.contains(want), "missing series {want:?}");
+    }
+    // Every indexer is present from the start — a series that only appears after the first failure is one
+    // nobody can alert on.
+    for id in ALL_INDEXERS {
+        let series = format!(r#"scout_indexer_requests_total{{indexer="{id}"}}"#);
+        assert!(body.contains(&series), "indexer {id} has no series before it is used");
+    }
 }
 
 // The stale path has its own counter, and it is the one the stale-while-revalidate work exists to make
 // visible — how often viewers are being served a list while it is rebuilt behind them.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test / recordingCache (package 4)"]
-fn metrics_counts_stale_hits() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::{join_cached, split_cached};
-        use crate::tests::handler::RecordingCache;
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
-        let cache = Arc::new(RecordingCache::new(MemoryCache::new(1 << 20)));
-        let deps = Deps::for_test(|d| {
-            d.cache = cache.clone();
-            d.metrics_token = Some(METRICS_TOKEN.to_owned());
-        });
-        let auth = [("authorization", &format!("Bearer {METRICS_TOKEN}") as &str)];
-        let path = format!("/{}/stream/movie/tt1234567.json", crate::tests::ticket::valid_blob());
-        get(&deps, &path, &[]);
+#[tokio::test]
+async fn metrics_counts_stale_hits() {
+    let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+    let h = new_handler(test_deps(|d| {
+        d.cache = cache.clone();
+        d.metrics_token = METRICS_TOKEN.to_owned();
+    }));
+    let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+    get(&h, &path, &[]).await;
 
-        let before = sample_value(get(&deps, "/metrics", &auth).body(), r#"scout_list_cache_total{result="stale"}"#);
+    let stale = r#"scout_list_cache_total{result="stale"}"#;
+    let before = sample_value(&body_str(&get_with(&h, "/metrics", &metrics_auth()).await), stale);
 
-        let key = cache.last_key();
-        let held = cache.get(&key).expect("nothing cached");
-        let (complete, _, etag, body) = split_cached(&held);
-        let backdated = (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH).expect("epoch").as_secs() as i64;
-        cache.put(&key, &join_cached(&complete, backdated, &etag, &body), Duration::from_secs(60));
-        get(&deps, &path, &[]);
+    let key = cache.last_key();
+    let held = cache.get(&key).expect("nothing cached");
+    let (complete, _, etag, body) = split_cached(&held);
+    let backdated = (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH).expect("epoch").as_secs() as i64;
+    cache.put(&key, &join_cached(complete, backdated, etag, body), Duration::from_secs(60));
+    get(&h, &path, &[]).await;
 
-        let after = sample_value(get(&deps, "/metrics", &auth).body(), r#"scout_list_cache_total{result="stale"}"#);
-        assert_eq!(after - before, 1, "stale hits moved by {}, want 1", after - before);
-    }
-    todo!("pending: metrics_test.go:~101 TestMetrics_countsStaleHits")
+    let after = sample_value(&body_str(&get_with(&h, "/metrics", &metrics_auth()).await), stale);
+    assert_eq!(after - before, 1, "stale hits moved by {}, want 1", after - before);
 }
 
 // The route is unauthenticated, like /health, and must therefore withhold exactly what /health withholds:
 // anything that says which debrid services or accounts this install uses. addbudget.go calls that a
 // confirmation oracle and refuses to publish it; publishing it one route over would simply move the leak.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test (package 4)"]
-fn metrics_carries_no_account_or_service_detail() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::config::DebridService;
-        let deps = Deps::for_test(|d| d.metrics_token = Some(METRICS_TOKEN.to_owned()));
-        get(&deps, &format!("/{}/stream/movie/tt1234567.json", crate::tests::ticket::valid_blob()), &[]);
-        let auth = [("authorization", &format!("Bearer {METRICS_TOKEN}") as &str)];
-        let body = get(&deps, "/metrics", &auth).body().clone();
+#[tokio::test]
+async fn metrics_carries_no_account_or_service_detail() {
+    let h = new_handler(test_deps(|d| d.metrics_token = METRICS_TOKEN.to_owned()));
+    get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await;
+    let body = body_str(&get_with(&h, "/metrics", &metrics_auth()).await);
 
-        // Only the SAMPLES are data. HELP text is documentation and says "accounts" on purpose.
-        let forbidden = [
-            DebridService::TorBox.as_str(),
-            DebridService::RealDebrid.as_str(),
-            DebridService::Premiumize.as_str(),
-            "tb-secret",
-            "tt1234567",
-        ];
-        for line in body.lines() {
-            if line.starts_with('#') || line.is_empty() {
-                continue;
-            }
-            for f in forbidden {
-                assert!(!line.contains(f), "/metrics sample discloses {f:?}: {line}");
-            }
+    // Only the SAMPLES are data. HELP text is documentation and says "accounts" on purpose.
+    let blob = valid_blob();
+    let forbidden = [
+        DebridService::TorBox.as_str(),
+        DebridService::RealDebrid.as_str(),
+        DebridService::Premiumize.as_str(),
+        "tb-secret",
+        "tt1234567",
+        blob.as_str(),
+    ];
+    for line in body.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        for f in forbidden {
+            assert!(!line.contains(f), "/metrics sample discloses {f:?}: {line}");
         }
     }
-    todo!("pending: metrics_test.go:~158 TestMetrics_carriesNoAccountOrServiceDetail")
 }
 
 #[test]

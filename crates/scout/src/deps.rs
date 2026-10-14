@@ -292,6 +292,10 @@ pub struct Deps {
     /// Client for reading the head of a resolved link. Separate from the scraper client so a probe's longer
     /// body read can't tie up the timeouts tuned for indexer queries. `None` means no probe runs.
     pub probe_client: Option<reqwest::Client>,
+    /// Replaces `probe_client` for the link check and token validation when set. Go's tests drive these through
+    /// the `*http.Client`'s transport; a `reqwest::Client` has no such seam, so a test sets this instead.
+    /// Production leaves it `None`.
+    pub(crate) probe_doer: Option<Arc<dyn Doer>>,
     pub scrape_timeout: Duration,
     pub list_ttl: Duration,
     /// Fixed public origin; when empty, fall back to forwarded headers.
@@ -363,6 +367,7 @@ pub fn build_deps(settings: &Settings, client: reqwest::Client, cache: Arc<dyn C
         meta: Some(Arc::new(cinemeta_meta(doer, &settings.cinemeta_url, cache.clone()))),
         cache,
         probe_client: Some(client),
+        probe_doer: None,
         scrape_timeout: settings.scrape_timeout,
         list_ttl: settings.list_ttl,
         public_url: settings.public_url.clone(),

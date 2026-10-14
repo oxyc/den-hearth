@@ -243,6 +243,36 @@ pub trait Store: Send + Sync {
     fn known_file_size(&self, _t: &ResolveTarget) -> Option<i64> {
         None
     }
+
+    /// Go's `accountSummarizer` (handler.go `accountBody` asserts `*torBoxStore` and calls `AccountSummary`):
+    /// the account-wide facts /<config>/account reports. `None` when the store publishes none (Real-Debrid,
+    /// Premiumize); `Some(Err)` is a read that failed, which the route degrades on.
+    async fn account_summary(&self) -> Option<Result<AccountSummary, StoreError>> {
+        None
+    }
+}
+
+/// What /<config>/account reports for an account that publishes facts: Go's `torboxAccountSummary`, with the two
+/// times already printed as RFC 3339 in the zone TorBox wrote them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub plan: i64,
+    pub cooldown_until: Option<String>,
+    pub premium_expires_at: Option<String>,
+    pub active: i64,
+    pub queued: i64,
+}
+
+impl From<torbox::TorboxAccountSummary> for AccountSummary {
+    fn from(s: torbox::TorboxAccountSummary) -> AccountSummary {
+        AccountSummary {
+            plan: s.plan,
+            cooldown_until: s.cooldown_until.map(|t| t.to_rfc3339()),
+            premium_expires_at: s.premium_expires_at.map(|t| t.to_rfc3339()),
+            active: s.active,
+            queued: s.queued,
+        }
+    }
 }
 
 /// FROZEN. Go `CacheTruth`: what the pool actually learned about a batch of hashes. Not a bare map of

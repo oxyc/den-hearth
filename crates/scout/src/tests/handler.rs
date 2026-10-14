@@ -94,6 +94,7 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
     let mut d = Deps {
         cache: Arc::new(MemoryCache::new(1 << 20)),
         probe_client: None,
+        probe_doer: None,
         meta: None,
         scrape_timeout: Duration::from_secs(1),
         list_ttl: Duration::from_secs(5 * 60),
@@ -336,6 +337,75 @@ impl<S: Store> Store for CountingResolveStore<S> {
     async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
         self.inner.status(t).await
     }
+}
+
+/// One store shared by every `make_stores` call, as Go hands the handler the same `Store` value each time. Every
+/// method, optional ones included, goes to the shared store.
+#[derive(Clone)]
+pub(crate) struct SharedStore(pub Arc<dyn Store>);
+
+#[async_trait]
+impl Store for SharedStore {
+    fn service(&self) -> DebridService {
+        self.0.service()
+    }
+
+    async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        self.0.cache_check(hashes).await
+    }
+
+    async fn resolve(&self, t: &ResolveTarget) -> Result<String, StoreError> {
+        self.0.resolve(t).await
+    }
+
+    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
+        self.0.status(t).await
+    }
+
+    async fn status_answer(&self, t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+        self.0.status_answer(t).await
+    }
+
+    async fn cancel(&self, info_hash: &str, reannounce: bool) -> Option<Result<crate::stores::CancelOutcome, StoreError>> {
+        self.0.cancel(info_hash, reannounce).await
+    }
+
+    fn recent_refusal(&self, info_hash: &str) -> Option<String> {
+        self.0.recent_refusal(info_hash)
+    }
+
+    fn add_in_flight(&self, info_hash: &str) -> Option<bool> {
+        self.0.add_in_flight(info_hash)
+    }
+
+    fn holds_torrent(&self, t: &ResolveTarget) -> Option<bool> {
+        self.0.holds_torrent(t)
+    }
+
+    fn scout_budget_spent(&self) -> Option<bool> {
+        self.0.scout_budget_spent()
+    }
+
+    fn account_refused(&self) -> Option<String> {
+        self.0.account_refused()
+    }
+
+    fn budget_account(&self) -> Option<String> {
+        self.0.budget_account()
+    }
+
+    fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {
+        self.0.known_file_size(t)
+    }
+
+    async fn account_summary(&self) -> Option<Result<crate::stores::AccountSummary, StoreError>> {
+        self.0.account_summary().await
+    }
+}
+
+/// `make_stores` returning the one shared store on every call.
+pub(crate) fn shared_stores(store: Arc<dyn Store>) -> Arc<dyn Fn(&crate::config::Config) -> Vec<Box<dyn Store>> + Send + Sync> {
+    Arc::new(move |_| vec![Box::new(SharedStore(store.clone())) as Box<dyn Store>])
 }
 
 /// A dead link, as a fake store's `resolve` returns it for a release nothing can deliver.

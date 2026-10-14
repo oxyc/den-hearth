@@ -145,7 +145,7 @@ pub(crate) const REBUILD_COOLOFF: Duration = Duration::from_secs(60);
 pub(crate) const MAX_CONCURRENT_REBUILDS: usize = 8;
 
 /// What /health says about that state, and what the log line marking the flip says too.
-const INDEXERS_DOWN_DETAIL: &str = "No indexer has answered the last few stream-list builds, so lists are coming back empty.";
+pub(crate) const INDEXERS_DOWN_DETAIL: &str = "No indexer has answered the last few stream-list builds, so lists are coming back empty.";
 
 /// What /health says once a source has missed scrapeFailThreshold builds in a row while others answered.
 const SOURCES_MISSING_DETAIL: &str =
@@ -990,6 +990,11 @@ impl Handler {
     /// Go `admitInstall`.
     pub(crate) fn admit_install(&self, config: &Config) -> bool {
         self.inner.admit_install(config)
+    }
+
+    /// Go `(*handler).verifyLink`.
+    pub(crate) async fn verify_link(&self, pool: &StorePool, rt: &ResolveTarget, link: &str) -> LinkVerdict {
+        self.inner.verify_link(pool, rt, link).await
     }
 
     /// Go `hydrateProbeFacts`.
@@ -2775,8 +2780,17 @@ impl Inner {
 
     /// Go `(*handler).verifyLink`: whether a freshly minted link is the file it should be.
     async fn verify_link(&self, pool: &StorePool, rt: &ResolveTarget, link: &str) -> LinkVerdict {
-        let doer = self.deps.probe_client.clone().map(ReqwestDoer);
-        crate::linkcheck::verify_link(doer.as_ref().map(|d| d as &dyn Doer), known_file_size(pool, rt), rt, link).await
+        let doer = self.probe_doer();
+        crate::linkcheck::verify_link(doer.as_deref(), known_file_size(pool, rt), rt, link).await
+    }
+
+    /// The client the link check and token validation go through: `Deps::probe_doer` when a test set one, else the
+    /// probe client.
+    fn probe_doer(&self) -> Option<Arc<dyn Doer>> {
+        self.deps
+            .probe_doer
+            .clone()
+            .or_else(|| self.deps.probe_client.clone().map(|c| Arc::new(ReqwestDoer(c)) as Arc<dyn Doer>))
     }
 
     /// handleProbe answers "can this play yet?" without changing anything. Same vocabulary as /play so the
@@ -3116,12 +3130,11 @@ impl Inner {
         // NOTHING here logs the token, and no log line names this route with its arguments. The configure
         // page seals the config in the browser, so this is the one request in the system where the server is
         // handed a token in the clear — it is used once, for one upstream read, and not written anywhere.
-        let res = match &self.deps.probe_client {
+        let res = match self.probe_doer() {
             None => ValidateResult { reason: "validation unavailable".to_owned(), ..Default::default() },
-            Some(client) => {
+            Some(doer) => {
                 let limiter = lock(&self.validate_limiter).clone();
-                let doer = ReqwestDoer(client.clone());
-                match timeout(VALIDATE_BUDGET, validate_debrid_token(&doer, &limiter, svc, &token)).await {
+                match timeout(VALIDATE_BUDGET, validate_debrid_token(doer.as_ref(), &limiter, svc, &token)).await {
                     Ok(res) => res,
                     Err(_) => ValidateResult { reason: "timed out".to_owned(), ..Default::default() },
                 }
@@ -3426,12 +3439,103 @@ pub(crate) fn torbox_plan_name(plan: i64) -> &'static str {
 /// accountBody is one configured account's answer within /<config>/account's array. A TorBox read that
 /// fails degrades to the bare service name — the add budget below is scout's own and always answerable,
 /// but without slots/queued there is nothing else honest to report.
-///
-/// CROSS-MODULE NEED: Go downcasts the store to `*torBoxStore` and calls `AccountSummary`; the frozen `Store` trait has
-/// no such method and `stores/torbox.rs` is not this branch's. Until `Store::account_summary` lands, every account
-/// answers with its service name alone, which is also what a failed TorBox read answers.
-async fn account_body(_deadline: TokioInstant, st: &dyn Store) -> serde_json::Value {
-    let _ = torbox_plan_name;
-    json!({"service": st.service().as_str()})
+async fn account_body(deadline: TokioInstant, st: &dyn Store) -> serde_json::Value {
+    let bare = || json!({"service": st.service().as_str()});
+    let summary = match timeout_at(deadline, st.account_summary()).await {
+        Ok(None) => return bare(),
+        Ok(Some(Ok(sum))) => sum,
+        Ok(Some(Err(err))) => {
+            log_limited("account-unavailable", &format!("account {}: {err}", st.service().as_str()));
+            return bare();
+        }
+        Err(_) => {
+            log_limited(
+                "account-unavailable",
+                &format!("account {}: context deadline exceeded", st.service().as_str()),
+            );
+            return bare();
+        }
+    };
+    let mut adds = serde_json::Map::new();
+    if let Some(acct) = st.budget_account() {
+        let budget = global_add_budget();
+        adds.insert("left".to_owned(), json!(budget.remaining(&acct)));
+        let frees_in = budget.frees_in(&acct, false);
+        if !frees_in.is_zero() {
+            adds.insert("freesAt".to_owned(), json!(format_utc_rfc3339(now_unix() + frees_in.as_secs() as i64)));
+        }
+    }
+    let mut body = json!({
+        "service": st.service().as_str(),
+        "plan": torbox_plan_name(summary.plan),
+        "slots": {"active": summary.active},
+        "queued": summary.queued,
+        "adds": adds,
+    });
+    if let Some(t) = &summary.cooldown_until {
+        body["cooldownUntil"] = json!(utc_rfc3339(t));
+    }
+    if let Some(t) = &summary.premium_expires_at {
+        body["expiresAt"] = json!(utc_rfc3339(t));
+    }
+    body
+}
+
+/// Go `time.Time.UTC().Format(time.RFC3339)` for a Unix second count.
+fn format_utc_rfc3339(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let rem = unix.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Re-prints an RFC 3339 time (as `Rfc3339::to_rfc3339` writes it) in UTC without a fraction, as Go's
+/// `.UTC().Format(time.RFC3339)` does. The input is our own output, so a shape that does not parse is returned
+/// unchanged.
+fn utc_rfc3339(s: &str) -> String {
+    let b = s.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> { s.get(from..from + len)?.parse().ok() };
+    let parsed = (|| {
+        let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+        let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+        let mut i = 19;
+        if b.get(i) == Some(&b'.') {
+            i += 1;
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        let offset = match b.get(i)? {
+            b'Z' => 0,
+            sign @ (b'+' | b'-') => {
+                let secs = num(i + 1, 2)? * 3600 + num(i + 4, 2)? * 60;
+                if *sign == b'-' {
+                    -secs
+                } else {
+                    secs
+                }
+            }
+            _ => return None,
+        };
+        // Howard Hinnant's days_from_civil.
+        let y = year - i64::from(month <= 2);
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let mp = if month > 2 { month - 3 } else { month + 9 };
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
+    })();
+    parsed.map(format_utc_rfc3339).unwrap_or_else(|| s.to_owned())
 }
 

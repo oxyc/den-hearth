@@ -1,17 +1,25 @@
 //! Go: `internal/scout/reqlog_test.go` (132 lines). Work package 6.
 //!
-//! `redact_path` is live. The request-log tests drive the handler and the deps (packages 4 and 6), so they are
-//! ignored with their bodies compiled out. `capture_log` is the Go `captureLog` helper; the crate has no log sink
-//! to redirect yet, so it is `todo!()` until the logging owner lands one.
+//! `capture_log` and `LogCapture` are the Go `captureLog` helper over the crate's thread-local log sink.
+
+use regex::Regex;
+
+use crate::cache::MemoryCache;
+use crate::deps::{build_deps, settings_from_env};
+use crate::handler::new_handler;
+use crate::tests::handler::{get, test_deps};
 
 /// Go `captureLog`: runs `f` with the crate's log output captured, and returns it.
 pub(crate) fn capture_log(f: impl FnOnce()) -> String {
     crate::loglimit::capture(f)
 }
 
-/// Stands in for Go's `(?m)^<prefix>\d+<suffix>$` regexes: a line that starts with `prefix` and ends with `suffix`.
-fn has_line(log: &str, prefix: &str, suffix: &str) -> bool {
-    log.lines().any(|l| l.starts_with(prefix) && l.ends_with(suffix))
+/// Go `captureLog(t)`: log output collected from now until the guard drops, readable meanwhile with `text()`.
+pub(crate) use crate::loglimit::Capture as LogCapture;
+
+/// Go `forgetLogged`: lets a condition speak again, whatever an earlier test's line did to its minute.
+pub(crate) fn forget_logged(key: &str) {
+    crate::loglimit::LIMITED_LOG.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(key);
 }
 
 // Only the per-install segments go; the route and the stream id stay, so the line still says what was
@@ -49,72 +57,57 @@ fn redact_path() {
 
 // Unset, empty and exactly "0" leave it off; any other value turns it on.
 #[test]
-#[ignore = "needs settings_from_env / build_deps from deps.rs (package 4)"]
 fn log_requests_setting() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::cache::MemoryCache;
-        use crate::deps::{build_deps, settings_from_env};
-        for (v, want) in [("", false), ("0", false), ("1", true), ("true", true), ("yes", true)] {
-            let s = settings_from_env(|k| if k == "LOG_REQUESTS" { v.to_owned() } else { String::new() });
-            let d = build_deps(&s, None, MemoryCache::new(1 << 10));
-            assert!(s.log_requests == want && d.log_requests == want, "LOG_REQUESTS={v:?}: got {}, want {want}", s.log_requests);
-        }
+    for (v, want) in [("", false), ("0", false), ("1", true), ("true", true), ("yes", true)] {
+        let s = settings_from_env(|k| if k == "LOG_REQUESTS" { v.to_owned() } else { String::new() });
+        let d = build_deps(&s, reqwest::Client::new(), std::sync::Arc::new(MemoryCache::new(1 << 10)));
+        assert!(s.log_requests == want && d.log_requests == want, "LOG_REQUESTS={v:?}: got {}, want {want}", s.log_requests);
     }
-    todo!("pending: reqlog_test.go:~59 TestLogRequestsSetting")
 }
 
 // Off by default and silent; on, one line per response with the config, the token and the whole query
 // string gone.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test and capture_log (packages 4, 6)"]
-fn request_log() {
-    // Enable when packages 4 and 6 land: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        let out = capture_log(|| {
-            get(&Deps::for_test(|_| {}), "/health", &[]);
-        });
-        assert!(!out.contains("/health"), "a request was logged with LOG_REQUESTS off:\n{out}");
+#[tokio::test]
+async fn request_log() {
+    let out = LogCapture::start();
+    get(&new_handler(test_deps(|_| {})), "/health", &[]).await;
+    assert!(!out.text().contains("/health"), "a request was logged with LOG_REQUESTS off:\n{}", out.text());
 
-        let deps = Deps::for_test(|d| d.log_requests = true);
-        let out = capture_log(|| {
-            get(&deps, "/health", &[]);
-            get(&deps, &format!("/{}/play/tok-secret?probe=1&token=query-secret", crate::tests::ticket::valid_blob()), &[]);
-        });
-        // One line per response, in the shape `<METHOD> <redacted path> <status> <ms>ms`.
-        assert!(has_line(&out, "GET /health 200 ", "ms"), "no line for /health in:\n{out}");
-        assert!(has_line(&out, "GET /<config>/play/<token> 400 ", "ms"), "no line for the play route in:\n{out}");
-        for leak in [crate::tests::ticket::valid_blob().as_str(), "tok-secret", "query-secret", "probe"] {
-            assert!(!out.contains(leak), "the request log carried {leak:?}:\n{out}");
-        }
+    let h = new_handler(test_deps(|d| d.log_requests = true));
+    get(&h, "/health", &[]).await;
+    let blob = crate::tests::ticket::valid_blob();
+    get(&h, &format!("/{blob}/play/tok-secret?probe=1&token=query-secret"), &[]).await;
+    let got = out.text();
+    for want in [r"(?m)^GET /health 200 \d+ms$", r"(?m)^GET /<config>/play/<token> 400 \d+ms$"] {
+        assert!(Regex::new(want).unwrap().is_match(&got), "no line matching {want} in:\n{got}");
     }
-    todo!("pending: reqlog_test.go:~82 TestRequestLog")
+    for leak in [blob.as_str(), "tok-secret", "query-secret", "probe"] {
+        assert!(!got.contains(leak), "the request log carried {leak:?}:\n{got}");
+    }
 }
 
 // The app's X-Request-Id ends the line, so its log and this one join exactly; a hostile value is cut down
 // to what cannot forge a line, and no header means no rid at all.
-#[test]
-#[ignore = "needs handler::serve / Deps::for_test and capture_log (packages 4, 6)"]
-fn request_log_carries_the_request_id() {
-    // Enable when packages 4 and 6 land: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        let deps = Deps::for_test(|d| d.log_requests = true);
-        let out = capture_log(|| {
-            get(&deps, "/health", &[("X-Request-Id", "a1B2-c3_d4")]);
-            get(&deps, "/manifest.json", &[("X-Request-Id", "x y\nGET /<config>/play 200 0ms zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")]);
-            get(&deps, "/config-key", &[]);
-            get(&deps, "/configure", &[("X-Request-Id", " \n<>")]);
-        });
-        // The id is cut to [A-Za-z0-9_-] and then to 32 characters.
-        assert!(has_line(&out, "GET /health 200 ", "ms rid=a1B2-c3_d4"), "rid line for /health missing:\n{out}");
-        assert!(out.contains("rid=xyGETconfigplay2000mszzzzzzzzzzz"), "rid line for /manifest.json missing:\n{out}");
-        assert!(has_line(&out, "GET /config-key ", "ms"), "config-key line missing:\n{out}");
-        assert!(!out.contains("<config>/play"), "a request id forged a line:\n{out}");
+//
+// A header value cannot carry a newline in an `http::HeaderValue`, so the two hostile values lose their "\n"; the
+// newline was only ever one more character the cut drops, and the spaces and angle brackets still exercise it.
+#[tokio::test]
+async fn request_log_carries_the_request_id() {
+    let out = LogCapture::start();
+    let h = new_handler(test_deps(|d| d.log_requests = true));
+    get(&h, "/health", &[("X-Request-Id", "a1B2-c3_d4")]).await;
+    let hostile = format!("x yGET /<config>/play 200 0ms{}", "z".repeat(100));
+    get(&h, "/manifest.json", &[("X-Request-Id", hostile.as_str())]).await;
+    get(&h, "/config-key", &[]).await;
+    get(&h, "/configure", &[("X-Request-Id", " <>")]).await;
+    let got = out.text();
+    for want in [
+        r"(?m)^GET /health 200 \d+ms rid=a1B2-c3_d4$",
+        r"(?m)^GET /manifest\.json 200 \d+ms rid=xyGETconfigplay2000mszzzzzzzzzzz$",
+        r"(?m)^GET /config-key \d+ \d+ms$",
+        r"(?m)^GET /configure 200 \d+ms$",
+    ] {
+        assert!(Regex::new(want).unwrap().is_match(&got), "no line matching {want} in:\n{got}");
     }
-    todo!("pending: reqlog_test.go:~111 TestRequestLogCarriesTheRequestID")
+    assert!(!got.contains("<config>/play"), "a request id forged a line:\n{got}");
 }

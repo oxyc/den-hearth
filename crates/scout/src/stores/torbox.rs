@@ -2699,6 +2699,10 @@ impl Store for TorBoxStore {
         let id = select_file_id(&files, t).ok()??;
         size_of(&files, id)
     }
+
+    async fn account_summary(&self) -> Option<Result<super::AccountSummary, StoreError>> {
+        Some(TorBoxStore::account_summary(self).await.map(Into::into))
+    }
 }
 
 impl TorBoxStore {
