@@ -45,3 +45,77 @@ pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
 pub fn b64url_encode(b: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(b)
 }
+
+/// Go `strings.ToLower`: maps each character through its SIMPLE lower-case form.
+///
+/// Rust's `str::to_lowercase` uses the full mapping (U+0130 becomes two characters) and a context rule for the
+/// final sigma, so it can disagree with Go on the same input. A value lower-cased here is then matched against an
+/// ASCII-only pattern (an infohash), where "İ" must become "i" as it does in Go.
+pub(crate) fn go_to_lower(s: &str) -> String {
+    s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
+}
+
+/// The shape of a JSON document as far as [`fold_json_keys`] needs it: which keys name fields, and what each holds.
+pub(crate) enum Shape {
+    /// A value with no field names inside it that matter.
+    Leaf,
+    /// An array whose elements all have the one shape.
+    Array(&'static Shape),
+    /// An object, with the exact spelling of each field it reads.
+    Object(&'static [(&'static str, &'static Shape)]),
+}
+
+/// A leaf, for `Shape::Object` tables to point at.
+pub(crate) static LEAF: Shape = Shape::Leaf;
+
+/// Go's `encoding/json` matches an object key to a struct field case-insensitively, after trying the exact
+/// spelling. serde matches exactly. This rewrites every key `shape` names to the field's exact spelling, so a
+/// document Go would have read as `{"DEBRID": …}` decodes here as well. Keys the shape does not name are left alone
+/// (serde ignores them, as Go does).
+///
+/// Folding is Go's simple case folding, which for the ASCII field names used here adds two characters to the
+/// ASCII pairs: U+017F (long s) folds with "s" and U+212A (Kelvin sign) with "k".
+///
+/// One divergence: the keys of a `serde_json::Map` are ordered, not in document order, so when one object holds
+/// two spellings of the same field the winner is the one that sorts last (the exact spelling when there is one),
+/// where Go keeps the later one in the document. A config that does that was not written by any encoder.
+pub(crate) fn fold_json_keys(v: &mut serde_json::Value, shape: &Shape) {
+    match (v, shape) {
+        (serde_json::Value::Object(map), Shape::Object(fields)) => {
+            let old = std::mem::take(map);
+            for (key, mut child) in old {
+                let field = fields
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .or_else(|| fields.iter().find(|(name, _)| fold_eq(name, &key)));
+                match field {
+                    Some((name, sub)) => {
+                        fold_json_keys(&mut child, sub);
+                        map.insert((*name).to_owned(), child);
+                    }
+                    None => {
+                        map.insert(key, child);
+                    }
+                }
+            }
+        }
+        (serde_json::Value::Array(items), Shape::Array(inner)) => {
+            for item in items {
+                fold_json_keys(item, inner);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether two keys are equal under simple case folding. `name` is ASCII.
+fn fold_eq(name: &str, key: &str) -> bool {
+    fn fold(c: char) -> char {
+        match c {
+            '\u{017F}' => 's',
+            '\u{212A}' => 'k',
+            c => c.to_ascii_lowercase(),
+        }
+    }
+    name.chars().map(fold).eq(key.chars().map(fold))
+}
