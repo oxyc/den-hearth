@@ -149,6 +149,9 @@ prefixed paths on :8090 then follow its own `PUBLIC_BASE_URL`, or the request's 
 
 ## Configuration
 
+The allocator is jemalloc with its purge tuning compiled in (`crates/hearth/src/alloc.rs`; the startup line
+`allocator: ...` shows what is in force); `_RJEM_MALLOC_CONF` (jemalloc's `MALLOC_CONF`, prefixed) overrides it.
+
 `PORT` (default 8090) and `HEARTH_WORKER_THREADS` (default 2) are hearth's own. Each service keeps the
 environment it has today, but several share names (`CACHE_DIR`, `CACHE_MAX_BYTES`, `CONFIG_KEY`,
 `METRICS_TOKEN`, `LOG_REQUESTS`, `SCOUT_ORIGINS`, `PUBLIC_BASE_URL`, ...), so a service can be given a
