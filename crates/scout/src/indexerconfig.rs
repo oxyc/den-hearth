@@ -36,7 +36,7 @@ use tokio::sync::OnceCell;
 use crate::config::{Config, DebridAccount, DebridService, Indexer};
 use crate::loglimit::log_limited;
 use crate::rank::RawStream;
-use crate::scrape::{DoError, Doer, Scraper, ScrapeQuery, DEFAULT_INDEXER_URLS};
+use crate::scrape::{DoError, Doer, Scraper, ScrapeQuery, UnaskableError, DEFAULT_INDEXER_URLS, SCRAPE_USER_AGENT};
 use crate::util::key_hash;
 
 /// Go `mintedTTL`: how long a minted config is reused. Long enough that minting is rare, short enough that a
@@ -323,12 +323,6 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
-/// Go `scrapeUserAgent` (scrape.go), the user agent every indexer and minting request is sent with. It belongs in
-/// scrape.rs with `MAX_SCRAPE_BYTES` (cinemeta.rs keeps a copy of that too); scrape.rs is not part of this
-/// module's review, so both wait there for whoever ports scrape.go.
-pub(crate) const SCRAPE_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
 /// Reads at most `limit` bytes of a response body. None when the body cannot be read.
 pub(crate) async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
@@ -424,7 +418,8 @@ impl Scraper for UnaskableScraper {
     }
 
     async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
-        Err(format!("{}: no config URL, not asked", self.indexer.0).into())
+        // Typed, so coverage can tell a misconfigured indexer from an outage: Go reads the scraper's type for that.
+        Err(Box::new(UnaskableError { indexer: self.indexer.0.clone(), transient: self.transient }))
     }
 }
 
