@@ -98,8 +98,11 @@ impl MemoryCache {
 impl Cache for MemoryCache {
     fn get(&self, key: &str) -> Option<Arc<str>> {
         let entry = self.entries.get(key)?;
-        if (self.now)() > entry.expires {
-            self.entries.remove(key);
+        let now = (self.now)();
+        if now > entry.expires {
+            // Conditional, under the shard lock: a `put` that landed since the read above has replaced the
+            // expired entry, and removing by key alone would delete the fresh one.
+            self.entries.remove_if(key, |e| now > e.expires);
             return None;
         }
         Some(entry.value)
