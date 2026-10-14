@@ -522,11 +522,12 @@ fn int_env(v: &str, d: usize) -> usize {
 }
 
 /// Go `boolEnvOr` reads a boolean env var that defaults to ON (unlike LogRequests's off-by-default check):
-/// unset or blank keeps the default, "0" or "false" (any case) is off, anything else is on.
-fn bool_env_or(v: &str, d: bool) -> bool {
+/// unset or blank keeps the default, "0", "false", "off" or "no" (any case) is off, anything else is on —
+/// the rule every Den addon reads `LOG_IDENTITY` by.
+pub(crate) fn bool_env_or(v: &str, d: bool) -> bool {
     let v = v.trim();
     if v.is_empty() {
         return d;
     }
-    v != "0" && !v.eq_ignore_ascii_case("false")
+    !["0", "false", "off", "no"].iter().any(|off| v.eq_ignore_ascii_case(off))
 }

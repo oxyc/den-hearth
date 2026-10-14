@@ -431,7 +431,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `SEGMENTS_DAILY_CAP` | `300` | Episodes fingerprinted per UTC day at most; past it a scan request is `503 busy`. Counted in memory, so a restart resets it. |
 | `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response; `POST /remux/session`'s line also carries `session=<id>` once it creates one. |
-| `LOG_IDENTITY` | on | `0`/`false` drops the title id, release label, size and the chosen audio/subtitle's language from the audio-track and end-of-session log lines, keeping everything else (session id, `rid`, codecs, channel counts, segment/second counts, end reason). |
+| `LOG_IDENTITY` | on | `0`/`false`/`off`/`no` (case-insensitive) drops the title id, release label, size and the chosen audio/subtitle's language from the audio-track and end-of-session log lines, keeping everything else (session id, `rid`, codecs, channel counts, segment/second counts, end reason). |
 | `PORT` | `8095` | |
 
 A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-_'); printf %s "$key" | sha256sum`.

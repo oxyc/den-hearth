@@ -1129,6 +1129,14 @@ fn log_identity_is_on_by_default_and_off_only_for_a_falsey_token() {
     }
 }
 
+#[test]
+fn env_opt_trims() {
+    std::env::set_var("DEN_REEL_TEST_ENV_OPT_TRIM", "  value \n");
+    assert_eq!(crate::config::env_opt("DEN_REEL_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
+    std::env::set_var("DEN_REEL_TEST_ENV_OPT_TRIM", "   ");
+    assert_eq!(crate::config::env_opt("DEN_REEL_TEST_ENV_OPT_TRIM"), None);
+}
+
 /// yt-dlp's `%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s` print line, parsed for the decision
 /// log — and never fatal to the download it describes when it doesn't parse.
 #[test]

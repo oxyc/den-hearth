@@ -49,9 +49,15 @@ pub struct Config {
 
 fn env_opt(key: &str) -> Option<String> {
     match env::var(key) {
-        Ok(v) if !v.is_empty() => Some(v),
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
         _ => None,
     }
+}
+
+/// `LOG_IDENTITY`: on unless it is `0`, `false`, `off` or `no` (trimmed, any case). Every Den addon
+/// reads it by this rule.
+pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
+    !matches!(v.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
 impl Config {
@@ -81,11 +87,34 @@ impl Config {
             metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
             log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
             // Default ON, unlike `LOG_REQUESTS` above — unset must keep diagnosing titles, not stop
-            // doing it, so only an explicit "0" turns it off.
-            log_identity: env_opt("LOG_IDENTITY").is_none_or(|v| v != "0"),
+            // doing it, so only an explicit off-token turns it off.
+            log_identity: log_identity_on(env_opt("LOG_IDENTITY").as_deref()),
             os_api_base: crate::opensubtitles::API.to_string(),
             scout_origins: crate::resync::parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
             scout_aliases: crate::resync::parse_aliases(&env_opt("SCOUT_ALIASES").unwrap_or_default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_identity_is_off_for_the_shared_off_tokens_only() {
+        assert!(log_identity_on(None));
+        assert!(log_identity_on(Some("")));
+        assert!(log_identity_on(Some("1")));
+        for v in ["0", "false", "off", "no", "FALSE", " Off "] {
+            assert!(!log_identity_on(Some(v)), "{v:?} should turn identity logging off");
+        }
+    }
+
+    #[test]
+    fn env_opt_trims() {
+        std::env::set_var("DEN_SUBTITLES_TEST_ENV_OPT_TRIM", "  value \n");
+        assert_eq!(env_opt("DEN_SUBTITLES_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
+        std::env::set_var("DEN_SUBTITLES_TEST_ENV_OPT_TRIM", "   ");
+        assert_eq!(env_opt("DEN_SUBTITLES_TEST_ENV_OPT_TRIM"), None);
     }
 }
