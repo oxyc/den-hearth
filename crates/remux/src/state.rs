@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use den_upstream::{ClientProfile, Redirect};
+
 use crate::config::Config;
 use crate::probe::MediaInfo;
 use crate::scout::Resolved;
@@ -415,22 +417,47 @@ impl Unplayable {
 /// How long a read from a release's host may sit with no byte arriving, while it is being read.
 const SOURCE_READ_IDLE: Duration = Duration::from_secs(30);
 
-/// The client that reads releases: the probe's ranged reads, and a session's ffmpeg through its door (`source`), on
-/// one pool, so ffmpeg's reads go over the connection the probe opened. No total timeout: a read of the film runs as
-/// long as ffmpeg takes it, paused whenever the player is far enough ahead, so only a connection that won't open and
-/// a read that stops arriving — timed only while it is being read — end one.
+/// How long a connection to a release's host, or to scout, may take to open.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The profile of the client that reads releases: the probe's ranged reads, and a session's ffmpeg through its door
+/// (`source`), on one pool, so ffmpeg's reads go over the connection the probe opened. No total timeout: a read of the
+/// film runs as long as ffmpeg takes it, paused whenever the player is far enough ahead, so only a connection that
+/// won't open and a read that stops arriving — timed only while it is being read — end one.
 ///
 /// It follows no redirect. `scout::resolve` walks the play URL's redirects itself and checks every hop (`SourceGuard`);
 /// the URL it ends on answers ranges directly. A redirect on a later read is an upstream sending the link somewhere
 /// new, which nothing has checked, so it is a failed read like an expired link, never a hop followed.
-pub fn source_client(connect: Duration, read_idle: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(connect)
-        .read_timeout(read_idle)
+pub fn source_profile(connect: Duration, read_idle: Duration) -> ClientProfile {
+    ClientProfile::new()
+        .redirect(Redirect::Never)
+        .connect(connect)
+        .read_idle(read_idle)
         .user_agent(crate::user_agent())
-        .build()
-        .expect("reqwest client")
+}
+
+pub fn source_client(connect: Duration, read_idle: Duration) -> reqwest::Client {
+    source_profile(connect, read_idle).build().expect("reqwest client")
+}
+
+/// The profile of the client for requests to Remux's own neighbours. Scout may spend its whole scrape timeout on a
+/// slow indexer before it answers a list, so the total bound is generous.
+fn service_profile() -> ClientProfile {
+    ClientProfile::new()
+        .connect(CONNECT_TIMEOUT)
+        .total(Duration::from_secs(60))
+        .user_agent(crate::user_agent())
+}
+
+/// The general client (the grant usage report to den-edge): redirects are reqwest's default.
+pub fn http_profile() -> ClientProfile {
+    service_profile()
+}
+
+/// Requests to scout: follows no redirect, so the service key cannot be carried off scout's origin
+/// (`scout::resolve` follows them by hand).
+pub fn scout_profile() -> ClientProfile {
+    service_profile().redirect(Redirect::Never)
 }
 
 pub struct AppState {
@@ -559,23 +586,13 @@ impl Drop for ProducerPermit {
 
 impl AppState {
     pub fn new(cfg: Config) -> Arc<AppState> {
-        let client = |redirects: reqwest::redirect::Policy| {
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                // Scout may spend its whole scrape timeout on a slow indexer before it answers a list.
-                .timeout(Duration::from_secs(60))
-                .user_agent(crate::user_agent())
-                .redirect(redirects)
-                .build()
-                .expect("reqwest client")
-        };
         let producer_slots = Arc::new(tokio::sync::Semaphore::new(cfg.max_active_remuxes));
         let transcode_slots = Arc::new(tokio::sync::Semaphore::new(cfg.max_transcodes));
         Arc::new(AppState {
             cfg,
-            http: client(reqwest::redirect::Policy::default()),
-            source_http: source_client(Duration::from_secs(10), SOURCE_READ_IDLE),
-            scout_http: client(reqwest::redirect::Policy::none()),
+            http: http_profile().build().expect("reqwest client"),
+            source_http: source_client(CONNECT_TIMEOUT, SOURCE_READ_IDLE),
+            scout_http: scout_profile().build().expect("reqwest client"),
             source_guard: crate::scout::SourceGuard::for_build(),
             sessions: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
@@ -1109,6 +1126,36 @@ pub(crate) async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each client keeps the settings it was fixed with. The source client has no total timeout, only a connect
+    /// bound and a read-idle one, and follows no redirect (#20): a redirect on a later read is a failed read. The
+    /// scout client follows none either, so the service key cannot leave scout's origin. Only the general client
+    /// follows redirects. All carry Remux's user agent.
+    #[test]
+    fn the_client_profiles_keep_their_timeouts_redirects_and_agent() {
+        let source = source_profile(CONNECT_TIMEOUT, SOURCE_READ_IDLE);
+        assert_eq!(source.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(source.read_idle_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(source.total_timeout(), None, "a total timeout would cut a film read that ffmpeg paces");
+        assert!(matches!(source.redirect_policy(), Redirect::Never));
+
+        let scout = scout_profile();
+        assert_eq!(scout.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(scout.total_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(scout.read_idle_timeout(), None);
+        assert!(matches!(scout.redirect_policy(), Redirect::Never));
+
+        let http = http_profile();
+        assert_eq!(http.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(http.total_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(http.read_idle_timeout(), None);
+        assert!(matches!(http.redirect_policy(), Redirect::Default));
+
+        for profile in [&source, &scout, &http] {
+            assert_eq!(profile.user_agent_str(), Some(crate::user_agent()));
+            assert_eq!(profile.address_guard(), &den_upstream::Guard::None);
+        }
+    }
 
     fn opened(url: &str) -> (Resolved, MediaInfo) {
         let info = MediaInfo {

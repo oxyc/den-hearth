@@ -8,8 +8,9 @@ use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use den_upstream::{ClientProfile, Paused, Pauses, Policy};
 use futures_util::future::Shared;
 use tokio::sync::Semaphore;
 
@@ -203,7 +204,7 @@ pub struct AppState {
     /// Paused while YouTube is throttling this box. Every path that would start an extraction —
     /// download, direct resolve, search — asks it first; a throttled extraction trips it, and one
     /// that works clears it. Surfaced as `degraded: youtube_throttled`.
-    pub youtube: crate::backoff::Backoff,
+    pub youtube: YoutubePause,
     /// The /health reason last logged (`None` = ok), so `note_health` writes a line only when the
     /// verdict changes.
     pub health_logged: Mutex<Option<&'static str>>,
@@ -338,30 +339,93 @@ impl AppState {
     }
 }
 
-/// rustls client for metadata lookups, with a modest total timeout so a wedged upstream can't pin
-/// a request forever.
-pub(crate) fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        // Named, so an upstream operator reading their logs can tell who is calling.
+/// Metadata lookups (TMDB, KinoCheck, the HLS playlists): rustls, with a modest total timeout so a wedged upstream
+/// can't pin a request forever. The user agent is named, so an upstream operator reading their logs can tell who is
+/// calling.
+pub(crate) fn metadata_profile() -> ClientProfile {
+    ClientProfile::new()
+        .total(Duration::from_secs(15))
         .user_agent(format!("den-reel/{}", crate::release_version()))
-        .build()
-        .expect("reqwest client")
 }
 
-/// The client for relaying media: no total or read timeout, because both would count the time a
-/// slow or paused player leaves the response unread. The relay bounds each upstream wait itself.
-pub(crate) fn media_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
+/// Relaying media: no total or read timeout, because both would count the time a slow or paused player leaves the
+/// response unread. The relay bounds each upstream wait itself.
+pub(crate) fn media_profile() -> ClientProfile {
+    ClientProfile::new()
+        .connect(Duration::from_secs(15))
         .user_agent(format!("den-reel/{}", crate::release_version()))
-        .build()
-        .expect("reqwest client")
+}
+
+pub(crate) fn http_client() -> reqwest::Client {
+    metadata_profile().build().expect("reqwest client")
+}
+
+pub(crate) fn media_client() -> reqwest::Client {
+    media_profile().build().expect("reqwest client")
+}
+
+/// The pause table for TMDB and KinoCheck, one entry per upstream and credential. An unstated refusal waits 30 s,
+/// doubling; a stated one waits as long as it asked, up to an hour, so a misconfigured or hostile upstream cannot
+/// switch discovery off for a day.
+pub(crate) fn discovery_pauses<K: std::hash::Hash + Eq + Clone>() -> Pauses<K> {
+    Pauses::new(Policy {
+        base: Duration::from_secs(30),
+        cap: Duration::from_secs(60 * 60),
+        jitter_permille: 200,
+        max_keys: 1024,
+    })
+}
+
+/// Log a refusal that began a pause, and an answer that ended one, so the transitions are in the log and not every
+/// request. Written after the table's lock is released: stderr is a pipe someone else drains.
+pub(crate) fn note_paused(name: &str, why: &str, paused: Paused) {
+    if paused.started {
+        eprintln!(
+            "{name}: {why} — pausing requests for {}s (strike {})",
+            paused.wait.as_millis().div_ceil(1000),
+            paused.strikes
+        );
+    }
+}
+
+pub(crate) fn note_lifted(name: &str, lifted: bool) {
+    if lifted {
+        eprintln!("{name}: answering again — pause lifted");
+    }
+}
+
+/// Paused while YouTube is throttling this box. Every path that would start an extraction — download, direct
+/// resolve, search — asks it first; a throttled extraction trips it, and one that works clears it. Times are epoch
+/// milliseconds on `AppState::clock`.
+pub struct YoutubePause(Pauses<()>);
+
+impl YoutubePause {
+    /// What is left of the pause, or `None` when YouTube may be asked.
+    pub fn remaining_ms(&self, now: u64) -> Option<u64> {
+        self.0.remaining(&(), Duration::from_millis(now)).map(|left| left.as_millis() as u64)
+    }
+
+    /// YouTube refused us: pause for the next window, five minutes doubling. Returns what is left of the pause.
+    pub fn trip(&self, now: u64, why: &str) -> u64 {
+        let paused = self.0.refuse(&(), None, Duration::from_millis(now));
+        note_paused("youtube", why, paused);
+        paused.wait.as_millis() as u64
+    }
+
+    /// YouTube answered: end any pause and forget the strikes.
+    pub fn clear(&self) {
+        note_lifted("youtube", self.0.clear(&()));
+    }
 }
 
 /// The YouTube throttle pause, with its production window.
-pub fn youtube_backoff() -> crate::backoff::Backoff {
-    crate::backoff::Backoff::new("youtube", crate::YOUTUBE_PAUSE_BASE_MS, crate::YOUTUBE_PAUSE_CAP_MS)
+pub fn youtube_backoff() -> YoutubePause {
+    YoutubePause(Pauses::new(Policy {
+        base: Duration::from_millis(crate::YOUTUBE_PAUSE_BASE_MS),
+        cap: Duration::from_millis(crate::YOUTUBE_PAUSE_CAP_MS),
+        jitter_permille: 200,
+        max_keys: 1,
+    }))
 }
 
 /// Real prober: ask yt-dlp whether the id is extractable here and (for the resolver's landscape

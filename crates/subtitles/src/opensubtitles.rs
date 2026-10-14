@@ -16,6 +16,14 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::ratelimit::{self, Pauses};
 
+/// The wait a refusal named, if it named one.
+fn stated(throttle: den_upstream::Throttle) -> Option<Duration> {
+    match throttle {
+        den_upstream::Throttle::Stated(wait) => Some(wait),
+        den_upstream::Throttle::Unstated => None,
+    }
+}
+
 /// OpenSubtitles asks every API consumer for `User-Agent: <app name> v<version>`, so this one keeps
 /// that form rather than the `den-subtitles/<version>` the shared client sends everywhere else.
 fn user_agent() -> String {
@@ -147,12 +155,12 @@ impl<'a> Client<'a> {
     ) {
         let key = self.api_limit_key();
         let now = SystemTime::now();
-        if ratelimit::throttled(status, headers) {
-            self.limits.api.limited(key, ratelimit::retry_after(headers, now));
+        if let Some(throttle) = den_upstream::throttle(status, headers, now) {
+            self.limits.api.limited(key, stated(throttle));
         } else if status.is_success() {
             self.limits.api.answered(key, observed);
             // Answered, and told the window is spent: the next call would be the 429.
-            if let Some(wait) = ratelimit::exhausted_for(headers, now) {
+            if let Some(wait) = den_upstream::exhausted_for(headers, now) {
                 self.limits.api.hold(key, wait);
             }
         }
@@ -337,10 +345,8 @@ impl<'a> Client<'a> {
             )
         {
             let code = resp.status();
-            let stated = ratelimit::throttled(code, resp.headers())
-                .then(|| ratelimit::retry_after(resp.headers(), SystemTime::now()))
-                .flatten();
-            self.limits.cdn.limited(cdn_key, stated);
+            let wait = den_upstream::throttle(code, resp.headers(), SystemTime::now()).and_then(stated);
+            self.limits.cdn.limited(cdn_key, wait);
             return Err(DownloadError::Unavailable(format!("subtitle CDN {code}")));
         }
         if !resp.status().is_success() {

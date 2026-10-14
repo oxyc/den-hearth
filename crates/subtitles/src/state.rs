@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use den_seal::Keyring;
+use den_upstream::ClientProfile;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Admission and the 64 MiB memory-cache cap are one 512 MiB cgroup budget. Three concurrent
@@ -68,17 +69,23 @@ pub struct AppState {
     pub llm_pauses: crate::ratelimit::Pauses,
 }
 
+/// The one client for OpenSubtitles, the translation providers and the subtitle CDN. Bounded so an upstream that
+/// never responds can't pin a request task forever: the connect bound is tight; the overall bound is generous
+/// because a translation batch on a slow model is legitimately slow (per-request LLM calls override it upward).
+/// Redirects are reqwest's default.
+pub(crate) fn api_profile() -> ClientProfile {
+    ClientProfile::new()
+        .user_agent(format!("den-subtitles/{}", crate::release_version()))
+        .connect(Duration::from_secs(10))
+        .total(Duration::from_secs(60))
+}
+
 impl AppState {
     pub fn new(cfg: Config) -> Arc<AppState> {
         // Bounded so an upstream (OpenSubtitles / LLM) that never responds can't pin a request task
         // forever. The connect bound is tight; the overall bound is generous because a translation
         // batch on a slow model is legitimately slow (per-request LLM calls override it upward).
-        let http = match reqwest::Client::builder()
-            .user_agent(format!("den-subtitles/{}", crate::release_version()))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()
-        {
+        let http = match api_profile().build() {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("warning: HTTP client init failed ({e}) — subtitle/translate routes will 503");
@@ -320,6 +327,27 @@ impl Drop for SyncPermit<'_> {
             self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
             self.stats.running.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    /// The shared client keeps the bounds it was fixed with: a tight connect, a generous total, redirects as
+    /// reqwest follows them, the named agent.
+    #[test]
+    fn the_api_profile_keeps_its_timeouts_redirects_and_agent() {
+        let profile = api_profile();
+        assert_eq!(profile.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(profile.total_timeout(), Some(Duration::from_secs(60)));
+        assert_eq!(profile.read_idle_timeout(), None);
+        assert!(matches!(profile.redirect_policy(), den_upstream::Redirect::Default));
+        assert_eq!(profile.address_guard(), &den_upstream::Guard::None);
+        assert_eq!(
+            profile.user_agent_str(),
+            Some(format!("den-subtitles/{}", crate::release_version()).as_str())
+        );
     }
 }
 

@@ -13,6 +13,8 @@ license = "MIT"
 den-seal = { path = "../seal" }
 # Response builders, conditional GETs, CORS, the request log line and the metrics bearer check, shared with Subtitles and Remux.
 den-http = { path = "../http" }
+# Client profiles, Retry-After and the per-credential pause, shared with Subtitles, Remux and Scout.
+den-upstream = { path = "../upstream" }
 # Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
 # minimal on a homelab box.

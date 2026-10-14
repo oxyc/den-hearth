@@ -7,8 +7,8 @@ publish = false
 license = "MIT"
 
 [dependencies]
-# The public-address classifier a play URL's non-scout hops are checked with, shared with Scout and Subtitles.
-den-net = { path = "../net" }
+# Client profiles and the address guard a play URL's non-scout hops are checked with, shared with Reel, Scout and Subtitles.
+den-upstream = { path = "../upstream" }
 # Response builders, CORS, the request log line and the metrics bearer check, shared with Reel and Subtitles.
 den-http = { path = "../http" }
 # Single-threaded async runtime: the process only routes requests and watches ffmpeg, which does the

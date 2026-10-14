@@ -11,6 +11,9 @@ license = "MIT"
 den-net = { path = "../net" }
 # The response body, conditional GETs, CORS, the bearer check and the request log line every addon shares.
 den-http = { path = "../http" }
+# Client profiles, the dial-time address guard, Retry-After and the per-credential pause, shared with Reel,
+# Subtitles and Remux.
+den-upstream = { path = "../upstream" }
 # The request and response bodies the handler serves.
 bytes = "1"
 http-body-util = "0.1"
@@ -51,10 +54,6 @@ regex = "1"
 fancy-regex = "0.19"
 # Go `net/url`, for the household source links in sources.go.
 url = "2"
-# Go `http.ParseTime` for a Retry-After date (upstreampause.go): IMF-fixdate, RFC 850 and asctime.
-httpdate = "1"
-# Go `math/rand` for the jitter on an unnamed pause (upstreampause.go).
-fastrand = "2"
 # The memory tier (cache.rs `MemoryCache`): a sharded, byte-weighted cache, so a hit does not queue behind a
 # write and the budget is bytes, not entries.
 quick_cache = "0.6"

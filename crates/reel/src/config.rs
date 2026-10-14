@@ -264,12 +264,7 @@ pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<u64> {
         }
         _ => return None,
     };
-    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's days_from_civil).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let days = den_upstream::civil::days_from_civil(year, month as u32, day as u32);
     let secs = days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60;
     u64::try_from(secs * 1000 + ms).ok()
 }

@@ -6,7 +6,7 @@
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -278,6 +278,11 @@ static ERROR_PAGE_PLAYS: AtomicU32 = AtomicU32::new(0);
 /// Lists and subtitles the `flaky` den-subtitles install was asked for.
 static FLAKY_LISTS: AtomicU32 = AtomicU32::new(0);
 static FLAKY_SUBTITLES: AtomicU32 = AtomicU32::new(0);
+/// Whether the `/p/hold/` copy of a fixture may be read past `HELD_FROM_TENTHS` of its length. Closed until a test
+/// opens it: a job reading that copy cannot reach the end of the film, so it cannot exit before the test says so.
+static HELD_COPY_OPEN: AtomicBool = AtomicBool::new(false);
+/// The part of a `hold` copy, in tenths of its length, that is served at once.
+const HELD_FROM_TENTHS: usize = 9;
 
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
 /// asks for.
@@ -486,6 +491,7 @@ async fn origin_handle(
             "tt0000002" => "hevc.mkv",
             "tt0000003" => "h264.mp4",
             "tt0000009" => "slow/h264.mkv",
+            "tt0000030" => "hold/h264.mkv",
             "tt0000011" => "av1.mkv",
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
@@ -541,6 +547,10 @@ async fn origin_handle(
             .unwrap();
     }
     let Some(rest) = path.strip_prefix("/f/") else { return origin_full(404, "") };
+    let (held, rest) = match rest.strip_prefix("hold/") {
+        Some(n) => (true, n),
+        None => (false, rest),
+    };
     let (slow, name) = match rest.strip_prefix("slow/") {
         Some(n) => (true, n),
         None => (false, rest),
@@ -579,6 +589,23 @@ async fn origin_handle(
         .header("content-length", slice.len());
     if status == 206 {
         b = b.header("content-range", format!("bytes {start}-{end}/{size}"));
+    }
+    if held && slice.len() >= 64 * 1024 {
+        // Everything up to the held point at once, then nothing until a test opens the copy.
+        let held_from = size / 10 * HELD_FROM_TENTHS;
+        let chunks: Vec<(usize, Bytes)> = slice
+            .chunks(32 * 1024)
+            .enumerate()
+            .map(|(i, c)| (start + i * 32 * 1024 + c.len(), Bytes::copy_from_slice(c)))
+            .collect();
+        let stream = futures_util::stream::unfold(chunks.into_iter(), move |mut it| async move {
+            let (end, c) = it.next()?;
+            while end > held_from && !HELD_COPY_OPEN.load(Relaxed) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Some((Ok::<_, Infallible>(hyper::body::Frame::data(c)), it))
+        });
+        return b.body(http_body_util::StreamBody::new(stream).boxed()).unwrap();
     }
     if !slow || slice.len() < 64 * 1024 {
         return b.body(Full::new(slice).boxed()).unwrap();
@@ -1385,11 +1412,16 @@ async fn a_session_outlives_five_minutes_of_silence() {
 #[tokio::test]
 #[ignore = "needs ffmpeg"]
 async fn a_paused_session_releases_its_producer_and_resumes_on_demand() {
+    // The release is a `hold` copy: its last tenth is withheld until the test opens it, so the first producer can
+    // fill its ahead window and be paused, but can never run to the end of the film first. On a copy that simply
+    // trickles, a loaded runner's supervisor (it looks at a running job every `TICK`) could miss the window between
+    // "four segments ahead" and "finished", leaving every segment on disk and nothing to resume.
+    HELD_COPY_OPEN.store(false, Relaxed);
     let origin = origin().await;
     let state = test_state(&origin, 4, Duration::from_secs(600));
     let cookie = login(&state, "phone-key").await;
     let created =
-        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000009"}"#).await.json();
+        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000030"}"#).await.json();
     let sid = created["sid"].as_str().unwrap().to_string();
     let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::OK);
@@ -1404,11 +1436,14 @@ async fn a_paused_session_releases_its_producer_and_resumes_on_demand() {
     }
     assert_eq!(state.active_producers.load(Relaxed), 0, "a paused producer kept its slot");
     assert!(state.session(&sid).is_some(), "parking the producer ended the logical session");
+    assert!(state.session(&sid).is_some_and(|s| s.job_pid().is_none()), "the producer was not parked");
+    assert_eq!(state.jobs_started.load(Relaxed), 1, "the first producer ended some other way than parked");
 
+    HELD_COPY_OPEN.store(true, Relaxed);
     let began = Instant::now();
     assert_eq!(call(&state, "GET", &format!("{base}seg5.m4s"), None, "").await.status, StatusCode::OK);
     assert!(began.elapsed() < Duration::from_secs(20), "resume exceeded the segment deadline");
-    assert!(state.jobs_started.load(Relaxed) >= 2, "resume did not start a fresh bounded producer");
+    assert_eq!(state.jobs_started.load(Relaxed), 2, "resume did not start a fresh bounded producer");
     state.end_all("test").await;
 }
 

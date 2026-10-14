@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use den_seal::Revocation;
+use den_upstream::ClientProfile;
 
 use crate::addbudget::{set_play_reserve, ADD_BUDGET_LIMIT, DEFAULT_PLAY_RESERVE};
 use crate::cache::Cache;
@@ -289,6 +290,13 @@ pub struct GuardedClient {
     writes: reqwest::Client,
 }
 
+/// The profile of the client Scout's stores, scrapers and probes share (Go `cmd/den-scout/main.go`): thirty seconds in
+/// all and a pooled keep-alive connection per host. Its redirect policy is per method (`GuardedClient`), so the
+/// profile leaves it unset.
+pub fn shared_profile() -> ClientProfile {
+    ClientProfile::new().total(Duration::from_secs(30)).pool(32, Duration::from_secs(90))
+}
+
 impl GuardedClient {
     /// `builder` is called twice, once per client, and must not set a redirect policy of its own.
     pub fn new(builder: impl Fn() -> reqwest::ClientBuilder) -> Result<GuardedClient, reqwest::Error> {
@@ -296,6 +304,11 @@ impl GuardedClient {
             reads: builder().redirect(reqwest::redirect::Policy::custom(follow_read_redirect)).build()?,
             writes: builder().redirect(reqwest::redirect::Policy::custom(follow_write_redirect)).build()?,
         })
+    }
+
+    /// The two clients of `profile`, which must not set a redirect policy of its own.
+    pub fn from_profile(profile: &ClientProfile) -> Result<GuardedClient, reqwest::Error> {
+        GuardedClient::new(|| profile.builder())
     }
 }
 

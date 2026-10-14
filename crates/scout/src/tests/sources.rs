@@ -5,6 +5,41 @@ use std::net::IpAddr;
 use crate::scrape::parse_stremio_streams;
 use crate::sources::MAX_SOURCE_URL;
 
+/// The household sources' client keeps what it was fixed with: thirty seconds in all, ten to connect, a pool of four
+/// idle connections for ninety seconds, its own redirect verdict, and the dial-time public-address guard (no proxy).
+#[test]
+fn the_source_profile_keeps_its_timeouts_redirect_and_guard() {
+    use std::time::Duration;
+
+    use den_upstream::{Guard, Redirect};
+
+    let profile = crate::sources::source_profile();
+    assert_eq!(profile.total_timeout(), Some(Duration::from_secs(30)));
+    assert_eq!(profile.connect_timeout(), Some(Duration::from_secs(10)));
+    assert_eq!(profile.read_idle_timeout(), None);
+    assert_eq!(profile.pool_settings(), Some((4, Duration::from_secs(90))));
+    assert!(matches!(profile.redirect_policy(), Redirect::Custom(_)));
+    assert_eq!(profile.address_guard(), &Guard::PublicDial);
+    assert_eq!(profile.user_agent_str(), None);
+}
+
+/// The shared client (stores, scrapers, probes) keeps its thirty seconds and its pool, and leaves the redirect
+/// policy to `GuardedClient`, which sets it per method.
+#[test]
+fn the_shared_profile_keeps_its_timeout_and_pool() {
+    use std::time::Duration;
+
+    use den_upstream::{Guard, Redirect};
+
+    let profile = crate::deps::shared_profile();
+    assert_eq!(profile.total_timeout(), Some(Duration::from_secs(30)));
+    assert_eq!(profile.connect_timeout(), None);
+    assert_eq!(profile.pool_settings(), Some((32, Duration::from_secs(90))));
+    assert!(matches!(profile.redirect_policy(), Redirect::Default));
+    assert_eq!(profile.address_guard(), &Guard::None);
+    assert!(crate::deps::GuardedClient::from_profile(&profile).is_ok());
+}
+
 #[test]
 fn normalize_sources() {
     let mf = "https://mediafusion.example/D-secret";
