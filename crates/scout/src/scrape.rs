@@ -224,7 +224,7 @@ pub(crate) fn parse_seeders(s: &str) -> Option<i64> {
 }
 
 /// Go `normalizeHash`: a 40- or 32-character lower-case alphanumeric hash, trimmed and lower-cased.
-fn normalize_hash(h: &str) -> Option<String> {
+pub(crate) fn normalize_hash(h: &str) -> Option<String> {
     let h = go_to_lower(h.trim());
     let well_formed = (h.len() == 40 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     well_formed.then_some(h)

@@ -1826,9 +1826,9 @@ fn decode_listing_does_not_retain_the_body() {
 }
 
 #[test]
-#[ignore = "needs hashNorm (package 5) and infoHashRe (package 6), plus a counting allocator"]
+#[ignore = "Go-runtime measurement (runtime.MemStats): the allocation bound on a 24 MiB hash needs a counting allocator in the test binary; hashNorm and infoHashRe exist now (scrape::normalize_hash, play::is_info_hash) and the functional half runs in decode_listing_drops_unusable_hashes_functional_half"]
 fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
-    // Enable when packages 5 and 6 land and a counting allocator is in place: move this body up.
+    // Kept as the Go body: only its allocation bound is out of reach.
     #[cfg(any())]
     fn pending() {
         // Hashes nothing could ask about are dropped before retention; a body of them still reads as
@@ -1882,4 +1882,101 @@ fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
         assert!(ok && got.get(&lowered).copied() == Some(7), "a hash judged on its raw byte length was dropped though it lowers into range");
     }
     todo!("pending: stores_test.go:2107 TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount")
+}
+
+// Not in the Go suite: the parts of the three allocation-measuring decode tests that do not need a counting
+// allocator — what the decoder answers, not how many bytes it allocated getting there.
+
+#[test]
+fn skip_value_refuses_runaway_nesting_functional_half() {
+    use crate::stores::torbox::{decode_listing, ListingFault};
+
+    let deep = format!(r#"{{"success":true,"x":{}"#, "[".repeat(1 << 20));
+    let (_, ok, fault) = decode_listing(deep.as_bytes());
+    assert!(!ok && fault == ListingFault::BadEnvelope, "runaway nesting: ok={ok} fault={fault:?}, want false and BadEnvelope");
+}
+
+#[test]
+fn decode_listing_does_not_retain_the_body_functional_half() {
+    use crate::stores::torbox::decode_listing;
+
+    // Two fixtures: bulk in a skipped top-level field, and bulk inside data[].
+    let mut skipped = String::from(r#"{"success":true,"unknown_field":["#);
+    let mut i = 0;
+    while skipped.len() < 24 << 20 {
+        if i > 0 {
+            skipped.push(',');
+        }
+        skipped.push_str(&format!(r#"{{"noise":"{}"}}"#, "f".repeat(6000)));
+        i += 1;
+    }
+    skipped.push_str(&format!(r#"],"data":[{{"id":1,"hash":"{}"}}]}}"#, "a".repeat(40)));
+
+    let mut in_data = String::from(r#"{"success":true,"data":["#);
+    let mut j = 0;
+    while in_data.len() < 24 << 20 {
+        if j > 0 {
+            in_data.push(',');
+        }
+        in_data.push_str(&format!(r#"{{"id":{j},"hash":"{j:040x}","files":"{}"}}"#, "f".repeat(6000)));
+        j += 1;
+    }
+    in_data.push_str("]}");
+
+    for (name, body) in [("bulk in a skipped top-level field", skipped.as_str()), ("bulk inside the data array", in_data.as_str())] {
+        let (ids, ok, _) = decode_listing(body.as_bytes());
+        assert!(ok, "{name}: the fixture did not decode");
+        assert!(!ids.is_empty(), "{name}: no entries");
+    }
+}
+
+#[test]
+fn decode_listing_drops_unusable_hashes_functional_half() {
+    use crate::play::{is_info_hash, MAX_INFO_HASH_LEN, MIN_INFO_HASH_LEN};
+    use crate::scrape::normalize_hash;
+    use crate::stores::torbox::{decode_listing, ListingFault};
+
+    // Hashes nothing could ask about are dropped before retention; a body of them still reads as
+    // "could not read this", never "the account holds nothing".
+    let good = "a".repeat(40);
+    let giant = format!(r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}},{{"id":2,"hash":"{good}"}}]}}"#, "A".repeat(8 << 20));
+    let (ids, ok, _) = decode_listing(giant.as_bytes());
+    assert!(ok, "one unusable entry must not make the whole listing unreadable");
+    assert_eq!(ids.get(&good).copied(), Some(2), "the usable entry was lost");
+    assert!(ids.keys().all(|k| k.len() <= 40), "retained a hash longer than any infohash");
+
+    let mut junk = String::from(r#"{"success":true,"data":["#);
+    for i in 0..=MAX_LISTING_ENTRIES {
+        if i > 0 {
+            junk.push(',');
+        }
+        junk.push_str(r#"{"id":1,"hash":"tooshort"}"#);
+    }
+    junk.push_str("]}");
+    let (_, ok, fault) = decode_listing(junk.as_bytes());
+    assert!(!ok && fault == ListingFault::TooManyEntries, "a listing of more than {MAX_LISTING_ENTRIES} unusable hashes: ok={ok} fault={fault:?}");
+
+    let renamed = format!(r#"{{"success":true,"data":[{{"id":1,"infohash":"{good}"}},{{"id":2,"infohash":"x"}}]}}"#);
+    let (_, ok, fault) = decode_listing(renamed.as_bytes());
+    assert!(!ok && fault == ListingFault::NoUsableEntries, "a listing whose entries all filtered out: ok={ok} fault={fault:?}");
+    let (ids, ok, _) = decode_listing(&br#"{"success":true,"data":[]}"#[..]);
+    assert!(ok && ids.is_empty(), "a genuinely empty account must stay an ANSWER");
+
+    // The filter keeps 32 (base32) and 40 (hex) character hashes, and nothing else.
+    assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds");
+    for n in [32usize, 40] {
+        assert!(normalize_hash(&"b".repeat(n)).is_some(), "hashNorm rejects a {n}-char hash the listing keeps");
+        let (got, ok, _) = decode_listing(format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{}"}}]}}"#, "b".repeat(n)).as_bytes());
+        assert!(ok && got.get(&"b".repeat(n)).copied() == Some(9), "a {n}-char hash that /play accepts was dropped");
+    }
+    for n in [31usize, 33, 39, 41, 64] {
+        assert!(normalize_hash(&"b".repeat(n)).is_none(), "hashNorm accepts a {n}-char hash the listing filter drops");
+    }
+
+    // The length that decides is the LOWERED one: 32 upper-case Kelvin signs lower into a valid hash.
+    let kelvin = "\u{212A}".repeat(32);
+    let lowered = kelvin.to_lowercase();
+    assert!(is_info_hash(&lowered), "the fixture does not lower into an askable hash");
+    let (got, ok, _) = decode_listing(format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{kelvin}"}}]}}"#).as_bytes());
+    assert!(ok && got.get(&lowered).copied() == Some(7), "a hash judged on its raw byte length was dropped though it lowers into range");
 }

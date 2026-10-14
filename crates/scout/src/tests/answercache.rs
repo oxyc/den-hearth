@@ -241,7 +241,7 @@ async fn scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_questio
 
 // A caller that arrives already canceled starts no work at all.
 #[test]
-#[ignore = "needs MemoryCache-free scrape_all_cached plus Scraper::answer_key (FROZEN change)"]
+#[ignore = "Go cancels the caller's context before calling and asserts the empty return values; in Rust a caller that has gone is a future dropped before it is polled, which runs nothing and returns nothing to assert on (the mid-flight departure is scrape_all_cached_one_caller_leaving_does_not_cancel_the_shared_question)"]
 fn scrape_all_cached_does_not_start_detached_work_for_a_canceled_caller() {
     #[cfg(any())]
     async fn pending() {
