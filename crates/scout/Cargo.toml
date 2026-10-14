@@ -8,6 +8,9 @@ license = "MIT"
 
 [dependencies]
 async-trait = "0.1"
+# Std and url base64 for the config path segment, the sealed-config key and the play token (Go
+# `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.
+base64 = "0.22"
 # The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
