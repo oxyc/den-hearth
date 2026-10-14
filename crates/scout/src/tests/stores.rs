@@ -1124,6 +1124,55 @@ fn decode_listing_entries_do_not_inherit_from_the_entry_before() {
     assert_eq!(ids.len(), 2, "expected exactly the two hashed entries, got {ids:?}");
 }
 
+// The entry's `id` is read straight to an int64 rather than through its text: the whole range is an id, and
+// anything else that is a valid number (a fraction, an exponent, one past either end) is a type error.
+#[test]
+fn decode_listing_id_is_an_int64_or_a_type_error() {
+    let hash = "a".repeat(40);
+    for (id, want) in [
+        ("9223372036854775807", Some(i64::MAX)),
+        ("-9223372036854775808", Some(i64::MIN)),
+        ("-0", Some(0)),
+        ("9223372036854775808", None),
+        ("-9223372036854775809", None),
+        ("1.0", None),
+        ("1e2", None),
+        ("-1.5E+3", None),
+    ] {
+        let body = format!(r#"{{"success":true,"data":[{{"id":{id},"hash":"{hash}"}}]}}"#);
+        let (ids, ok, fault) = decode_listing(body.as_bytes());
+        match want {
+            Some(want) => assert!(ok && id_of(&ids, &hash) == want, "id {id}: ok={ok} ids={ids:?}"),
+            None => assert!(!ok && fault == ListingFault::BadEnvelope, "id {id}: ok={ok} fault={fault:?}"),
+        }
+    }
+}
+
+// Keys match case-insensitively by simple folding, after their escapes are decoded; escapes inside a field that
+// is skipped, or in the middle of the hash, do not disturb the entry around them.
+#[test]
+fn decode_listing_keys_fold_and_unescape() {
+    let hash = "ab".repeat(20);
+    let upper = hash.to_uppercase();
+    for key in ["id", "ID", "Id"] {
+        let body = format!(r#"{{"success":true,"data":[{{"{key}":5,"hash":"{hash}"}}]}}"#);
+        assert_eq!(id_of(&decode_listing(body.as_bytes()).0, &hash), 5, "key {key}");
+    }
+    for key in ["hash", "HASH", "HaSh", "ha\u{17f}h", "\\u0068ash", "h\\u0061sh"] {
+        let body = format!(r#"{{"success":true,"data":[{{"id":6,"{key}":"{upper}"}}]}}"#);
+        assert_eq!(id_of(&decode_listing(body.as_bytes()).0, &hash), 6, "key {key}");
+    }
+    for key in ["hash2", "hashh", "has", "ha\u{17f}", "idd", "\\u00e9d", "ha\\ud800sh"] {
+        let body = format!(r#"{{"success":true,"data":[{{"id":6,"{key}":"{hash}"}}]}}"#);
+        let (_, ok, fault) = decode_listing(body.as_bytes());
+        assert!(!ok && fault == ListingFault::NoUsableEntries, "key {key}: ok={ok} fault={fault:?}");
+    }
+    // A surrogate pair, a lone surrogate, a BMP escape and the short escapes, all spelled as JSON escapes.
+    let name = "a\\n\\\"b\\\" \\ud83d\\ude00 \\ud800x \\u00e9";
+    let body = format!(r#"{{"success":true,"data":[{{"id":7,"name":"{name}","hash":"{hash}"}}]}}"#);
+    assert_eq!(id_of(&decode_listing(body.as_bytes()).0, &hash), 7);
+}
+
 // A deeply nested unknown field is refused rather than walked: a body nested past the bound is an envelope
 // fault, not a long walk.
 #[test]

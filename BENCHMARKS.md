@@ -39,7 +39,7 @@ allocator, which counts the same thing (calls to the allocator per iteration).
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | decode_config_segment/plain | 3.53 µs | 2.24 µs | 0.6x | 3.68 µs | 2.27 µs | 0.6x | 70 | 34 | 7.05 KB | 1.79 KB |
 | decode_config_segment/sealed | 26.3 µs | 47.5 µs | 1.8x | 27.6 µs | 48 µs | 1.7x | 71 | 44 | 7.56 KB | 3.03 KB |
-| decode_torbox_listing (10.5 MB) | 19.4 ms | 27.2 ms | 1.4x | 19.6 ms | 27.6 ms | 1.4x | **457,788** | 9,584 | 4.66 MB | 11.5 MB |
+| decode_torbox_listing (10.5 MB) | 7.68 ms | 27.2 ms | 3.5x | 7.80 ms | 27.6 ms | 3.5x | 4,766 | 9,584 | 763 KB | 11.5 MB |
 | memory_get_hit | 132 ns | 39.4 ns | 0.3x | 140 ns | 39.8 ns | 0.3x | 2.19 | 0 | 1.14 KB | 0 B |
 | memory_get_miss | 18.1 ns | 4.88 ns | 0.3x | 18.2 ns | 4.93 ns | 0.3x | 0 | 0 | 0 | 0 B |
 | memory_put_evicting | 120 ns | 102 ns | 0.9x | 199 ns | 105 ns | 0.5x | 3.17 | 2 | 1.18 KB | 112 B |
@@ -74,10 +74,11 @@ allocator, which counts the same thing (calls to the allocator per iteration).
   cache (`get` is 3x slower: it clones the value, so 2.2 allocations and a copy of the entry per hit, where Go returns the
   string). The causes below are read from the code and not profiled: a ticket's payload goes through a
   `serde_json::Value` and `fold_json_keys` before it is a struct and the AEAD key is expanded on every call.
-- **Allocation outlier**: decoding a 10.5 MB TorBox listing (4,752 torrents) makes **457,788 allocations**, 48x Go's
-  9,584, for the same answer and at 1.4x the speed: about 96 per torrent. Read from the code, not profiled: each of an
-  entry's 24 top-level keys is read into a `String` and lowercased into a second one (`entry_field`) before it is
-  found to be a key to skip.
+- **Allocation outlier, fixed by perf/hot-listing**: decoding a 10.5 MB TorBox listing (4,752 torrents) made **457,788
+  allocations**, 48x Go's 9,584, at 1.4x Go's speed: about 96 per torrent, from reading every key into a `String`
+  (and a second one to lower-case it), every skipped number into a `String`, and a `Vec` per skipped container. It now
+  makes 4,766 (the hash strings the map keeps, plus the map's growth) and runs in 7.68 ms against 19.6 ms back to back
+  (the before and after runs are in `bench/results/hot-listing-before-*` and `hot-listing-after-*`).
 
 ### Hot paths of the other three services (allocations per call)
 
