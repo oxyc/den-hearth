@@ -95,6 +95,12 @@ pub fn url_sig_ok(key: &[u8], sid: &str, exp: u64, presented: &str) -> bool {
     presented.len() == SIG_LEN && presented.as_bytes().ct_eq(url_sig(key, sid, exp).as_bytes()).into()
 }
 
+/// The key a session's restart record in scratch is sealed with (`resume`): derived from `REMUX_URL_KEY` under its
+/// own domain, so it signs nothing and nothing it seals can pass for a signature.
+pub fn record_key(key: &[u8]) -> [u8; 32] {
+    mac(key, "den-remux/session-record", &[])
+}
+
 /// A browser's id: the first 8 bytes of its key hash. Stable across logins, names nothing secret, and
 /// stops matching the moment that hash is removed from `BROWSER_KEY_HASHES`.
 pub fn browser_id(hash: &[u8; 32]) -> String {

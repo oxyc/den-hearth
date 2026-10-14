@@ -42,7 +42,7 @@ const SNAP: f64 = 0.05;
 pub const TRAIL: f64 = 1.0;
 
 /// One thing a player can pick: a language, and where its cues come from.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Rendition {
     /// As `lang::canonical` gives it.
     pub lang: String,

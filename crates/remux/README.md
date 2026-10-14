@@ -379,8 +379,9 @@ Low resource use comes first, and the design follows from it:
   libva has to load Intel's driver at run time, which a fully static binary cannot, and that driver is
   most of the image now. Disk only: nothing loads it until a transcode starts. den-reel's image on the box is 693 MB
   (Debian ffmpeg, yt-dlp, deno, MP4Box).
-- **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start and a
-  session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
+- **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start — keeping the
+  sessions a shutdown suspended, to resume (`ARCHITECTURE.md`), and removing those not resumed within
+  `SESSION_IDLE_SECS` — and a session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
   while its ffmpeg is actually running and otherwise sleeps until a request or its idle deadline.
 - **One ffmpeg per session**, `-threads 1` (the video is copied; AAC needs one thread — a 7.1 track decoded and
   encoded to 5.1 took 0.90 CPU-s for 30 s against stereo's 0.60, 34× real time on one Apple Silicon core), paused with
@@ -418,7 +419,7 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `MAX_ACTIVE_REMUXES` | `2` | ffmpeg producers active at once. Extra sessions wait fairly when media is requested. |
 | `PRODUCER_IDLE_SECS` | `10` | Reap a producer paused on a full ahead window after this long, or promptly under producer contention; keep its logical session and finished GOPs. |
 | `SESSION_IDLE_SECS` | `600` | A session with no request for this long is ended (min 30). |
-| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: every `s-*` directory in it is deleted at start. Stable probe metadata and unplayable verdicts persist here without credentials. |
+| `SCRATCH_DIR` | `/cache` | Where GOP files go. den-remux's alone: at start every `s-*` directory is deleted but a session's that a shutdown suspended — its sealed record opens and is unexpired, and it was written to within `SESSION_IDLE_SECS` — which is kept to resume (`ARCHITECTURE.md`) and deleted if no player returns within `SESSION_IDLE_SECS`. Must be on disk, not a tmpfs, for sessions to survive a restart. Stable probe metadata and unplayable verdicts persist here without credentials. |
 | `SCRATCH_MAX_BYTES` | `1073741824` | Cap across sessions; past it a job pauses once the requested segment is done (min 64 MiB). |
 | `FFMPEG_PATH` | `ffmpeg` | The image sets `/usr/local/bin/ffmpeg`. (There is no `FFPROBE_PATH`: probing is done in-process.) |
 | `MAX_TRANSCODES` | `1` | Active producers transcoding on the GPU at once; `0` turns transcoding off. Copies do not count. |
