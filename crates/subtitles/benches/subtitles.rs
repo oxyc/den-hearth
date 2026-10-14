@@ -208,14 +208,56 @@ fn etag_of_body(bencher: Bencher) {
     bencher.counter(BytesCount::new(body.len())).bench(|| subs::etag_of(black_box(body.as_bytes())));
 }
 
+/// A changed body on each put, so the disk tier has a write to do on every iteration.
 #[divan::bench]
 fn cache_put_disk(bencher: Bencher) {
     let dir = tempfile::tempdir().unwrap();
-    let cache = subs::Cache::new(1 << 20, Some(dir.path().to_path_buf()));
+    // A disk budget the run cannot reach, so it measures the write and not the sweep a burst past the budget starts.
+    let cache = subs::Cache::new(1 << 30, Some(dir.path().to_path_buf()));
     let body = srt(2000);
     let mut i = 0usize;
     bencher.counter(BytesCount::new(body.len())).bench_local(|| {
-        cache.put(format!("dl:{}", i & 127), black_box(body.clone()), Duration::from_secs(3600));
+        cache.put(format!("dl:{}", i & 127), black_box(format!("{i}{body}")), Duration::from_secs(3600));
+        i += 1;
+    });
+}
+
+/// What the full 64 MiB memory tier holds: a household's subtitle bodies, or the small markers and counters that
+/// outnumber them. (entries, bytes per entry), each about 60 MiB in all.
+const FULL: [(usize, usize); 2] = [(900, 70_000), (30_000, 2_000)];
+
+fn full_cache(entries: usize, size: usize) -> subs::Cache {
+    let cache = subs::Cache::new(64 << 20, None);
+    let value = "x".repeat(size);
+    for i in 0..entries {
+        cache.put(format!("os:{i}"), value.clone(), Duration::from_secs(3600));
+    }
+    cache
+}
+
+/// A hit in a cache at its budget: 0 is 900 bodies, 1 is 30,000 markers.
+#[divan::bench(args = [0, 1])]
+fn cache_get_hit_full(bencher: Bencher, shape: usize) {
+    let (entries, size) = FULL[shape];
+    let cache = full_cache(entries, size);
+    let mut x = 0x9E37_79B9usize;
+    bencher.bench_local(|| {
+        x = x.wrapping_mul(2_654_435_761).wrapping_add(1) % entries;
+        cache.get_shared(black_box(&format!("os:{x}")))
+    });
+}
+
+/// A put into a cache at its budget, so each one evicts: the cost of making room.
+#[divan::bench(args = [0, 1])]
+fn cache_put_evicting(bencher: Bencher, shape: usize) {
+    let (entries, size) = FULL[shape];
+    // Ten percent more than fits, so the tier is evicting before the first measured put.
+    let entries = entries * 11 / 10;
+    let cache = full_cache(entries, size);
+    let value = "x".repeat(size);
+    let mut i = entries;
+    bencher.bench_local(|| {
+        cache.put(format!("os:{i}"), black_box(value.clone()), Duration::from_secs(3600));
         i += 1;
     });
 }

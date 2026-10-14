@@ -496,6 +496,50 @@ nix run nixpkgs#cargo-nextest -- nextest run --workspace --locked --profile ci  
 python3 bench/test_speed.py --label after --root . --target /tmp/target --runs 3 # the table above
 ```
 
+### One cache tier (den-cache)
+
+Scout and Subtitles used to carry two different tiered caches; both are now `crates/cache`, built from Scout's design.
+Measured by replaying household traffic against the real cache on a real directory with a simulated clock
+(`crates/subtitles/benches/cache_replay.rs`, `crates/scout/benches/cache_replay.rs`; the Subtitles replay also counts heap with
+a counting allocator). Before = `58d32df` (baseline hooks only), after = this branch. Raw lines:
+`bench/results/den-cache/`. Subtitles, 24 h / 400 titles and 72 h / 150 titles:
+
+| | before | after |
+|---|---:|---:|
+| disk writes per hour | 144.1 / 86.5 | 139.2 / 82.0 |
+| bytes written per hour | 4,629,736 / 2,379,720 | 4,629,638 / 2,379,631 |
+| hit rate | 0.376 / 0.493 | 0.376 / 0.493 |
+| heap with the cache full (MB) | 69.5 / 70.8 | 70.7 / 70.7 |
+| hourly sweep (ms, 2.8-3.7 k files) | 14-38 / 34-63 | 0.9 / 3.1-3.4 |
+| restart over the same directory, 24 h run (ms; fastest / median of 4) | 35.0 / 37.2 | 36.5 / 36.8 |
+
+In this replay the writes it saves are the pin that is written twice in a row (the same value, 180 days): the search
+entries, quota counters and bodies all change, or are new, so there is nothing else to skip. Bytes do not move because
+those files are 5-10 bytes. Opening the cache walks the directory once: that one pass builds the index and reclaims what
+expired, so the boot sweep is not a second pass (an earlier version of this branch read the directory twice and was
+slower to start). Restart runs were interleaved, before/after, at load average 17-28 on a shared laptop; the first run
+after a build is a 5-10x cold-cache outlier on either side. The sweep time and restart rows for 72 h come from earlier,
+two-pass runs and are in the raw lines only.
+
+Scout, 24 h: writes 256.8 /h and 362 skipped puts, unchanged; bytes 2,162,663 -> 2,163,849 /h (the length in the
+header); hit rate 0.627 unchanged; restart over 4,352 files (fastest / median of 3) 61.2 / 78.1 ms before, 58.8 / 59.5
+ms after, one directory listing in both.
+
+Divan, `bench/micro.sh subtitles cache_` (median / mean ns, a cache holding about 64 MiB):
+
+| | before | after |
+|---|---:|---:|
+| hit, 900 bodies of 70 KB | 123 / 120 | 69 / 78 |
+| hit, 30,000 markers of 2 KB | 412 / 499 | 214 / 245 |
+| put that evicts, 900 bodies | 2,361 / 2,365 | 1,153 / 1,349 |
+| put that evicts, 30,000 markers | 60,260 / 86,800 | 188 / 207 |
+| put with a disk write (157 KB) | 135,000 / 199,000 | 142,000 / 145,000 |
+| `get_shared` hit, 64 bodies | 45.5 | 51.5 |
+
+The eviction was a scan of every entry for the least recently used; a put into a full cache of small entries now costs
+what an insert costs. Scout's memory tier is the same code as before, and `cache_mem` `get_hit` t=1 reads 21.6 ns before and
+22.5 ns after (this laptop was shared, and the same binary reads 20-50 ns from run to run).
+
 ## How to run
 
 ```sh

@@ -419,6 +419,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "den-cache"
+version = "0.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "quick_cache",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "den-hearth"
 version = "0.1.0"
 dependencies = [
@@ -531,6 +541,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chacha20poly1305",
+ "den-cache",
  "den-http",
  "den-media",
  "den-net",
@@ -542,7 +553,6 @@ dependencies = [
  "hkdf",
  "http",
  "http-body-util",
- "quick_cache",
  "regex",
  "reqwest",
  "serde",
@@ -573,6 +583,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chardetng",
+ "den-cache",
  "den-http",
  "den-net",
  "den-seal",

@@ -89,7 +89,7 @@ pub fn replay_cache(
     dir: &Path,
     clock: std::sync::Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
 ) -> TieredCache {
-    TieredCache::new(memory_bytes, dir).with_clock(clock)
+    TieredCache::new_with_clock(memory_bytes, dir, clock)
 }
 
 /// What the process does once an hour (hearth's `sweep_every`). Returns entries removed.
@@ -100,8 +100,8 @@ pub fn replay_hourly(cache: &TieredCache) -> i64 {
 /// A tiered cache with the disk budget off, so a long write benchmark measures the write and not the sweep a
 /// burst past the budget starts (the Go benchmark does the same).
 pub fn tiered_cache_without_disk_budget(memory_bytes: usize, dir: &Path) -> TieredCache {
-    let mut cache = TieredCache::new(memory_bytes, dir);
-    cache.max_bytes = 0;
+    let cache = TieredCache::new(memory_bytes, dir);
+    cache.set_max_bytes(0);
     cache
 }
 

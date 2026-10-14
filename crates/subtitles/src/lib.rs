@@ -393,9 +393,10 @@ pub fn init(cfg: Config) -> Arc<AppState> {
     }
     let state = AppState::new(cfg);
 
-    // Reclaim the disk cache hourly. `Cache::new` sweeps at boot, which bounds the store across
-    // restarts but not within one — a container that stays up keeps writing entries that only a
-    // repeat request for the same key would ever expire.
+    // Reclaim the disk cache hourly. Opening the cache walks the directory once and drops what expired
+    // or is torn while the process was down, which bounds the store across restarts but not within
+    // one — a container that stays up keeps writing entries that only a repeat request for the same
+    // key would ever expire.
     {
         let state = state.clone();
         tokio::spawn(async move {
