@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -33,10 +33,48 @@ pub const TRANSLATE_NS: &str = "translate:";
 /// resident headroom reserved for subprocesses and transient buffers.
 pub const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+/// A cached value: shared text, valid UTF-8 by construction (it is only ever built from a `String`),
+/// so reading it as `&str` costs nothing and handing it to a response copies nothing.
+///
+/// Cloning is a refcount bump, so concurrent serves of a hot body hold one copy between them rather
+/// than one each. The cue-density numbers the serve log reports are measured at most once per body,
+/// on the first hit that asks, and shared by every later one.
+#[derive(Clone)]
+pub struct Text(Arc<TextInner>);
+
+struct TextInner {
+    text: String,
+    stats: OnceLock<Option<crate::srt::Stats>>,
+}
+
+impl Text {
+    pub fn new(text: String) -> Text {
+        Text(Arc::new(TextInner { text, stats: OnceLock::new() }))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0.text
+    }
+
+    /// The body as a response payload, sharing this allocation instead of copying it.
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::from_owner(self.clone())
+    }
+
+    /// `srt::stats` over this body, parsed on the first call only.
+    pub fn stats(&self) -> Option<crate::srt::Stats> {
+        *self.0.stats.get_or_init(|| crate::srt::stats(&crate::srt::parse(&self.0.text)))
+    }
+}
+
+impl AsRef<[u8]> for Text {
+    fn as_ref(&self) -> &[u8] {
+        self.0.text.as_bytes()
+    }
+}
+
 struct Entry {
-    /// Shared, not owned by one reader: a hit hands out a refcounted view of this allocation, so
-    /// concurrent serves of a hot body hold one copy between them rather than one each.
-    value: Bytes,
+    value: Text,
     size: usize,
     expires: Instant,
     /// Monotonic touch counter for LRU (cheaper than reordering a list under a mutex).
@@ -248,18 +286,18 @@ impl Cache {
     /// An owned copy of the value. For small markers and counters; a body that is served should go
     /// through `get_shared`, which copies nothing.
     pub fn get(&self, key: &str) -> Option<String> {
-        self.get_shared(key).map(into_string)
+        self.get_shared(key).map(|v| v.as_str().to_owned())
     }
 
     /// The value as a refcounted view of the cached allocation: no copy, and it stays valid after the
     /// entry is evicted or expires (the memory is then freed with the last reader).
-    pub fn get_shared(&self, key: &str) -> Option<Bytes> {
+    pub fn get_shared(&self, key: &str) -> Option<Text> {
         if let Some(v) = self.mem_get(key) {
             return Some(v);
         }
         // Memory miss: fall back to disk, then repopulate memory for the next hit.
         if let Some((value, remaining)) = self.disk_get(key) {
-            let value = Bytes::from(value);
+            let value = Text::new(value);
             self.mem_put(key.to_string(), value.clone(), remaining);
             return Some(value);
         }
@@ -268,7 +306,7 @@ impl Cache {
 
     pub fn put(&self, key: String, value: String, ttl: Duration) {
         self.disk_put(&key, &value, ttl);
-        self.mem_put(key, Bytes::from(value), ttl);
+        self.mem_put(key, Text::new(value), ttl);
     }
 
     /// How long `key` has left, if it is present — for a marker whose lifetime is the answer, like a
@@ -282,7 +320,7 @@ impl Cache {
             }
         }
         let (value, remaining) = self.disk_get(key)?;
-        self.mem_put(key.to_string(), Bytes::from(value), remaining);
+        self.mem_put(key.to_string(), Text::new(value), remaining);
         Some(remaining)
     }
 
@@ -303,7 +341,7 @@ impl Cache {
     /// paid for. That is the trade. A retry by the same process, which is the common case and the
     /// one the viewer is sitting in front of, is unaffected.
     pub fn put_mem(&self, key: String, value: String, ttl: Duration) {
-        self.mem_put(key, Bytes::from(value), ttl);
+        self.mem_put(key, Text::new(value), ttl);
     }
 
     /// Forget a key in both tiers. For an entry that has been proven wrong rather than merely stale
@@ -335,12 +373,12 @@ impl Cache {
     /// a disk probe that, for a key only ever written by `put_mem`, cannot hit — a blocking `open`
     /// per lookup, ~150 of them per resumed film, all of them ENOENT.
     pub fn get_mem(&self, key: &str) -> Option<String> {
-        self.mem_get(key).map(into_string)
+        self.mem_get(key).map(|v| v.as_str().to_owned())
     }
 
     // ---- memory tier -------------------------------------------------------
 
-    fn mem_get(&self, key: &str) -> Option<Bytes> {
+    fn mem_get(&self, key: &str) -> Option<Text> {
         let mut g = self.inner.lock().unwrap();
         g.tick += 1;
         let tick = g.tick;
@@ -361,10 +399,10 @@ impl Cache {
     /// `size` counts the value once, however many readers hold a view of it: an evicted entry's bytes
     /// are freed when its last reader finishes, so a body still being served is briefly resident
     /// outside the budget, but never duplicated by it.
-    fn mem_put(&self, key: String, value: Bytes, ttl: Duration) {
+    fn mem_put(&self, key: String, value: Text, ttl: Duration) {
         let mut g = self.inner.lock().unwrap();
         g.tick += 1;
-        let size = key.len() + value.len();
+        let size = key.len() + value.as_str().len();
         if let Some(old) = g.map.remove(&key) {
             g.bytes -= old.size;
         }
@@ -484,11 +522,6 @@ impl Cache {
             let _ = std::fs::remove_file(&tmp);
         }
     }
-}
-
-/// Only `String`s go in, so the bytes are always valid UTF-8 and the fallback never substitutes.
-fn into_string(v: Bytes) -> String {
-    String::from_utf8(v.to_vec()).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn unix_now() -> u64 {
@@ -779,13 +812,44 @@ mod tests {
         c.put("k".into(), "0123456789".into(), HOUR);
         let a = c.get_shared("k").unwrap();
         let b = c.get_shared("k").unwrap();
-        assert_eq!(&a[..], b"0123456789");
-        assert_eq!(a.as_ptr(), b.as_ptr(), "a hit copied the body");
+        assert_eq!(a.as_str(), "0123456789");
+        assert_eq!(a.as_str().as_ptr(), b.as_str().as_ptr(), "a hit copied the body");
+        assert_eq!(a.to_bytes().as_ptr(), a.as_str().as_ptr(), "the response payload copied the body");
         assert_eq!(c.stats().bytes, "k".len() + 10, "readers must not add to the budget");
         // A reader outlives the entry's eviction and still sees the same bytes.
         c.remove("k");
-        assert_eq!(&a[..], b"0123456789");
+        assert_eq!(a.as_str(), "0123456789");
         assert_eq!(c.stats().bytes, 0);
+    }
+
+    #[test]
+    fn a_bodys_cue_stats_are_those_of_parsing_it() {
+        let mut srt = String::new();
+        for i in 0..40u64 {
+            let (s, e) = (i * 3000, i * 3000 + 1500);
+            srt.push_str(&format!(
+                "{}\n{:02}:{:02}:{:02},000 --> {:02}:{:02}:{:02},500\nline {i}\n\n",
+                i + 1,
+                s / 3_600_000,
+                s / 60_000 % 60,
+                s / 1000 % 60,
+                e / 3_600_000,
+                e / 60_000 % 60,
+                e / 1000 % 60
+            ));
+        }
+        let want = crate::srt::stats(&crate::srt::parse(&srt)).expect("a measurable body");
+        let c = Cache::new(1 << 20, None);
+        c.put("k".into(), srt, HOUR);
+        let text = c.get_shared("k").unwrap();
+        for _ in 0..2 {
+            let got = text.stats().expect("stats");
+            assert_eq!((got.count, got.span_ms, got.max_gap_ms), (want.count, want.span_ms, want.max_gap_ms));
+            assert_eq!(got.per_minute, want.per_minute);
+        }
+        // Tiny values (markers, counters) have nothing to measure.
+        c.put("m".into(), "1".into(), HOUR);
+        assert!(c.get_shared("m").unwrap().stats().is_none());
     }
 
     #[test]
@@ -793,7 +857,7 @@ mod tests {
         let dir = tmpdir("shared-disk");
         Cache::new(1 << 20, Some(dir.clone())).put("k".into(), "v1".into(), HOUR);
         let fresh = Cache::new(1 << 20, Some(dir));
-        assert_eq!(&fresh.get_shared("k").unwrap()[..], b"v1");
+        assert_eq!(fresh.get_shared("k").unwrap().as_str(), "v1");
         assert_eq!(fresh.get_mem("k"), Some("v1".into()), "the disk hit was not hoisted into memory");
     }
 

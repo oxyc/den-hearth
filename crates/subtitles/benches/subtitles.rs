@@ -157,6 +157,34 @@ fn cache_get_shared_hit(bencher: Bencher) {
     });
 }
 
+/// What a settled-subtitle hit did before bodies were shared: copy the body out of the cache, parse
+/// it again for the serve log's cue stats, and hand the copy to the response.
+#[divan::bench]
+fn serve_hit_copy_and_reparse(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    cache.put("dl:0".into(), body.clone(), Duration::from_secs(3600));
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get(black_box("dl:0")).unwrap();
+        let stats = subs::stats(&subs::parse(&hit));
+        (stats.map(|s| s.count), subs::srt_response(hit))
+    });
+}
+
+/// The same hit now: a shared view of the cached body, stats measured once per body, and the
+/// response payload sharing the cached allocation.
+#[divan::bench]
+fn serve_hit_shared(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    cache.put("dl:0".into(), body.clone(), Duration::from_secs(3600));
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get_shared(black_box("dl:0")).unwrap();
+        let stats = hit.stats();
+        (stats.map(|s| s.count), subs::srt_response_shared(hit.to_bytes()))
+    });
+}
+
 #[divan::bench]
 fn cache_put_disk(bencher: Bencher) {
     let dir = tempfile::tempdir().unwrap();

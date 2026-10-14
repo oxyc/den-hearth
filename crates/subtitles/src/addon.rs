@@ -164,24 +164,44 @@ fn serve_line(
     cache: &str,
     body: Option<&str>,
 ) -> String {
+    serve_line_measured(
+        state,
+        ctx,
+        outcome,
+        reason,
+        upstream,
+        cache,
+        body.and_then(|b| srt::stats(&srt::parse(b))),
+    )
+}
+
+/// `serve_line` for a body whose cue density is already measured. A cached body measures itself once
+/// (`Text::stats`) instead of being parsed again on every hit.
+fn serve_line_measured(
+    state: &AppState,
+    ctx: ServeCtx<'_>,
+    outcome: &str,
+    reason: &str,
+    upstream: Option<&str>,
+    cache: &str,
+    stats: Option<srt::Stats>,
+) -> String {
     let mut line = logging::Line::new("serve", outcome, state.cfg.log_identity).reason(reason);
     if let Some(u) = upstream {
         line = line.upstream(u);
     }
     line = line.field("cache", cache);
     line = ctx.identity_fields(line);
-    if let Some(body) = body {
-        if let Some(s) = srt::stats(&srt::parse(body)) {
-            line = stats_fields(line, &s);
-        }
+    if let Some(s) = stats {
+        line = stats_fields(line, &s);
     }
     line.rid(ctx.rid).finish()
 }
 
-/// A cached body as text for the serve log. Cache values are only ever written from a `String`, so
-/// the `None` is unreachable; it would only drop the cue stats from the line, never the response.
-fn cached_text(body: &bytes::Bytes) -> Option<&str> {
-    std::str::from_utf8(body).ok()
+/// `log_serve` for a cache hit: the line carries the body's cue stats, measured at most once per
+/// cached body rather than parsed on every hit.
+fn log_serve_cached(state: &AppState, ctx: ServeCtx<'_>, outcome: &str, reason: &str, body: &cache::Text) {
+    eprintln!("{}", serve_line_measured(state, ctx, outcome, reason, None, "hit", body.stats()));
 }
 
 /// Prints what `serve_line` builds. The split exists for the test above it: this one call site is
@@ -876,8 +896,8 @@ pub async fn handle_subtitle_file(
         lang,
     };
     if let Some(hit) = state.cache.get_shared(&cache_key) {
-        log_serve(state, ctx, "served", "cache_hit", None, "hit", cached_text(&hit));
-        let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit));
+        log_serve_cached(state, ctx, "served", "cache_hit", &hit);
+        let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes()));
         return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
     }
     let Some(http) = state.http.as_ref() else {
@@ -891,8 +911,8 @@ pub async fn handle_subtitle_file(
     let flight = if resync_url.is_some() || ref_id.is_some() {
         let guard = state.inflight.acquire(&cache_key).await;
         if let Some(hit) = state.cache.get_shared(&cache_key) {
-            log_serve(state, ctx, "served", "cache_hit", None, "hit", cached_text(&hit));
-            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit));
+            log_serve_cached(state, ctx, "served", "cache_hit", &hit);
+            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes()));
             return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
         }
         Some(guard)
@@ -1085,8 +1105,8 @@ async fn sync_and_cache(
         };
         // Settled while we waited: the alignment we were about to run has already been run.
         if let Some(hit) = state.cache.get_shared(&cache_key) {
-            log_serve(state, log, "served", "settled_while_waiting", None, "hit", cached_text(&hit));
-            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit));
+            log_serve_cached(state, log, "served", "settled_while_waiting", &hit);
+            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes()));
             return httputil::add_timing(resp, CACHE_HIT);
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
@@ -2248,7 +2268,7 @@ pub async fn handle_translate(
     // translation that exists and had just been confirmed.
     // The `Server-Timing` phase for the translated text: `cache;desc=hit`, or how long the run took.
     let settled = if cache_key == body_key {
-        cached_body.as_ref().map(|body| bytes::Bytes::from(body.srt.clone()))
+        cached_body.as_ref().map(|body| cache::Text::new(body.srt.clone()))
     } else {
         state.cache.get_shared(&cache_key)
     };
@@ -2260,10 +2280,13 @@ pub async fn handle_translate(
             // client told `immutable` will not come back for a year.
             let outcome = if anchor_unknown { "degraded" } else { "served" };
             let reason = if anchor_unknown { "anchor_unknown" } else { "cache_hit" };
-            log_serve(state, ctx, outcome, reason, None, "hit", cached_text(&settled));
+            log_serve_cached(state, ctx, outcome, reason, &settled);
             let resp = match anchor_unknown {
-                true => httputil::degraded(httputil::srt_provisional_shared(settled), "upstream_unavailable"),
-                false => httputil::srt_shared(settled),
+                true => httputil::degraded(
+                    httputil::srt_provisional_shared(settled.to_bytes()),
+                    "upstream_unavailable",
+                ),
+                false => httputil::srt_shared(settled.to_bytes()),
             };
             let resp = with_cached_subtitle_offset(state, &cache_key, resp);
             return httputil::add_timing(resp, CACHE_HIT);

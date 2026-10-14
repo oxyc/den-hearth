@@ -297,6 +297,7 @@ const MIN_FULLEST_FOR_RELATIVE_JUDGEMENT: usize = 20;
 /// The density measurements `looks_incomplete` judges a file by, surfaced so a caller can put them
 /// in the decision log — the same numbers that decided "sparse" are what makes that verdict
 /// checkable later from the journal, rather than trusted on the strength of a boolean alone.
+#[derive(Clone, Copy)]
 pub struct Stats {
     pub count: usize,
     pub span_ms: u64,

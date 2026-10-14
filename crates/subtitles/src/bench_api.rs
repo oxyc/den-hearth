@@ -3,6 +3,7 @@
 
 pub use crate::cache::Cache;
 pub use crate::fetch::subtitle_text;
+pub use crate::httputil::{srt as srt_response, srt_shared as srt_response_shared};
 pub use crate::opensubtitles::{rank, Subtitle};
 pub use crate::srt::{has_a_cue, looks_incomplete, parse, serialize, serialize_vtt, stats, Cue};
 
