@@ -37,7 +37,12 @@ pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
             .with_decode_allow_trailing_bits(true)
             .with_decode_padding_mode(DecodePaddingMode::RequireNone),
     );
-    let cleaned: String = s.trim_end_matches('=').chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    let trimmed = s.trim_end_matches('=');
+    // Nothing but a hand-wrapped segment holds a line break, so the copy that drops them is the rare path.
+    if !trimmed.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+        return LENIENT.decode(trimmed).map_err(|e| e.to_string());
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
     LENIENT.decode(cleaned).map_err(|e| e.to_string())
 }
 
