@@ -376,7 +376,19 @@ impl Cache for TieredCache {
         }
         let raw = fs::read(self.dir.join(&name));
         self.stats.read(raw.as_ref().map_or(0, Vec::len));
-        let raw = raw.ok()?;
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(e) => {
+                // The file went after the index was told about it (a concurrent retire or sweep, or something
+                // outside the process). The sweep only walks files that exist, so nothing else would ever drop
+                // this entry, and every get would repeat the failed read. The index holds sizes but no running
+                // total, and `written` counts bytes written since the last sweep, so there is nothing else to adjust.
+                if e.kind() == io::ErrorKind::NotFound {
+                    self.index().remove(&name);
+                }
+                return None;
+            }
+        };
         // "<unix-expiry>\n<value>". Wall-clock on disk on purpose: a monotonic deadline means nothing to the
         // process that reads the file after a restart.
         let nl = raw.iter().position(|&b| b == b'\n').filter(|&nl| nl > 0)?;
@@ -422,6 +434,9 @@ impl Cache for TieredCache {
             return;
         }
         let now = unix_secs((self.clock)());
+        // Skipping the rewrite keeps the file's older expiry: after a restart the entry can lapse up to a quarter
+        // of `ttl` early. Refreshing only the expiry would still mean rewriting the file (`<expiry>\n<value>`),
+        // and saving that write is the point of the rule. Deliberate; see PORTING.md.
         if self.on_disk_is_current(&name, value, ttl, now) {
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
             return;

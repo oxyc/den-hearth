@@ -148,12 +148,16 @@ fn play_ticket_payload_keys_open_whatever_their_spelling() {
     let tk = ticket_keys(&kr);
     let hash = "a".repeat(40);
     let x = unix_secs(SystemTime::now() + Duration::from_secs(3600));
+    // The key `h` as a JSON unicode escape (backslash, `u`, then 0068), built here so no editor or tool can fold
+    // the escape back into a plain `h`.
+    let escaped_h = format!("{}u0068", '\\');
     let payloads = [
         ("exact", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
         ("upper case", format!(r#"{{"H":"{hash}","F":4,"D":[["torbox","tb"]],"X":{x}}}"#)),
         ("one key off", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"X":{x}}}"#)),
         ("an unknown key", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x},"extra":[1]}}"#)),
-        ("an escaped key", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
+        // Only a decoder that unescapes keys finds this `h`.
+        ("an escaped key", format!(r#"{{"{escaped_h}":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
         ("a repeated key", format!(r#"{{"h":"nope","h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
         (
             "a repeated spelling",

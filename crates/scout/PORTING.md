@@ -106,6 +106,16 @@ everything and is the last to go green.
   are ignored with that reason.
 - **Shared-type changes made at merge:** `StoreError::ScoutSide`, `Scraper::answer_key`, and
   `Cache::persistent` now returns `Option<bool>` (`None` = not reporting, the gauge's -1).
+- **`Cache::get` is no longer Go's signature, on purpose.** It returns `Option<Arc<str>>` where Go returns a
+  string copy, so a memory hit costs a reference count instead of an allocation and a copy (measured 22 ns
+  against Go's 39 ns; `bench/results/scout-cache/`). A caller that needs an owned `String` copies it itself.
+  The seam is otherwise frozen; this is the one deliberate change.
+- **A restarted durable entry can live up to 25% shorter than asked.** `TieredCache::put` keeps an existing
+  file, and does not rewrite it, when it already holds the same value with at least three quarters of the
+  requested TTL left (`on_disk_is_current`). The file is `<expiry>\n<value>`, so refreshing the expiry means
+  rewriting the value; skipping that rewrite is the point (SSD wear). Memory is refreshed by every put, so the
+  full TTL holds while the process lives. After a restart, the entry is served from the file's older expiry, so
+  it can lapse up to a quarter of its TTL early and is rebuilt on the next request. Accepted trade, not a bug.
 
 ### Package 1: Stores I (TorBox) - 3,082 test lines
 

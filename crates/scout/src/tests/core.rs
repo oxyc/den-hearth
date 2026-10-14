@@ -557,6 +557,38 @@ fn memory_cache_ttl_and_eviction() {
     assert!(resident > 0 && resident <= 1000, "{resident} scan bytes resident, want 1..=1000");
 }
 
+// A `put` that lands between `get` reading an expired entry and removing it must survive. The clock is the
+// one call `get` makes in that window, so the test's clock performs the put the first time it is read after
+// being armed.
+#[test]
+fn memory_cache_expiry_does_not_remove_a_concurrent_fresh_put() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    let clock = Arc::new(Mutex::new(UNIX_EPOCH + Duration::from_secs(1000)));
+    let armed = Arc::new(AtomicBool::new(false));
+    let cell: Arc<OnceLock<Arc<MemoryCache>>> = Arc::new(OnceLock::new());
+    let mut c = MemoryCache::new(1 << 20);
+    {
+        let (clock, armed, cell) = (Arc::clone(&clock), Arc::clone(&armed), Arc::clone(&cell));
+        c.now = Box::new(move || {
+            let t = *clock.lock().unwrap();
+            if armed.swap(false, Ordering::SeqCst) {
+                cell.get().expect("cache set").put("k", "new", Duration::from_secs(3600));
+            }
+            t
+        });
+    }
+    let c = Arc::new(c);
+    cell.set(Arc::clone(&c)).ok().expect("set once");
+
+    c.put("k", "old", Duration::from_secs(10));
+    *clock.lock().unwrap() += Duration::from_secs(11);
+    armed.store(true, Ordering::SeqCst);
+    assert!(c.get("k").is_none(), "the expired value is not served");
+    assert_eq!(c.get("k").as_deref(), Some("new"), "the fresh put was removed along with the expired value");
+}
+
 /// The Go test's `c.now = func() time.Time { return now }`: a clock the test can move.
 fn clock_fn(clock: &Arc<Mutex<SystemTime>>) -> Box<dyn Fn() -> SystemTime + Send + Sync> {
     let clock = Arc::clone(clock);
