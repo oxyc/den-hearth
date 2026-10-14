@@ -141,6 +141,73 @@ fn cache_get_mem_hit(bencher: Bencher) {
     });
 }
 
+/// The serve path's read: a refcounted view of the cached body, no copy.
+#[divan::bench]
+fn cache_get_shared_hit(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    for i in 0..64 {
+        cache.put(format!("dl:{i}"), body.clone(), Duration::from_secs(3600));
+    }
+    let mut i = 0usize;
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get_shared(black_box(&format!("dl:{}", i & 63)));
+        i += 1;
+        hit
+    });
+}
+
+/// What a settled-subtitle hit did before bodies were shared: copy the body out of the cache, parse
+/// it again for the serve log's cue stats, and hand the copy to the response.
+#[divan::bench]
+fn serve_hit_copy_and_reparse(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    cache.put("dl:0".into(), body.clone(), Duration::from_secs(3600));
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get(black_box("dl:0")).unwrap();
+        let stats = subs::stats(&subs::parse(&hit));
+        (stats.map(|s| s.count), subs::srt_response(hit))
+    });
+}
+
+/// The same hit now: a shared view of the cached body, stats measured once per body, and the
+/// response payload sharing the cached allocation.
+#[divan::bench]
+fn serve_hit_shared(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    cache.put("dl:0".into(), body.clone(), Duration::from_secs(3600));
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get_shared(black_box("dl:0")).unwrap();
+        let stats = hit.stats();
+        (stats.map(|s| s.count), subs::srt_response_shared(hit.to_bytes(), hit.etag()))
+    });
+}
+
+/// `serve_hit_shared` with the ETag hashed from the body on every hit, as it was before the validator
+/// was kept next to the cached body.
+#[divan::bench]
+fn serve_hit_shared_rehash(bencher: Bencher) {
+    let cache = subs::Cache::new(64 << 20, None);
+    let body = srt(2000);
+    cache.put("dl:0".into(), body.clone(), Duration::from_secs(3600));
+    bencher.counter(BytesCount::new(body.len())).bench_local(|| {
+        let hit = cache.get_shared(black_box("dl:0")).unwrap();
+        let stats = hit.stats();
+        let bytes = hit.to_bytes();
+        let etag = subs::etag_of(&bytes);
+        (stats.map(|s| s.count), subs::srt_response_shared(bytes, &etag))
+    });
+}
+
+/// The validator alone, over a feature film's subtitle.
+#[divan::bench]
+fn etag_of_body(bencher: Bencher) {
+    let body = srt(2000);
+    bencher.counter(BytesCount::new(body.len())).bench(|| subs::etag_of(black_box(body.as_bytes())));
+}
+
 #[divan::bench]
 fn cache_put_disk(bencher: Bencher) {
     let dir = tempfile::tempdir().unwrap();
