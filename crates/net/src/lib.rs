@@ -1,8 +1,36 @@
 //! One public-address classifier. Scout's household sources, Subtitles' resync hops and Remux's source fetches all
 //! refuse a URL that leads off the public internet, and each had its own list, missing ranges the others covered.
 //! This is the union of them, so a range added here is refused everywhere.
+//!
+//! It also holds the one reading of a config path segment's base64url, so Scout, Reel and Subtitles open the same
+//! links.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use base64::alphabet::URL_SAFE;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use base64::Engine as _;
+
+/// A config segment's base64url, padded or not (lenient, like the TS decoder and Go's decoder).
+///
+/// Trailing `=` are trimmed, carriage returns and newlines are skipped anywhere, and non-zero trailing bits are
+/// accepted, as Go's `RawURLEncoding` does. Install ids are NOT read with this: they stay strict.
+pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(false)
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+    let trimmed = s.trim_end_matches('=');
+    // Nothing but a hand-wrapped segment holds a line break, so the copy that drops them is the rare path.
+    if !trimmed.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+        return LENIENT.decode(trimmed).map_err(|e| e.to_string());
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    LENIENT.decode(cleaned).map_err(|e| e.to_string())
+}
 
 /// Whether `ip` is an address on the public internet: not loopback, private (RFC 1918), CGNAT (100.64/10, where a
 /// tailnet lives), link-local (the 169.254.169.254 metadata endpoint), unspecified, broadcast, multicast,

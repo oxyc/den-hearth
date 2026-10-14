@@ -6,8 +6,6 @@
 
 use std::collections::HashSet;
 
-use base64::alphabet::URL_SAFE;
-use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use serde::Deserialize;
 
@@ -170,23 +168,10 @@ fn is_plaintext(blob: &str) -> bool {
     b64url_decode(blob).is_some_and(|d| d.first().is_some_and(|b| *b != crate::seal::SEALED_VERSION))
 }
 
-/// The config segment's base64url, read exactly as den-scout reads it (`util::b64url_decode` there), so a
-/// link opens on all three addons or on none: padding is trimmed, carriage returns and newlines are skipped
-/// anywhere, and non-zero trailing bits are accepted. Install ids stay strict (`is_install_id`).
+/// The config segment's base64url, read by the one decoder Scout, Reel and Subtitles share (`den_net`), so a link
+/// opens on all three or on none. Install ids stay strict (`is_install_id`).
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
-    const LENIENT: GeneralPurpose = GeneralPurpose::new(
-        &URL_SAFE,
-        GeneralPurposeConfig::new()
-            .with_encode_padding(false)
-            .with_decode_allow_trailing_bits(true)
-            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
-    );
-    let trimmed = s.trim_end_matches('=');
-    if !trimmed.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
-        return LENIENT.decode(trimmed).ok();
-    }
-    let cleaned: String = trimmed.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
-    LENIENT.decode(cleaned).ok()
+    den_net::b64url_decode(s).ok()
 }
 
 /// Decode the config path segment into a validated config, or `None` (→ 400). The decoded bytes are

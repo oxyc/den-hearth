@@ -2,6 +2,10 @@
 name = "den-net"
 version = "0.0.0"
 edition = "2021"
-description = "The one answer to \"is this address on the public internet\", shared by every service that fetches a URL it was handed"
+description = "Small rules every addon must read the same way: is this address on the public internet, and how is a config path segment decoded"
 publish = false
 license = "MIT"
+
+[dependencies]
+# The lenient base64url the config segment is read with (`b64url_decode`).
+base64 = "0.23"
