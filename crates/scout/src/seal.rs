@@ -2,6 +2,12 @@
 //! XSalsa20-Poly1305, nonce = blake2b_24(eph_pub || recipient_pub)), interoperable byte for byte with
 //! libsodium.js and the Rust `crypto_box` crate den-subtitles and den-reel use.
 
+use base64::Engine;
+use blake2::digest::consts::U24;
+use blake2::Digest;
+use crypto_box::aead::{Aead, OsRng};
+use crypto_box::{Nonce, PublicKey, SalsaBox, SecretKey};
+
 /// Go `sealedVersion`: the first byte of a DECODED config segment marking a sealed blob. A legacy
 /// plaintext segment starts with `{` (0x7b), so the two never collide.
 pub const SEALED_VERSION: u8 = 0x01;
@@ -26,40 +32,106 @@ pub struct SealKeyring {
 }
 
 /// Go `newSealKeypair`.
+/// Go `newSealKeypair`.
 pub fn new_seal_keypair(priv_key: [u8; X25519_KEY_SIZE]) -> SealKeypair {
-    todo!("seal.go newSealKeypair")
+    let pub_key = *SecretKey::from(priv_key).public_key().as_bytes();
+    SealKeypair { priv_key, pub_key }
 }
 
-/// Go `sealNonce`: blake2b_24(ephPub || recipientPub).
+/// Go `sealNonce`: blake2b_24(ephPub || recipientPub) — the libsodium crypto_box_seal nonce derivation.
 pub fn seal_nonce(eph_pub: &[u8; X25519_KEY_SIZE], recipient_pub: &[u8; X25519_KEY_SIZE]) -> [u8; 24] {
-    todo!("seal.go sealNonce")
+    let mut h = blake2::Blake2b::<U24>::new();
+    h.update(eph_pub);
+    h.update(recipient_pub);
+    let mut n = [0u8; 24];
+    n.copy_from_slice(&h.finalize());
+    n
 }
 
-/// Go `seal`: encrypts to `recipient_pub`; output = eph_pub (32) || box(plaintext).
+/// Go `seal`: encrypts to `recipient_pub` (crypto_box_seal). Output = eph_pub(32) || box(plaintext).
 pub fn seal(recipient_pub: &[u8; X25519_KEY_SIZE], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    todo!("seal.go seal")
+    let eph_sk = SecretKey::generate(&mut OsRng);
+    let eph_pub = *eph_sk.public_key().as_bytes();
+    let nonce: Nonce = seal_nonce(&eph_pub, recipient_pub).into();
+    let recipient = PublicKey::from(*recipient_pub);
+    let ct = SalsaBox::new(&recipient, &eph_sk)
+        .encrypt(&nonce, plaintext)
+        .map_err(|_| "sealed: encrypt failed".to_owned())?;
+    let mut out = Vec::with_capacity(SEAL_EPH_PUB_SIZE + ct.len());
+    out.extend_from_slice(&eph_pub);
+    out.extend_from_slice(&ct);
+    Ok(out)
 }
 
 impl SealKeyring {
-    /// Go `(*sealKeyring).open`: fails closed, no key opening it is an error and no plaintext.
+    /// Go `(*sealKeyring).open`: decrypts a crypto_box_seal ciphertext with the keyring (current key first,
+    /// then prior keys). Fails closed: returns an error and no plaintext if no key opens it (never a
+    /// partial/empty config).
     pub fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, String> {
-        todo!("seal.go sealKeyring.open")
+        if sealed.len() < SEAL_OVERHEAD {
+            return Err("sealed: too short".to_owned());
+        }
+        let mut eph_pub = [0u8; X25519_KEY_SIZE];
+        eph_pub.copy_from_slice(&sealed[..SEAL_EPH_PUB_SIZE]);
+        let ct = &sealed[SEAL_EPH_PUB_SIZE..];
+        let eph = PublicKey::from(eph_pub);
+        for k in &self.keys {
+            let nonce: Nonce = seal_nonce(&eph_pub, &k.pub_key).into();
+            if let Ok(pt) = SalsaBox::new(&eph, &SecretKey::from(k.priv_key)).decrypt(&nonce, ct) {
+                return Ok(pt);
+            }
+        }
+        Err("sealed: no key opened it".to_owned())
     }
 
-    /// Go `currentPubBase64` (standard base64), empty with no keys.
+    /// Go `currentPubBase64` (standard base64), empty with no keys. The current recipient public key is
+    /// served to /configure + /config-key so the browser (or den-app) can seal to it.
     pub fn current_pub_base64(&self) -> String {
-        todo!("seal.go currentPubBase64")
+        match self.keys.first() {
+            Some(k) => base64::engine::general_purpose::STANDARD.encode(k.pub_key),
+            None => String::new(),
+        }
     }
 }
 
 /// Go `parseSealKeyring`: a current base64 private key plus comma-separated prior keys. Empty current
-/// gives `Ok(None)` (sealed URLs disabled); a malformed current key is an error; a malformed prior key
-/// is skipped and logged.
+/// gives `Ok(None)` (sealed URLs disabled; legacy plaintext still works); a malformed current key is an
+/// error; a malformed prior key is skipped and logged.
 pub fn parse_seal_keyring(current: &str, prev: &str) -> Result<Option<SealKeyring>, String> {
-    todo!("seal.go parseSealKeyring")
+    let current = current.trim();
+    if current.is_empty() {
+        return Ok(None);
+    }
+    // A bad CURRENT key is a real misconfig.
+    let mut keys = vec![key_from_b64(current)?];
+    // A malformed PRIOR key is skipped, not fatal — a typo in one rotation entry must not disable the
+    // whole ring (which would silently take sealing offline for the good current key too).
+    for p in prev.split(',') {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match key_from_b64(p) {
+            Ok(k) => keys.push(k),
+            Err(e) => eprintln!("skipping a malformed CONFIG_KEYS_PREV entry: {e}"),
+        }
+    }
+    Ok(Some(SealKeyring { keys }))
+}
+
+/// One base64 X25519 private key, as Go's `add` closure reads it.
+fn key_from_b64(s: &str) -> Result<SealKeypair, String> {
+    const BAD: &str = "sealed: bad config key (want base64 32-byte X25519 private key)";
+    let raw = decode_key_b64(s).map_err(|_| BAD.to_owned())?;
+    let priv_key: [u8; X25519_KEY_SIZE] = raw.try_into().map_err(|_| BAD.to_owned())?;
+    Ok(new_seal_keypair(priv_key))
 }
 
 /// Go `decodeKeyB64`: std or url base64, with or without padding.
 pub fn decode_key_b64(s: &str) -> Result<Vec<u8>, String> {
-    todo!("seal.go decodeKeyB64")
+    use base64::engine::general_purpose as gp;
+    [gp::STANDARD, gp::STANDARD_NO_PAD, gp::URL_SAFE, gp::URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|enc| enc.decode(s).ok())
+        .ok_or_else(|| "bad base64".to_owned())
 }

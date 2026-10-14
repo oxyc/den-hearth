@@ -11,8 +11,9 @@ async-trait = "0.1"
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
 # `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.
 base64 = "0.22"
-# Go `crypto/sha256`: the 128-bit cache-key digest `key_hash` returns (util.go).
-sha2 = "0.10"
+# Go `crypto/sha256`: the 128-bit cache-key digest `key_hash` returns (util.go), the disk tier's file
+# names (diskcache.go), and HKDF-SHA256 for play tickets.
+sha2 = "0.11"
 # Go's `encoding/json`: `json.Marshal` for string literals in config fixtures (`jsonString`), the JSON
 # text `validate_config` takes, the streamed TorBox account listing (`decodeListing`), and the response
 # bodies the handler tests decode.
@@ -20,14 +21,19 @@ serde_json = "1"
 # XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`). The ticket owner uses it
 # in production; the tests build a legacy ticket with it.
 chacha20poly1305 = "0.10"
+# X25519 + XSalsa20-Poly1305 for the sealed config (Go `golang.org/x/crypto/nacl/box` and `curve25519`). The same
+# version den-subtitles and den-reel carry. Its `OsRng` is the Go `crypto/rand` behind the ephemeral seal key.
+crypto_box = "0.9"
+# BLAKE2b-192 for the seal nonce (Go `golang.org/x/crypto/blake2b`). crypto_box already depends on it.
+blake2 = "0.10"
+# HKDF-SHA256 for the play-ticket key (Go `crypto/hkdf`), on the sha2/hmac pair den-remux already carries.
+hkdf = "0.13"
 # The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http = "1"
-# Go `crypto/sha256`: the disk tier names an entry's file by the SHA-256 of its key.
-sha2 = "0.10"
 # Go `time.NewTicker`: `TieredCache::sweep_every` runs on a tokio interval and cancels by dropping the future.
 tokio = { version = "1", features = ["time"] }
 
