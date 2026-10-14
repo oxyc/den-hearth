@@ -135,7 +135,7 @@ impl TieredCache {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn disabled(&self) -> bool {
+    pub(crate) fn disabled(&self) -> bool {
         self.lock().off
     }
 

@@ -997,6 +997,17 @@ impl Handler {
         self.inner.verify_link(pool, rt, link).await
     }
 
+    /// Go `(*handler).handleProbe`, called directly with the pool a test builds, on the status budget the route gives
+    /// it.
+    pub(crate) async fn handle_probe(&self, config: &Config, pool: &StorePool, rt: &ResolveTarget) -> http::Response<Vec<u8>> {
+        let deadline = Inner::deadline_in(self.inner.status_budget());
+        let out = self.inner.handle_probe(config, pool, &rt.info_hash, rt, "", deadline).await;
+        let mut res = http::Response::new(out.body);
+        *res.status_mut() = http::StatusCode::from_u16(out.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        *res.headers_mut() = out.headers;
+        res
+    }
+
     /// Go `hydrateProbeFacts`.
     pub(crate) fn hydrate_probe_facts(&self, streams: &mut [RawStream], sid: Option<&StreamId>) {
         self.inner.hydrate_probe_facts(streams, sid);

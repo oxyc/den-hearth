@@ -22,6 +22,7 @@ use crate::rank::RawStream;
 use crate::scrape::{DoError, ScrapeQuery, Scraper};
 use crate::seal::{parse_seal_keyring, SealKeyring};
 use crate::stores::{DeadLinkError, ResolveTarget, StatusAnswer, Store, StoreError, StoreStatus, ERR_CHECK_FAILED};
+use crate::tests::mock::resp;
 use crate::util::b64url_encode;
 
 /// `gib` in handler_test.go.
@@ -1957,9 +1958,9 @@ fn split_cached_treats_every_unknown_form_the_same_way() {
 }
 
 #[tokio::test]
-#[ignore = "needs package 1's torBoxStore and package 2's StorePool (the play path's resolve and status budgets)"]
+#[ignore = "Go's deadlineStore reads the deadline each Status call arrives with (ctx.Deadline()); a Rust store takes no deadline, so a prompt read cannot report its budget. See handle_play_a_status_read_that_cannot_answer_is_bounded_by_the_status_budget for the half that can be measured"]
 async fn handle_play_poll_reads_use_the_status_budget() {
-    // Enable when package 1's TorBox store and package 2's StorePool land: move `pending` up and delete the wrapper.
+    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
     #[cfg(any())]
     async fn pending() {
         // Go TestHandlePlay_pollReadsUseTheStatusBudget: a poll-route status read never takes the resolve budget,
@@ -2027,47 +2028,210 @@ fn escalated_status_ctx_cannot_outlive_the_resolve_budget() {
     assert!(escalated_status_ctx(None, now, STATUS_BUDGET).is_none(), "escalated from a context with no deadline");
 }
 
-#[tokio::test]
-#[ignore = "needs package 1's torBoxStore (the probe's refusal path)"]
-async fn handle_probe_reports_a_refusal_it_discovers_itself() {
-    // Enable when package 1's TorBox store lands: move `pending` up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Go TestHandleProbe_reportsARefusalItDiscoversItself: a refusal the probe discovers itself is reported as
-        // a refusal, not as an absence (404 "not_queued").
-        let held = "a".repeat(40);
-        for warm in [false, true] {
-            let cache = Arc::new(MemoryCache::new(1 << 20));
-            cache.put(&torrent_id_key("tb-secret", &held), "42", crate::handler::RESOLVE_CACHE_TTL);
-            if warm {
-                cache.put(&resolve_key("tb-secret", &held), r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#, crate::handler::RESOLVE_CACHE_TTL);
-            }
-            let store = TorBoxStore::with_client(
-                "tb-secret",
-                cache.clone(),
-                MockDoer::new(move |r: &http::Request<String>| {
-                    if warm && r.uri().path().contains("requestdl") {
-                        return resp(429, "{}");
-                    }
-                    if r.uri().path().contains("mylist") {
-                        return resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#);
-                    }
-                    resp(200, &format!(r#"{{"data":{{"{held}":{{"name":"x"}}}}}}"#))
-                }),
-            );
-            let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
-            let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: held.clone(), season: Some(1), episode: Some(2), ..Default::default() });
-            let rec = get(&h, &format!("/{}/play/{tok}?probe=1", valid_blob()), &[]).await;
-            assert_ne!(rec.status(), 404, "probe answered 404 for a refusal it saw itself (warm={warm})");
+// A status budget the Rust stores cannot see. Go's `deadlineStore` and `recordingCheckStore` read `ctx.Deadline()` to
+// learn the budget the handler built; a Rust store takes no deadline and is simply dropped when the budget is spent,
+// so the two ignored tests below cannot read it. What a store CAN observe is how long it was allowed to run, and
+// these two tests measure that instead: a store that outlasts any budget, on a paused clock, records how long it
+// lived before the handler dropped it.
+
+/// A store whose reads never answer, and which remembers how long each one lived before being dropped.
+#[derive(Clone)]
+struct LifetimeStore {
+    svc: DebridService,
+    /// Whether a resolve serves a link; otherwise it finds nothing, as Go's `deadlineStore` does.
+    resolves: bool,
+    status_lived: Arc<std::sync::Mutex<Vec<Duration>>>,
+    check_lived: Arc<std::sync::Mutex<Vec<Duration>>>,
+}
+
+impl LifetimeStore {
+    fn new(svc: DebridService, resolves: bool) -> LifetimeStore {
+        LifetimeStore { svc, resolves, status_lived: Default::default(), check_lived: Default::default() }
+    }
+}
+
+/// Records, on drop, how long the read that held it lived (tokio time, so a paused clock reads exactly).
+struct Lived {
+    since: tokio::time::Instant,
+    into: Arc<std::sync::Mutex<Vec<Duration>>>,
+}
+
+impl Drop for Lived {
+    fn drop(&mut self) {
+        self.into.lock().expect("the lock").push(self.since.elapsed());
+    }
+}
+
+/// Outlasts any budget the handler can hand out (the resolve budget is 45 s).
+async fn outlast(into: &Arc<std::sync::Mutex<Vec<Duration>>>) {
+    let _lived = Lived { since: tokio::time::Instant::now(), into: Arc::clone(into) };
+    tokio::time::sleep(Duration::from_secs(100)).await;
+}
+
+#[async_trait]
+impl Store for LifetimeStore {
+    fn service(&self) -> DebridService {
+        self.svc
+    }
+
+    async fn cache_check(&self, _hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        outlast(&self.check_lived).await;
+        Ok(HashMap::new())
+    }
+
+    async fn resolve(&self, _t: &ResolveTarget) -> Result<String, StoreError> {
+        if self.resolves {
+            Ok("https://cdn.example/added.mkv".to_owned())
+        } else {
+            Err(dead_link("nothing here"))
         }
     }
-    todo!("pending: handler_test.go:TestHandleProbe_reportsARefusalItDiscoversItself")
+
+    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+        outlast(&self.status_lived).await;
+        None
+    }
+
+    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+        outlast(&self.status_lived).await;
+        Some((StoreStatus::default(), StatusAnswer::Unknown))
+    }
+}
+
+// Not in the Go suite: `handle_play_poll_reads_use_the_status_budget` for the half Rust can see. A status read that
+// cannot answer is the one that gets escalated; it must live no longer than the status budget, the escalated retry
+// no longer than twice it, and the probe route, which never escalates, only the first.
+#[tokio::test(start_paused = true)]
+async fn handle_play_a_status_read_that_cannot_answer_is_bounded_by_the_status_budget() {
+    let budget = crate::handler::DEFAULT_STATUS_BUDGET;
+    for (route, want_reads, want_doubled) in [("", 3usize, 1usize), ("?probe=1", 1, 0)] {
+        let store = LifetimeStore::new(DebridService::TorBox, false);
+        let lived = store.status_lived.clone();
+        let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "a".repeat(40), ..Default::default() });
+        get(&h, &format!("/{}/play/{tok}{route}", valid_blob()), &[]).await;
+
+        let reads = lived.lock().expect("the lock").clone();
+        assert!(!reads.is_empty(), "play{route}: the status read never happened, so this asserts nothing");
+        // The rule, stated exactly: a read on the poll route never takes the RESOLVE budget, and at most one — the
+        // escalation, on the path about to spend an add — may take double the status budget. The ceiling is 2x
+        // spelled out, not escalated_status_budget(), which is what the handler derives the deadline from.
+        let ceiling = 2 * budget;
+        for (i, left) in reads.iter().enumerate() {
+            assert!(
+                *left <= ceiling,
+                "play{route}: status read {i} lived {left:?}, want no more than {ceiling:?} — a poll read must not be able to hold the poll for the whole resolve budget"
+            );
+        }
+        let doubled = reads.iter().filter(|l| **l > budget).count();
+        assert_eq!(doubled, want_doubled, "play{route}: reads exceeding the ordinary status budget: {reads:?}");
+        assert_eq!(reads.len(), want_reads, "play{route}: status reads: {reads:?}");
+    }
+}
+
+// Not in the Go suite: `play_the_preference_cache_check_is_budgeted` for what Rust can see. /play's preference cache
+// check gets a slice of the resolve clock, never the whole thing, and a check that cannot answer leaves the play able
+// to resolve.
+#[tokio::test(start_paused = true)]
+async fn play_the_preference_cache_check_lives_no_longer_than_the_status_budget() {
+    let store = LifetimeStore::new(DebridService::TorBox, true);
+    let checks = store.check_lived.clone();
+    let h = new_handler(test_deps(move |d| d.make_stores = Arc::new(move |_| vec![Box::new(store.clone())])));
+    h.set_status_budget(Duration::from_millis(150));
+    // TWO accounts: the preference check is gated on more than one being configured.
+    let two = blob(r#"{"debrid":[{"service":"torbox","token":"tb"},{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}"#);
+    let tok = crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: "c".repeat(40), ..Default::default() });
+
+    let rr = get(&h, &format!("/{two}/play/{tok}"), &[]).await;
+    assert_eq!(rr.status(), 302, "play: {}, want 302", rr.status());
+
+    let lived = checks.lock().expect("the lock").clone();
+    let Some(got) = lived.first() else { panic!("no cache check was made, so this test is not exercising its budget") };
+    // The status budget exactly, not "roughly": handed the resolve clock the check lives 45 s and the resolve that
+    // follows runs on what is left of it.
+    assert!(
+        *got <= Duration::from_millis(150),
+        "the preference cache check lived {got:?}, want about the 150ms status budget — handed the resolve clock it can spend all of it and leave the resolve an expired one, which queues nothing and answers 404 for a release that is alive"
+    );
+}
+
+// The probe DISCOVERS refusals; it just used to throw them away, inspecting only `err == nil` and then
+// relying on the backoff cache to have been written by someone else. A refusal that reaches it
+// unrecorded fell through to 404 "not_queued" — a claim, not a shrug — so during a throttle the very URL
+// the client polls to draw its progress bar said nothing was queued while /play said the debrid was
+// refusing. Both unrecorded classes are driven here: errNoFileList, which is never recorded anywhere,
+// and TorBox's warm-entry fast path.
+#[tokio::test]
+async fn handle_probe_reports_a_refusal_it_discovers_itself() {
+    use crate::cache::{Cache, MemoryCache};
+    use crate::stores::refusal::{resolve_key, torrent_id_key};
+    use crate::stores::torbox::{TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
+
+    let held = "a".repeat(40);
+    type Reply = Box<dyn Fn(&reqwest::Request) -> reqwest::Response + Send + Sync>;
+    let unusable_held = held.clone();
+    let throttled_held = held.clone();
+    let cases: Vec<(&str, bool, Reply)> = vec![
+        (
+            "mylist answers something unusable",
+            false,
+            Box::new(move |r| {
+                if r.url().path().contains("mylist") {
+                    return resp(200, r#"{"unexpected":"envelope"}"#);
+                }
+                resp(200, &format!(r#"{{"data":{{"{unusable_held}":{{"name":"x"}}}}}}"#))
+            }),
+        ),
+        (
+            "a throttled link request on a warm entry",
+            true,
+            Box::new(move |r| {
+                if r.url().path().contains("requestdl") {
+                    return resp(429, "{}");
+                }
+                if r.url().path().contains("mylist") {
+                    return resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#);
+                }
+                resp(200, &format!(r#"{{"data":{{"{throttled_held}":{{"name":"x"}}}}}}"#))
+            }),
+        ),
+    ];
+    for (name, warm, reply) in cases {
+        let cache = Arc::new(MemoryCache::new(1 << 20));
+        // The account HOLDS it, so the probe's NoAdd resolve reaches the read path rather than
+        // returning "this would queue" before it asks anything.
+        cache.put(&torrent_id_key("tb-secret", &held), "42", RESOLVE_CACHE_TTL);
+        if warm {
+            cache.put(&resolve_key("tb-secret", &held), r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#, RESOLVE_CACHE_TTL);
+        }
+        let store: Arc<dyn Store> = Arc::new(TorBoxStore {
+            token: "tb-secret".to_owned(),
+            cache: Some(cache),
+            api: TORBOX_API.to_owned(),
+            client: Arc::new(crate::tests::mock::MockDoer(move |r: reqwest::Request| Ok(reply(&r)))),
+        });
+        let h = new_handler(test_deps(move |d| d.make_stores = crate::tests::handler::shared_stores(store.clone())));
+        let tok = crate::play::encode_play_token(&crate::play::PlayTarget {
+            info_hash: held.clone(),
+            season: Some(1),
+            episode: Some(2),
+            ..Default::default()
+        });
+        let rec = get(&h, &format!("/{}/play/{tok}?probe=1", valid_blob()), &[]).await;
+        assert_ne!(
+            rec.status(),
+            404,
+            "{name}: probe answered {} {} — a refusal it saw itself was reported as an absence",
+            rec.status(),
+            body_str(&rec).trim()
+        );
+    }
 }
 
 #[tokio::test]
-#[ignore = "needs the status budget as a mutable value (statusBudget) and package 2's StorePool"]
+#[ignore = "Go's recordingCheckStore reads the deadline its CacheCheck arrives with (ctx.Deadline()); a Rust store takes no deadline. See play_the_preference_cache_check_lives_no_longer_than_the_status_budget for the same property measured as how long the check lived"]
 async fn play_the_preference_cache_check_is_budgeted() {
-    // Enable when the status budget and StorePool land: move `pending` up and delete the wrapper.
+    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
     #[cfg(any())]
     async fn pending() {
         // Go TestPlay_thePreferenceCacheCheckIsBudgeted: /play's preference cache check gets a slice of the resolve
@@ -2087,9 +2251,9 @@ async fn play_the_preference_cache_check_is_budgeted() {
 }
 
 #[tokio::test]
-#[ignore = "needs package 1's torBoxStore and package 3's global add budget"]
+#[ignore = "Go resolves with an already-cancelled context and asserts nothing was charged or sent; a Rust store takes no context, a spent clock is a dropped future, and a future dropped before its first poll has no result to assert on"]
 async fn resolve_a_spent_clock_does_not_buy_an_add() {
-    // Enable when package 1's TorBox store and package 3's add budget land: move `pending` up and delete the wrapper.
+    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
     #[cfg(any())]
     async fn pending() {
         // Go TestResolve_aSpentClockDoesNotBuyAnAdd: a resolve on a spent clock must not charge an add, and issues
@@ -2112,9 +2276,9 @@ async fn resolve_a_spent_clock_does_not_buy_an_add() {
 }
 
 #[tokio::test]
-#[ignore = "needs package 2's StorePool (ResolvePreferring) and package 1's torBoxStore"]
+#[ignore = "Go calls ResolvePreferring with an already-cancelled context so that the first store fails before it charges; ResolvePreferring takes no context here and no store can be told the clock is spent, so the first store would be asked (and charged) for real"]
 async fn resolve_preferring_a_spent_clock_still_surfaces_an_in_flight_add() {
-    // Enable when package 2's StorePool lands: move `pending` up and delete the wrapper.
+    // Kept as the Go body: it needs a store-level deadline that the Store trait does not carry.
     #[cfg(any())]
     async fn pending() {
         // Go TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd: a spent clock still reports an add scout
