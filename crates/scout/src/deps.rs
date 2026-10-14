@@ -366,9 +366,9 @@ pub struct Deps {
     /// Client for reading the head of a resolved link. Separate from the scraper client so a probe's longer
     /// body read can't tie up the timeouts tuned for indexer queries. `None` means no probe runs.
     pub probe_client: Option<reqwest::Client>,
-    /// Replaces `probe_client` for the link check and token validation when set. Go's tests drive these through
-    /// the `*http.Client`'s transport; a `reqwest::Client` has no such seam, so a test sets this instead.
-    /// Production leaves it `None`.
+    /// What the probe, link check and token validation send through, in place of `probe_client` when set.
+    /// `build_deps` sets it to the shared, pause-honouring client (Go's probe uses that same client); tests set
+    /// their own doer here, since a `reqwest::Client` has no transport seam.
     pub(crate) probe_doer: Option<Arc<dyn Doer>>,
     pub scrape_timeout: Duration,
     pub list_ttl: Duration,
