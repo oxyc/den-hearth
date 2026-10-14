@@ -27,6 +27,9 @@ mod sync;
 mod translate;
 mod userconfig;
 
+#[cfg(feature = "bench")]
+pub mod bench_api;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};

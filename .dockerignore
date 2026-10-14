@@ -5,3 +5,5 @@ target
 crates/*/Dockerfile
 crates/*/.github
 crates/*/docker-bake.hcl
+bench/fixtures
+bench/results

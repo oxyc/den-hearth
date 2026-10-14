@@ -44,5 +44,16 @@ rusty-chromaprint = "0.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Forwards to the private modules' hot paths for benches/remux.rs (src/bench_api.rs). Off in every build that ships.
+bench = []
+
+[[bench]]
+name = "remux"
+harness = false
+required-features = ["bench"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+# Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
+divan = "0.1"

@@ -1,0 +1,4 @@
+__pycache__/
+/fixtures/
+/results/failed-*
+/results/.*.partial

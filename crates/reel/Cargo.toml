@@ -49,8 +49,19 @@ subtle = "2"
 # the Date header, so this too is a direct edge rather than new code.
 httpdate = "1"
 
+[features]
+# Forwards to the private modules' hot paths for benches/reel.rs (src/bench_api.rs). Off in every build that ships.
+bench = []
+
+[[bench]]
+name = "reel"
+harness = false
+required-features = ["bench"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+# Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
+divan = "0.1"
 
 # killpg: kill_on_drop reaps only the direct child, and yt-dlp forks ffmpeg to do the merge.
 [target.'cfg(unix)'.dependencies]
