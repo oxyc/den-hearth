@@ -10,10 +10,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::addbudget::{budget_account, global_add_budget};
 use crate::cache::{Cache, MemoryCache};
+use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
+use crate::stores::refusal::{add_outcome_unknown, backed_off};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
+use crate::tests::addbudget::{install_budget, HOUR};
+use crate::tests::mock::resp;
 use crate::util::DetachedFlight;
+
+fn base(req: &reqwest::Request) -> String {
+    req.url().path().rsplit('/').next().unwrap_or("").to_owned()
+}
 
 /// A `Doer` that answers the requests its closure has an answer for and never answers the rest, which is how a
 /// test holds a call open until its caller is dropped.
@@ -81,6 +90,38 @@ async fn a_shared_flight_reports_shared_to_the_caller_that_started_it_too() {
     // Alone, nothing was shared.
     let alone = LONE_FLIGHT.run("k", || async { 9 }).await;
     assert_eq!(alone, (Some(9), false), "a caller nobody joined");
+}
+
+// createtorrent answered 400 "already queued", and the lookup that finds the queue entry is abandoned. Go's lookup
+// fails with its context and the add falls through to the answered-failure code: the charge goes back (TorBox
+// created nothing) and Resolve files the 400 as a refusal. Dropped here, the charge stayed spent and nothing was
+// filed, so a polled release kept spending the hour's allowance on a 400.
+#[tokio::test(start_paused = true)]
+async fn an_add_dropped_during_the_already_queued_lookup_is_refunded_and_filed() {
+    let _budget = install_budget(HOUR, 50);
+    let hash = "c".repeat(40);
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let s = store(
+        "tb-review-diff-issue-drop",
+        &cache,
+        Arc::new(Stalling(|req| match base(req).as_str() {
+            "createtorrent" => Some(resp(400, r#"{"error":"DIFF_ISSUE","detail":"Download already queued."}"#)),
+            // The queue listing never comes back.
+            "getqueued" => None,
+            _ => Some(resp(404, "{}")),
+        })),
+    );
+    let account = budget_account(DebridService::TorBox, &s.account_identity());
+    let before = global_add_budget().remaining(&account);
+    let dropped = tokio::time::timeout(Duration::from_secs(1), s.add_magnet(&hash, false, false)).await;
+    assert!(dropped.is_err(), "the add should still have been waiting for the queue listing");
+    assert_eq!(global_add_budget().remaining(&account), before, "the charge for an add TorBox refused must go back");
+    assert!(!add_outcome_unknown(&*cache, DebridService::TorBox, &s.account_identity(), &hash), "the answer was read");
+    assert_eq!(
+        backed_off(&*cache, DebridService::TorBox, &s.account_identity(), &hash).as_deref(),
+        Some("torbox createtorrent http 400 (DIFF_ISSUE: Download already queued.)"),
+        "the refusal Resolve files for that answer"
+    );
 }
 
 // Go counts a TorBox call when `do` returns, and a context that ends makes `do` return an error, so a call its

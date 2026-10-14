@@ -234,6 +234,27 @@ impl Drop for CallCount {
     }
 }
 
+/// What an add that createtorrent answered with a failure leaves behind when its caller goes away before the code
+/// that files the failure has run: the charge handed back (`refundUnusedAdd`) and the refusal `Resolve` writes for
+/// the error `addMagnet` returns. Armed across the one await between the answer and that code.
+struct AbandonedAnswer<'a> {
+    store: &'a TorBoxStore,
+    info_hash: &'a str,
+    err: StoreError,
+    armed: bool,
+}
+
+impl Drop for AbandonedAnswer<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let identity = self.store.account_identity();
+        refund_unused_add(&identity);
+        record_refusal(self.store.cache(), DebridService::TorBox, &identity, self.info_hash, &self.err);
+    }
+}
+
 impl TorBoxStore {
     /// A store's cache, or the one that holds nothing where Go has a nil `Cache`.
     fn cache(&self) -> &dyn Cache {
@@ -492,7 +513,18 @@ impl TorBoxStore {
             // marker, or one whose marker's TTL lapsed) is undiscoverable from createtorrent's error body
             // alone, so the queue's own listing is asked to find it.
             if status == 400 && torbox_already_queued_error(&raw) {
-                if let Ok((qid, true)) = self.find_queued_by_hash(info_hash).await {
+                // The lookup runs on the caller's context in Go, so a caller that goes away during it makes the
+                // lookup fail and the add fall through to the answered-failure code below. Dropping this future
+                // must leave that state: the charge handed back, and the refusal Resolve files for that answer.
+                let mut abandoned = AbandonedAnswer {
+                    store: self,
+                    info_hash,
+                    err: dead_link(format!("torbox createtorrent http {status}{detail}")),
+                    armed: true,
+                };
+                let found = self.find_queued_by_hash(info_hash).await;
+                abandoned.armed = false;
+                if let Ok((qid, true)) = found {
                     refund_unused_add(&identity);
                     mark_added_by_us(cache, &identity, info_hash);
                     cache.put_class(
