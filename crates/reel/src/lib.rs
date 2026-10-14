@@ -574,15 +574,22 @@ fn sources_ask(uri: &hyper::Uri) -> Option<String> {
 /// slashes are skipped, so `//<config>/…` and `//m/s/<cap>` are redacted as their one-slash forms are.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
     let rest = path.trim_start_matches('/');
-    if let Some(rest) = rest.strip_prefix("m/") {
-        if let Some((filed @ ("n" | "s"), _)) = rest.split_once('/') {
-            return format!("/m/{filed}/<cap>").into();
+    // Whatever follows `m`, in any case, is a capability or a mangled try at one. Only `n` and `s` are filed
+    // routes, and the rest of the path is never shown.
+    let (first, after) = rest.split_once('/').unwrap_or((rest, ""));
+    if first.eq_ignore_ascii_case("m") {
+        if after.is_empty() {
+            return "/m".into();
         }
+        return match (first, after.split_once('/')) {
+            ("m", Some((filed @ ("n" | "s"), _))) => format!("/m/{filed}/<cap>").into(),
+            _ => "/m/<cap>".into(),
+        };
     }
     if rest.starts_with("_internal/validate/m/s/") {
         return "/_internal/validate/m/s/<cap>".into();
     }
-    const ROUTES: [&str; 15] = [
+    const ROUTES: [&str; 14] = [
         "health",
         "metrics",
         "manifest.json",
@@ -597,7 +604,6 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
         "hls",
         "seg",
         "sources",
-        "m",
     ];
     den_http::log::redact_first_segment(path, &ROUTES)
 }
