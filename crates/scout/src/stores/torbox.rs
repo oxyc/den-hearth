@@ -217,6 +217,23 @@ impl Reply {
     }
 }
 
+/// Counts one TorBox call by endpoint and outcome when it ends, however it ends.
+///
+/// Go counts the call beside the request (`metrics.torboxCall(endpoint, err == nil && …)` after `s.do`), and a
+/// cancelled context makes `do` return an error, whether the caller was still waiting for an outbound slot or for
+/// the response. A call its caller walked away from is therefore an `error` in the counters. Cancellation here is
+/// dropping the future, which would otherwise leave the call uncounted.
+struct CallCount {
+    endpoint: &'static str,
+    ok: bool,
+}
+
+impl Drop for CallCount {
+    fn drop(&mut self) {
+        metrics().torbox_call(self.endpoint, self.ok);
+    }
+}
+
 impl TorBoxStore {
     /// A store's cache, or the one that holds nothing where Go has a nil `Cache`.
     fn cache(&self) -> &dyn Cache {
@@ -239,10 +256,10 @@ impl TorBoxStore {
     /// Go `torBoxStore.do`: every TorBox request waits for an outbound slot first. The call is counted by endpoint
     /// and outcome (Go does it beside the request in `get`, `addMagnet` and `controlRequest`; it is the same count).
     async fn send(&self, req: reqwest::Request) -> Result<Reply, DoError> {
-        let endpoint = torbox_endpoint(req.url());
+        let mut count = CallCount { endpoint: torbox_endpoint(req.url()), ok: false };
         let slot = OUTBOUND.acquire().await.map_err(|_| DoError::from("the outbound limiter is closed"))?;
         let resp = self.client.do_request(req).await;
-        metrics().torbox_call(endpoint, resp.as_ref().is_ok_and(|r| r.status().is_success()));
+        count.ok = resp.as_ref().is_ok_and(|r| r.status().is_success());
         Ok(Reply { resp: resp?, _slot: slot })
     }
 
