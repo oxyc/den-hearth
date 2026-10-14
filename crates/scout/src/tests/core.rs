@@ -242,118 +242,126 @@ fn play_token() {
     assert!(decode_play_token(&blob(r#"{"h":"short"}"#)).is_none(), "short hash should be rejected");
 }
 
-// Needs `pickEpisodeFile` from season.go (work package 5). The Go body is kept, to port once it lands.
+// Needs `pickEpisodeFile` from season.go (work package 5). The body is ported and compiled out until it lands.
 #[test]
 #[ignore = "needs pick_episode_file from season.rs (package 5)"]
 fn pick_episode_file() {
-    /*
-    files := []TorrentFile{
-        {Index: 0, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
-        {Index: 1, Name: "Show.S01E02.1080p.mkv", SizeBytes: intp(900)},
-        {Index: 2, Name: "Show.S01E02.sample.mkv", SizeBytes: intp(5)},
-        {Index: 3, Name: "readme.txt", SizeBytes: intp(1)},
+    // Enable when package 5 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::season::{pick_episode_file, TorrentFile};
+        let files = vec![
+            TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+            TorrentFile { index: 1, name: "Show.S01E02.1080p.mkv".into(), size_bytes: Some(900) },
+            TorrentFile { index: 2, name: "Show.S01E02.sample.mkv".into(), size_bytes: Some(5) },
+            TorrentFile { index: 3, name: "readme.txt".into(), size_bytes: Some(1) },
+        ];
+        // SxxExx pick (largest on ties)
+        let got = pick_episode_file(&files, 1, 2);
+        assert!(matches!(got, Ok(Some(1))), "SxxExx pick (largest on ties): got {got:?} want 1");
+        let got = pick_episode_file(&[TorrentFile { index: 7, name: "Show 1x03.mp4".into(), size_bytes: None }], 1, 3);
+        assert!(matches!(got, Ok(Some(7))), "1x03: got {got:?}");
+        let got = pick_episode_file(&[TorrentFile { index: 8, name: "Show.104.mp4".into(), size_bytes: None }], 1, 4);
+        assert!(matches!(got, Ok(Some(8))), "104: got {got:?}");
+        // Neither name is episode-labelled and there is more than one candidate, so this function has NO
+        // opinion — the largest-video fallback moved out to the callers, where it comes after the indexer's
+        // fileIdx instead of pre-empting it. Answering here made a guess beat a fact: a non-nil result makes
+        // every caller return before FileIdx is read, so a bare-numbered pack ("[Grp] Show - 03") served the
+        // same file for every episode of it.
+        let multi = [
+            TorrentFile { index: 4, name: "a.mkv".into(), size_bytes: Some(10) },
+            TorrentFile { index: 5, name: "b.mkv".into(), size_bytes: Some(20) },
+        ];
+        let got = pick_episode_file(&multi, 9, 9);
+        assert!(matches!(got, Ok(None)), "no-match on a multi-file pool → no opinion: got {got:?}");
+        // One candidate is different: there the largest really is the only thing it could be.
+        let got = pick_episode_file(&[TorrentFile { index: 4, name: "a.mkv".into(), size_bytes: Some(10) }], 9, 9);
+        assert!(matches!(got, Ok(Some(4))), "a lone unlabelled video is still the answer: got {got:?} want 4");
+        let got = pick_episode_file(&[], 1, 1);
+        assert!(matches!(got, Ok(None)), "no files → nil: got {got:?}");
     }
-    if got, err := pickEpisodeFile(files, 1, 2); err != nil || got == nil || *got != 1 {
-        t.Errorf("SxxExx pick (largest on ties): got %v, %v want 1", got, err)
-    }
-    if got, err := pickEpisodeFile([]TorrentFile{{Index: 7, Name: "Show 1x03.mp4"}}, 1, 3); err != nil || got == nil || *got != 7 {
-        t.Errorf("1x03: got %v, %v", got, err)
-    }
-    if got, err := pickEpisodeFile([]TorrentFile{{Index: 8, Name: "Show.104.mp4"}}, 1, 4); err != nil || got == nil || *got != 8 {
-        t.Errorf("104: got %v, %v", got, err)
-    }
-    // Neither name is episode-labelled and there is more than one candidate, so this function has NO
-    // opinion — the largest-video fallback moved out to the callers, where it comes after the indexer's
-    // fileIdx instead of pre-empting it. Answering here made a guess beat a fact: a non-nil result makes
-    // every caller return before FileIdx is read, so a bare-numbered pack ("[Grp] Show - 03") served the
-    // same file for every episode of it.
-    if got, err := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}, {Index: 5, Name: "b.mkv", SizeBytes: intp(20)}}, 9, 9); err != nil || got != nil {
-        t.Errorf("no-match on a multi-file pool → no opinion: got %v, %v", got, err)
-    }
-    // One candidate is different: there the largest really is the only thing it could be.
-    if got, err := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}}, 9, 9); err != nil || got == nil || *got != 4 {
-        t.Errorf("a lone unlabelled video is still the answer: got %v, %v want 4", got, err)
-    }
-    if got, err := pickEpisodeFile(nil, 1, 1); got != nil || err != nil {
-        t.Errorf("no files → nil: got %v, %v", got, err)
-    }
-    */
+    todo!("pending: core_test.go:203 TestPickEpisodeFile")
 }
 
-// Needs `selectFileID` from stores.go (work package 1, torbox.rs). The Go body is kept, to port once it lands.
+// Needs `selectFileID` from stores.go (work package 1, torbox.rs). The body is ported and compiled out until it lands.
 #[test]
 #[ignore = "needs select_file_id from stores/torbox.rs (package 1)"]
 fn select_file_id_torbox() {
-    /*
-    // TorBox file ids (Index) are NOT positions in Torrentio's list, so a series episode must be
-    // name-matched, never resolved via the passed-through fileIdx (FOLLOWUP #13).
-    pack := []TorrentFile{
-        {Index: 50, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
-        {Index: 55, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
+    // Enable when package 1 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::season::TorrentFile;
+        use crate::stores::{select_file_id, ResolveTarget};
+        // TorBox file ids (Index) are NOT positions in Torrentio's list, so a series episode must be
+        // name-matched, never resolved via the passed-through fileIdx (FOLLOWUP #13).
+        let pack = vec![
+            TorrentFile { index: 50, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+            TorrentFile { index: 55, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
+        ];
+        let got = select_file_id(&pack, &ResolveTarget { season: Some(1), episode: Some(2), file_idx: Some(99), ..Default::default() });
+        assert!(matches!(got, Ok(Some(55))), "episode name-match wins over fileIdx: got {got:?} want 55 (TorBox id)");
+        // fileIdx-only → POSITION in the list mapped to TorBox's file id (files[1].Index == 55).
+        let got = select_file_id(&pack, &ResolveTarget { file_idx: Some(1), ..Default::default() });
+        assert!(matches!(got, Ok(Some(55))), "fileIdx position → TorBox id: got {got:?} want 55");
+        // fileIdx-only with no file list (single-file fast path / list failure) → raw passthrough.
+        let got = select_file_id(&[], &ResolveTarget { file_idx: Some(7), ..Default::default() });
+        assert!(matches!(got, Ok(Some(7))), "fileIdx passthrough when no list: got {got:?} want 7");
+        let got = select_file_id(&pack, &ResolveTarget::default());
+        assert!(matches!(got, Ok(None)), "no selector → nil, got {got:?}");
     }
-    s1, e2, wrong := 1, 2, 99
-    if got, err := selectFileID(pack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); err != nil || got == nil || *got != 55 {
-        t.Errorf("episode name-match wins over fileIdx: got %v, %v want 55 (TorBox id)", got, err)
-    }
-    // fileIdx-only → POSITION in the list mapped to TorBox's file id (files[1].Index == 55).
-    one := 1
-    if got, err := selectFileID(pack, ResolveTarget{FileIdx: &one}); err != nil || got == nil || *got != 55 {
-        t.Errorf("fileIdx position → TorBox id: got %v, %v want 55", got, err)
-    }
-    // fileIdx-only with no file list (single-file fast path / list failure) → raw passthrough.
-    seven := 7
-    if got, err := selectFileID(nil, ResolveTarget{FileIdx: &seven}); err != nil || got == nil || *got != 7 {
-        t.Errorf("fileIdx passthrough when no list: got %v, %v want 7", got, err)
-    }
-    if got, err := selectFileID(pack, ResolveTarget{}); got != nil || err != nil {
-        t.Errorf("no selector → nil, got %v, %v", got, err)
-    }
-    */
+    todo!("pending: core_test.go:236 TestSelectFileIDTorBox")
 }
 
-// Needs `realDebridStore.pickFileID` and `premiumizeStore.pickIndex` (work package 2). The Go body is kept.
+// Needs `realDebridStore.pickFileID` and `premiumizeStore.pickIndex` (work package 2). The body is ported and
+// compiled out until it lands.
 #[test]
 #[ignore = "needs pick_file_id / pick_index from stores/realdebrid.rs and premiumize.rs (package 2)"]
 fn pick_file_id_prefers_episode_match() {
-    /*
-    s1, e2, wrong := 1, 2, 0 // fileIdx=0 would (wrongly) point at E01 by position
-    rdPack := []TorrentFile{
-        {Index: 10, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
-        {Index: 20, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
+    // Enable when package 2 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::season::TorrentFile;
+        use crate::stores::premiumize::PremiumizeStore;
+        use crate::stores::realdebrid::RealDebridStore;
+        use crate::stores::ResolveTarget;
+        // fileIdx=0 would (wrongly) point at E01 by position
+        let t = ResolveTarget { season: Some(1), episode: Some(2), file_idx: Some(0), ..Default::default() };
+        let rd_pack = vec![
+            TorrentFile { index: 10, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+            TorrentFile { index: 20, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
+        ];
+        let got = RealDebridStore::default().pick_file_id(&rd_pack, &t);
+        assert!(matches!(got, Ok(Some(20))), "RD episode match over fileIdx: got {got:?} want 20");
+        // Premiumize index == position
+        let pm_pack = vec![
+            TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+            TorrentFile { index: 1, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
+        ];
+        let got = PremiumizeStore::default().pick_index(&pm_pack, &t);
+        assert!(matches!(got, Ok(Some(1))), "PM episode match over fileIdx: got {got:?} want 1");
     }
-    if got, err := (&realDebridStore{}).pickFileID(rdPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); err != nil || got == nil || *got != 20 {
-        t.Errorf("RD episode match over fileIdx: got %v, %v want 20", got, err)
-    }
-    pmPack := []TorrentFile{ // Premiumize index == position
-        {Index: 0, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
-        {Index: 1, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
-    }
-    if got, err := (&premiumizeStore{}).pickIndex(pmPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); err != nil || got == nil || *got != 1 {
-        t.Errorf("PM episode match over fileIdx: got %v, %v want 1", got, err)
-    }
-    */
+    todo!("pending: core_test.go:262 TestPickFileIDPrefersEpisodeMatch")
 }
 
-// Needs `cleanLabel` and `sizeLabel` from label.go (work package 5). The Go body is kept.
+// Needs `cleanLabel` and `sizeLabel` from label.go (work package 5). The body is ported and compiled out until it lands.
 #[test]
 #[ignore = "needs clean_label / size_label from label.rs (package 5)"]
 fn clean_label_and_size() {
-    /*
-    s := RawStream{Title: "Movie 2160p WEB-DL HDR Atmos", SizeBytes: intp(18 * gib)}
-    if got := cleanLabel(s); got != "4K • WEB-DL • HDR • Atmos • 18 GB" {
-        t.Errorf("cleanLabel=%q", got)
+    // Enable when package 5 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::label::{clean_label, size_label};
+        use crate::rank::RawStream;
+        const GIB: i64 = 1 << 30;
+        const MIB: i64 = 1 << 20;
+        let s = RawStream { title: "Movie 2160p WEB-DL HDR Atmos".into(), size_bytes: Some(18 * GIB), ..Default::default() };
+        assert_eq!(clean_label(&s), "4K • WEB-DL • HDR • Atmos • 18 GB", "cleanLabel");
+        let sz = 3.4 * GIB as f64;
+        assert_eq!(size_label(sz as i64), "3.4 GB", "sizeLabel small");
+        assert_eq!(size_label(700 * MIB), "700 MB", "sizeLabel mb");
+        assert_eq!(clean_label(&RawStream { title: "mysterious".into(), ..Default::default() }), "Stream", "cleanLabel empty");
     }
-    sz := 3.4 * float64(gib)
-    if got := sizeLabel(int(sz)); got != "3.4 GB" {
-        t.Errorf("sizeLabel small=%q", got)
-    }
-    if got := sizeLabel(700 * mib); got != "700 MB" {
-        t.Errorf("sizeLabel mb=%q", got)
-    }
-    if got := cleanLabel(RawStream{Title: "mysterious"}); got != "Stream" {
-        t.Errorf("cleanLabel empty=%q", got)
-    }
-    */
+    todo!("pending: core_test.go:280 TestCleanLabelAndSize")
 }
 
 // Fauda S1E3: the picker must say what this stream actually is (1.1 GB) and name the pack only as
@@ -361,14 +369,22 @@ fn clean_label_and_size() {
 #[test]
 #[ignore = "needs clean_label from label.rs (package 5)"]
 fn clean_label_pack_size_is_context_not_the_headline() {
-    /*
-    episodeSize, packSize := 1_136_580_921, 68*gib
-    s := RawStream{Title: "Fauda.S01E03.1080p.WEB-DL", SizeBytes: &episodeSize, PackSizeBytes: &packSize}
-    want := "1080p • WEB-DL • 1.1 GB · from a 68 GB pack"
-    if got := cleanLabel(s); got != want {
-        t.Errorf("cleanLabel=%q, want %q", got, want)
+    // Enable when package 5 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::label::clean_label;
+        use crate::rank::RawStream;
+        const GIB: i64 = 1 << 30;
+        let s = RawStream {
+            title: "Fauda.S01E03.1080p.WEB-DL".into(),
+            size_bytes: Some(1_136_580_921),
+            pack_size_bytes: Some(68 * GIB),
+            ..Default::default()
+        };
+        let want = "1080p • WEB-DL • 1.1 GB · from a 68 GB pack";
+        assert_eq!(clean_label(&s), want, "cleanLabel");
     }
-    */
+    todo!("pending: core_test.go:299 TestCleanLabel_packSizeIsContextNotTheHeadline")
 }
 
 // A never-opened pack (unresolvedSeasonPack left SizeBytes nil): the label must name the number as a
@@ -378,103 +394,110 @@ fn clean_label_pack_size_is_context_not_the_headline() {
 #[test]
 #[ignore = "needs clean_label from label.rs (package 5)"]
 fn clean_label_unknown_episode_size_names_the_pack_in_the_headline() {
-    /*
-    packSize := 68 * gib
-    s := RawStream{Title: "Fauda.S01.COMPLETE.1080p.WEB-DL", PackSizeBytes: &packSize}
-    want := "1080p • WEB-DL • 68 GB pack"
-    if got := cleanLabel(s); got != want {
-        t.Errorf("cleanLabel=%q, want %q", got, want)
+    // Enable when package 5 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::label::clean_label;
+        use crate::rank::RawStream;
+        const GIB: i64 = 1 << 30;
+        let s = RawStream { title: "Fauda.S01.COMPLETE.1080p.WEB-DL".into(), pack_size_bytes: Some(68 * GIB), ..Default::default() };
+        assert_eq!(clean_label(&s), "1080p • WEB-DL • 68 GB pack", "cleanLabel");
     }
-    */
+    todo!("pending: core_test.go:312 TestCleanLabel_unknownEpisodeSizeNamesThePackInTheHeadline")
 }
 
-// Needs `streamAttributes` and `StreamAttributes` from attributes.go (work package 5). The Go body is kept.
+// Needs `streamAttributes` and `StreamAttributes` from attributes.go (work package 5). The body is ported and
+// compiled out until it lands.
 #[test]
 #[ignore = "needs stream_attributes from attributes.rs (package 5)"]
 fn stream_attributes() {
-    /*
-    a := streamAttributes(RawStream{Title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos", SizeBytes: intp(40 * gib),
-        Seeders: intp(12), Cached: true, CacheKnown: true})
-    if a.Resolution == nil || *a.Resolution != "2160p" || a.Source == nil || *a.Source != "remux" ||
-        a.Codec == nil || *a.Codec != "hevc" || !a.HDR || !a.DolbyVision || a.Audio == nil || *a.Audio != "Atmos" ||
-        a.HDRFormat == nil || *a.HDRFormat != "HDR" || a.ThreeD || a.Cached == nil || !*a.Cached ||
-        a.Seeders == nil || *a.Seeders != 12 {
-        t.Errorf("rich attrs: %+v", a)
-    }
+    // Enable when package 5 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
+        use crate::attributes::stream_attributes;
+        use crate::rank::RawStream;
+        const GIB: i64 = 1 << 30;
+        let a = stream_attributes(&RawStream {
+            title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos".into(),
+            size_bytes: Some(40 * GIB),
+            seeders: Some(12),
+            cached: true,
+            cache_known: true,
+            ..Default::default()
+        });
+        assert!(
+            a.resolution.as_deref() == Some("2160p")
+                && a.source.as_deref() == Some("remux")
+                && a.codec.as_deref() == Some("hevc")
+                && a.hdr
+                && a.dolby_vision
+                && a.audio.as_deref() == Some("Atmos")
+                && a.hdr_format.as_deref() == Some("HDR")
+                && !a.three_d
+                && a.cached == Some(true)
+                && a.seeders == Some(12),
+            "rich attrs: {a:?}"
+        );
 
-    // Cachedness is reported only when it was observed. A failed cache check leaves `Cached` at its zero
-    // value, and sending that as `false` is a claim nobody made — the client reads a definite "must
-    // download" and queues a fetch for a release the debrid may already hold.
-    unknown := streamAttributes(RawStream{Title: "Movie.1080p.WEB-DL", Cached: false, CacheKnown: false})
-    if unknown.Cached != nil {
-        t.Errorf("unchecked cachedness must be omitted, got %v", *unknown.Cached)
-    }
-    held := streamAttributes(RawStream{Title: "Movie.1080p.WEB-DL", Cached: false, CacheKnown: true})
-    if held.Cached == nil || *held.Cached {
-        t.Errorf("an observed 'not held' must be reported as false, got %v", held.Cached)
-    }
-    // HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
-    hdrCases := map[string]string{
-        "Movie 2160p WEB-DL DDP5.1 DV HDR10+ HEVC": "HDR10+", // HDR10+ beats a bare hdr10 token
-        "Movie 2160p WEB-DL HLG HEVC":              "HLG",
-        "Movie 2160p WEB-DL HDR10 HEVC":            "HDR10",
-        "Movie 2160p WEB-DL HDR HEVC":              "HDR",
-        "Movie 1080p BluRay x264":                  "",
-    }
-    for title, want := range hdrCases {
-        f := streamAttributes(RawStream{Title: title}).HDRFormat
-        got := ""
-        if f != nil {
-            got = *f
-        }
-        if got != want {
-            t.Errorf("hdrFormat(%q)=%q want %q", title, got, want)
-        }
-    }
+        // Cachedness is reported only when it was observed. A failed cache check leaves `Cached` at its zero
+        // value, and sending that as `false` is a claim nobody made — the client reads a definite "must
+        // download" and queues a fetch for a release the debrid may already hold.
+        let unknown = stream_attributes(&RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: false, ..Default::default() });
+        assert!(unknown.cached.is_none(), "unchecked cachedness must be omitted, got {:?}", unknown.cached);
+        let held = stream_attributes(&RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: true, ..Default::default() });
+        assert_eq!(held.cached, Some(false), "an observed 'not held' must be reported as false");
 
-    // Source-truth audio: normalized codec family + channel layout + atmos flag (so the client can
-    // compute what Den actually delivers). DDP5 1 (space) still resolves to 5.1.
-    type ac struct {
-        codec, channels string
-        atmos           bool
-    }
-    audioCases := map[string]ac{
-        "Movie 2160p WEB-DL DDP5.1 Atmos HEVC":    {"eac3", "5.1", true},
-        "Movie 2160p REMUX TrueHD.Atmos.7.1 HEVC": {"truehd", "7.1", true},
-        "Movie 1080p BluRay DTS-HD.MA.5.1 x264":   {"dtshdma", "5.1", false},
-        "Movie 2160p UHD BluRay DTS-X 7.1 HEVC":   {"dtsx", "7.1", false},
-        "Movie 2160p WEB-DL DDP5 1 HEVC":          {"eac3", "5.1", false},
-        "Movie 1080p BluRay AC3 2.0 x264":         {"ac3", "2.0", false},
-    }
-    for title, want := range audioCases {
-        g := streamAttributes(RawStream{Title: title})
-        codec, chans := "", ""
-        if g.AudioCodec != nil {
-            codec = *g.AudioCodec
+        // HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
+        let hdr_cases = [
+            ("Movie 2160p WEB-DL DDP5.1 DV HDR10+ HEVC", "HDR10+"), // HDR10+ beats a bare hdr10 token
+            ("Movie 2160p WEB-DL HLG HEVC", "HLG"),
+            ("Movie 2160p WEB-DL HDR10 HEVC", "HDR10"),
+            ("Movie 2160p WEB-DL HDR HEVC", "HDR"),
+            ("Movie 1080p BluRay x264", ""),
+        ];
+        for (title, want) in hdr_cases {
+            let got = stream_attributes(&RawStream { title: title.into(), ..Default::default() }).hdr_format.unwrap_or_default();
+            assert_eq!(got, want, "hdrFormat({title:?})");
         }
-        if g.AudioChannels != nil {
-            chans = *g.AudioChannels
+
+        // Source-truth audio: normalized codec family + channel layout + atmos flag (so the client can
+        // compute what Den actually delivers). DDP5 1 (space) still resolves to 5.1.
+        let audio_cases = [
+            ("Movie 2160p WEB-DL DDP5.1 Atmos HEVC", "eac3", "5.1", true),
+            ("Movie 2160p REMUX TrueHD.Atmos.7.1 HEVC", "truehd", "7.1", true),
+            ("Movie 1080p BluRay DTS-HD.MA.5.1 x264", "dtshdma", "5.1", false),
+            ("Movie 2160p UHD BluRay DTS-X 7.1 HEVC", "dtsx", "7.1", false),
+            ("Movie 2160p WEB-DL DDP5 1 HEVC", "eac3", "5.1", false),
+            ("Movie 1080p BluRay AC3 2.0 x264", "ac3", "2.0", false),
+        ];
+        for (title, codec, channels, atmos) in audio_cases {
+            let g = stream_attributes(&RawStream { title: title.into(), ..Default::default() });
+            let got_codec = g.audio_codec.unwrap_or_default();
+            let got_chans = g.audio_channels.unwrap_or_default();
+            assert!(
+                got_codec == codec && got_chans == channels && g.atmos == atmos,
+                "audio({title:?})= {{{got_codec} {got_chans} {}}} want {{{codec} {channels} {atmos}}}",
+                g.atmos
+            );
         }
-        if codec != want.codec || chans != want.channels || g.Atmos != want.atmos {
-            t.Errorf("audio(%q)= {%q %q %v} want {%q %q %v}", title, codec, chans, g.Atmos, want.codec, want.channels, want.atmos)
+        assert!(stream_attributes(&RawStream { title: "Movie 2160p WEB-DL KORSUB HEVC".into(), ..Default::default() }).hardcoded_subs, "KORSUB → hardcodedSubs");
+        let sources = [
+            ("X 1080p WEB-DL", "webdl"),
+            ("X 1080p WEBRip", "webrip"),
+            ("X 1080p BluRay", "bluray"),
+            ("X 720p HDTV", "hdtv"),
+            ("X DVDRip", "dvdrip"),
+            ("X 2024 HDCAM", "cam"),
+        ];
+        for (title, want) in sources {
+            let s = stream_attributes(&RawStream { title: title.into(), ..Default::default() }).source;
+            assert_eq!(s.as_deref(), Some(want), "source({title:?})");
         }
+        assert!(stream_attributes(&RawStream { title: "X mystery".into(), ..Default::default() }).source.is_none(), "no source → nil");
+        let a = stream_attributes(&RawStream { title: "Movie 2160p WEB-DL HDR10".into(), ..Default::default() });
+        assert!(a.hdr && !a.dolby_vision, "HDR10 without DV");
     }
-    if !streamAttributes(RawStream{Title: "Movie 2160p WEB-DL KORSUB HEVC"}).HardcodedSubs {
-        t.Error("KORSUB → hardcodedSubs")
-    }
-    sources := map[string]string{"X 1080p WEB-DL": "webdl", "X 1080p WEBRip": "webrip", "X 1080p BluRay": "bluray", "X 720p HDTV": "hdtv", "X DVDRip": "dvdrip", "X 2024 HDCAM": "cam"}
-    for title, want := range sources {
-        if s := streamAttributes(RawStream{Title: title}).Source; s == nil || *s != want {
-            t.Errorf("source(%q)=%v want %q", title, s, want)
-        }
-    }
-    if streamAttributes(RawStream{Title: "X mystery"}).Source != nil {
-        t.Error("no source → nil")
-    }
-    if a := streamAttributes(RawStream{Title: "Movie 2160p WEB-DL HDR10"}); !a.HDR || a.DolbyVision {
-        t.Error("HDR10 without DV")
-    }
-    */
+    todo!("pending: core_test.go:321 TestStreamAttributes")
 }
 
 #[test]
