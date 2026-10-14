@@ -24,6 +24,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http = "1"
+# Go `regexp` (RE2): the release-title patterns in rank.go and attributes.go.
+regex = "1"
+# Go `regexp2`: the one "upscaled" junk pattern, which needs a lookbehind that RE2 does not have.
+fancy-regex = "0.19"
 
 [dev-dependencies]
 # Go's `t.TempDir()`.
