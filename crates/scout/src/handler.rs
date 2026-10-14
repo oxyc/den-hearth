@@ -453,8 +453,14 @@ fn entry_body(entry: &Arc<str>, body: Cow<'_, str>) -> Bytes {
     match body {
         Cow::Borrowed(part) => {
             // `part` is a slice of `entry` (split_cached), so its offset in the entry is its address less the entry's.
-            let start = part.as_ptr() as usize - entry.as_ptr() as usize;
-            Bytes::from_owner(Shared(Arc::clone(entry))).slice(start..start + part.len())
+            // A borrowed body from anywhere else is copied rather than sliced out of the wrong allocation.
+            let base = entry.as_ptr() as usize;
+            match (part.as_ptr() as usize).checked_sub(base) {
+                Some(start) if start + part.len() <= entry.len() => {
+                    Bytes::from_owner(Shared(Arc::clone(entry))).slice(start..start + part.len())
+                }
+                _ => Bytes::copy_from_slice(part.as_bytes()),
+            }
         }
         Cow::Owned(relabelled) => Bytes::from(relabelled),
     }
