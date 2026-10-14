@@ -9,3 +9,9 @@ pub struct TorrentFile {
     pub name: String,
     pub size_bytes: Option<i64>,
 }
+
+/// Go `pickEpisodeFile`: the index of the file in a season pack that holds `season`/`episode`. The
+/// `Err` side stands in for Go's `error`; the season porter settles its real type.
+pub(crate) fn pick_episode_file(_files: &[TorrentFile], _season: i64, _episode: i64) -> Result<Option<i64>, String> {
+    todo!()
+}
