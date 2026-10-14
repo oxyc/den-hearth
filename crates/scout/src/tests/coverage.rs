@@ -146,7 +146,8 @@ async fn stream_envelope_reports_coverage() {
         assert!(env.v == 1 && env.answer_kind == kind && env.coverage.complete == complete, "{name}: envelope = {env:?}");
         let header = crate::tests::handler::hdr(&rr, "x-den-degraded");
         assert!(header == degraded && env.degraded == header, "{name}: X-Den-Degraded {header:?}, envelope {:?}", env.degraded);
-        assert!(env.generated_at.is_some() && (degraded.is_empty()) == env.expires_at.is_none(), "{name}: generatedAt/expiresAt");
+        // A cached (non-degraded) list says when it expires; an uncached (degraded) one does not.
+        assert!(env.generated_at.is_some() && degraded.is_empty() != env.expires_at.is_none(), "{name}: generatedAt/expiresAt");
         assert_eq!(env.coverage.sources.len(), outcomes.len(), "{name}: coverage sources");
         for (i, want) in outcomes.iter().enumerate() {
             assert_eq!(env.coverage.sources[i].outcome, *want, "{name}: source {i} outcome");
