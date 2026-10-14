@@ -1,12 +1,7 @@
-//! Go: `internal/scout/stores_test.go` (2276 lines). Work package 1.
+//! Go: `internal/scout/stores_test.go` (2276 lines).
 //!
-//! Covers all three stores; the Real-Debrid and Premiumize parts need work package 2's modules.
-//!
-//! The tests that reach only the TorBox store and its listing decode are live (red at `todo!()` until the
-//! torbox module lands). The rest are kept in the `pending` module below, cfg-gated, with the reason on each:
-//! they need a symbol another package owns (`torrent_id_key`, `resolve_key`, `StorePool`, `realDebridStore`,
-//! `writeQueuedBody`, the metrics set), or a Go-runtime measurement (`runtime.MemStats`, Go's `singleflight`
-//! and map identity) that has no Rust counterpart without a counting allocator in the test binary.
+//! Covers all three stores. The Go tests that measured allocations with `runtime.MemStats` are not here: they
+//! need a counting allocator in the test binary.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
@@ -15,7 +10,7 @@ use std::time::Duration;
 
 use crate::cache::{Cache, MemoryCache};
 use crate::config::{Config, DebridAccount, DebridService};
-use crate::handler::{rd_only, write_queued_body};
+use crate::handler::{queued_body, rd_only};
 use crate::scrape::{DoError, Doer};
 use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
@@ -35,11 +30,6 @@ use crate::tests::mock::{resp, MockDoer};
 use crate::util::key_hash;
 
 const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-/// Go `path.Base(r.URL.Path)`.
-fn base(req: &reqwest::Request) -> String {
-    req.url().path().rsplit('/').next().unwrap_or("").to_owned()
-}
 
 /// Go `r.URL.Query().Get(key)`: empty when absent.
 fn query(req: &reqwest::Request, key: &str) -> String {
@@ -540,7 +530,7 @@ fn fetch_account_listing_streams_and_detects_truncation() {
     // Truncation is detectable, and must not look like an empty account.
     // Constructed exactly as production does: the reader is given limit+1 so that "read the cap exactly"
     // and "cut off at the cap" are distinguishable.
-    let mut td = TruncationDetector { r: std::io::Read::take(big.as_bytes(), (1 << 10) + 1), limit: 1 << 10 };
+    let mut td = TruncationDetector { r: std::io::Read::take(big.as_bytes(), (1 << 10) + 1) };
     let (_, ok, _) = decode_listing(&mut td);
     assert!(!ok, "a truncated listing decoded as a valid answer");
     assert!(td.truncated(), "truncation went undetected — it would read as 'this account holds nothing'");
@@ -1093,8 +1083,7 @@ fn truncation_detector_a_body_of_exactly_the_cap_is_whole() {
     {
         // Constructed exactly as fetchAccountListing does it.
         let body = "x".repeat(size);
-        let mut td =
-            TruncationDetector { r: std::io::Read::take(body.as_bytes(), (LIMIT + 1) as u64), limit: LIMIT };
+        let mut td = TruncationDetector { r: std::io::Read::take(body.as_bytes(), (LIMIT + 1) as u64) };
         let n = std::io::copy(&mut td, &mut std::io::sink()).expect("read");
         assert_eq!(
             td.truncated(),
@@ -1826,7 +1815,7 @@ async fn torbox_status_answer_coordination_includes_api_identity() {
 fn queued_body_carries_state_and_swarm() {
     // The 202 body names the state and the swarm when the store knew them, and omits the counts when it didn't.
     let decode = |status: StoreStatus| -> serde_json::Value {
-        serde_json::from_slice(&write_queued_body(&status).body).expect("decode")
+        serde_json::from_slice(&serde_json::to_vec(&queued_body(&status)).expect("encode")).expect("decode")
     };
     let stalled = decode(StoreStatus {
         state: FETCH_STALLED.into(),
@@ -1950,277 +1939,6 @@ async fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
         crate::metrics::background_panic() > before,
         "the panic was not counted — an operator has nothing to alert on"
     );
-}
-
-#[test]
-#[ignore = "Go-runtime measurement (runtime.MemStats): needs a counting allocator in the test binary"]
-fn listing_memo_is_bounded_by_torrents_and_drops_expired_entries() {
-    // Enable when the listing memo's internal shape is settled: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        // The memo is bounded by torrents held, not by accounts, and an expired entry stops being resident.
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        let per = MAX_LISTING_MEMO_ENTRIES / 10;
-        let ids =
-            |n: usize| -> HashMap<String, i64> { (0..n).map(|i| (format!("{i:040x}"), i as i64)).collect() };
-        for i in 0..15 {
-            put_cached_listing(&*cache, &format!("acct-{i}"), ids(per));
-        }
-        let (total, accounts) = listing_memo_totals();
-        assert!(total <= MAX_LISTING_MEMO_ENTRIES, "the memo holds {total} torrents across {accounts} accounts, ceiling is {MAX_LISTING_MEMO_ENTRIES}");
-        assert!(
-            total >= MAX_LISTING_MEMO_ENTRIES - per,
-            "the memo holds only {total} torrents — the flood never reached the ceiling"
-        );
-
-        // REFRESHING an account evicts nobody.
-        reset_listing_memo();
-        let half = MAX_LISTING_MEMO_ENTRIES / 2;
-        put_cached_listing(&*cache, "a", ids(half));
-        put_cached_listing(&*cache, "b", ids(half));
-        for i in 0..3 {
-            put_cached_listing(&*cache, "a", ids(half));
-            assert!(
-                listing_memo_has(&*cache, "b"),
-                "refresh {i} of account a evicted account b, which still fits"
-            );
-        }
-
-        // An expired entry is dropped on LOOKUP, not left for the next account's put.
-        set_listing_memo_stale(
-            &*cache,
-            "stale",
-            ids(3),
-            Instant::now() - LISTING_TTL - Duration::from_secs(1),
-        );
-        assert!(cached_listing(&*cache, "stale").is_none(), "an expired listing was served");
-        assert_eq!(listing_memo_len(), 0, "the expired entry is still resident");
-    }
-    todo!("pending: stores_test.go:1451 TestListingMemo_isBoundedByTorrentsAndDropsExpiredEntries")
-}
-
-#[test]
-#[ignore = "Go-only: interface comparability (uncomparable Cache values) has no Rust counterpart"]
-fn listing_memo_survives_an_uncomparable_cache() {
-    // Enable only if the memo keys on something that can be uncomparable; otherwise delete.
-    #[cfg(any())]
-    fn pending() {
-        // A Cache that cannot be a map key gets no memo, rather than panicking inside a request handler.
-        // In Go this is a static-vs-dynamic comparability check on the Cache interface value; Rust keys the
-        // memo on the cache's allocation address, so there is no uncomparable shape to exercise.
-        assert!(!memoisable(&UncomparableCache), "an uncomparable cache was memoised");
-        assert!(memoisable(&MemoryCache::new(1 << 10)), "a comparable Cache was refused the memo");
-    }
-    todo!("pending: stores_test.go:1552 TestListingMemo_survivesAnUncomparableCache")
-}
-
-#[test]
-#[ignore = "Go-runtime measurement (runtime.MemStats): needs a counting allocator in the test binary"]
-fn account_listing_memo_hits_share_one_parsed_map() {
-    // Enable when a counting allocator is in place: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A memo hit hands every caller the same parsed map, rather than re-parsing the listing per caller.
-        const ENTRIES: usize = 2000;
-        let mut body = String::from(r#"{"success":true,"data":["#);
-        for i in 0..ENTRIES {
-            if i > 0 {
-                body.push(',');
-            }
-            body.push_str(&format!(r#"{{"id":{i},"hash":"{i:040x}"}}"#));
-        }
-        body.push_str("]}");
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let f = fetches.clone();
-        let s = tb(
-            "memo",
-            TORBOX_API,
-            Some(Arc::new(MemoryCache::new(1 << 20))),
-            mock(move |_| {
-                f.fetch_add(1, Ordering::SeqCst);
-                Ok(resp(200, &body))
-            }),
-        );
-        let (first, ok) = s.account_listing().await;
-        assert!(ok && first.len() == ENTRIES, "first read: ok={ok} entries={}", first.len());
-        let before = allocated_bytes();
-        let mut got = Vec::new();
-        for i in 0..8 {
-            let (ids, ok) = s.account_listing().await;
-            assert!(ok, "memo hit {i} missed");
-            got.push(ids);
-        }
-        let allocated = allocated_bytes() - before;
-        assert_eq!(fetches.load(Ordering::SeqCst), 1, "fetched the listing more than once for nine reads");
-        for (i, ids) in got.iter().enumerate() {
-            assert_eq!(ids.len(), first.len(), "memo hit {i} returned a different count");
-            assert!(
-                same_map(ids, &first),
-                "memo hit {i} returned a private copy of the listing, not the shared map"
-            );
-        }
-        assert!(
-            allocated <= 64 << 10,
-            "{} memo hits allocated {allocated} bytes — the listing is being re-parsed per caller",
-            got.len()
-        );
-    }
-    todo!("pending: stores_test.go:1600 TestAccountListing_memoHitsShareOneParsedMap")
-}
-
-#[test]
-#[ignore = "Go-runtime measurement (runtime.MemStats): needs a counting allocator in the test binary"]
-fn skip_value_refuses_runaway_nesting() {
-    // Enable when a counting allocator is in place: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        // A deeply nested unknown field is refused rather than walked.
-        let deep = format!(r#"{{"success":true,"x":{}"#, "[".repeat(1 << 20));
-        let before = allocated_bytes();
-        let (_, ok, fault) = decode_listing(deep.as_bytes());
-        let allocated = allocated_bytes() - before;
-        assert!(
-            !ok && fault == ListingFault::BadEnvelope,
-            "runaway nesting: ok={ok} fault={fault:?}, want false and BadEnvelope"
-        );
-        assert!(
-            allocated <= deep.len() as u64,
-            "walking {} bytes of nesting allocated {allocated} bytes",
-            deep.len()
-        );
-    }
-    todo!("pending: stores_test.go:1941 TestSkipValue_refusesRunawayNesting")
-}
-
-#[test]
-#[ignore = "Go-runtime measurement (runtime.MemStats): needs a counting allocator in the test binary"]
-fn decode_listing_does_not_retain_the_body() {
-    // Enable when a counting allocator is in place: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        // The listing decode must not RETAIN the body — that property, not just "it parses", keeps a 64 MiB cap
-        // safe inside a 230 MiB budget. Two fixtures: bulk in a skipped top-level field, and bulk inside data[].
-        let mut skipped = String::from(r#"{"success":true,"unknown_field":["#);
-        let mut i = 0;
-        while skipped.len() < 24 << 20 {
-            if i > 0 {
-                skipped.push(',');
-            }
-            skipped.push_str(&format!(r#"{{"noise":"{}"}}"#, "f".repeat(6000)));
-            i += 1;
-        }
-        skipped.push_str(&format!(r#"],"data":[{{"id":1,"hash":"{}"}}]}}"#, "a".repeat(40)));
-
-        let mut in_data = String::from(r#"{"success":true,"data":["#);
-        let mut j = 0;
-        while in_data.len() < 24 << 20 {
-            if j > 0 {
-                in_data.push(',');
-            }
-            in_data.push_str(&format!(r#"{{"id":{j},"hash":"{j:040x}","files":"{}"}}"#, "f".repeat(6000)));
-            j += 1;
-        }
-        in_data.push_str("]}");
-
-        for (name, body, ceiling_per_mille) in [
-            ("bulk in a skipped top-level field", skipped.as_str(), 2000u64),
-            ("bulk inside the data array", in_data.as_str(), 500u64),
-        ] {
-            let before = allocated_bytes();
-            let (ids, ok, _) = decode_listing(body.as_bytes());
-            let allocated = allocated_bytes() - before;
-            assert!(ok, "{name}: the fixture did not decode");
-            assert!(!ids.is_empty(), "{name}: no entries");
-            let ceiling = body.len() as u64 * ceiling_per_mille / 1000;
-            assert!(allocated <= ceiling, "{name}: decoding a {}-byte listing allocated {allocated} bytes, ceiling {ceiling} — the body is being buffered, not streamed", body.len());
-        }
-    }
-    todo!("pending: stores_test.go:2023 TestDecodeListing_doesNotRetainTheBody")
-}
-
-#[test]
-#[ignore = "Go-runtime measurement (runtime.MemStats): the allocation bound on a 24 MiB hash needs a counting allocator in the test binary; hashNorm and infoHashRe exist now (scrape::normalize_hash, play::is_info_hash) and the functional half runs in decode_listing_drops_unusable_hashes_functional_half"]
-fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
-    // Kept as the Go body: only its allocation bound is out of reach.
-    #[cfg(any())]
-    fn pending() {
-        // Hashes nothing could ask about are dropped before retention; a body of them still reads as
-        // "could not read this", never "the account holds nothing".
-        let good = "a".repeat(40);
-        let giant = format!(
-            r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}},{{"id":2,"hash":"{good}"}}]}}"#,
-            "A".repeat(8 << 20)
-        );
-        let (ids, ok, _) = decode_listing(giant.as_bytes());
-        assert!(ok, "one unusable entry must not make the whole listing unreadable");
-        assert_eq!(ids.get(&good).copied(), Some(2), "the usable entry was lost");
-        assert!(ids.keys().all(|k| k.len() <= 40), "retained a hash longer than any infohash");
-
-        let mut junk = String::from(r#"{"success":true,"data":["#);
-        for i in 0..=MAX_LISTING_ENTRIES {
-            if i > 0 {
-                junk.push(',');
-            }
-            junk.push_str(r#"{"id":1,"hash":"tooshort"}"#);
-        }
-        junk.push_str("]}");
-        let (_, ok, fault) = decode_listing(junk.as_bytes());
-        assert!(
-            !ok && fault == ListingFault::TooManyEntries,
-            "a listing of more than {MAX_LISTING_ENTRIES} unusable hashes: ok={ok} fault={fault:?}"
-        );
-
-        let renamed = format!(
-            r#"{{"success":true,"data":[{{"id":1,"infohash":"{good}"}},{{"id":2,"infohash":"x"}}]}}"#
-        );
-        let (_, ok, fault) = decode_listing(renamed.as_bytes());
-        assert!(
-            !ok && fault == ListingFault::NoUsableEntries,
-            "a listing whose entries all filtered out: ok={ok} fault={fault:?}"
-        );
-        let (ids, ok, _) = decode_listing(br#"{"success":true,"data":[]}"#);
-        assert!(ok && ids.is_empty(), "a genuinely empty account must stay an ANSWER");
-
-        // The filter keeps 32 (base32) and 40 (hex) character hashes, and nothing else.
-        const { assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds") };
-        for n in [32usize, 40] {
-            assert!(hash_norm_matches(&"b".repeat(n)), "hashNorm rejects a {n}-char hash the listing keeps");
-            let (got, ok, _) = decode_listing(
-                format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{}"}}]}}"#, "b".repeat(n)).as_bytes(),
-            );
-            assert!(
-                ok && got.get(&"b".repeat(n)).copied() == Some(9),
-                "a {n}-char hash that /play accepts was dropped"
-            );
-        }
-        for n in [31usize, 33, 39, 41, 64] {
-            assert!(
-                !hash_norm_matches(&"b".repeat(n)),
-                "hashNorm accepts a {n}-char hash the listing filter drops"
-            );
-        }
-
-        // The cheap pre-guard stops ToLower copying a giant value.
-        let huge = format!(r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}}]}}"#, "A".repeat(24 << 20));
-        let before = allocated_bytes();
-        let _ = decode_listing(huge.as_bytes());
-        assert!(
-            allocated_bytes() - before <= 4 * huge.len() as u64,
-            "a listing with a huge hash allocated more than 4x its body"
-        );
-
-        // The length that decides is the LOWERED one: 32 upper-case Kelvin signs lower into a valid hash.
-        let kelvin = "K".repeat(32);
-        let lowered = kelvin.to_lowercase();
-        assert!(info_hash_re_matches(&lowered), "the fixture does not lower into an askable hash");
-        let (got, ok, _) =
-            decode_listing(format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{kelvin}"}}]}}"#).as_bytes());
-        assert!(
-            ok && got.get(&lowered).copied() == Some(7),
-            "a hash judged on its raw byte length was dropped though it lowers into range"
-        );
-    }
-    todo!("pending: stores_test.go:2107 TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount")
 }
 
 // Not in the Go suite: the parts of the three allocation-measuring decode tests that do not need a counting

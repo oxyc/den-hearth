@@ -1,4 +1,4 @@
-//! Go: `internal/scout/client_test.go` (132 lines). Work package 5.
+//! Go: `internal/scout/client_test.go` (132 lines).
 
 use crate::attributes::stream_attributes;
 use crate::client::{

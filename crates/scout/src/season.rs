@@ -1,6 +1,5 @@
 //! Port of `internal/scout/season.go`: picking the right file out of a season pack (SxxExx, 1x02,
-//! "season 1 episode 2", absolute numbering). `TorrentFile` is FROZEN (see PORTING.md): every store lists
-//! files in this shape.
+//! "season 1 episode 2", absolute numbering). Every store lists files as `TorrentFile`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
@@ -9,7 +8,6 @@ use fancy_regex::{Captures, Regex as FancyRegex, RegexBuilder as FancyRegexBuild
 
 use crate::rank::re2;
 use crate::stores::StoreError;
-use crate::util::go_to_lower;
 
 /// fancy-regex gives up on a match after this many backtracks and reports an error, where Go's regexp2 has no
 /// limit and always answers. Callers read an error as "no match", so with the default (1,000,000) a long enough
@@ -35,7 +33,7 @@ fn net_word_boundary() -> String {
 /// .NET's `$` without the multiline option: the end of the text, or just before a final newline.
 const NET_END: &str = r"(?=\n?\z)";
 
-/// FROZEN. Go `TorrentFile`.
+/// Go `TorrentFile`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TorrentFile {
     pub index: i64,
@@ -214,7 +212,7 @@ impl EpisodeNamer {
 
     fn names(&self, name: &str) -> bool {
         matches_episode(name, &self.patterns)
-            || range_holds_episode(&go_to_lower(base_name(name)), self.season, self.episode)
+            || range_holds_episode(&str::to_lowercase(base_name(name)), self.season, self.episode)
     }
 }
 
@@ -234,7 +232,7 @@ pub(crate) fn unresolved_season_pack(title: &str, season: i64, episode: i64) -> 
     if matches_episode(title, &cached_episode_patterns(season, episode)) {
         return false;
     }
-    let lower = go_to_lower(title);
+    let lower = str::to_lowercase(title);
     if range_holds_episode(base_name(&lower), season, episode) {
         return true;
     }
@@ -292,7 +290,7 @@ pub(crate) fn cached_episode_patterns(season: i64, episode: i64) -> Arc<EpisodeP
 
 /// Go `matchesEpisode`: whether a release title names the episode `patterns` was built for.
 pub(crate) fn matches_episode(name: &str, patterns: &EpisodePatterns) -> bool {
-    let n = go_to_lower(base_name(name));
+    let n = str::to_lowercase(base_name(name));
     patterns.iter().any(|p| p.is_match(&n))
 }
 
@@ -480,7 +478,7 @@ pub(crate) fn pick_episode_file(
 /// carries no recognised video extension.
 fn episode_file_pool(files: &[TorrentFile]) -> Vec<&TorrentFile> {
     let videos: Vec<&TorrentFile> =
-        files.iter().filter(|f| VIDEO_EXT_RE.is_match(&go_to_lower(&f.name))).collect();
+        files.iter().filter(|f| VIDEO_EXT_RE.is_match(&str::to_lowercase(&f.name))).collect();
     if videos.is_empty() {
         files.iter().collect()
     } else {
@@ -492,7 +490,7 @@ fn episode_file_pool(files: &[TorrentFile]) -> Vec<&TorrentFile> {
 /// `labelledEpisodeRe.match(strings.ToLower(baseName(name)))`, which `pickEpisodeFile`, `unlabelledCandidates`
 /// and `otherEpisode` all spell out.
 pub(crate) fn declares_episode(name: &str) -> bool {
-    LABELLED_EPISODE_RE.is_match(&go_to_lower(base_name(name)))
+    LABELLED_EPISODE_RE.is_match(&str::to_lowercase(base_name(name)))
 }
 
 /// Go `largest`: the biggest file, the earliest one on a tie. None for an empty list.
@@ -559,7 +557,7 @@ pub(crate) fn largest_episode_candidate(files: &[TorrentFile]) -> Option<&Torren
 /// least half the size of its largest video. A file whose size is unknown is given the benefit of the doubt.
 pub(crate) fn is_feature_sized(files: &[TorrentFile], f: &TorrentFile) -> bool {
     let pool = episode_file_pool(files);
-    if pool.len() < files.len() && !VIDEO_EXT_RE.is_match(&go_to_lower(&f.name)) {
+    if pool.len() < files.len() && !VIDEO_EXT_RE.is_match(&str::to_lowercase(&f.name)) {
         return false;
     }
     let size = f.size_bytes.unwrap_or(0);

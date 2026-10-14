@@ -1,4 +1,4 @@
-//! Go: `internal/scout/probe_test.go` (201 lines). Work package 5.
+//! Go: `internal/scout/probe_test.go` (201 lines).
 //!
 //! The Go tests serve responses from `httptest.NewServer`. Here `serve_once` does the same for one request
 //! on a `std::net` listener and thread, so the crate's dev-dependencies stay as they are.

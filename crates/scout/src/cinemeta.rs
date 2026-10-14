@@ -1,4 +1,4 @@
-//! Port of `internal/scout/cinemeta.go`. Work package 5.
+//! Port of `internal/scout/cinemeta.go`.
 //!
 //! Cinemeta (the public Stremio metadata addon) maps an IMDb id → title/year. den-scout uses those to drop
 //! torrents a tracker mistagged with another title's id. It's a best-effort side lookup: any failure
@@ -38,7 +38,7 @@ use crate::cache::Cache;
 use crate::indexerconfig::{null_default, read_capped, Flight};
 use crate::rank::YEAR_TOKEN;
 use crate::scrape::{Doer, MAX_SCRAPE_BYTES, SCRAPE_USER_AGENT};
-use crate::util::{go_to_lower, key_hash};
+use crate::util::key_hash;
 
 /// Go `cinemetaBase`: the public Cinemeta service.
 pub(crate) const CINEMETA_BASE: &str = "https://v3-cinemeta.strem.io";
@@ -166,5 +166,5 @@ async fn fetch_cinemeta(client: &dyn Doer, base: &str, typ: &str, imdb: &str) ->
 
 /// Go `firstYear` pulls the first plausible 4-digit year out of a string like "2026" or "2019–2023".
 fn first_year(s: &str) -> i64 {
-    YEAR_TOKEN.find(&go_to_lower(s)).and_then(|m| m.as_str().parse().ok()).unwrap_or(0)
+    YEAR_TOKEN.find(&str::to_lowercase(s)).and_then(|m| m.as_str().parse().ok()).unwrap_or(0)
 }

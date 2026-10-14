@@ -1,4 +1,4 @@
-//! Go: `internal/scout/cancel_test.go` (272 lines). Work package 1.
+//! Go: `internal/scout/cancel_test.go` (272 lines).
 //!
 //! Every test here goes through the handler (`new_handler`, `test_deps`, `method`) and the cache key of package 2
 //! (`torrent_id_key`). `sameCalls` is an order-sensitive equality, so it is an `assert_eq!` on the recorded call

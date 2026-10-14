@@ -1,4 +1,4 @@
-//! Port of `internal/scout/manifest.go`. Work package 4.
+//! Port of `internal/scout/manifest.go`.
 
 use std::sync::OnceLock;
 

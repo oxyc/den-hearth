@@ -1,13 +1,11 @@
 //! Port of `internal/scout/probe.go`: reading the head of a resolved link to learn what the file itself
 //! says (container, codecs, audio layout, HDR, Dolby Vision, languages), Matroska first; MP4 and AVI are
-//! in `probe_mp4.rs` and `probe_avi.rs`. `Probe` is FROZEN (see PORTING.md): `RawStream` carries it and
-//! the cache stores it as JSON.
+//! in `probe_mp4.rs` and `probe_avi.rs`. `RawStream` carries a `Probe`, and the cache stores it as JSON.
 
 use serde::{Deserialize, Serialize};
 
 use crate::indexerconfig::null_default;
 use crate::scrape::Doer;
-use crate::util::go_to_lower;
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
@@ -22,7 +20,7 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
-/// FROZEN. Go `Probe`. The serde attributes reproduce the Go JSON tags (`omitempty` is
+/// Go `Probe`. The serde attributes reproduce the Go JSON tags (`omitempty` is
 /// `skip_serializing_if`); `audioLanguages` and `subtitleLanguages` carry no `omitempty` in Go, and
 /// absent decodes as empty.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -75,8 +73,7 @@ pub struct Probe {
 /// Go `probeBytes`: how much of a file's head a probe reads.
 pub(crate) const PROBE_BYTES: usize = 1 << 20;
 
-/// Go `ErrNoTracks`: a head with no Tracks element. A reason constant, per PORTING.md's convention for
-/// sentinel errors.
+/// Go `ErrNoTracks`: a head with no Tracks element, as the error string callers compare against.
 pub(crate) const ERR_NO_TRACKS: &str = "no track information in the file head";
 
 /// Go `idTrackType`: the Matroska TrackType element id.
@@ -305,8 +302,8 @@ pub(crate) fn parse_track_entry(entry: &[u8]) -> (u8, String) {
 /// group or match on. Everything lands on ISO 639-1 where a mapping exists; anything else passes through
 /// as given rather than being dropped.
 pub(crate) fn clean_lang(b: &[u8]) -> String {
-    let raw = go_lossy_utf8(b);
-    let s = go_to_lower(raw.trim_end_matches('\0').trim());
+    let raw = String::from_utf8_lossy(b);
+    let s = raw.trim_end_matches('\0').trim().to_lowercase();
     if s == "und" || s.is_empty() {
         return String::new();
     }
@@ -319,28 +316,6 @@ pub(crate) fn clean_lang(b: &[u8]) -> String {
         Some((_, two)) => (*two).to_string(),
         None => base.to_string(),
     }
-}
-
-/// Go's reading of bytes that may not be UTF-8: `strings.ToLower` and friends turn each byte that is not part of a
-/// valid sequence into its own U+FFFD, where `String::from_utf8_lossy` turns a whole broken sequence into one. A
-/// language tag is whatever bytes the muxer wrote, and it is passed through as given, so the count shows.
-fn go_lossy_utf8(mut b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len());
-    while !b.is_empty() {
-        match std::str::from_utf8(b) {
-            Ok(valid) => {
-                out.push_str(valid);
-                break;
-            }
-            Err(e) => {
-                let (valid, rest) = b.split_at(e.valid_up_to());
-                out.push_str(std::str::from_utf8(valid).unwrap_or_default());
-                out.push('\u{FFFD}');
-                b = rest.get(1..).unwrap_or_default();
-            }
-        }
-    }
-    out
 }
 
 /// Go `iso639`: ISO 639-2 (bibliographic AND terminological — muxers emit both) to 639-1, for the languages

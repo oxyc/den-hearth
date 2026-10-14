@@ -1,4 +1,4 @@
-//! Go: `internal/scout/stores_failure_test.go` (352 lines). Work package 2.
+//! Go: `internal/scout/stores_failure_test.go` (352 lines).
 //!
 //! Every way a debrid can fail to hand over a link. These matter more than the happy path: a resolve that
 //! returns an error lets the pool fall through to another service, while one that panics, hangs, or

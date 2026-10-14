@@ -1,9 +1,14 @@
-//! Port of `internal/scout/loglimit.go`. Work package 6.
+//! Port of `internal/scout/loglimit.go`.
 //!
 //! The log records changes of state, not events. A request-path line fires on every request for as long
 //! as its cause lasts — an indexer that is down is down for every scrape, a client waiting on a download
 //! polls every two seconds — so each such line goes through logLimited, and a condition writes at most
 //! one line a minute however much traffic it sees. Per-request detail is what LOG_REQUESTS is for.
+//!
+//! Not `den_http::log::LimitedLog`, which the other addons share: that one writes straight to stderr, says
+//! "more like it", and has no clock a test can move. Scout's tests read lines through `capture`, rewind a
+//! condition's entry to let it speak again, keep a table per test thread so parallel tests do not silence each
+//! other, and pin the "more like this" wording.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

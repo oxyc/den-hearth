@@ -1,4 +1,4 @@
-//! Port of `internal/scout/probe_fanout.go`. Work package 5.
+//! Port of `internal/scout/probe_fanout.go`.
 //!
 //! The pure half: what a probe's facts change about a stream, which releases are worth probing, and the cache key a
 //! probed file lives under. Go also hangs `hydrateKnownSizes`, `probeTop` and `probeBehind` on the handler (they read
@@ -17,7 +17,6 @@ use crate::metrics::metrics;
 use crate::probe::Probe;
 use crate::rank::{detect_resolution_lower, junk_class_of, quality_score_lower, RawStream, PREFERENCE_SINK};
 use crate::stores::{CacheTruth, ResolveTarget};
-use crate::util::go_to_lower;
 
 /// Go `probeTopN`: how many of the ranked releases get probed. The list is already in the order the client will show,
 /// so the ones a viewer actually considers are at the top — probing all twenty would spend a debrid resolve
@@ -208,7 +207,7 @@ pub(crate) fn browser_probe_candidates(
         return frontier;
     }
     let score = |stream: &RawStream, include_client: bool| -> i64 {
-        let lower = go_to_lower(&stream.title);
+        let lower = str::to_lowercase(&stream.title);
         let mut out = quality_score_lower(&lower, stream, junk_class_of(&lower));
         let prefer = &cfg.filters.prefer_resolution;
         if !prefer.is_empty() {

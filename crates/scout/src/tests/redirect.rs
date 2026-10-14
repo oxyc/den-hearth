@@ -1,4 +1,4 @@
-//! Go: `internal/scout/redirect_test.go` (132 lines). Work package 4.
+//! Go: `internal/scout/redirect_test.go` (132 lines).
 //!
 //! Tests `RefuseRedirectReplay`, the redirect policy in `deps.go`. Go's `http.Client.CheckRedirect` has no
 //! reqwest twin of the same shape (`reqwest::redirect::Policy::custom` is the nearest), so the port

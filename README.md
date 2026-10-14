@@ -5,7 +5,7 @@ remux and transcode) in one process and one runtime.
 
 ```
 crates/
-  scout/      den-scout      library: the Rust port of the Go den-scout (see crates/scout/PORTING.md)
+  scout/      den-scout      library: ported from the Go den-scout, which it replaced
   reel/       den-reel       library
   subtitles/  den-subtitles  library
   remux/      den-remux      library

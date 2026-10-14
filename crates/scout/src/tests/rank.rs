@@ -1,4 +1,4 @@
-//! Go: `internal/scout/rank_test.go` (400 lines). Work package 5.
+//! Go: `internal/scout/rank_test.go` (400 lines).
 //!
 //! Also holds the helpers the other ranking tests share (`rs`, `intp`, `titles`), the way `rank_test.go`
 //! is where Go's `rank_show_test.go` and `extra_test.go` get them from.

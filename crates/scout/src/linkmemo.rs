@@ -1,4 +1,4 @@
-//! Port of `internal/scout/linkmemo.go`. Work package 6.
+//! Port of `internal/scout/linkmemo.go`.
 //!
 //! Remembers minted playback links, in process memory only: a playback link is a credential for as long as it
 //! lives, so it never goes through the shared cache, which writes through to disk.
@@ -120,11 +120,13 @@ impl LinkMemo {
     }
 
     /// Go `ll.Len()`: how many entries the recency list holds.
+    #[cfg(test)]
     pub(crate) fn lru_len(&self) -> usize {
         self.lock().order.len()
     }
 
     /// Go `len(items)`: how many keys the map holds.
+    #[cfg(test)]
     pub(crate) fn map_len(&self) -> usize {
         self.lock().items.len()
     }

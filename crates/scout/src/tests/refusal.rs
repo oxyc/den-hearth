@@ -1,4 +1,4 @@
-//! Go: `internal/scout/refusal_test.go` (1563 lines). Work package 2.
+//! Go: `internal/scout/refusal_test.go` (1563 lines).
 //!
 //! About a third of it goes through the handler (`TestHandleProbe_*`, `TestHandlePlay_*`, `TestProbeAndPlay_*`).
 //! Go calls `handleProbe` directly in some; `Handler::handle_probe` is that call. The rest go through `serve`.
@@ -82,7 +82,9 @@ fn store_for(
     match svc {
         DebridService::RealDebrid => Box::new(real_debrid(token, cache, client)),
         DebridService::Premiumize => Box::new(premiumize(token, cache, client)),
-        DebridService::TorBox => unreachable!("TorBox is work package 1"),
+        DebridService::TorBox => {
+            unreachable!("this helper builds only the Real-Debrid and Premiumize stores")
+        }
     }
 }
 
@@ -767,49 +769,6 @@ async fn handle_play_an_in_flight_add_is_queued_not_refused() {
         "a release scout itself queued was reported as the debrid refusing: {}",
         body_str(&rec)
     );
-}
-
-// A spent clock must not be remembered as the STORE refusing.
-//
-// The guard that stops an add being charged on a dead context returns a StoreUnavailableError, and
-// recordRefusal files anything that is not a cancellation, not errScoutSide, not errAddInFlight and not
-// errTorrentGone. So the refusal memory learned that TorBox had declined a release TorBox was never
-// asked about: one cancelled poll — a viewer changing focus is enough — made a healthy release answer
-// 503 on BOTH routes for the next sixty seconds, on a fresh clock, with the store skipped as "backing
-// off". The clock is scout's, so the error says so, and errScoutSide is what keeps it out of the memory.
-//
-// All three stores, because only TorBox's guard had a test and the other two were free to drift.
-//
-// Ported with `tokio::time::timeout(Duration::ZERO, ...)` standing in for the spent context: a Rust
-// store takes no context (PORTING.md), so a zero deadline is the closest seam.
-#[tokio::test]
-#[ignore = "Go resolves each store with an already-cancelled context and asserts the error is scout-side and unremembered; the Rust stores take no context, so a spent clock is a dropped future with no error to inspect"]
-async fn resolve_a_spent_clock_is_not_remembered_as_the_store_refusing() {
-    #[cfg(any())]
-    async fn pending() {
-        for svc in [DebridService::TorBox, DebridService::RealDebrid, DebridService::Premiumize] {
-            let token = format!("clock-{svc:?}");
-            let hash = "7".repeat(40);
-            let cache = mem();
-            let quiet = answer(200, r#"{"data":{}}"#);
-            let store = store_for_any(svc, &token, &cache, quiet);
-
-            let err = match tokio::time::timeout(Duration::ZERO, store.resolve(&target(&hash))).await {
-                Err(_elapsed) => StoreError::Cancelled,
-                Ok(Ok(_)) => panic!("a resolve on a spent clock should not succeed"),
-                Ok(Err(e)) => e,
-            };
-            assert!(
-                matches!(err, StoreError::Cancelled),
-                "a spent clock reported {err:?} — not marked as scout's own, so recordRefusal files it and the store is blamed for a request it never saw"
-            );
-            assert!(
-                backed_off(&*cache, svc, &token, &hash).is_none(),
-                "a spent clock left a refusal against {svc:?} — the next poll skips a healthy store for a minute, on both /play and ?probe=1"
-            );
-        }
-    }
-    todo!("pending: refusal_test.go:538")
 }
 
 // The probe stops believing an add at the same moment /play does.

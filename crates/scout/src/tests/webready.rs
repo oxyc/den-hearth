@@ -1,7 +1,4 @@
-//! Go: `internal/scout/webready_test.go` (29 lines). Work package 5.
-//!
-//! `webReady` is defined in Go's `handler.go` (line 2190), not `client.go`. PORTING.md assigns this file to
-//! `client.rs`, so the Rust stub lives there for now; the handler porter may move it.
+//! Go: `internal/scout/webready_test.go` (29 lines). `web_ready` lives in `client.rs`.
 
 use crate::probe::Probe;
 use crate::rank::RawStream;

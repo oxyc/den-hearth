@@ -1,6 +1,5 @@
-//! Port of the TorBox half of `internal/scout/stores.go` (lines 446-3770 less the refusal helpers in
-//! `refusal.rs`): `torBoxStore`, its check-cached batcher, account listing, status, cancel and file
-//! selection. Owned by the "Stores I" work package.
+//! The TorBox store (Go `torBoxStore`): its check-cached batcher, account listing, status, cancel and file
+//! selection.
 //!
 //! Context: Go threads a `context.Context` through every call. Here a call's deadline is the caller's
 //! `tokio::time::timeout` and its cancellation is dropping the future. Work that Go runs detached from the
@@ -43,7 +42,7 @@ use crate::stores::refusal::{
     remember_cached, resolve_key, settle_add_attempt, torbox_account_identity, torrent_id_key,
     torrent_miss_key, transport_error, transport_kind, unknown_outcome, TORRENT_MISS_TTL,
 };
-use crate::util::{go_to_lower, key_hash, Shape, LEAF};
+use crate::util::{key_hash, Shape, LEAF};
 
 use super::{
     build_request, dead_link, encode_form, join_all, magnet_for, read_limited, read_store_error,
@@ -378,7 +377,7 @@ impl TorBoxStore {
         };
         let mut answer = HashMap::with_capacity(hashes.len());
         for hash in hashes {
-            let held = data.is_some_and(|d| d.contains_key(hash) || d.contains_key(&go_to_upper(hash)));
+            let held = data.is_some_and(|d| d.contains_key(hash) || d.contains_key(&str::to_uppercase(hash)));
             answer.insert(hash.clone(), held);
         }
         TorboxCheckResult { cached: answer, ok: true }
@@ -401,7 +400,7 @@ impl TorBoxStore {
             let Some(answer) = answer else { continue };
             batch_ok[i] = true;
             for h in batch {
-                result.insert(h.clone(), answer.get(&go_to_lower(h)).copied().unwrap_or(false));
+                result.insert(h.clone(), answer.get(&str::to_lowercase(h)).copied().unwrap_or(false));
             }
         }
         remember_cached(self.cache(), DebridService::TorBox, &self.account_identity(), &result);
@@ -410,7 +409,7 @@ impl TorBoxStore {
 
     /// Go `torBoxStore.checkCachedBatch`.
     pub(crate) async fn check_cached_batch(&self, hashes: &[String]) -> Option<HashMap<String, bool>> {
-        let mut set: Vec<String> = hashes.iter().map(|h| go_to_lower(h)).collect();
+        let mut set: Vec<String> = hashes.iter().map(|h| str::to_lowercase(h)).collect();
         set.sort();
         let key = format!("{}:{}", key_hash(&self.account_identity()), key_hash(&set.join(",")));
         let store = self.clone();
@@ -766,10 +765,10 @@ impl TorBoxStore {
         if success == Some(false) {
             return Ok((0, false));
         }
-        let needle = go_to_lower(info_hash);
+        let needle = str::to_lowercase(info_hash);
         for (id, hash) in entries {
             if let Some(id) = id {
-                if go_to_lower(&hash) == needle {
+                if str::to_lowercase(&hash) == needle {
                     return Ok((id, true));
                 }
             }
@@ -837,7 +836,7 @@ impl TorBoxStore {
         }
         let refused = serde_json::from_slice::<Value>(&raw).ok().is_some_and(|v| {
             v.as_object()
-                .and_then(|o| o.iter().find(|(k, _)| go_to_lower(k) == "success"))
+                .and_then(|o| o.iter().find(|(k, _)| str::to_lowercase(k) == "success"))
                 .is_some_and(|(_, s)| matches!(s, Value::Bool(false)))
         });
         if refused {
@@ -1215,7 +1214,7 @@ impl TorBoxStore {
         if !ok {
             return (0, false, false);
         }
-        match ids.get(&go_to_lower(info_hash)) {
+        match ids.get(&str::to_lowercase(info_hash)) {
             Some(id) => (*id, true, true),
             None => (0, false, true),
         }
@@ -1360,8 +1359,7 @@ impl TorBoxStore {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
         let decode = tokio::task::spawn_blocking(move || {
             let reader = ChunkReader { rx, current: Vec::new(), pos: 0 };
-            let mut limited =
-                TruncationDetector { r: reader.take(MAX_LISTING_BYTES as u64 + 1), limit: MAX_LISTING_BYTES };
+            let mut limited = TruncationDetector { r: reader.take(MAX_LISTING_BYTES as u64 + 1) };
             let (ids, ok, fault) = decode_listing(&mut limited);
             (ids, ok, fault, limited.truncated())
         });
@@ -1804,11 +1802,6 @@ fn torbox_endpoint(u: &reqwest::Url) -> &'static str {
     }
 }
 
-/// Go `strings.ToUpper` for a hash: simple per-character upper-casing.
-fn go_to_upper(s: &str) -> String {
-    s.chars().map(|c| c.to_uppercase().next().unwrap_or(c)).collect()
-}
-
 /// Feeds the blocking listing decode from the async body reader.
 struct ChunkReader {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -1840,7 +1833,11 @@ impl Read for ChunkReader {
 
 /// Go `torboxStatusKey`.
 pub(crate) fn torbox_status_key(identity: &str, info_hash: &str) -> String {
-    format!("torbox:status:{}:{}", key_hash(&canonical_torbox_identity(identity)), go_to_lower(info_hash))
+    format!(
+        "torbox:status:{}:{}",
+        key_hash(&canonical_torbox_identity(identity)),
+        str::to_lowercase(info_hash)
+    )
 }
 
 /// Go `clearTorboxStatus`.
@@ -1854,7 +1851,11 @@ pub(crate) fn clear_torbox_status(cache: &dyn Cache, identity: &str, info_hash: 
 /// it is written only at the moment a fresh add (or a queued add TorBox later promotes) resolves to a real
 /// torrent id, never on the "already held" fast path that merely discovers one.
 pub(crate) fn torbox_added_key(identity: &str, info_hash: &str) -> String {
-    format!("torbox:addedbyus:{}:{}", key_hash(&canonical_torbox_identity(identity)), go_to_lower(info_hash))
+    format!(
+        "torbox:addedbyus:{}:{}",
+        key_hash(&canonical_torbox_identity(identity)),
+        str::to_lowercase(info_hash)
+    )
 }
 
 pub(crate) fn mark_added_by_us(cache: &dyn Cache, identity: &str, info_hash: &str) {
@@ -1875,7 +1876,11 @@ pub(crate) fn clear_added_by_us(cache: &dyn Cache, identity: &str, info_hash: &s
 /// the next poll finds no torrent id and no "add in flight" marker (the add already settled — it succeeded) and
 /// sends createtorrent again, once per poll, until the hourly allowance is gone.
 pub(crate) fn torbox_queued_key(identity: &str, info_hash: &str) -> String {
-    format!("torbox:queuedid:{}:{}", key_hash(&canonical_torbox_identity(identity)), go_to_lower(info_hash))
+    format!(
+        "torbox:queuedid:{}:{}",
+        key_hash(&canonical_torbox_identity(identity)),
+        str::to_lowercase(info_hash)
+    )
 }
 
 /// Go `torboxQueuedMissKey` remembers that findQueuedByHash read the account's queue listing and the hash was
@@ -1883,7 +1888,11 @@ pub(crate) fn torbox_queued_key(identity: &str, info_hash: &str) -> String {
 /// reason: a release that is genuinely nowhere must not pay for a fresh getqueued on every poll of a two-second
 /// cadence.
 pub(crate) fn torbox_queued_miss_key(identity: &str, info_hash: &str) -> String {
-    format!("torbox:noqueue:{}:{}", key_hash(&canonical_torbox_identity(identity)), go_to_lower(info_hash))
+    format!(
+        "torbox:noqueue:{}:{}",
+        key_hash(&canonical_torbox_identity(identity)),
+        str::to_lowercase(info_hash)
+    )
 }
 
 /// Go `torrentListKey` — the account's hash → torrent-id map. Account-scoped like every other key here.
@@ -2082,7 +2091,7 @@ fn torbox_already_queued_error(raw: &[u8]) -> bool {
             return true;
         }
     }
-    go_to_lower(detail).contains("already queued")
+    str::to_lowercase(detail).contains("already queued")
 }
 
 /// Go `torboxEntryState` is the subset of one mylist-by-id entry Cancel needs: whether TorBox has finished with
@@ -2929,7 +2938,7 @@ impl Store for TorBoxStore {
     /// never a torrent scout did not add, never one already finished — both checked here — and never one a
     /// sibling queue entry still needs, which only the CLIENT can know and so is not this store's job.
     async fn cancel(&self, info_hash: &str, reannounce: bool) -> Option<Result<CancelOutcome, StoreError>> {
-        Some(self.cancel_release(&go_to_lower(info_hash), reannounce).await)
+        Some(self.cancel_release(&str::to_lowercase(info_hash), reannounce).await)
     }
 
     fn recent_refusal(&self, info_hash: &str) -> Option<String> {
@@ -3077,7 +3086,7 @@ fn torbox_is_finished(finished: Option<bool>, state: Option<&str>) -> bool {
         return true;
     }
     let Some(state) = state else { return false };
-    matches!(go_to_lower(state.trim()).as_str(), "completed" | "cached" | "uploading")
+    matches!(str::to_lowercase(state.trim()).as_str(), "completed" | "cached" | "uploading")
 }
 
 /// Go's `%q` for a log line.

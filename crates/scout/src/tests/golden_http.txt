@@ -1,0 +1,1072 @@
+== preflight on any path
+> OPTIONS /anything/at/all
+< 204
+< access-control-allow-headers: *
+< access-control-allow-methods: GET, HEAD, POST, DELETE, OPTIONS
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-max-age: 86400
+< timing-allow-origin: *
+
+
+== configure page
+> GET /
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< content-type: text/html; charset=utf-8
+< etag: "3f92e2860fade9ef"
+< timing-allow-origin: *
+<html: 127400 bytes, FNV-1a-64 3f92e2860fade9ef>
+
+== configure revalidated
+> GET /configure
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< etag: <the tag revalidated>
+< timing-allow-origin: *
+
+
+== configure revalidated with a weak tag
+> GET /configure/
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< etag: <the tag revalidated>
+< timing-allow-origin: *
+
+
+== configure HEAD
+> HEAD /configure
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< content-type: text/html; charset=utf-8
+< etag: <the previous response's>
+< timing-allow-origin: *
+<html: 0 bytes, FNV-1a-64 cbf29ce484222325>
+
+== health
+> GET /health
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"coverage":"complete","status":"ok"}
+
+== health HEAD
+> HEAD /health
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+
+
+== health POST
+> POST /health
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: GET, HEAD
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"method_not_allowed"}
+
+== PUT on a list
+> PUT /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: GET, HEAD
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"method_not_allowed"}
+
+== metrics without a token configured
+> GET /metrics
+> authorization: …
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== manifest
+> GET /manifest.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< content-type: application/json
+< etag: "91894a767836d12f"
+< timing-allow-origin: *
+{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}
+
+== manifest revalidated
+> GET /manifest.json
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< etag: <the tag revalidated>
+< timing-allow-origin: *
+
+
+== manifest revalidated, no match
+> GET /manifest.json
+> if-none-match: …
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< content-type: application/json
+< etag: "91894a767836d12f"
+< timing-allow-origin: *
+{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}
+
+== config-key without a key
+> GET /config-key
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"epoch":0,"error":"no_key"}
+
+== configured manifest
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/manifest.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=3600, stale-while-revalidate=600
+< content-type: application/json
+< etag: "afd2d5c27f9ff7e4"
+< timing-allow-origin: *
+{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Cached-first, ranked, junk-filtered streams via torbox.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":false}}
+
+== configured manifest revalidated
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/manifest.json
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=3600, stale-while-revalidate=600
+< etag: <the tag revalidated>
+< timing-allow-origin: *
+
+
+== configured manifest, bad config
+> GET /not-a-config/manifest.json
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_config"}
+
+== unknown one-segment path
+> GET /nope
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== unknown route under a config
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/nope/x
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== list, bad id
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/nope.json
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_id"}
+
+== list, bad config
+> GET /not-a-config/stream/movie/tt1234567.json
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"error":"bad_config"}
+
+== list, cold build
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, warm hit
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: cache;desc=hit, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, revalidated
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< etag: <the tag revalidated>
+< server-timing: cache;desc=hit, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+
+
+== list, revalidated with a weak tag
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< etag: <the tag revalidated>
+< server-timing: cache;desc=hit, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+
+
+== list, HEAD
+> HEAD /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the previous response's>
+< server-timing: cache;desc=hit, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+
+
+== list, ranked for a browser
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+> x-den-playable: …
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: cache;desc=hit, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, unreadable playable report
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+> x-den-playable: …
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: cache;desc=hit, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, episode
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/series/tt1234567:1:2.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjAsInMiOjEsImUiOjJ9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjAsInMiOjEsImUiOjJ9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, debug
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json?debug=1
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"debug":{"deduped":3,"ranked":2,"droppedBy":{"cam":1},"kept":[{"title":"Movie 2160p WEB-DL HDR","score":12201,"resolution":"2160p","cached":true},{"title":"Movie 1080p WEB-DL","score":9203,"resolution":"1080p","cached":true}]},"den":{"v":1,"answerKind":"live","generatedAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, debug paced
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json?debug=1
+< 429
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 10
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"error":"debug_rate_limited"}
+
+== list, scoped config
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwic2NvcGUiOiJhdmFpbGFiaWxpdHkifQ/stream/movie/tt1234567.json
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"error":"bad_config"}
+
+== stale: cold build
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== stale: served while it rebuilds
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=60
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: cache;desc=stale, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"stale","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, a release name with & < > in it
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Fast & Furious <Director's Cut> 2160p WEB-DL HDR","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Fast & Furious <Director's Cut> 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsImYiOjB9","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== list, every indexer down
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+< x-den-degraded: indexers
+{"streams":[],"den":{"v":1,"answerKind":"unknown","degraded":"indexers","generatedAt":"*","coverage":{"complete":false,"sources":[{"id":"torrentio","outcome":"unreachable","items":0,"observedAt":"*"}]}}}
+
+== play, resolved
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 302
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-length: 0
+< location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
+< server-timing: resolve;dur=*, total;dur=*
+< timing-allow-origin: *
+
+
+== play, from the link memo
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 302
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-length: 0
+< location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
+< server-timing: total;dur=*
+< timing-allow-origin: *
+
+
+== play, HEAD
+> HEAD /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: GET
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+
+
+== play, POST
+> POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: GET, HEAD
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"method_not_allowed"}
+
+== play, bad token
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/nope
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"error":"bad_token"}
+
+== play, bad config
+> GET /not-a-config/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"error":"bad_config"}
+
+== play, probe ready
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9?probe=1
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"state":"ready"}
+
+== play, probe not queued
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9?probe=1
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"error":"not_queued"}
+
+== play, dead
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: resolve;dur=*, total;dur=*
+< timing-allow-origin: *
+{"error":"dead_link"}
+
+== play, downloading
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
+< 202
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"etaSeconds":90,"progress":0.25,"seeds":4,"service":"torbox","state":"downloading"}
+
+== play, downloading at zero
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
+< 202
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"progress":0,"service":"torbox","state":"downloading"}
+
+== play, store refused
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< server-timing: resolve;dur=*, total;dur=*
+< timing-allow-origin: *
+{"error":"store_unavailable","service":"torbox"}
+
+== cancel, legacy route, no store can
+> DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 501
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"unsupported"}
+
+== cancel, bad token
+> DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/nope
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_token"}
+
+== DELETE elsewhere
+> DELETE /health
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: GET, HEAD
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"method_not_allowed"}
+
+== account
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/account
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+[{"service":"torbox"}]
+
+== account, bad config
+> GET /not-a-config/account
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_config"}
+
+== validate GET
+> GET /validate
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: POST
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"method_not_allowed"}
+
+== validate, not JSON
+> POST /validate
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_request"}
+
+== validate, unknown service
+> POST /validate
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_request"}
+
+== validate, no client to ask with
+> POST /validate
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"valid":false,"reason":"validation unavailable"}
+
+== availability
+> POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"availability":{"tt1234567":"available"}}
+
+== availability GET
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: POST
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"method_not_allowed"}
+
+== availability, bad id
+> POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_id"}
+
+== availability, not JSON
+> POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_request"}
+
+== availability, bad config
+> POST /not-a-config/availability
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_config"}
+
+== availability, too deep
+> POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/x/availability
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== config-key
+> GET /config-key
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=300
+< content-type: application/json
+< etag: "83d99f3b543af8bb"
+< timing-allow-origin: *
+{"epoch":0,"key":"j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8="}
+
+== config-key revalidated
+> GET /config-key
+> if-none-match: …
+< 304
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=300
+< etag: <the tag revalidated>
+< timing-allow-origin: *
+
+
+== metrics, refused
+> GET /metrics
+> authorization: …
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== metrics, bare token
+> GET /metrics
+> authorization: …
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== metrics
+> GET /metrics
+> authorization: …
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: text/plain; version=0.0.4; charset=utf-8
+< timing-allow-origin: *
+<metrics: 155 lines, first "# HELP scout_build_info The running den-scout version.">
+
+== list with tickets
+> GET /<sealed config>/stream/movie/tt1234567.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/p/<ticket>","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/p/<ticket>","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== plaintext config while sealing is on
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"error":"bad_config"}
+
+== ticket, resolved
+> GET /p/<ticket>
+< 302
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-length: 0
+< location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
+< server-timing: resolve;dur=*, total;dur=*
+< timing-allow-origin: *
+
+
+== ticket, HEAD
+> HEAD /p/<ticket>
+< 405
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< allow: GET
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+
+
+== ticket, garbage
+> GET /p/garbage
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"error":"bad_ticket"}
+
+== ticket, expired
+> GET /p/<ticket>
+< 410
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"error":"ticket_expired"}
+
+== ticket, probe
+> GET /p/<ticket>?probe=1
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"state":"ready"}
+
+== ticket cancel, no store can
+> DELETE /p/<ticket>
+< 501
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"unsupported"}
+
+== ticket cancel, expired
+> DELETE /p/<ticket>
+< 410
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"ticket_expired"}
+
+== ticket cancel, garbage
+> DELETE /p/garbage
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_ticket"}
+
+== /p/ without tickets is a config segment
+> GET /p/garbage
+< 404
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"not_found"}
+
+== scoped list, refused
+> GET /<sealed scoped config>/stream/movie/tt1234567.json
+< 403
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"error":"out_of_scope"}
+
+== scoped list, den-remux
+> GET /<sealed scoped config>/stream/movie/tt1234567.json
+> x-den-remux-key: …
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
+< content-type: application/json
+< etag: <the body's FNV-1a-64>
+< server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"streams":[{"name":"Den Scout","title":"Movie 2160p WEB-DL HDR","url":"https://scout.example/p/<ticket>","attributes":{"resolution":"2160p","source":"webdl","codec":null,"hdr":true,"dolbyVision":false,"hdrFormat":"HDR","audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":19327352832,"seeders":100,"cached":true,"label":"4K • WEB-DL • HDR • 18 GB","bitDepth":10},"behaviorHints":{"bingeGroup":"den-scout|2160p|webdl|hdr|","notWebReady":true,"filename":"Movie 2160p WEB-DL HDR"}},{"name":"Den Scout","title":"Movie 1080p WEB-DL","url":"https://scout.example/p/<ticket>","attributes":{"resolution":"1080p","source":"webdl","codec":null,"hdr":false,"dolbyVision":false,"hdrFormat":null,"audio":null,"audioCodec":null,"audioChannels":null,"atmos":false,"hardcodedSubs":false,"threeD":false,"sizeBytes":8589934592,"seeders":50,"cached":true,"label":"1080p • WEB-DL • 8.0 GB"},"behaviorHints":{"bingeGroup":"den-scout|1080p|webdl||","notWebReady":true,"filename":"Movie 1080p WEB-DL"}}],"den":{"v":1,"answerKind":"live","generatedAt":"*","expiresAt":"*","coverage":{"complete":true,"sources":[{"id":"torrentio","outcome":"answered","items":3,"observedAt":"*"}]}}}
+
+== scoped list, wrong remux key
+> GET /<sealed scoped config>/stream/movie/tt1234567.json
+> x-den-remux-key: …
+< 403
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+< vary: X-Den-Playable
+{"error":"out_of_scope"}
+
+== legacy play closed
+> GET /<sealed config>/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 403
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< server-timing: total;dur=*
+< timing-allow-origin: *
+{"error":"legacy_play_closed"}
+
+== legacy cancel closed
+> DELETE /<sealed config>/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 403
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"legacy_play_closed"}
+
+== bad key: health
+> GET /health
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"detail":"CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed","reason":"config_key_invalid","status":"degraded"}
+
+== bad key: configure
+> GET /
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< content-type: text/html; charset=utf-8
+< etag: "3f92e2860fade9ef"
+< timing-allow-origin: *
+<html: 127400 bytes, FNV-1a-64 3f92e2860fade9ef>
+
+== bad key: manifest
+> GET /manifest.json
+< 200
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: public, max-age=3600, stale-while-revalidate=600
+< content-type: application/json
+< etag: "91894a767836d12f"
+< timing-allow-origin: *
+{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}
+
+== bad key: config-key
+> GET /config-key
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< timing-allow-origin: *
+{"error":"config_key_invalid"}
+
+== bad key: configured manifest
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/manifest.json
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< timing-allow-origin: *
+{"error":"config_key_invalid"}
+
+== bad key: list
+> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< timing-allow-origin: *
+{"error":"config_key_invalid"}
+
+== bad key: ticket
+> GET /p/garbage
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< timing-allow-origin: *
+{"error":"config_key_invalid"}
+
+== bad key: cancel
+> DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< timing-allow-origin: *
+{"error":"config_key_invalid"}
+
+== bad key: availability
+> POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
+< 503
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< retry-after: 60
+< timing-allow-origin: *
+{"error":"config_key_invalid"}
+
+== bad key: preflight
+> OPTIONS /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
+< 204
+< access-control-allow-headers: *
+< access-control-allow-methods: GET, HEAD, POST, DELETE, OPTIONS
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-max-age: 86400
+< timing-allow-origin: *
+
+
+== bad key: validate
+> POST /validate
+< 400
+< access-control-allow-origin: *
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< cache-control: no-store
+< content-type: application/json
+< timing-allow-origin: *
+{"error":"bad_request"}
+
+== request log
+GET /health 200 *ms rid=abc-123
+GET /manifest.json 200 *ms rid=xyz
+GET /<config>/manifest.json 200 *ms
+GET /<config>/stream/movie/tt1234567.json 200 *ms rid=abc-123
+GET /p/<ticket> 302 *ms rid=abc-123
+DELETE /p/<ticket> 410 *ms
+GET /<config>/play/<token> 200 *ms
+GET /p/<ticket> 400 *ms
+GET /<config>/stream/movie/tt1%0AGET%20/health.json 400 *ms
+OPTIONS /<config> 204 *ms

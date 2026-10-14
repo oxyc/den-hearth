@@ -1,4 +1,4 @@
-//! Port of `internal/scout/configure.go` (which embeds `configure.html`). Work package 4.
+//! Port of `internal/scout/configure.go` (which embeds `configure.html`).
 
 /// The /configure page — embedded so the binary is self-contained (distroless, no runtime file).
 /// Builds the install link in the browser and seals the debrid token to the addon's key

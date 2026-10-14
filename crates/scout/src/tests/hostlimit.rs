@@ -1,4 +1,4 @@
-//! Go: `internal/scout/hostlimit_test.go` (258 lines). Work package 6.
+//! Go: `internal/scout/hostlimit_test.go` (258 lines).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

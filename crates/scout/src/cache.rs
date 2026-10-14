@@ -1,5 +1,4 @@
-//! Port of `internal/scout/cache.go`: the cache seam (stream lists and per-hash truth) and its in-memory
-//! TTL backend, bounded by bytes. `Cache` and `CacheClass` are FROZEN (see PORTING.md).
+//! The cache seam (stream lists and per-hash truth) and its in-memory TTL backend, bounded by bytes.
 //!
 //! The default backend is an in-memory TTL cache bounded by BYTES (audit #1: a count cap let a large
 //! resultCap × many titles blow the heap and OOM the container). Thread-safe, and sharded: a hit on one shard
@@ -11,20 +10,17 @@ use std::time::{Duration, SystemTime};
 use quick_cache::sync::Cache as Sharded;
 use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 
-/// FROZEN. Go `Cache`. Thread-safe. `get` returns `None` for a missing or expired key.
-///
-/// The one deliberate departure from the Go seam is `get`'s return type (see below).
+/// Go `Cache`. Thread-safe. `get` returns `None` for a missing or expired key.
 pub trait Cache: Send + Sync {
     /// The value is shared with the cache, not copied out of it: a hit costs a reference count, and a caller that
-    /// needs an owned `String` makes that copy itself. Go returns a string copy; this seam was changed on purpose
-    /// for zero-copy hits (measured 22 ns against Go's 39 ns), and is otherwise still frozen.
+    /// needs an owned `String` makes that copy itself (measured 22 ns against Go's copying 39 ns).
     fn get(&self, key: &str) -> Option<Arc<str>>;
     fn put(&self, key: &str, value: &str, ttl: Duration);
 
     /// Go's `classifiedCache` optional interface (`PutClass`), folded in as a defaulted method: a cache
     /// that does not understand classes keeps the old write-through behaviour, which is what this
     /// default does. Go's `cachePut(cache, ...)` is `cache.put_class(...)`.
-    fn put_class(&self, key: &str, value: &str, ttl: Duration, class: CacheClass) {
+    fn put_class(&self, key: &str, value: &str, ttl: Duration, _class: CacheClass) {
         self.put(key, value, ttl)
     }
 
@@ -35,7 +31,7 @@ pub trait Cache: Send + Sync {
     }
 }
 
-/// FROZEN. Go `CacheClass`: facts worth surviving a deploy versus coordination state useful only to this
+/// Go `CacheClass`: facts worth surviving a deploy versus coordination state useful only to this
 /// process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheClass {
@@ -43,8 +39,8 @@ pub enum CacheClass {
     Volatile,
 }
 
-/// Go `MemoryCache`: in-memory TTL cache bounded by BYTES (key + value). The internals are the porter's; only
-/// the constructor and the `Cache` impl are the surface.
+/// Go `MemoryCache`: in-memory TTL cache bounded by BYTES (key + value). Only the constructor and the `Cache` impl
+/// are the surface.
 ///
 /// A byte-weighted `quick_cache`: sharded locks, so concurrent hits do not queue behind one mutex (measured at
 /// 8 threads: a hit 10.5 µs -> 0.24 µs, a put 13 µs -> 0.9 µs; `bench/results/scout-cache/`), and CLOCK-Pro

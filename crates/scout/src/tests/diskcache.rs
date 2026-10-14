@@ -1,4 +1,4 @@
-//! Go: `internal/scout/diskcache_test.go` (320 lines). Work package 6.
+//! Go: `internal/scout/diskcache_test.go` (320 lines).
 
 use std::fs::{self, File, FileTimes};
 use std::path::Path;

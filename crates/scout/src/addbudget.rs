@@ -1,4 +1,4 @@
-//! Port of `internal/scout/addbudget.go`. Work package 3.
+//! Port of `internal/scout/addbudget.go`.
 //!
 //! A local ceiling on debrid ADDS, per account.
 //!
@@ -182,11 +182,13 @@ fn drop_drained(spent: &mut HashMap<String, Vec<SystemTime>>, cutoff: SystemTime
 }
 
 /// Go's nil-receiver `take`: a nil budget admits everything.
+#[cfg(test)]
 pub(crate) fn budget_take(budget: Option<&AddBudget>, account: &str, prefetch: bool) -> bool {
     budget.is_none_or(|b| b.take(account, prefetch))
 }
 
 /// Go's nil-receiver `remaining`: -1 for a nil budget, which has no count to report.
+#[cfg(test)]
 pub(crate) fn budget_remaining(budget: Option<&AddBudget>, account: &str) -> i64 {
     budget.map_or(-1, |b| b.remaining(account))
 }
@@ -224,17 +226,10 @@ pub(crate) fn global_add_budget() -> Arc<AddBudget> {
     }
 }
 
-/// Replaces the process-wide budget and returns the one it replaced. Go assigns `globalAddBudget` directly;
-/// the Rust form returns the previous value so a test can put it back.
+/// Replaces this test thread's budget and returns the one it replaced, so a test can put it back.
+#[cfg(test)]
 pub(crate) fn set_global_add_budget(budget: Arc<AddBudget>) -> Arc<AddBudget> {
-    #[cfg(not(test))]
-    {
-        std::mem::replace(&mut *GLOBAL_ADD_BUDGET.lock().unwrap_or_else(PoisonError::into_inner), budget)
-    }
-    #[cfg(test)]
-    {
-        GLOBAL_ADD_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget))
-    }
+    GLOBAL_ADD_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget))
 }
 
 /// Go `SetPlayReserve` sets how many adds of the hour a prefetch may not spend. Called once at startup, from

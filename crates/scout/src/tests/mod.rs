@@ -1,6 +1,5 @@
-//! The Go test files of `internal/scout`, one Rust module each, declared here so that no porter has to edit
-//! this file. Each module is an empty shell with a header naming its Go file; see PORTING.md for who ports
-//! which. They live inside the crate (not under `tests/`) because the Go tests reach unexported items.
+//! Scout's tests, most of them one module per Go test file of `internal/scout` with a header naming it. They live
+//! inside the crate (not under `tests/`) because they reach crate-private items.
 //!
 //! Two lints are off for tests only: the Go table tests port as tuple arrays, which `type_complexity`
 //! flags, and tests that share process-wide state (log limiter, minted-config map) serialise on a std
@@ -21,6 +20,7 @@ mod deps;
 mod diskcache;
 mod extra;
 mod go_wire_vectors;
+mod golden;
 mod handler;
 mod hostlimit;
 mod indexerconfig;

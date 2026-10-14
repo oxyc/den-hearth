@@ -1,4 +1,4 @@
-//! Go: `internal/scout/coverage_test.go` (219 lines). Work package 4.
+//! Go: `internal/scout/coverage_test.go` (219 lines).
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,10 +1,9 @@
-//! Port of `internal/scout/client.go`. Work package 5.
+//! Port of `internal/scout/client.go`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::attributes::{container_of, StreamAttributes};
 use crate::rank::RawStream;
-use crate::util::go_to_lower;
 
 /// A browser's report of what it plays, as Den Web sends it to den-remux and den-remux passes on in
 /// X-Den-Playable (den-edge web/src/lib/playable.ts). With it a stream list is ranked for that browser rather
@@ -161,12 +160,11 @@ fn remux_opens(s: &RawStream) -> bool {
     if matches!(container_of(s.clone()).as_str(), "avi" | "webm") {
         return false;
     }
-    let name = go_to_lower(&s.title);
+    let name = str::to_lowercase(&s.title);
     !REMUX_REFUSED_EXT.iter().any(|ext| name.ends_with(ext))
 }
 
-/// Go `webReady` (defined in `handler.go`, line 2190; placed here per PORTING.md's assignment of
-/// `webready_test.go`).
+/// Go `webReady`: whether a browser can play the release as it is served (an https MP4).
 pub(crate) fn web_ready(s: &RawStream, url: &str) -> bool {
     url.starts_with("https://") && container_of(s.clone()) == "mp4"
 }

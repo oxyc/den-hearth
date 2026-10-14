@@ -1,4 +1,4 @@
-//! Go: `internal/scout/decisionlog_test.go` (192 lines). Work package 6.
+//! Go: `internal/scout/decisionlog_test.go` (192 lines).
 //!
 //! The rank, scrape and cancel decision lines come out of the handler, the Stremio scraper and the cancel route.
 

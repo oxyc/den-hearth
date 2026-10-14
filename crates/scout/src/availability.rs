@@ -1,4 +1,4 @@
-//! Port of `internal/scout/availability.go`. Work package 4.
+//! Port of `internal/scout/availability.go`.
 //!
 //! Stream availability for a page of titles at once: the question Den's poster rows ask — does this movie
 //! have anything to play? — answered in one request instead of a probe per poster, for the TV and for a
@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use http::{Method, Request, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time::{timeout_at, Instant as TokioInstant};
@@ -21,8 +23,8 @@ use tokio::time::{timeout_at, Instant as TokioInstant};
 use crate::cache::CacheClass;
 use crate::config::{Config, DebridService};
 use crate::handler::{
-    err_out, lock, marshal, spawn_background, write_json, Inner, Out, RankOpts, RankedList, Req,
-    LIST_BUILD_SLACK, MAX_SEEDS, NO_STORE,
+    error, json_response, lock, method_not_allowed, spawn_background, split_path, to_json, Inner, RankOpts,
+    RankedList, Resp, LIST_BUILD_SLACK, MAX_SEEDS,
 };
 use crate::id::StreamId;
 use crate::metrics::metrics;
@@ -63,9 +65,9 @@ fn is_imdb_id(s: &str) -> bool {
 /// separately, so it carries an id of its own.
 pub(crate) fn verdict_prefix(config: &Config) -> String {
     let f = &config.filters;
-    // Go hashes `json.Marshal` of the config with its scope, install id and epoch cleared; what matters is that every
-    // other field takes part, so two configs that ask different questions never share a verdict.
-    let canonical = marshal(&json!({
+    // The hash of the config with its scope, install id and epoch cleared; what matters is that every other field
+    // takes part, so two configs that ask different questions never share a verdict.
+    let canonical = to_json(&json!({
         "CachedOnly": config.cached_only,
         "Debrid": config.debrid.iter().map(|d| json!({"Service": d.service.as_str(), "Token": d.token})).collect::<Vec<_>>(),
         "Epoch": 0,
@@ -102,43 +104,44 @@ impl Drop for CheckDone {
 impl Inner {
     /// handleAvailability — POST /<config>/availability {"ids":["tt…"]} →
     /// {"availability":{"tt…":"available"|"unavailable"|"unknown"}}.
-    pub(crate) fn handle_availability(self: &Arc<Self>, req: &Req) -> Out {
-        if req.method != http::Method::POST {
-            let mut out = err_out(405, "method_not_allowed");
-            out.set("allow", "POST");
-            return out;
+    pub(crate) fn handle_availability(self: &Arc<Self>, req: &Request<Bytes>, path: &str) -> Resp {
+        if req.method() != Method::POST {
+            return method_not_allowed("POST");
         }
-        let parts = crate::handler::split_path(&req.path);
+        let parts = split_path(path);
         if parts.len() != 2 {
-            return err_out(404, "not_found");
+            return error(StatusCode::NOT_FOUND, "not_found");
         }
-        let Some(config) = self.open_config(&parts[0]) else { return err_out(400, "bad_config") };
+        let Some(config) = self.open_config(parts[0]) else {
+            return error(StatusCode::BAD_REQUEST, "bad_config");
+        };
 
         #[derive(Deserialize, Default)]
-        struct Body {
+        struct Asked {
             #[serde(default)]
             ids: Option<Vec<String>>,
         }
         static SHAPE: Shape = Shape::Object(&[("ids", &LEAF)]);
-        // The first JSON value in at most maxAvailabilityBody bytes, as Go's decoder over a MaxBytesReader reads it.
-        let window = &req.body[..req.body.len().min(MAX_AVAILABILITY_BODY)];
+        // The first JSON value in at most maxAvailabilityBody bytes; whatever follows it is ignored.
+        let body = req.body();
+        let window = &body[..body.len().min(MAX_AVAILABILITY_BODY)];
         let decoded = serde_json::Deserializer::from_slice(window)
             .into_iter::<serde_json::Value>()
             .next()
             .and_then(Result::ok)
             .and_then(|mut v| {
                 fold_json_keys(&mut v, &SHAPE);
-                serde_json::from_value::<Body>(v).ok()
+                serde_json::from_value::<Asked>(v).ok()
             });
         let ids = match decoded {
             Some(body) => body.ids.unwrap_or_default(),
-            None => return err_out(400, "bad_request"),
+            None => return error(StatusCode::BAD_REQUEST, "bad_request"),
         };
         if ids.len() > MAX_AVAILABILITY_IDS {
-            return err_out(400, "bad_request");
+            return error(StatusCode::BAD_REQUEST, "bad_request");
         }
         if ids.iter().any(|id| !is_imdb_id(id)) {
-            return err_out(400, "bad_id");
+            return error(StatusCode::BAD_REQUEST, "bad_id");
         }
         let prefix = verdict_prefix(&config);
         let mut out: BTreeMap<&str, &str> = BTreeMap::new();
@@ -154,7 +157,7 @@ impl Inner {
             };
             out.insert(id, verdict);
         }
-        write_json(200, &json!({ "availability": out }), NO_STORE)
+        json_response(StatusCode::OK, &json!({ "availability": out }))
     }
 
     fn record_verdict(&self, key: &str, available: bool) {

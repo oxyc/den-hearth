@@ -1,8 +1,10 @@
-//! Port of `internal/scout/reqlog.go`. Work package 6.
+//! The request log's redaction: one line per response when `LOG_REQUESTS` is on (`Handler::serve` writes it with
+//! `den_http::log::request_line`), its path redacted here. The first segment of a per-install route is the
+//! credential, and a play token names the release being watched.
 //!
-//! The request log: one line per response when `LOG_REQUESTS` is on. The path is redacted (the first segment of a
-//! per-install route is the credential, and a play token names the release being watched), and the request id is
-//! cut down to what cannot forge a line.
+//! Not `den_http::log::redact_first_segment`: that keeps the rest of the path as it came, and this one also
+//! replaces the `/p/<ticket>` and `/play/<token>` segments and escapes every segment it keeps, so a path cannot
+//! write a newline into the log.
 
 use crate::ticket::TICKET_ROUTE;
 
@@ -67,7 +69,3 @@ fn path_segment_escape(s: &str) -> String {
     }
     out
 }
-
-/// Go `requestID`: the caller's `X-Request-Id` as it may be logged: only `[A-Za-z0-9_-]` survives, cut at 32.
-/// It comes off the network, so nothing it carries can forge a line or smuggle a credential into the log.
-pub(crate) use den_http::log::sanitize_request_id as request_id;

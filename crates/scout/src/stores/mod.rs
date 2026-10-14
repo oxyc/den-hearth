@@ -1,13 +1,11 @@
-//! Port of `internal/scout/stores.go` (5,142 lines), split across this directory because two work
-//! packages share it. This file holds what is shared and FROZEN (see PORTING.md): the `Store` trait, the
-//! resolve target, status and error types. The rest of the Go file lands in:
+//! The debrid stores. This file holds what they share: the `Store` trait, the resolve target, status and error
+//! types. The rest is:
 //!
-//! - `refusal.rs`: lines 780-1560, cache keys, add attempts, queued/held markers, refusal backoff and
-//!   the reporters (`StorePool::recent_refusal` and friends)
-//! - `torbox.rs`: lines 446-3770 minus the above, the TorBox store, its listing, status and cancel
-//! - `realdebrid.rs`: lines 3770-4316
-//! - `premiumize.rs`: lines 4316-4722
-//! - `pool.rs`: lines 4722-end, `StorePool`, `CacheTruth`, `build_stores`
+//! - `refusal.rs`: cache keys, add attempts, queued/held markers, refusal backoff and the reporters
+//!   (`StorePool::recent_refusal` and friends)
+//! - `torbox.rs`: the TorBox store, its listing, status and cancel
+//! - `realdebrid.rs`, `premiumize.rs`: the other two stores
+//! - `pool.rs`: `StorePool`, `CacheTruth`, `build_stores`
 
 pub mod pool;
 pub mod premiumize;
@@ -24,7 +22,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::config::DebridService;
-use crate::util::go_to_lower;
 
 /// Go `resolveCacheTTL` (stores.go:449): how long a remembered torrent id, file list or held mark lives.
 pub(crate) const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -43,7 +40,7 @@ pub const MAX_LISTING_BYTES: usize = 64 << 20;
 // Debrid stores (ported from src/stores/*). Two ops: CacheCheck (which hashes are cached?) and Resolve
 // (infohash → playable https link). Scout resolves server-side; the token never leaves the server.
 
-/// FROZEN. Go `ResolveTarget`: an infohash + either the exact file, or the series episode to pick from a pack.
+/// Go `ResolveTarget`: an infohash + either the exact file, or the series episode to pick from a pack.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolveTarget {
     pub info_hash: String,
@@ -77,7 +74,7 @@ pub struct ResolveTarget {
     pub imdb: String,
 }
 
-/// FROZEN. Go `statusAnswer`: three values, because "it is not being fetched" and "I could not find out" are
+/// Go `statusAnswer`: three values, because "it is not being fetched" and "I could not find out" are
 /// different facts and only the first may lead to an add — collapsing them into a bool is what let a
 /// throttled account's 503 read as a definitive no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +87,7 @@ pub enum StatusAnswer {
     Unknown,
 }
 
-/// FROZEN. Go `StoreStatus` — how far along a queued release is. Progress is 0…1; ETASeconds is nil unless the
+/// Go `StoreStatus` — how far along a queued release is. Progress is 0…1; ETASeconds is nil unless the
 /// store reports a real one (a made-up countdown is worse than none).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoreStatus {
@@ -112,14 +109,14 @@ pub struct StoreStatus {
     pub service: Option<DebridService>,
 }
 
-/// FROZEN. The stable fetch states the 202 body carries.
+/// The stable fetch states the 202 body carries.
 pub const FETCH_QUEUED: &str = "queued";
 pub const FETCH_FETCHING: &str = "fetching";
 pub const FETCH_DOWNLOADING: &str = "downloading";
 pub const FETCH_STALLED: &str = "stalled";
 pub const FETCH_FAILED: &str = "failed";
 
-/// FROZEN. Go `CancelOutcome` is what a cancel (or reannounce) attempt found. Done is true for a successful
+/// Go `CancelOutcome` is what a cancel (or reannounce) attempt found. Done is true for a successful
 /// delete or reannounce; otherwise Reason says why nothing was done — "not_queued" (nothing of ours to cancel),
 /// "finished" (it already completed, so it is kept), or "not_ours" (the account held this before scout ever
 /// asked for it). Status carries the current wait, for a reannounce's 202 answer.
@@ -132,7 +129,7 @@ pub struct CancelOutcome {
     pub status: StoreStatus,
 }
 
-/// FROZEN. Go `DeadLinkError`: nothing could deliver the file, so the route answers 404.
+/// Go `DeadLinkError`: nothing could deliver the file, so the route answers 404.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLinkError {
     pub reason: String,
@@ -161,7 +158,7 @@ pub const ERR_TORRENT_GONE: &str = "torbox no longer has this torrent";
 /// errCheckFailed marks a cache check that could not reach the store at all.
 pub const ERR_CHECK_FAILED: &str = "cache check failed";
 
-/// FROZEN. Go `StoreUnavailableError` — the SERVICE refused us, which says nothing about the release. A rate
+/// Go `StoreUnavailableError` — the SERVICE refused us, which says nothing about the release. A rate
 /// limit or a 5xx answered as 404 told the client "this release is dead" and it fell through every remaining
 /// source getting the same answer, then sat on a wait for a download nobody had started. Distinct so the route
 /// can answer 503 and the app can say the debrid is the problem.
@@ -184,7 +181,7 @@ impl fmt::Display for StoreUnavailableError {
     }
 }
 
-/// FROZEN. What a store call can fail with: Go returns `error` and callers branch on the concrete type
+/// What a store call can fail with: Go returns `error` and callers branch on the concrete type
 /// (`*DeadLinkError`, `*StoreUnavailableError`, `errAddInFlight`, `errAddQueued`, context cancellation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -227,7 +224,7 @@ impl fmt::Display for StoreError {
     }
 }
 
-/// FROZEN. Go `Store`: a debrid backend.
+/// Go `Store`: a debrid backend.
 ///
 /// `cache_check` returns ONLY what it learned: a hash it could not check is ABSENT from the map, which
 /// the pool reads as unknown. Do not pre-seed the map with false. The error is `Err` only when NOTHING
@@ -268,7 +265,7 @@ pub trait Store: Send + Sync {
     /// is fetching it", so /play queued a duplicate — more load on an account already refusing, which is the
     /// one failure mode that feeds itself. Real-Debrid and Premiumize answer false always and mean it, so
     /// leaving them on the bool keeps "unknown" meaning something a caller can act on.
-    async fn status_answer(&self, t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
         None
     }
 
@@ -276,26 +273,26 @@ pub trait Store: Send + Sync {
     /// fetching. Only TorBox implements it — Real-Debrid's delete exists but is unbuilt until someone uses RD
     /// (see den#204), and Premiumize has no equivalent at all — so the route answers 501 "unsupported" for
     /// either. `None` when the store cannot cancel.
-    async fn cancel(&self, info_hash: &str, reannounce: bool) -> Option<Result<CancelOutcome, StoreError>> {
+    async fn cancel(&self, _info_hash: &str, _reannounce: bool) -> Option<Result<CancelOutcome, StoreError>> {
         None
     }
 
     /// Go `refusalReporter.RecentRefusal` — a store that can say it was recently refused for a hash, with the
     /// reason. Optional, because only a store with a cache can remember one; a store that doesn't implement it
     /// simply never reports a refusal.
-    fn recent_refusal(&self, info_hash: &str) -> Option<String> {
+    fn recent_refusal(&self, _info_hash: &str) -> Option<String> {
         None
     }
 
     /// Go `addInFlightReporter.AddInFlight` — a store that can say whether an add of OURS is out and
     /// unanswered for a hash.
-    fn add_in_flight(&self, info_hash: &str) -> Option<bool> {
+    fn add_in_flight(&self, _info_hash: &str) -> Option<bool> {
         None
     }
 
     /// Go `heldTorrentReporter.HoldsTorrent` — a store that already has an id for this release, so it can be
     /// resolved without buying anything. A pure cache read in every implementation.
-    fn holds_torrent(&self, t: &ResolveTarget) -> Option<bool> {
+    fn holds_torrent(&self, _t: &ResolveTarget) -> Option<bool> {
         None
     }
 
@@ -353,7 +350,7 @@ impl From<torbox::TorboxAccountSummary> for AccountSummary {
     }
 }
 
-/// FROZEN. Go `CacheTruth`: what the pool actually learned about a batch of hashes. Not a bare map of
+/// Go `CacheTruth`: what the pool actually learned about a batch of hashes. Not a bare map of
 /// yes/no, because "no" and "could not find out" have opposite costs.
 #[derive(Debug, Clone, Default)]
 pub struct CacheTruth {
@@ -391,7 +388,7 @@ impl CacheTruth {
 /// on lowercase prefixes because the documented spellings carry parenthesised qualifiers and casing varies.
 /// Anything unrecognised is "downloading", which is what every wait was called before this existed.
 pub fn torbox_fetch_state(raw: &str) -> &'static str {
-    let s = go_to_lower(raw.trim());
+    let s = str::to_lowercase(raw.trim());
     if s.starts_with("failed")
         || s.starts_with("error")
         || s.starts_with("expired")

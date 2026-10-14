@@ -33,15 +33,6 @@ pub fn b64url_encode(b: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(b)
 }
 
-/// Go `strings.ToLower`: maps each character through its SIMPLE lower-case form.
-///
-/// Rust's `str::to_lowercase` uses the full mapping (U+0130 becomes two characters) and a context rule for the
-/// final sigma, so it can disagree with Go on the same input. A value lower-cased here is then matched against an
-/// ASCII-only pattern (an infohash), where "İ" must become "i" as it does in Go.
-pub(crate) fn go_to_lower(s: &str) -> String {
-    s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
-}
-
 /// The shape of a JSON document as far as [`fold_json_keys`] needs it: which keys name fields, and what each holds.
 pub(crate) enum Shape {
     /// A value with no field names inside it that matter.

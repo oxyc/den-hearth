@@ -1,10 +1,6 @@
-//! Go: `internal/scout/addbudget_test.go` (3782 lines, 101 tests). Work package 3.
+//! Go: `internal/scout/addbudget_test.go` (3782 lines, 101 tests).
 //!
-//! The tests that exercise the budget alone run against `addbudget.rs` and fail at its `todo!()` stubs until it
-//! lands. Most of the file drives the stores, so it also needs the store impls, the refusal memory and the
-//! handler from packages 1, 2 and 4, which have not landed. Those items are stood in for by `foreign` at the
-//! bottom of this file so the crate compiles; every test that reaches one is `#[ignore]`d. When an owner lands,
-//! delete its stand-ins here and point the test at the real item.
+//! The budget alone, and the stores, refusal memory and handler that spend from it.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

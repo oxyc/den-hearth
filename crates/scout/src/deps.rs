@@ -1,6 +1,6 @@
 //! Port of `internal/scout/deps.go`: `Settings` from the environment, the startup summary line, the
-//! redirect policy every debrid-facing client carries, and `BuildDeps`. `Settings` is FROZEN (see
-//! PORTING.md): the handler, metrics and the startup line all read it.
+//! redirect policy every debrid-facing client carries, and `BuildDeps`. The handler, metrics and the startup
+//! line all read `Settings`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use crate::stores::Store;
 use crate::ticket::DEFAULT_PLAY_TICKET_TTL;
 use crate::upstreampause::pause_on_refusal;
 
-/// FROZEN. Go `Settings`: configuration from env so the same binary runs anywhere. No debrid secret
+/// Go `Settings`: configuration from env so the same binary runs anywhere. No debrid secret
 /// lives here; the token rides in the per-install addon URL. Go's zero `time.Time` is `None`.
 #[derive(Debug, Clone)]
 pub struct Settings {

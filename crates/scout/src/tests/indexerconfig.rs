@@ -1,4 +1,4 @@
-//! Go: `internal/scout/indexerconfig_test.go` (429 lines). Work package 5.
+//! Go: `internal/scout/indexerconfig_test.go` (429 lines).
 //!
 //! The Go tests share the package-level `minted` cache, so each test here takes `serial()` to keep the
 //! parallel Rust test runner from interleaving them.

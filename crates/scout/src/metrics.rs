@@ -1,4 +1,4 @@
-//! Port of `internal/scout/metrics.go`. Work package 6.
+//! Port of `internal/scout/metrics.go`.
 //!
 //! Counters for the questions this package used to answer only by grepping logs: which indexer is earning
 //! its slice of the scrape budget, how often a list is served from cache, how many builds come back
@@ -11,14 +11,14 @@
 //! Package-level rather than threaded through, because the interesting events happen in free functions
 //! (scrapeAll) as much as on the handler, and passing a collector into all of them would be a much larger
 //! change than the counters justify. Atomics only: these sit on the request path and must not allocate or
-//! contend. The Prometheus text is written by hand: a client library would be the first runtime dependency this
-//! binary has.
+//! contend. The Prometheus text is written with `den_http::prom`, as every den addon writes its own.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
 #[cfg(not(test))]
 use std::sync::LazyLock;
+
+use den_http::prom;
 
 use crate::addbudget::global_add_budget;
 use crate::attributes::StreamAttributes;
@@ -281,9 +281,8 @@ impl MetricSet {
 
         // Which release is answering, in the same shape every den addon publishes (<addon>_build_info), so one
         // query across the stack shows what each box is running without asking each manifest.
-        b.push_str("# HELP scout_build_info The running den-scout version.\n");
-        b.push_str("# TYPE scout_build_info gauge\n");
-        let _ = writeln!(b, r#"scout_build_info{{version="{}"}} 1"#, manifest_version());
+        let version = format!(r#"version="{}""#, manifest_version());
+        prom::series(&mut b, "scout_build_info", "gauge", "The running den-scout version.", &version, 1);
 
         counter(
             &mut b,
@@ -343,12 +342,18 @@ impl MetricSet {
             "Debrid API calls avoided by coordination or request policy.",
             &series(&self.torbox_avoided, &METRIC_TORBOX_AVOIDED, "reason"),
         );
-        b.push_str("# HELP scout_debrid_status_active Active shared status reads.\n");
-        b.push_str("# TYPE scout_debrid_status_active gauge\n");
-        let _ = writeln!(b, "scout_debrid_status_active {}", ld(&self.torbox_status_active));
-        b.push_str("# HELP scout_debrid_status_waiters Requests waiting on shared status reads.\n");
-        b.push_str("# TYPE scout_debrid_status_waiters gauge\n");
-        let _ = writeln!(b, "scout_debrid_status_waiters {}", ld(&self.torbox_status_waiters));
+        let active = ld(&self.torbox_status_active);
+        prom::series(
+            &mut b,
+            "scout_debrid_status_active",
+            "gauge",
+            "Active shared status reads.",
+            "",
+            active,
+        );
+        let waiters = ld(&self.torbox_status_waiters);
+        let help = "Requests waiting on shared status reads.";
+        prom::series(&mut b, "scout_debrid_status_waiters", "gauge", help, "", waiters);
 
         let per_indexer = |counters: &Series| -> Vec<(String, i64)> {
             metric_indexers().map(|id| (format!(r#"indexer="{id}""#), ld(&counters[id]))).collect()
@@ -430,22 +435,22 @@ impl MetricSet {
         if accounts == 0 {
             left = -1;
         }
-        b.push_str("# HELP scout_add_budget_remaining Smallest remaining hourly add allowance across accounts (-1 = none spent).\n");
-        b.push_str("# TYPE scout_add_budget_remaining gauge\n");
-        let _ = writeln!(b, "scout_add_budget_remaining {left}");
+        let help = "Smallest remaining hourly add allowance across accounts (-1 = none spent).";
+        prom::series(&mut b, "scout_add_budget_remaining", "gauge", help, "", left);
 
         // The same allowance as each intent sees it: a prefetch stops the reserve short of zero.
         let mut prefetch_left = left;
         if left >= 0 {
             prefetch_left = (left - budget.play_reserve()).max(0);
         }
-        b.push_str(
-            "# HELP scout_add_budget_remaining_by_intent Smallest remaining hourly add allowance across accounts, \
-             as a viewer waiting (play) and a prefetch see it (-1 = none spent).\n",
+        prom::family(
+            &mut b,
+            "scout_add_budget_remaining_by_intent",
+            "gauge",
+            "Smallest remaining hourly add allowance across accounts, as a viewer waiting (play) and a prefetch \
+             see it (-1 = none spent).",
+            &[(r#"intent="play""#, left), (r#"intent="prefetch""#, prefetch_left)],
         );
-        b.push_str("# TYPE scout_add_budget_remaining_by_intent gauge\n");
-        let _ = writeln!(b, r#"scout_add_budget_remaining_by_intent{{intent="play"}} {left}"#);
-        let _ = writeln!(b, r#"scout_add_budget_remaining_by_intent{{intent="prefetch"}} {prefetch_left}"#);
         counter(
             &mut b,
             "scout_add_budget_refusals_total",
@@ -456,9 +461,8 @@ impl MetricSet {
             ],
         );
 
-        b.push_str("# HELP scout_cache_persistent Durable cache tier writing (1), disabled (0), not reported (-1).\n");
-        b.push_str("# TYPE scout_cache_persistent gauge\n");
-        let _ = writeln!(b, "scout_cache_persistent {cache_persistent}");
+        let help = "Durable cache tier writing (1), disabled (0), not reported (-1).";
+        prom::series(&mut b, "scout_cache_persistent", "gauge", help, "", cache_persistent);
 
         b
     }
@@ -492,15 +496,10 @@ pub fn cache_persistent_gauge(c: &dyn Cache) -> i64 {
     }
 }
 
-/// Go `counter` writes one HELP/TYPE block and its samples. An empty label string means an unlabelled series.
+/// One counter's HELP/TYPE block and its samples. An empty label string means an unlabelled series.
 fn counter(b: &mut String, name: &str, help: &str, samples: &[(String, i64)]) {
-    let _ = writeln!(b, "# HELP {name} {help}");
-    let _ = writeln!(b, "# TYPE {name} counter");
+    prom::family::<i64>(b, name, "counter", help, &[]);
     for (labels, value) in samples {
-        b.push_str(name);
-        if !labels.is_empty() {
-            let _ = write!(b, "{{{labels}}}");
-        }
-        let _ = writeln!(b, " {value}");
+        prom::sample(b, name, labels, value);
     }
 }

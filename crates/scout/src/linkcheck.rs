@@ -1,4 +1,4 @@
-//! Port of `internal/scout/linkcheck.go`. Work package 6.
+//! Port of `internal/scout/linkcheck.go`.
 
 use std::time::Duration;
 

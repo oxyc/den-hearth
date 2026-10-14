@@ -1,4 +1,4 @@
-//! Port of `internal/scout/indexerconfig.go`. Work package 5.
+//! Port of `internal/scout/indexerconfig.go`.
 //!
 //! Minting the per-install config segment that comet and mediafusion require.
 //!

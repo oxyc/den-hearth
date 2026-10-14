@@ -1,4 +1,4 @@
-//! Go: `internal/scout/availability_test.go` (300 lines). Work package 4.
+//! Go: `internal/scout/availability_test.go` (300 lines).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};

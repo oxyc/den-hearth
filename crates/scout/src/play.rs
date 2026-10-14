@@ -1,9 +1,9 @@
 //! Port of `internal/scout/play.go`: what `/play` resolves, and the legacy play token.
 
 use crate::config::is_finite;
-use crate::util::{b64url_decode, b64url_encode, fold_json_keys, go_to_lower, Shape, LEAF};
+use crate::util::{b64url_decode, b64url_encode, fold_json_keys, Shape, LEAF};
 
-/// FROZEN. Go `PlayTarget`: an infohash plus either the exact file or series coordinates to pick from a
+/// Go `PlayTarget`: an infohash plus either the exact file or series coordinates to pick from a
 /// pack. The debrid token is NOT here; it rides in the config blob on the URL path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlayTarget {
@@ -81,7 +81,7 @@ pub fn decode_play_token(tok: &str) -> Option<PlayTarget> {
     let mut value: serde_json::Value = serde_json::from_slice(&data).ok()?;
     fold_json_keys(&mut value, &SHAPE);
     let raw: PlayRaw = serde_json::from_value(value).ok()?;
-    let h = go_to_lower(&raw.h.unwrap_or_default());
+    let h = str::to_lowercase(&raw.h.unwrap_or_default());
     if !is_info_hash(&h) {
         return None;
     }

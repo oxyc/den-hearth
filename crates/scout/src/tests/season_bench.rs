@@ -1,4 +1,4 @@
-//! Go: `internal/scout/season_bench_test.go` (61 lines). Work package 5.
+//! Go: `internal/scout/season_bench_test.go` (61 lines).
 //!
 //! Benchmarks. Each Go `Benchmark*` is a plain `#[test]` marked `#[ignore = "benchmark"]` that runs the
 //! same loop; it gates nothing. Run with `cargo test -- --ignored benchmark`.

@@ -1,13 +1,10 @@
-//! Port of `internal/scout/handler.go`: the runtime-agnostic core as an HTTP service (ported from
-//! src/handler.ts). Off-device by design: the app never sees a torrent or a debrid token. Routes are served
-//! at the service root. Work package 4.
+//! The scout routes as an HTTP service, served at the service root. Off-device by design: the app never sees a
+//! torrent or a debrid token.
 //!
-//! The Go `http.Handler` becomes `Handler::serve`, which takes an `http::Request` and returns an
-//! `http::Response`. Go's request context is gone: a client that disconnects drops the `serve` future, which
-//! aborts the task serving it, and a deadline is the explicit `tokio::time::Instant` handed down to whatever
-//! takes one. Work that must outlive the request (a stream-list build shared by every viewer of a title, the
-//! stale rebuild, the probe fan-out, the availability check) is spawned on its own task, which is what Go's
-//! `context.WithoutCancel` plus a detached goroutine did.
+//! `Handler::serve` takes an `http::Request` and returns an `http::Response`. A client that disconnects drops the
+//! `serve` future, which aborts the task serving it, and a deadline is the explicit `tokio::time::Instant` handed
+//! down to whatever takes one. Work that must outlive the request (a stream-list build shared by every viewer of a
+//! title, the stale rebuild, the probe fan-out, the availability check) is spawned on its own task.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -18,8 +15,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use den_http::{full, Body, X_DEN_DEGRADED};
 use den_seal::Rejected;
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use http::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE, ETAG, HOST, RETRY_AFTER, VARY};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{watch, Semaphore};
@@ -55,7 +55,7 @@ use crate::probe_fanout::{
 use crate::rank::{
     cap_seeds, rank_streams_debug, real_debrid_blocked, title_tokens, RankDebug, RankFilters, RawStream,
 };
-use crate::reqlog::{redact_path, request_id};
+use crate::reqlog::redact_path;
 use crate::scrape::{scrape_covered, Doer, ScrapeQuery, Scraper};
 use crate::stores::pool::{has_cache_truth, status_detail_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
@@ -64,7 +64,7 @@ use crate::stores::{
     FETCH_QUEUED,
 };
 use crate::ticket::{TicketError, TicketKeys, TICKET_ROUTE};
-use crate::util::{etag_hex, fold_json_keys, go_to_lower, key_hash, Shape, LEAF};
+use crate::util::{etag_hex, fold_json_keys, key_hash, Shape, LEAF};
 use crate::validate::{validate_debrid_token, ValidateResult, MAX_VALIDATE_BODY, VALIDATE_BUDGET};
 
 /// Go `staticCache`.
@@ -353,11 +353,13 @@ impl RebuildGate {
     }
 
     /// Whether a lease is held for the key at all, expired or not.
+    #[cfg(test)]
     pub(crate) fn holds(&self, key: &str) -> bool {
         self.rebuilds.contains_key(key)
     }
 
     /// How many background rebuilds are in flight.
+    #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live
     }
@@ -365,156 +367,116 @@ impl RebuildGate {
 
 // --- request and response -----------------------------------------------------------------------------------
 
-/// One request, decoded the way Go's `*http.Request` hands it to a handler: the path percent-decoded, the query
-/// as sent, the headers, and where it arrived.
-pub(crate) struct Req {
-    pub(crate) method: Method,
-    /// Go `r.URL.Path`.
-    pub(crate) path: String,
-    /// Go `r.URL.RawQuery`.
-    pub(crate) query: String,
-    pub(crate) headers: HeaderMap,
-    pub(crate) body: Vec<u8>,
-    /// Go `r.TLS != nil`, read off the URI's scheme.
-    pub(crate) https: bool,
-    /// Go `r.Host`.
-    pub(crate) host: String,
+/// What every route answers with.
+pub(crate) type Resp = Response<Body>;
+
+/// A request header's first value, "" when it is absent or not visible ASCII.
+pub(crate) fn header<'a>(req: &'a Request<Bytes>, name: &str) -> &'a str {
+    req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-impl Req {
-    fn new(req: http::Request<Vec<u8>>) -> Req {
-        let (parts, body) = req.into_parts();
-        let host = parts
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| parts.uri.authority().map(|a| a.as_str().to_owned()))
-            .unwrap_or_default();
-        Req {
-            path: percent_decode(parts.uri.path()),
-            query: parts.uri.query().unwrap_or("").to_owned(),
-            https: parts.uri.scheme_str() == Some("https"),
-            method: parts.method,
-            headers: parts.headers,
-            body,
-            host,
-        }
-    }
+/// Whether the query's first `key` is `value` (`?probe=1`, `?op=reannounce`).
+pub(crate) fn query_is(req: &Request<Bytes>, key: &str, value: &str) -> bool {
+    req.uri().query().is_some_and(|q| {
+        url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == key).is_some_and(|(_, v)| v == value)
+    })
+}
 
-    /// Go `r.Header.Get`: the first value, "" when absent.
-    pub(crate) fn header(&self, name: &str) -> String {
-        self.headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned()
-    }
+/// The caller's `X-Request-Id` as a log line may carry it; "" when there is none.
+pub(crate) fn rid(req: &Request<Bytes>) -> String {
+    den_http::log::request_id(req.headers()).unwrap_or_default()
+}
 
-    /// Go `r.URL.Query().Get`.
-    pub(crate) fn query_get(&self, key: &str) -> String {
-        if self.query.is_empty() {
-            return String::new();
-        }
-        url::form_urlencoded::parse(self.query.as_bytes())
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default()
+/// Sets a header whose value is built at run time. A value that is not a valid header (a link with a control
+/// character in it) is left out rather than answered with a 500.
+pub(crate) fn set_header(resp: &mut Resp, name: HeaderName, value: &str) {
+    if let Ok(v) = HeaderValue::from_str(value) {
+        resp.headers_mut().insert(name, v);
     }
 }
 
-/// Go's decoded `URL.Path`: `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
-use den_http::percent_decode_path as percent_decode;
-
-/// A response being built: Go's `ResponseWriter` after its handler has run.
-pub(crate) struct Out {
-    pub(crate) status: u16,
-    pub(crate) headers: HeaderMap,
-    pub(crate) body: Vec<u8>,
+/// A JSON body, never stored by a cache.
+pub(crate) fn json_response(status: StatusCode, body: &(impl Serialize + ?Sized)) -> Resp {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, JSON_TYPE)
+        .header(CACHE_CONTROL, NO_STORE)
+        .body(full(to_json(body)))
+        .expect("a static response")
 }
 
-impl Out {
-    pub(crate) fn new(status: u16) -> Out {
-        Out { status, headers: HeaderMap::new(), body: Vec::new() }
-    }
-
-    /// Go `Header().Set`.
-    pub(crate) fn set(&mut self, name: &str, value: &str) {
-        if let (Ok(n), Ok(v)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
-            self.headers.insert(n, v);
-        }
-    }
-
-    /// Go `Header().Add`.
-    pub(crate) fn add(&mut self, name: &str, value: &str) {
-        if let (Ok(n), Ok(v)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
-            self.headers.append(n, v);
-        }
-    }
-
-    /// Go `Header().Get`.
-    pub(crate) fn get(&self, name: &str) -> String {
-        self.headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned()
-    }
+/// The refusal every route writes: `{"error": <code>}`, never stored.
+pub(crate) fn error(status: StatusCode, code: &str) -> Resp {
+    json_response(status, &json!({ "error": code }))
 }
 
-/// Go `writeJSON`: a JSON body with its status and, when given, its Cache-Control.
-pub(crate) fn write_json(status: u16, body: &(impl Serialize + ?Sized), cache_control: &str) -> Out {
-    let mut out = Out::new(status);
-    out.set("content-type", JSON_TYPE);
-    if !cache_control.is_empty() {
-        out.set("cache-control", cache_control);
-    }
-    out.body = marshal(body).into_bytes();
-    out
-}
-
-/// Go `errBody` written the way every refusal writes it.
-pub(crate) fn err_out(status: u16, msg: &str) -> Out {
-    write_json(status, &json!({ "error": msg }), NO_STORE)
+/// A refusal of the method, naming the ones the route takes.
+pub(crate) fn method_not_allowed(allow: &'static str) -> Resp {
+    let mut resp = error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    resp.headers_mut().insert(ALLOW, HeaderValue::from_static(allow));
+    resp
 }
 
 /// The 503 an install-config request gets while CONFIG_KEY is malformed. Retry-After is a hint to clients, not a
 /// promise: only an operator fixing the variable and restarting clears it.
-fn config_key_invalid_out() -> Out {
-    let mut out = err_out(503, "config_key_invalid");
-    out.set("retry-after", "60");
-    out
+fn config_key_invalid() -> Resp {
+    let mut resp = error(StatusCode::SERVICE_UNAVAILABLE, "config_key_invalid");
+    resp.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("60"));
+    resp
 }
 
-/// Go `json.Marshal`: serde's output, with the characters Go's encoder escapes for HTML safety written as it
-/// writes them (`<`, `>`, `&`, U+2028 and U+2029). Only strings can hold any of them, so the whole text is safe to
-/// rewrite.
-pub(crate) fn marshal<T: Serialize + ?Sized>(v: &T) -> String {
-    let s = serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned());
-    if !s.contains(['<', '>', '&', '\u{2028}', '\u{2029}']) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("\\u003c"),
-            '>' => out.push_str("\\u003e"),
-            '&' => out.push_str("\\u0026"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            c => out.push(c),
+/// A body that may be cached and revalidated: its ETag (`etag_for`, or `etag` when the caller already has it) is
+/// what a conditional GET is answered against, in `Handler::serve`.
+fn cacheable(body: impl Into<Bytes>, etag: &str, content_type: &'static str, cache_control: &str) -> Resp {
+    let body = body.into();
+    let etag = if etag.is_empty() {
+        Cow::Owned(etag_for(std::str::from_utf8(&body).unwrap_or_default()))
+    } else {
+        Cow::Borrowed(etag)
+    };
+    let mut resp = Response::new(full(body));
+    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    set_header(&mut resp, CACHE_CONTROL, cache_control);
+    set_header(&mut resp, ETAG, &etag);
+    resp
+}
+
+/// The body a cached list entry serves. A body taken as it is from the entry is shared with the cache rather than
+/// copied out of it: on a warm hit, the request that pays nothing else should not pay for a copy of the list.
+fn entry_body(entry: &Arc<str>, body: Cow<'_, str>) -> Bytes {
+    struct Shared(Arc<str>);
+    impl AsRef<[u8]> for Shared {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_bytes()
         }
     }
-    out
+    match body {
+        Cow::Borrowed(part) => {
+            // `part` is a slice of `entry` (split_cached), so its offset in the entry is its address less the entry's.
+            let start = part.as_ptr() as usize - entry.as_ptr() as usize;
+            Bytes::from_owner(Shared(Arc::clone(entry))).slice(start..start + part.len())
+        }
+        Cow::Owned(relabelled) => Bytes::from(relabelled),
+    }
 }
 
-/// A number as Go's encoder writes a float64: whole values without a decimal point.
-fn go_num(f: f64) -> serde_json::Value {
+/// A value as JSON text. Every type serialized here has string keys, so this cannot fail; "null" stands in if it
+/// ever does.
+pub(crate) fn to_json<T: Serialize + ?Sized>(v: &T) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// The 202's `progress`: a whole value without a fraction (`0`, `1`), as clients have always been sent it, and a
+/// fraction as it is.
+fn progress_number(f: f64) -> serde_json::Value {
     if f.fract() == 0.0 && f.abs() < 1e15 {
         return serde_json::Value::from(f as i64);
     }
     serde_json::Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number)
 }
 
-/// msDur formats a duration as Server-Timing's milliseconds, to a tenth — a warm hit takes well under one,
-/// and "0" says nothing.
-pub(crate) fn ms_dur(d: Duration) -> String {
-    format!("{:.1}", d.as_micros() as f64 / 1000.0)
-}
-
-/// Go `time.Duration.String()`, for the lines that print one.
+/// A duration as the log lines and the startup warning have always printed one (`10m0s`, `1.5s`, `250ms`, Go's
+/// `time.Duration` form): operators grep for it, and the startup warning's test pins it.
 pub(crate) fn go_duration(d: Duration) -> String {
     fn frac(v: u128, unit: u128) -> String {
         let (whole, rem) = (v / unit, v % unit);
@@ -565,12 +527,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-pub(crate) fn split_path(p: &str) -> Vec<String> {
-    p.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+/// A path's segments, empty ones dropped: `//<config>//stream` is `[<config>, stream]`.
+pub(crate) fn split_path(p: &str) -> Vec<&str> {
+    p.split('/').filter(|s| !s.is_empty()).collect()
 }
 
-fn at(parts: &[String], i: usize) -> &str {
-    parts.get(i).map_or("", String::as_str)
+fn at<'a>(parts: &[&'a str], i: usize) -> &'a str {
+    parts.get(i).copied().unwrap_or("")
 }
 
 // --- the cached-entry format --------------------------------------------------------------------------------
@@ -687,7 +650,7 @@ fn to_stremio_stream(s: &RawStream, sid: &StreamId, play_url: &dyn Fn(&PlayTarge
         name: "Den Scout".to_owned(),
         title: s.title.clone(), // raw release name
         behavior_hints: StreamHints {
-            binge_group: binge_group(&go_to_lower(&s.title), &s.title),
+            binge_group: binge_group(&str::to_lowercase(&s.title), &s.title),
             not_web_ready: !web_ready(s, &url),
             filename: s.title.clone(),
         },
@@ -726,8 +689,8 @@ const MAX_PLAYABLE_HEADER: usize = 2048;
 /// is none, or it doesn't parse: a list ranked for the TV is a worse answer for a browser, not a wrong one.
 /// The key is taken from the report re-encoded, so browsers that report the same thing share one list however
 /// their JSON was spelled.
-pub(crate) fn client_playable(req: &Req) -> (Option<ClientPlayable>, String) {
-    let raw = req.header(PLAYABLE_HEADER);
+pub(crate) fn client_playable(req: &Request<Bytes>) -> (Option<ClientPlayable>, String) {
+    let raw = header(req, PLAYABLE_HEADER);
     if raw.is_empty() {
         return (None, String::new());
     }
@@ -751,7 +714,7 @@ pub(crate) fn client_playable(req: &Req) -> (Option<ClientPlayable>, String) {
         ("vp9Profile2", &LEAF),
     ]);
     let parsed = (raw.len() <= MAX_PLAYABLE_HEADER)
-        .then(|| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .then(|| serde_json::from_str::<serde_json::Value>(raw).ok())
         .flatten()
         .and_then(|mut v| {
             fold_json_keys(&mut v, &SHAPE);
@@ -764,7 +727,7 @@ pub(crate) fn client_playable(req: &Req) -> (Option<ClientPlayable>, String) {
         );
         return (None, String::new());
     };
-    let canonical = marshal(&p);
+    let canonical = to_json(&p);
     (Some(p), key_hash(&canonical))
 }
 
@@ -879,7 +842,7 @@ pub(crate) struct Inner {
     /// Set once a legacy play URL has been served while tickets are on, so that is logged once per process.
     legacy_play_noted: AtomicBool,
     // Precomputed static responses (audit #15 — no per-request rebuild/rehash).
-    manifest_unconf: String,
+    manifest_unconf: Bytes,
     manifest_unconf_etag: String,
     configure_etag: String,
     // The three stream-list Cache-Control headers. Every input is fixed once ListTTL is known, so
@@ -888,8 +851,6 @@ pub(crate) struct Inner {
     list_cache: String,
     partial_list_cache: String,
     stale_list_cache: String,
-    /// staleIfErrorFor(ListTTL, PlayTicketTTL), fixed once both are known.
-    stale_if_error: Duration,
     /// outageHoldFor(ListTTL, PlayTicketTTL): how long a complete list is kept for the stale_list fallback.
     outage_hold: Duration,
     status_budget_ms: AtomicU64,
@@ -920,46 +881,55 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 impl Handler {
-    /// Serves one request, as Go's `http.Handler.ServeHTTP` does. The response body is buffered.
-    pub async fn serve(&self, req: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
+    /// Serves one request. The request body is already read (hearth bounds it); the response body is whole.
+    ///
+    /// A cacheable answer carries its ETag, and a matching `If-None-Match` (weak or strong) collapses it to a 304
+    /// here, after the route, the way every den addon answers a conditional GET. A HEAD gets every header a GET
+    /// would and no body.
+    pub async fn serve<B: Into<Bytes>>(&self, req: Request<B>) -> Resp {
         let started = Instant::now();
-        let head_only = req.method() == Method::HEAD;
+        let req = req.map(Into::into);
+        let method = req.method().clone();
         // Decided here, once: with the request log off nothing below is paid.
         let log_line = self.inner.deps.log_requests.then(|| {
-            let rid =
-                request_id(req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or(""));
-            (req.method().clone(), redact_path(&percent_decode(req.uri().path())), rid)
+            let path = redact_path(&den_http::percent_decode_path(req.uri().path()));
+            (path, den_http::log::request_id(req.headers()))
         });
         let inner = self.inner.clone();
         // Convert any unforeseen panic into a clean 500 instead of a dropped connection. The request runs on its
-        // own task, which is what lets a panic in it be seen here at all.
+        // own task, which is what lets a panic in it be seen here at all. The task hands the request back for the
+        // conditional-GET headers.
         let served = AbortOnDrop(tokio::spawn(async move {
-            let req = Req::new(req);
-            inner.route(&req).await
+            let resp = inner.route(&req).await;
+            (req, resp)
         }))
         .await;
-        let mut out = match served {
-            Ok(out) => out,
-            Err(_) => {
-                let mut out = err_out(500, "internal");
-                add_cors(&mut out);
-                out
-            }
+        let mut resp = match served {
+            Ok((req, resp)) => den_http::apply_conditional(&method, req.headers(), resp),
+            Err(_) => den_http::apply_conditional(
+                &method,
+                &http::HeaderMap::new(),
+                error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            ),
         };
-        if let Some((method, path, rid)) = log_line {
-            let rid = if rid.is_empty() { String::new() } else { format!(" rid={rid}") };
-            emit(&format!("{method} {path} {} {}ms{rid}", out.status, started.elapsed().as_millis()));
+        add_cors(&mut resp);
+        if let Some((path, rid)) = log_line {
+            let ms = started.elapsed().as_millis();
+            emit(&den_http::log::request_line(
+                method.as_str(),
+                &path,
+                resp.status().as_u16(),
+                ms,
+                rid.as_deref(),
+            ));
         }
-        if head_only {
-            out.body.clear();
-        }
-        let mut res = http::Response::new(out.body);
-        *res.status_mut() =
-            http::StatusCode::from_u16(out.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-        *res.headers_mut() = out.headers;
-        res
+        resp
     }
+}
 
+/// What the tests reach the handler's internals through.
+#[cfg(test)]
+impl Handler {
     /// Shortens the status budget, for a test (see `DEFAULT_STATUS_BUDGET`).
     pub(crate) fn set_status_budget(&self, d: Duration) {
         self.inner.status_budget_ms.store(d.as_millis() as u64, Ordering::Relaxed);
@@ -997,14 +967,13 @@ impl Handler {
         config: &Config,
         pool: &StorePool,
         rt: &ResolveTarget,
-    ) -> http::Response<Vec<u8>> {
+    ) -> Response<Vec<u8>> {
+        use http_body_util::BodyExt;
         let deadline = Inner::deadline_in(self.inner.status_budget());
-        let out = self.inner.handle_probe(config, pool, &rt.info_hash, rt, "", deadline).await;
-        let mut res = http::Response::new(out.body);
-        *res.status_mut() =
-            http::StatusCode::from_u16(out.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-        *res.headers_mut() = out.headers;
-        res
+        let resp = self.inner.handle_probe(config, pool, &rt.info_hash, rt, "", deadline).await;
+        let (parts, body) = resp.into_parts();
+        let body = body.collect().await.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+        Response::from_parts(parts, body)
     }
 
     /// Go `hydrateProbeFacts`.
@@ -1050,13 +1019,22 @@ impl Handler {
 /// The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
 /// Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
 /// Retry-After and ETag too, or a browser client can neither wait as asked nor revalidate.
-fn add_cors(out: &mut Out) {
-    out.set("access-control-allow-origin", "*");
-    out.set(
-        "access-control-expose-headers",
+fn add_cors(resp: &mut Resp) {
+    den_http::cors_stamp(
+        resp.headers_mut(),
         "Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy",
     );
-    out.set("timing-allow-origin", "*");
+}
+
+/// The CORS preflight, answered on every path. Scout takes POST (/validate, /availability) and DELETE (cancel)
+/// as well as reads, so it names those where den-http's read-only preflight does not.
+fn preflight() -> Resp {
+    let mut resp = den_http::preflight();
+    resp.headers_mut().insert(
+        http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, HEAD, POST, DELETE, OPTIONS"),
+    );
+    resp
 }
 
 /// A background task whose panic is counted and said, not allowed to take the process down. Go's
@@ -1153,8 +1131,9 @@ impl Inner {
         // No stale-if-error on a stale body: the client should come back once the rebuild this response
         // booked has landed, not hold the old list for a day on the next error.
         let stale_list_cache = format!("private, max-age={short_sec}");
-        let manifest_unconf = marshal(&build_manifest(None));
+        let manifest_unconf = to_json(&build_manifest(None));
         let manifest_unconf_etag = etag_for(&manifest_unconf);
+        let manifest_unconf = Bytes::from(manifest_unconf);
         Inner {
             tickets,
             flights: Mutex::new(HashMap::new()),
@@ -1171,7 +1150,6 @@ impl Inner {
             list_cache,
             partial_list_cache,
             stale_list_cache,
-            stale_if_error,
             outage_hold,
             status_budget_ms: AtomicU64::new(DEFAULT_STATUS_BUDGET.as_millis() as u64),
             debug_limiter: Mutex::new(Arc::new(new_host_limiter(Duration::from_secs(10), 3))),
@@ -1193,51 +1171,42 @@ impl Inner {
 
     // --- routing ----------------------------------------------------------------------------------------
 
-    async fn route(self: &Arc<Self>, req: &Req) -> Out {
-        let mut out = self.route_inner(req).await;
-        add_cors(&mut out);
-        out
-    }
-
-    async fn route_inner(self: &Arc<Self>, req: &Req) -> Out {
+    async fn route(self: &Arc<Self>, req: &Request<Bytes>) -> Resp {
         // A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
         // refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
         // does nothing but name what may follow, so it cannot reach /play's resolve.
-        if req.method == Method::OPTIONS {
-            let mut out = Out::new(204);
-            out.set("access-control-allow-methods", "GET, HEAD, POST, DELETE, OPTIONS");
-            out.set("access-control-allow-headers", "*");
-            // A day, so a browser stops re-preflighting every request.
-            out.set("access-control-max-age", "86400");
-            return out;
+        if req.method() == Method::OPTIONS {
+            return preflight();
         }
+        // `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
+        let path = den_http::percent_decode_path(req.uri().path());
         // CONFIG_KEY is set but malformed: nothing that carries an install config (a config segment, a play
         // ticket, the availability batch, a cancel) can be trusted, sealed or plaintext, so all of it is a 503
         // until an operator fixes the variable. That includes /config-key, which has no key to hand out. Only the
         // static pages, /health, /metrics and /validate (a pasted token, no config) keep their own handling.
         if self.deps.config_key_invalid
             && !matches!(
-                req.path.as_str(),
+                path.as_str(),
                 "/" | "/configure" | "/configure/" | "/health" | "/metrics" | "/manifest.json" | "/validate"
             )
         {
-            return config_key_invalid_out();
+            return config_key_invalid();
         }
         // DELETE cancels (or, with ?op=reannounce, reannounces) the release a ticket or a legacy play token
         // names — den#204. Matched ahead of the GET/HEAD-only gate below, which otherwise answers every other
         // verb with 405; cancel is the one route besides /validate and /availability that is not a read.
-        if req.method == Method::DELETE {
-            return self.handle_cancel(req).await;
+        if req.method() == Method::DELETE {
+            return self.handle_cancel(req, &path).await;
         }
         // /validate is the one route that is not a read: it takes a pasted token and asks the service whether
         // it works, so it is a POST and is matched before the gate below rather than carved out of it.
-        if req.path == "/validate" {
+        if path == "/validate" {
             return self.handle_validate(req).await;
         }
         // The availability batch is a POST as well — a page of ids does not belong in a URL — and it too is
         // matched ahead of the gate. It answers from cache or starts a read-only check; it never resolves.
-        if req.path.ends_with("/availability") {
-            return self.handle_availability(req);
+        if path.ends_with("/availability") {
+            return self.handle_availability(req, &path);
         }
         // Every route here is a read, so GET/HEAD is the entire vocabulary — and until this gate existed the
         // handler dispatched on PATH ALONE, which made that an assumption rather than a rule. `/play` is the
@@ -1245,14 +1214,12 @@ impl Inner {
         // fifty an hour. So any verb at all — a link unfurler's POST, a crawler's PUT — reached the one code
         // path this package spends the most effort keeping accidental callers out of (see the probe route's
         // `?probe=1`, probeTop's held-only rule, and addbudget.go).
-        if req.method != Method::GET && req.method != Method::HEAD {
-            let mut out = err_out(405, "method_not_allowed");
-            out.set("allow", "GET, HEAD");
-            return out;
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            return method_not_allowed("GET, HEAD");
         }
-        match req.path.as_str() {
+        match path.as_str() {
             "/" | "/configure" | "/configure/" => {
-                return self.conditional(req, CONFIGURE_PAGE, &self.configure_etag, HTML_TYPE, STATIC_CACHE);
+                return cacheable(CONFIGURE_PAGE, &self.configure_etag, HTML_TYPE, STATIC_CACHE);
             }
             "/health" => {
                 // Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
@@ -1279,7 +1246,7 @@ impl Inner {
                 if accounts > 0 {
                     status["addBudgetRemaining"] = json!(left);
                 }
-                return write_json(200, &status, NO_STORE);
+                return json_response(StatusCode::OK, &status);
             }
             "/metrics" => {
                 // Prometheus text format, behind a bearer token, and OFF when no token is configured.
@@ -1296,19 +1263,18 @@ impl Inner {
                 // Dropping the useful labels would have left an endpoint not worth scraping, so the other option
                 // is taken: a token. Unset means 404 rather than an empty 200, so an operator who has not
                 // configured one is not told there is something here to poke at.
-                if !self.metrics_authorized(req) {
-                    return err_out(404, "not_found");
+                if !den_http::metrics_authorized(req.headers(), Some(&self.deps.metrics_token)) {
+                    return error(StatusCode::NOT_FOUND, "not_found");
                 }
-                let mut out = Out::new(200);
-                out.set("content-type", "text/plain; version=0.0.4; charset=utf-8");
-                out.set("cache-control", NO_STORE);
-                out.body = metrics().render(cache_persistent_gauge(&*self.deps.cache)).into_bytes();
-                return out;
+                return Response::builder()
+                    .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+                    .header(CACHE_CONTROL, NO_STORE)
+                    .body(full(metrics().render(cache_persistent_gauge(&*self.deps.cache))))
+                    .expect("a static response");
             }
             "/manifest.json" => {
-                return self.conditional(
-                    req,
-                    &self.manifest_unconf,
+                return cacheable(
+                    self.manifest_unconf.clone(),
                     &self.manifest_unconf_etag,
                     JSON_TYPE,
                     STATIC_CACHE,
@@ -1326,49 +1292,63 @@ impl Inner {
                     // The epoch rides along: /configure stamps it into a new config as `ep`, so a link built after
                     // CONFIG_EPOCH is bumped is not refused by it. The page fetches with cache: "no-cache", so
                     // a browser revalidates (a 304 while nothing changed) rather than keeping a pre-bump epoch.
-                    let body = marshal(&json!({"epoch": self.deps.revocation.epoch(), "key": pub_key}));
-                    return self.conditional(req, &body, &etag_for(&body), JSON_TYPE, KEY_CACHE);
+                    let body = to_json(&json!({"epoch": self.deps.revocation.epoch(), "key": pub_key}));
+                    return cacheable(body, "", JSON_TYPE, KEY_CACHE);
                 }
                 // The epoch rides the 404 too: a plaintext link built while CONFIG_EPOCH > 0 must still carry
                 // it, or it would be refused the moment it was made. Matches den-subtitles and den-reel.
-                return write_json(
-                    404,
+                return json_response(
+                    StatusCode::NOT_FOUND,
                     &json!({"epoch": self.deps.revocation.epoch(), "error": "no_key"}),
-                    NO_STORE,
                 );
             }
             _ => {}
         }
 
-        let parts = split_path(&req.path); // ["<config>", "stream"|"play"|"manifest.json", ...]
-                                           // /p/<ticket> exists only while tickets are on; without them it stays the 404 it always was.
+        // ["<config>", "stream"|"play"|"manifest.json", ...]
+        let parts = split_path(&path);
+        // /p/<ticket> exists only while tickets are on; without them it stays the 404 it always was.
         if parts.len() == 2 && parts[0] == TICKET_ROUTE && self.tickets.is_some() {
-            return self.handle_ticket_play(req, &parts[1]).await;
+            return self.handle_ticket_play(req, parts[1]).await;
         }
-        let config_blob = parts.first().map_or("", String::as_str);
+        let config_blob = at(&parts, 0);
         match at(&parts, 1) {
             "manifest.json" => {
-                let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
-                let body = marshal(&build_manifest(Some(&config)));
-                self.conditional(req, &body, "", JSON_TYPE, CONFIGURED_MANIFEST_CACHE)
+                let Some(config) = self.open_config(config_blob) else {
+                    return error(StatusCode::BAD_REQUEST, "bad_config");
+                };
+                let body = to_json(&build_manifest(Some(&config)));
+                cacheable(body, "", JSON_TYPE, CONFIGURED_MANIFEST_CACHE)
             }
             "stream" => self.handle_stream(req, config_blob, &parts).await,
             "play" => self.handle_play(req, config_blob, &parts).await,
             "account" => self.handle_account(req, config_blob).await,
-            _ => err_out(404, "not_found"),
+            _ => error(StatusCode::NOT_FOUND, "not_found"),
         }
     }
 
     // --- stream lists -----------------------------------------------------------------------------------
 
-    async fn handle_stream(self: &Arc<Self>, req: &Req, config_blob: &str, parts: &[String]) -> Out {
-        let Some(sid) = parse_stream_id(at(parts, 2), at(parts, 3)) else { return err_out(400, "bad_id") };
-        let mut out = self.handle_stream_for(req, config_blob, &sid).await;
-        out.add("vary", PLAYABLE_HEADER);
-        out
+    async fn handle_stream(
+        self: &Arc<Self>,
+        req: &Request<Bytes>,
+        config_blob: &str,
+        parts: &[&str],
+    ) -> Resp {
+        let Some(sid) = parse_stream_id(at(parts, 2), at(parts, 3)) else {
+            return error(StatusCode::BAD_REQUEST, "bad_id");
+        };
+        let mut resp = self.handle_stream_for(req, config_blob, &sid).await;
+        resp.headers_mut().append(VARY, HeaderValue::from_static(PLAYABLE_HEADER));
+        resp
     }
 
-    async fn handle_stream_for(self: &Arc<Self>, req: &Req, config_blob: &str, sid: &StreamId) -> Out {
+    async fn handle_stream_for(
+        self: &Arc<Self>,
+        req: &Request<Bytes>,
+        config_blob: &str,
+        sid: &StreamId,
+    ) -> Resp {
         let start = Instant::now();
         let origin = self.public_origin(req);
         // audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
@@ -1413,32 +1393,31 @@ impl Inner {
         // Not a general answer to /stream traffic with a varying config blob, which misses the list cache in
         // the same way. That is pre-existing, is bounded by the indexer limiter, and is a separate question
         // from this branch.
-        if is_debug_request(req) {
-            let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
+        if query_is(req, "debug", "1") {
+            let Some(config) = self.open_config(config_blob) else {
+                return error(StatusCode::BAD_REQUEST, "bad_config");
+            };
             if let Some(refused) = self.refuse_scoped(req, &config) {
                 return refused;
             }
             let limiter = lock(&self.debug_limiter).clone();
             if !limiter.allow(DEBUG_LIMITER_KEY) {
-                let mut out = err_out(429, "debug_rate_limited");
-                out.set("retry-after", "10");
-                return out;
+                let mut resp = error(StatusCode::TOO_MANY_REQUESTS, "debug_rate_limited");
+                resp.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("10"));
+                return resp;
             }
-            let rid = request_id(&req.header("x-request-id"));
             let key = format!("{cache_key}:debug");
-            let job = ListJob::new(config, list_key, client, rid);
+            let job = ListJob::new(config, list_key, client, rid(req));
             let res = self.shared(key, self.clone().build_task(job, true)).await;
-            let Some(res) = res else { return err_out(500, "internal") };
-            let mut out = Out::new(200);
-            if !res.degraded.is_empty() {
-                out.set("X-Den-Degraded", &res.degraded);
-            }
-            out.set("server-timing", &format!("{}, total;dur={}", res.timing, ms_dur(start.elapsed())));
+            let Some(res) = res else { return error(StatusCode::INTERNAL_SERVER_ERROR, "internal") };
             let (_, _, _, body) = split_cached(&res.value);
-            out.set("content-type", JSON_TYPE);
-            out.set("cache-control", NO_STORE);
-            out.body = body.as_bytes().to_vec();
-            return out;
+            let mut resp = Response::builder()
+                .header(CONTENT_TYPE, JSON_TYPE)
+                .header(CACHE_CONTROL, NO_STORE)
+                .body(full(body.to_owned()))
+                .expect("a static response");
+            mark_degraded(&mut resp, &res.degraded);
+            return with_timing(resp, &res.timing, start);
         }
 
         if let Some(hit) = self.deps.cache.get(&cache_key) {
@@ -1466,13 +1445,10 @@ impl Inner {
                         etag = Cow::Owned(etag_for(&relabelled));
                         body = Cow::Owned(relabelled);
                     }
-                    let mut out = self.conditional(req, &body, &etag, JSON_TYPE, &self.stale_list_cache);
-                    out.set("X-Den-Degraded", "stale_list");
-                    out.set(
-                        "server-timing",
-                        &format!("cache;desc=stale_list, total;dur={}", ms_dur(start.elapsed())),
-                    );
-                    return out;
+                    let body = entry_body(&hit, body);
+                    let mut resp = cacheable(body, &etag, JSON_TYPE, &self.stale_list_cache);
+                    mark_degraded(&mut resp, "stale_list");
+                    return with_timing(resp, "cache;desc=stale_list", start);
                 }
                 metrics().list_cache_miss.fetch_add(1, Ordering::Relaxed);
                 return self.last_resort(req, start, list_key, Held { fresh_until, etag, body }).await;
@@ -1496,14 +1472,15 @@ impl Inner {
                     body = Cow::Owned(relabelled);
                 }
             }
-            let mut out = self.conditional(req, &body, &etag, JSON_TYPE, header);
-            out.set("server-timing", &format!("{served}, total;dur={}", ms_dur(start.elapsed())));
-            return out;
+            let body = entry_body(&hit, body);
+            return with_timing(cacheable(body, &etag, JSON_TYPE, header), served, start);
         }
 
         // Miss: decode now (#16 — a warm hit never pays decode/validate).
         metrics().list_cache_miss.fetch_add(1, Ordering::Relaxed);
-        let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
+        let Some(config) = self.open_config(config_blob) else {
+            return error(StatusCode::BAD_REQUEST, "bad_config");
+        };
         // Only the miss path needs this: a warm hit is keyed on the blob, and nothing builds a list for a
         // scoped blob to hit.
         if let Some(refused) = self.refuse_scoped(req, &config) {
@@ -1513,12 +1490,11 @@ impl Inner {
         // Detach the shared build from the request: a client disconnect (Stremio routinely races and cancels
         // addon requests) must not cancel the scrape mid-flight and let an empty list get cached and served
         // to every follower. The build runs on a task of its own, which a dropped request does not abort.
-        let rid = request_id(&req.header("x-request-id"));
-        let job = ListJob::new(config, list_key, client, rid);
+        let job = ListJob::new(config, list_key, client, rid(req));
         let res = self.shared(cache_key.clone(), self.clone().build_task(job, false)).await;
         match res {
-            Some(res) => self.write_built(req, start, &res),
-            None => err_out(500, "internal"),
+            Some(res) => self.write_built(start, &res),
+            None => error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
 
@@ -1570,20 +1546,22 @@ impl Inner {
     /// such a build the key cools off for rebuildCooloff, during which the held list is served without scraping.
     async fn last_resort(
         self: &Arc<Self>,
-        req: &Req,
+        req: &Request<Bytes>,
         start: Instant,
         key: ListKey<'_>,
         held: Held<'_>,
-    ) -> Out {
+    ) -> Resp {
         let ListKey { config_blob, sid, cache_key, .. } = key;
         let Held { fresh_until, etag, body } = held;
-        let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
+        let Some(config) = self.open_config(config_blob) else {
+            return error(StatusCode::BAD_REQUEST, "bad_config");
+        };
         if let Some(refused) = self.refuse_scoped(req, &config) {
             return refused;
         }
         let now = Instant::now();
         let usable = SystemTime::now() < unix_time(fresh_until) + self.outage_hold;
-        let serve_held = |timing: &str| -> Out {
+        let serve_held = |phases: &str| -> Resp {
             let ago = SystemTime::now().duration_since(unix_time(fresh_until)).unwrap_or_default();
             log_limited(
                 "stale-list",
@@ -1601,31 +1579,26 @@ impl Inner {
                 held_etag = Cow::Owned(etag_for(&relabelled));
                 held = Cow::Owned(relabelled);
             }
-            let mut out = self.conditional(req, &held, &held_etag, JSON_TYPE, &self.stale_list_cache);
-            out.set("X-Den-Degraded", "stale_list");
-            out.set(
-                "server-timing",
-                &format!("{timing}cache;desc=stale_list, total;dur={}", ms_dur(start.elapsed())),
-            );
-            out
+            let mut resp = cacheable(held.into_owned(), &held_etag, JSON_TYPE, &self.stale_list_cache);
+            mark_degraded(&mut resp, "stale_list");
+            with_timing(resp, phases, start)
         };
         if usable && lock(&self.rebuilds).in_outage(cache_key, now) {
-            return serve_held("");
+            return serve_held("cache;desc=stale_list");
         }
         let (client, _) = client_playable(req);
-        let rid = request_id(&req.header("x-request-id"));
-        let job = ListJob::new(config, key, client, rid);
+        let job = ListJob::new(config, key, client, rid(req));
         let res = self.shared(cache_key.to_owned(), self.clone().build_task(job, false)).await;
-        let Some(res) = res else { return err_out(500, "internal") };
+        let Some(res) = res else { return error(StatusCode::INTERNAL_SERVER_ERROR, "internal") };
         if res.degraded == "indexers" && usable {
             lock(&self.rebuilds).mark_outage(cache_key, now, now + REBUILD_COOLOFF);
-            return serve_held(&format!("{}, ", res.timing));
+            return serve_held(&format!("{}, cache;desc=stale_list", res.timing));
         }
-        self.write_built(req, start, &res)
+        self.write_built(start, &res)
     }
 
     /// writeBuilt answers with a list built for this request (or for the build it joined).
-    fn write_built(&self, req: &Req, start: Instant, res: &BuildResult) -> Out {
+    fn write_built(&self, start: Instant, res: &BuildResult) -> Resp {
         // A follower of a shared build reports the build it was handed — which is the work its answer cost.
         let (_, _, etag, body) = split_cached(&res.value);
         // A degraded build is deliberately not cached server-side, "so the next request retries instead of
@@ -1643,14 +1616,11 @@ impl Inner {
         } else {
             &self.list_cache
         };
-        let mut out = self.conditional(req, body, etag, JSON_TYPE, cache_header);
+        let mut resp = cacheable(body.to_owned(), etag, JSON_TYPE, cache_header);
         // Signal a degraded build so the app can say "sources temporarily unavailable" rather than treating
         // an empty list as "no results" (a total indexer/cache-check outage otherwise looks identical).
-        if !res.degraded.is_empty() {
-            out.set("X-Den-Degraded", &res.degraded);
-        }
-        out.set("server-timing", &format!("{}, total;dur={}", res.timing, ms_dur(start.elapsed())));
-        out
+        mark_degraded(&mut resp, &res.degraded);
+        with_timing(resp, &res.timing, start)
     }
 
     /// rebuildBehind refreshes an expired list alongside the stale answer, which is written by the caller the
@@ -1663,7 +1633,7 @@ impl Inner {
     /// The work runs detached from the request, on a task of its own: the request is over by the time it
     /// matters. The config is decoded on this path rather than on the hit path, because a warm hit must keep
     /// paying nothing for decode/validate — this runs only on the rare stale hit.
-    fn rebuild_behind(self: &Arc<Self>, req: &Req, key: ListKey<'_>) {
+    fn rebuild_behind(self: &Arc<Self>, req: &Request<Bytes>, key: ListKey<'_>) {
         let ListKey { config_blob, cache_key, .. } = key;
         let budget = self.deps.scrape_timeout + LIST_BUILD_SLACK;
         let now = Instant::now();
@@ -1684,9 +1654,8 @@ impl Inner {
             return;
         };
         let (client, _) = client_playable(req);
-        let rid = request_id(&req.header("x-request-id"));
         let this = self.clone();
-        let job = ListJob::new(config, key, client, rid);
+        let job = ListJob::new(config, key, client, rid(req));
         let flight_key = cache_key.to_owned();
         spawn_background("stale list rebuild", async move {
             // The booking is released from the guard, so a panic cannot strand the key permanently.
@@ -1763,7 +1732,7 @@ impl Inner {
         sources.extend(quarantined_reports(config));
         let cov = Coverage { complete: scrape_complete, sources };
         metrics().coverage(&cov.sources);
-        let mut timing = format!("scrape;dur={}", ms_dur(phase.elapsed()));
+        let mut timing = den_http::timing("scrape", phase.elapsed());
 
         // The accounting object the rank decision line reads. When the request asked for ?debug=1 it is the SAME
         // object, so ?debug=1's accounting is unchanged; otherwise this is the only place the rank decision line
@@ -1817,7 +1786,8 @@ impl Inner {
                     (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false)
                 }
             };
-            timing.push_str(&format!(", cache-check;dur={}", ms_dur(phase.elapsed())));
+            timing.push_str(", ");
+            timing.push_str(&den_http::timing("cache-check", phase.elapsed()));
             for s in seeds.iter_mut() {
                 s.cached = truth.cached(&s.info_hash);
                 // Whether that false means "not held" or "nobody could ask" is decided here, once, and carried —
@@ -2031,7 +2001,8 @@ impl Inner {
         // the viewer will see; before serialisation, so a cached probe rides along in this same response.
         let phase = Instant::now();
         if self.probe_top_for_client(config, &ranked, Some(sid), &truth, client.as_ref()) {
-            timing.push_str(&format!(", probe;dur={}", ms_dur(phase.elapsed())));
+            timing.push_str(", ");
+            timing.push_str(&den_http::timing("probe", phase.elapsed()));
         }
 
         let play_url = self.play_urls(config, config_blob, origin);
@@ -2069,7 +2040,7 @@ impl Inner {
             expires_at: cached.then(|| whole_seconds(now + ttl)),
             coverage,
         };
-        let body = marshal(&StreamsResponse { streams: out, debug: dbg, den: env });
+        let body = to_json(&StreamsResponse { streams: out, debug: dbg, den: env });
         let etag = etag_for(&body);
         let value = join_cached(scrape_complete, fresh_until, &etag, &body);
         if degraded {
@@ -2295,7 +2266,7 @@ impl Inner {
                     self.links.put(&link_memo_key(config, &job.target), &link, false, SystemTime::now());
                 }
                 if let Ok(p) = probed {
-                    self.deps.cache.put(&job.key, &marshal(&p), PROBE_TTL);
+                    self.deps.cache.put(&job.key, &to_json(&p), PROBE_TTL);
                 }
             })
             .await;
@@ -2303,7 +2274,7 @@ impl Inner {
 
     // --- /play ------------------------------------------------------------------------------------------
 
-    async fn handle_play(self: &Arc<Self>, req: &Req, config_blob: &str, parts: &[String]) -> Out {
+    async fn handle_play(self: &Arc<Self>, req: &Request<Bytes>, config_blob: &str, parts: &[&str]) -> Resp {
         // GET only — HEAD is refused rather than answered.
         //
         // A HEAD here would have to either resolve (the whole point of not allowing it: an uncached release
@@ -2320,27 +2291,30 @@ impl Inner {
             return refused;
         }
         let mut phases = String::new();
-        let mut out = self.handle_legacy_play(req, config_blob, parts, &mut phases).await;
-        stamp_play(&mut out, start, &phases);
-        out
+        let resp = self.handle_legacy_play(req, config_blob, parts, &mut phases).await;
+        with_timing(resp, &phases, start)
     }
 
     async fn handle_legacy_play(
         self: &Arc<Self>,
-        req: &Req,
+        req: &Request<Bytes>,
         config_blob: &str,
-        parts: &[String],
+        parts: &[&str],
         phases: &mut String,
-    ) -> Out {
+    ) -> Resp {
         // While tickets are on, this route only serves stream lists cached from before them, and a client can
         // hold one for a day on stale-if-error. LEGACY_PLAY_UNTIL is when that allowance ends.
         if self.tickets.is_some()
             && self.deps.legacy_play_until.is_some_and(|until| SystemTime::now() >= until)
         {
-            return err_out(403, "legacy_play_closed");
+            return error(StatusCode::FORBIDDEN, "legacy_play_closed");
         }
-        let Some(target) = decode_play_token(at(parts, 2)) else { return err_out(400, "bad_token") };
-        let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
+        let Some(target) = decode_play_token(at(parts, 2)) else {
+            return error(StatusCode::BAD_REQUEST, "bad_token");
+        };
+        let Some(config) = self.open_config(config_blob) else {
+            return error(StatusCode::BAD_REQUEST, "bad_config");
+        };
         if let Some(refused) = self.refuse_scoped(req, &config) {
             return refused;
         }
@@ -2355,38 +2329,38 @@ impl Inner {
 
     /// handleTicketPlay is GET /p/<ticket>. The ticket stands in for both the config segment and the token of
     /// the legacy route, and what it opens to goes through the same resolve.
-    async fn handle_ticket_play(self: &Arc<Self>, req: &Req, ticket: &str) -> Out {
+    async fn handle_ticket_play(self: &Arc<Self>, req: &Request<Bytes>, ticket: &str) -> Resp {
         let start = Instant::now();
         if let Some(refused) = begin_play(req, start) {
             return refused;
         }
         let mut phases = String::new();
-        let mut out = match self.tickets.as_ref().map(|t| t.open(ticket, SystemTime::now())) {
+        let resp = match self.tickets.as_ref().map(|t| t.open(ticket, SystemTime::now())) {
             // 410, not 400: the ticket was good and has lapsed. What the client holds is an old stream list, not
             // a wrong one, and fetching the list again gets it fresh tickets.
-            Some(Err(TicketError::Expired)) => err_out(410, "ticket_expired"),
+            Some(Err(TicketError::Expired)) => error(StatusCode::GONE, "ticket_expired"),
             // A revoked install gets the answer a ticket that does not open gets.
             Some(Ok((config, target))) if self.admit_install(&config) => {
                 self.resolve_play(req, &config, &target, &mut phases).await
             }
-            _ => err_out(400, "bad_ticket"),
+            _ => error(StatusCode::BAD_REQUEST, "bad_ticket"),
         };
-        stamp_play(&mut out, start, &phases);
-        out
+        with_timing(resp, &phases, start)
     }
 
-    /// resolvePlay is the play route's work once a request is admitted, whichever route admitted it.
+    /// resolvePlay is the play route's work once a request is admitted, whichever route admitted it. What it spent
+    /// its time on goes in `phases`, for Server-Timing.
     async fn resolve_play(
         self: &Arc<Self>,
-        req: &Req,
+        req: &Request<Bytes>,
         config: &Config,
         target: &PlayTarget,
         phases: &mut String,
-    ) -> Out {
+    ) -> Resp {
         let start = Instant::now();
         let pool = StorePool { stores: (self.deps.make_stores)(config) };
         let resolve_deadline = Self::deadline_in(RESOLVE_BUDGET);
-        let rid = request_id(&req.header("x-request-id"));
+        let rid = rid(req);
         let rt = ResolveTarget {
             info_hash: target.info_hash.clone(),
             file_idx: target.file_idx,
@@ -2396,7 +2370,7 @@ impl Inner {
             title: target.title.clone(),
             imdb: target.imdb.clone(),
             // ?prefetch=1 — nobody is waiting on this add, so it may not spend the adds kept for Play.
-            prefetch: req.query_get("prefetch") == "1",
+            prefetch: query_is(req, "prefetch", "1"),
             ..Default::default()
         };
         let status_budget = self.status_budget();
@@ -2405,7 +2379,7 @@ impl Inner {
         // polling this URL to render a progress bar was adding the torrent again on every poll. TorBox allows
         // 60 adds an hour; a single three-minute wait spent thirty-six of them, and the account was throttled
         // out of playing anything at all. A probe reports what is true right now and starts nothing.
-        if req.query_get("probe") == "1" {
+        if query_is(req, "probe", "1") {
             // On the STATUS budget, not the resolve one. A probe answers and starts nothing, and the client
             // polls it on a two-second cadence — so it belongs under the ceiling statusBudget's own comment
             // describes ("far under the resolve budget so a wait answers promptly instead of hanging the
@@ -2442,7 +2416,7 @@ impl Inner {
         // the resolve below mints its replacement. Dropped up front, not only overwritten on success, so a
         // resolve that fails this time does not leave the dead link to be served on the next plain request.
         let memo_key = link_memo_key(config, &rt);
-        if req.query_get("fresh") == "1" {
+        if query_is(req, "fresh", "1") {
             self.links.forget(&memo_key);
         } else if let Some(hit) = self.links.get(&memo_key, SystemTime::now()) {
             // A link /play minted was checked before it was served; one the probe minted was not. So the check
@@ -2503,7 +2477,7 @@ impl Inner {
                 let held_start = Instant::now();
                 let resolved =
                     timeout(self.warm_resolve_budget(), pool.resolve_cached_only(&read_only, &holders)).await;
-                *phases = format!("held;dur={}, ", ms_dur(held_start.elapsed()));
+                *phases = den_http::timing("held", held_start.elapsed());
                 match resolved {
                     Ok(Ok(link)) => return self.serve_play_link(&pool, &rt, &memo_key, link).await,
                     other => {
@@ -2665,7 +2639,10 @@ impl Inner {
                 status: 0,
             })),
         };
-        phases.push_str(&format!("resolve;dur={}, ", ms_dur(resolve_start.elapsed())));
+        if !phases.is_empty() {
+            phases.push_str(", ");
+        }
+        phases.push_str(&den_http::timing("resolve", resolve_start.elapsed()));
         let err = match resolved {
             Ok(link) => return self.serve_play_link(&pool, &rt, &memo_key, link).await,
             Err(err) => err,
@@ -2792,7 +2769,7 @@ impl Inner {
                 &rt,
             ),
         );
-        err_out(404, "dead_link")
+        error(StatusCode::NOT_FOUND, "dead_link")
     }
 
     /// servePlayLink answers /play with a link a store has just minted: checked, remembered, redirected.
@@ -2815,7 +2792,7 @@ impl Inner {
         rt: &ResolveTarget,
         memo_key: &str,
         mut link: String,
-    ) -> Out {
+    ) -> Resp {
         let mut verdict = self.verify_link(pool, rt, &link).await;
         if verdict == LinkVerdict::WrongFile {
             self.links.forget(memo_key);
@@ -2828,7 +2805,7 @@ impl Inner {
         }
         if verdict == LinkVerdict::Broken {
             self.links.forget(memo_key);
-            return err_out(404, "dead_link");
+            return error(StatusCode::NOT_FOUND, "dead_link");
         }
         self.links.put(memo_key, &link, verdict == LinkVerdict::Playable, SystemTime::now());
         write_play_redirect(&link)
@@ -2931,7 +2908,7 @@ impl Inner {
         rt: &ResolveTarget,
         rid: &str,
         deadline: TokioInstant,
-    ) -> Out {
+    ) -> Resp {
         let start = Instant::now();
         let (status, ok, unknown) = pool.status(rt, Some(deadline)).await;
         if ok {
@@ -2970,7 +2947,7 @@ impl Inner {
                         "probe-ready",
                         &play_decision("probe", "served", "ready", "", start.elapsed(), rid, rt),
                     );
-                    return write_json(200, &json!({"state": "ready"}), NO_STORE);
+                    return json_response(StatusCode::OK, &json!({"state": "ready"}));
                 }
                 // The probe DOES discover refusals — it just used to throw them away, inspecting only `err ==
                 // nil` and then relying on the backoff cache to have been written by someone else. Any refusal
@@ -3120,44 +3097,46 @@ impl Inner {
             "probe-not-queued",
             &play_decision("probe", "skipped", "not queued", "", start.elapsed(), rid, rt),
         );
-        err_out(404, "not_queued")
+        error(StatusCode::NOT_FOUND, "not_queued")
     }
 
     // --- cancel -----------------------------------------------------------------------------------------
 
     /// handleCancel is DELETE /p/<ticket> (and, for parity, DELETE /<config>/play/<token>) — den#204. Both
     /// routes open to the same target as their GET siblings and share resolveCancel.
-    async fn handle_cancel(self: &Arc<Self>, req: &Req) -> Out {
-        let parts = split_path(&req.path);
+    async fn handle_cancel(self: &Arc<Self>, req: &Request<Bytes>, path: &str) -> Resp {
+        let parts = split_path(path);
         if parts.len() == 2 && parts[0] == TICKET_ROUTE && self.tickets.is_some() {
-            return self.handle_ticket_cancel(req, &parts[1]).await;
+            return self.handle_ticket_cancel(req, parts[1]).await;
         }
         if parts.len() == 3 && parts[1] == "play" {
-            return self.handle_legacy_cancel(req, &parts[0], &parts[2]).await;
+            return self.handle_legacy_cancel(req, parts[0], parts[2]).await;
         }
-        let mut out = err_out(405, "method_not_allowed");
-        out.set("allow", "GET, HEAD");
-        out
+        method_not_allowed("GET, HEAD")
     }
 
-    async fn handle_ticket_cancel(&self, req: &Req, ticket: &str) -> Out {
+    async fn handle_ticket_cancel(&self, req: &Request<Bytes>, ticket: &str) -> Resp {
         match self.tickets.as_ref().map(|t| t.open(ticket, SystemTime::now())) {
-            Some(Err(TicketError::Expired)) => err_out(410, "ticket_expired"),
+            Some(Err(TicketError::Expired)) => error(StatusCode::GONE, "ticket_expired"),
             Some(Ok((config, target))) if self.admit_install(&config) => {
                 self.resolve_cancel(req, &config, &target).await
             }
-            _ => err_out(400, "bad_ticket"),
+            _ => error(StatusCode::BAD_REQUEST, "bad_ticket"),
         }
     }
 
-    async fn handle_legacy_cancel(&self, req: &Req, config_blob: &str, token: &str) -> Out {
+    async fn handle_legacy_cancel(&self, req: &Request<Bytes>, config_blob: &str, token: &str) -> Resp {
         if self.tickets.is_some()
             && self.deps.legacy_play_until.is_some_and(|until| SystemTime::now() >= until)
         {
-            return err_out(403, "legacy_play_closed");
+            return error(StatusCode::FORBIDDEN, "legacy_play_closed");
         }
-        let Some(target) = decode_play_token(token) else { return err_out(400, "bad_token") };
-        let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
+        let Some(target) = decode_play_token(token) else {
+            return error(StatusCode::BAD_REQUEST, "bad_token");
+        };
+        let Some(config) = self.open_config(config_blob) else {
+            return error(StatusCode::BAD_REQUEST, "bad_config");
+        };
         if let Some(refused) = self.refuse_scoped(req, &config) {
             return refused;
         }
@@ -3167,9 +3146,9 @@ impl Inner {
     /// resolveCancel is the cancel route's work once a target and its config are admitted. It asks every
     /// configured debrid account that can cancel, in configured order, and answers with the first one that has
     /// an opinion about this hash — see storeCanceller's own comment for why only TorBox implements it.
-    async fn resolve_cancel(&self, req: &Req, config: &Config, target: &PlayTarget) -> Out {
+    async fn resolve_cancel(&self, req: &Request<Bytes>, config: &Config, target: &PlayTarget) -> Resp {
         let start = Instant::now();
-        let rid = request_id(&req.header("x-request-id"));
+        let rid = rid(req);
         let rt = ResolveTarget {
             info_hash: target.info_hash.clone(),
             file_idx: target.file_idx,
@@ -3179,7 +3158,7 @@ impl Inner {
             imdb: target.imdb.clone(),
             ..Default::default()
         };
-        let reannounce = req.query_get("op") == "reannounce";
+        let reannounce = query_is(req, "op", "reannounce");
         let deadline = Self::deadline_in(self.status_budget());
         let stores = (self.deps.make_stores)(config);
         let mut saw_canceller = false;
@@ -3245,13 +3224,13 @@ impl Inner {
                     &rt,
                 ),
             );
-            return err_out(501, "unsupported");
+            return error(StatusCode::NOT_IMPLEMENTED, "unsupported");
         }
         log_limited(
             "cancel",
             &play_decision("cancel", "skipped", "nothing queued", "", start.elapsed(), &rid, &rt),
         );
-        err_out(404, "not_queued")
+        error(StatusCode::NOT_FOUND, "not_queued")
     }
 
     // --- /account ---------------------------------------------------------------------------------------
@@ -3259,53 +3238,54 @@ impl Inner {
     /// handleAccount is GET /<config>/account — den#204: one quiet line of slot and allowance usage per
     /// configured debrid account, in configured order. A non-TorBox account answers with its service name and
     /// nothing else: Real-Debrid and Premiumize publish no comparable facts.
-    async fn handle_account(&self, req: &Req, config_blob: &str) -> Out {
-        let Some(config) = self.open_config(config_blob) else { return err_out(400, "bad_config") };
+    async fn handle_account(&self, req: &Request<Bytes>, config_blob: &str) -> Resp {
+        let Some(config) = self.open_config(config_blob) else {
+            return error(StatusCode::BAD_REQUEST, "bad_config");
+        };
         if let Some(refused) = self.refuse_scoped(req, &config) {
             return refused;
         }
         let deadline = Self::deadline_in(self.status_budget());
         let stores = (self.deps.make_stores)(&config);
-        let mut out = Vec::with_capacity(stores.len());
+        let mut accounts = Vec::with_capacity(stores.len());
         for st in &stores {
-            out.push(account_body(deadline, st.as_ref()).await);
+            accounts.push(account_body(deadline, st.as_ref()).await);
         }
-        write_json(200, &out, NO_STORE)
+        json_response(StatusCode::OK, &accounts)
     }
 
     // --- /validate --------------------------------------------------------------------------------------
 
-    async fn handle_validate(&self, req: &Req) -> Out {
-        if req.method != Method::POST {
-            let mut out = err_out(405, "method_not_allowed");
-            out.set("allow", "POST");
-            return out;
+    async fn handle_validate(&self, req: &Request<Bytes>) -> Resp {
+        if req.method() != Method::POST {
+            return method_not_allowed("POST");
         }
         #[derive(Deserialize, Default)]
-        struct Body {
+        struct Asked {
             #[serde(default)]
             service: Option<String>,
             #[serde(default)]
             token: Option<String>,
         }
         static SHAPE: Shape = Shape::Object(&[("service", &LEAF), ("token", &LEAF)]);
-        // The first JSON value in at most maxValidateBody bytes, as Go's decoder over a MaxBytesReader reads it.
-        let window = &req.body[..req.body.len().min(MAX_VALIDATE_BODY)];
+        // The first JSON value in at most maxValidateBody bytes; whatever follows it is ignored.
+        let body = req.body();
+        let window = &body[..body.len().min(MAX_VALIDATE_BODY)];
         let decoded = serde_json::Deserializer::from_slice(window)
             .into_iter::<serde_json::Value>()
             .next()
             .and_then(Result::ok)
             .and_then(|mut v| {
                 fold_json_keys(&mut v, &SHAPE);
-                serde_json::from_value::<Body>(v).ok()
+                serde_json::from_value::<Asked>(v).ok()
             });
-        let Some(body) = decoded else { return err_out(400, "bad_request") };
+        let Some(body) = decoded else { return error(StatusCode::BAD_REQUEST, "bad_request") };
         let (service, token) = (body.service.unwrap_or_default(), body.token.unwrap_or_default());
         // Whitelisted the same way validateConfig does it, and the same length ceiling, so this route cannot
         // be used to send arbitrary strings to an upstream.
         let Some(svc) = DebridService::parse(&service).filter(|_| !token.is_empty() && token.len() <= 512)
         else {
-            return err_out(400, "bad_request");
+            return error(StatusCode::BAD_REQUEST, "bad_request");
         };
 
         // NOTHING here logs the token, and no log line names this route with its arguments. The configure
@@ -3324,62 +3304,42 @@ impl Inner {
             }
         };
         if res.throttled {
-            let mut out = write_json(429, &res, NO_STORE);
-            out.set("retry-after", "2");
-            return out;
+            let mut resp = json_response(StatusCode::TOO_MANY_REQUESTS, &res);
+            resp.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("2"));
+            return resp;
         }
-        write_json(200, &res, NO_STORE)
+        json_response(StatusCode::OK, &res)
     }
 
     // --- shared plumbing --------------------------------------------------------------------------------
 
-    /// metricsAuthorized reports whether this request may read /metrics: `Authorization: Bearer <token>`, the
-    /// token trimmed, the rule every den addon shares. A bare token without the scheme is refused. Compared in
-    /// constant time: the token is a shared secret and a timing-variable compare on a route anyone can reach
-    /// is a needless gift.
-    fn metrics_authorized(&self, req: &Req) -> bool {
-        den_http::bearer_matches(&req.header("authorization"), &self.deps.metrics_token)
-    }
-
-    /// publicOrigin: PUBLIC_BASE_URL when set (audit #8), else forwarded headers / Host.
-    fn public_origin(&self, req: &Req) -> String {
+    /// publicOrigin: PUBLIC_BASE_URL when set (audit #8), else forwarded headers, then the request's own scheme
+    /// and Host.
+    fn public_origin(&self, req: &Request<Bytes>) -> String {
         if !self.deps.public_url.is_empty() {
             return self.deps.public_url.trim_end_matches('/').to_owned();
         }
         let mut proto = first_header(req, "x-forwarded-proto");
         if proto.is_empty() {
-            proto = if req.https { "https" } else { "http" }.to_owned();
+            proto = if req.uri().scheme_str() == Some("https") { "https" } else { "http" };
         }
         let mut host = first_header(req, "x-forwarded-host");
         if host.is_empty() {
-            host = req.host.clone();
+            host = req
+                .headers()
+                .get(HOST)
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| req.uri().authority().map(|a| a.as_str()))
+                .unwrap_or("");
         }
         format!("{proto}://{host}")
     }
 
-    /// conditional serves a cacheable GET with ETag/If-None-Match → 304. etag may be precomputed ("" → hash).
-    fn conditional(&self, req: &Req, body: &str, etag: &str, content_type: &str, cache_control: &str) -> Out {
-        let etag = if etag.is_empty() { Cow::Owned(etag_for(body)) } else { Cow::Borrowed(etag) };
-        let inm = req.header("if-none-match");
-        if !inm.is_empty() && etag_matches(&inm, &etag) {
-            let mut out = Out::new(304);
-            out.set("etag", &etag);
-            out.set("cache-control", cache_control);
-            return out;
-        }
-        let mut out = Out::new(200);
-        out.set("content-type", content_type);
-        out.set("cache-control", cache_control);
-        out.set("etag", &etag);
-        out.body = body.as_bytes().to_vec();
-        out
-    }
-
     /// remuxAuthorized reports whether the request carries den-remux's service key (X-Den-Remux-Key), compared
     /// in constant time. Never true while REMUX_KEY is unset.
-    fn remux_authorized(&self, req: &Req) -> bool {
+    fn remux_authorized(&self, req: &Request<Bytes>) -> bool {
         let key = &self.deps.remux_key;
-        let got = req.header("x-den-remux-key");
+        let got = header(req, "x-den-remux-key");
         !key.is_empty() && !got.is_empty() && constant_time_eq(got.as_bytes(), key.as_bytes())
     }
 
@@ -3388,11 +3348,11 @@ impl Inner {
     /// availability-scoped config may list and play, so the browser drives playback through den-remux with the
     /// scoped URL it already holds and never gets a stream-capable config. The resulting tickets stay on the
     /// homelab (den-remux resolves them; the browser gets only its own signed session URLs).
-    fn refuse_scoped(&self, req: &Req, config: &Config) -> Option<Out> {
+    fn refuse_scoped(&self, req: &Request<Bytes>, config: &Config) -> Option<Resp> {
         if config.scope.is_empty() || (config.scope == SCOPE_AVAILABILITY && self.remux_authorized(req)) {
             return None;
         }
-        Some(err_out(403, "out_of_scope"))
+        Some(error(StatusCode::FORBIDDEN, "out_of_scope"))
     }
 
     /// openConfig is decodeConfig plus admitInstall: every route that takes a config segment opens it here, so a
@@ -3451,48 +3411,45 @@ fn unix_time(secs: i64) -> SystemTime {
     }
 }
 
-fn first_header(req: &Req, name: &str) -> String {
-    let v = req.header(name);
-    v.split(',').next().unwrap_or("").trim().to_owned()
+/// The first of a comma-separated header's values (a proxy chain's `X-Forwarded-*`), "" when absent.
+fn first_header<'a>(req: &'a Request<Bytes>, name: &str) -> &'a str {
+    header(req, name).split(',').next().unwrap_or("").trim()
 }
 
-/// isDebugRequest checks for ?debug=1 without parsing a query string that is almost always absent.
-fn is_debug_request(req: &Req) -> bool {
-    !req.query.is_empty() && req.query_get("debug") == "1"
+/// Marks a response as a fallback (`X-Den-Degraded`), when there is a reason.
+fn mark_degraded(resp: &mut Resp, reason: &str) {
+    if !reason.is_empty() {
+        set_header(resp, HeaderName::from_static(X_DEN_DEGRADED), reason);
+    }
 }
 
-/// RFC 9110 §13.1.2: `If-None-Match` compares weakly, so a `W/` prefix on either side is ignored. A
-/// proxy that compresses (Cloudflare) weakens the ETag the client then sends back.
-pub(crate) use den_http::if_none_match_matches as etag_matches;
+/// Server-Timing: the phases a route named, closed by the total since `start`. A response with no phases still
+/// says how long it took.
+fn with_timing(resp: Resp, phases: &str, start: Instant) -> Resp {
+    let total = den_http::timing("total", start.elapsed());
+    den_http::add_timing(den_http::timed(resp, phases), &total)
+}
 
 /// beginPlay is what both play routes do first: refuse any verb but GET (see handlePlay for why HEAD is refused
-/// too). Server-Timing is stamped on whatever the route answers, by `stamp_play`.
-fn begin_play(req: &Req, start: Instant) -> Option<Out> {
-    if req.method == Method::GET {
+/// too). Server-Timing is stamped on the refusal like on everything else the route answers.
+fn begin_play(req: &Request<Bytes>, start: Instant) -> Option<Resp> {
+    if req.method() == Method::GET {
         return None;
     }
-    let mut out = err_out(405, "method_not_allowed");
-    out.set("allow", "GET");
-    stamp_play(&mut out, start, "");
-    Some(out)
-}
-
-/// playTiming stamps Server-Timing on whatever /play answers: the route has a dozen exits, and setting the header
-/// at each was a dozen chances to forget one.
-fn stamp_play(out: &mut Out, start: Instant, phases: &str) {
-    out.set("server-timing", &format!("{phases}total;dur={}", ms_dur(start.elapsed())));
+    Some(with_timing(method_not_allowed("GET"), "", start))
 }
 
 /// writePlayRedirect is /play's success answer.
 ///
 /// Standard bodyless 302 (audit / AetherEngine fix): explicit Content-Length:0 so the Node/Go layer
 /// doesn't send a chunked empty body that strict redirect-followers read as 0 bytes and fail on.
-fn write_play_redirect(link: &str) -> Out {
-    let mut out = Out::new(302);
-    out.set("location", link);
-    out.set("cache-control", NO_STORE);
-    out.set("content-length", "0");
-    out
+fn write_play_redirect(link: &str) -> Resp {
+    let mut resp = Response::new(full(""));
+    *resp.status_mut() = StatusCode::FOUND;
+    set_header(&mut resp, http::header::LOCATION, link);
+    resp.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
+    resp.headers_mut().insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    resp
 }
 
 fn write_cancel_outcome(
@@ -3500,21 +3457,21 @@ fn write_cancel_outcome(
     rid: &str,
     start: Instant,
     outcome: &crate::stores::CancelOutcome,
-) -> Out {
+) -> Resp {
     match outcome.reason.as_str() {
         "finished" => {
             log_limited(
                 "cancel",
                 &play_decision("cancel", "refused", "finished", "", start.elapsed(), rid, rt),
             );
-            return err_out(409, "finished");
+            return error(StatusCode::CONFLICT, "finished");
         }
         "not_ours" => {
             log_limited(
                 "cancel",
                 &play_decision("cancel", "refused", "not_ours", "", start.elapsed(), rid, rt),
             );
-            return err_out(409, "not_ours");
+            return error(StatusCode::CONFLICT, "not_ours");
         }
         _ => {}
     }
@@ -3526,12 +3483,14 @@ fn write_cancel_outcome(
         return write_queued_body(&outcome.status);
     }
     log_limited("cancel", &play_decision("cancel", "served", "cancelled", "", start.elapsed(), rid, rt));
-    Out::new(204)
+    let mut resp = Response::new(full(""));
+    *resp.status_mut() = StatusCode::NO_CONTENT;
+    resp
 }
 
 /// writeQueued — the "it's coming" answer: 202 plus whatever the store actually reported. `etaSeconds` is
 /// omitted rather than guessed when the service doesn't supply one.
-pub(crate) fn write_queued(rt: &ResolveTarget, rid: &str, dur: Duration, status: &StoreStatus) -> Out {
+pub(crate) fn write_queued(rt: &ResolveTarget, rid: &str, dur: Duration, status: &StoreStatus) -> Resp {
     // The wait, as the viewer sees it. A percentage alone can't distinguish a slow fetch from a dead
     // swarm, so the rate is logged beside it — this is the line to read when someone says "it's stuck".
     let rate = status
@@ -3567,11 +3526,17 @@ fn queued_state(status: &StoreStatus) -> &str {
     }
 }
 
-/// Go `writeQueuedBody`.
-pub(crate) fn write_queued_body(status: &StoreStatus) -> Out {
+/// The 202 a queued release is answered with.
+pub(crate) fn write_queued_body(status: &StoreStatus) -> Resp {
+    json_response(StatusCode::ACCEPTED, &queued_body(status))
+}
+
+/// What a queued release's 202 says: its state and progress, and whichever of the service, swarm, ETA and rate the
+/// store reported.
+pub(crate) fn queued_body(status: &StoreStatus) -> serde_json::Value {
     let mut body = serde_json::Map::new();
     body.insert("state".to_owned(), json!(queued_state(status)));
-    body.insert("progress".to_owned(), go_num(status.progress));
+    body.insert("progress".to_owned(), progress_number(status.progress));
     if let Some(service) = status.service {
         body.insert("service".to_owned(), json!(service.as_str()));
     }
@@ -3587,17 +3552,18 @@ pub(crate) fn write_queued_body(status: &StoreStatus) -> Out {
     if let Some(bps) = status.bytes_per_second {
         body.insert("bytesPerSecond".to_owned(), json!(bps));
     }
-    write_json(202, &serde_json::Value::Object(body), NO_STORE)
+    serde_json::Value::Object(body)
 }
 
 /// writeAddBudgetSpent answers scout_busy with the add budget's limit and window as the IETF draft RateLimit
 /// headers, beside Retry-After: nothing is left, and the budget frees in `wait`.
-fn write_add_budget_spent(wait: Duration, body: &serde_json::Value) -> Out {
+fn write_add_budget_spent(wait: Duration, body: &serde_json::Value) -> Resp {
     let secs = wait_secs(wait);
-    let mut out = write_unavailable(wait, body);
-    out.set("ratelimit-policy", &format!("\"adds\";q={ADD_BUDGET_LIMIT};w={}", ADD_BUDGET_WINDOW.as_secs()));
-    out.set("ratelimit", &format!("\"adds\";r=0;t={secs}"));
-    out
+    let mut resp = write_unavailable(wait, body);
+    let policy = format!("\"adds\";q={ADD_BUDGET_LIMIT};w={}", ADD_BUDGET_WINDOW.as_secs());
+    set_header(&mut resp, HeaderName::from_static("ratelimit-policy"), &policy);
+    set_header(&mut resp, HeaderName::from_static("ratelimit"), &format!("\"adds\";r=0;t={secs}"));
+    resp
 }
 
 /// A wait in whole seconds, rounded up, and at least one.
@@ -3607,10 +3573,10 @@ fn wait_secs(wait: Duration) -> u64 {
 
 /// writeUnavailable answers 503 with a Retry-After of at least a second, so a client that honours it waits as long as
 /// the refusal behind the answer lasts instead of polling into it.
-fn write_unavailable(wait: Duration, body: &serde_json::Value) -> Out {
-    let mut out = write_json(503, body, NO_STORE);
-    out.set("retry-after", &wait_secs(wait).to_string());
-    out
+fn write_unavailable(wait: Duration, body: &serde_json::Value) -> Resp {
+    let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, body);
+    resp.headers_mut().insert(RETRY_AFTER, HeaderValue::from(wait_secs(wait)));
+    resp
 }
 
 fn scout_busy_for(pool: &StorePool, prefetch: bool) -> Duration {

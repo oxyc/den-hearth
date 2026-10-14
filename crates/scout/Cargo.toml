@@ -2,18 +2,21 @@
 name = "den-scout"
 version = "0.0.0"
 edition = "2021"
-description = "Port of den-scout's internal/scout (Go) to Rust. A skeleton: shared types and one empty module per Go file, no logic yet"
+description = "The stream-list and play addon: indexer scrapes, debrid cache checks and resolves, ranking, play tickets"
 publish = false
 license = "MIT"
 
 [dependencies]
 # The public-address classifier household sources are guarded with, shared with Subtitles and Remux.
 den-net = { path = "../net" }
-# The pure helpers Scout shares with the other addons: FNV hash, weak If-None-Match, the bearer check, the request-id filter.
+# The response body, conditional GETs, CORS, the bearer check and the request log line every addon shares.
 den-http = { path = "../http" }
+# The request and response bodies the handler serves.
+bytes = "1"
+http-body-util = "0.1"
 async-trait = "0.1"
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
-# `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.
+# `encoding/base64`).
 base64 = "0.23"
 # Go `crypto/sha256`: the 128-bit cache-key digest `key_hash` returns (util.go), the disk tier's file
 # names (diskcache.go), and HKDF-SHA256 for play tickets.
@@ -23,8 +26,8 @@ sha2 = "0.11"
 # bodies the handler tests decode. `raw_value` is Go's `json.RawMessage`: a stale list keeps its `streams` array
 # exactly as it was written (coverage.rs `stale_body`).
 serde_json = { version = "1", features = ["raw_value"] }
-# XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`). The ticket owner uses it
-# in production; the tests build a legacy ticket with it.
+# XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`); the tests build a legacy
+# ticket with it too.
 chacha20poly1305 = "0.10"
 # The sealed-config keyring (crypto_box_seal; Go `seal.go`) and the install-revocation policy, shared with
 # Reel and Subtitles.

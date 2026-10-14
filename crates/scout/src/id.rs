@@ -1,6 +1,6 @@
 //! Port of `internal/scout/id.go`: parsing the Stremio stream id route segments.
 
-/// FROZEN. Go `StreamID`: `tt<digits>` (movie) or `tt<digits>:S:E` (series episode).
+/// Go `StreamID`: `tt<digits>` (movie) or `tt<digits>:S:E` (series episode).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamId {
     /// "movie" | "series"

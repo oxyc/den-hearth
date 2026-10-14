@@ -1,4 +1,4 @@
-//! Go: `internal/scout/account_test.go` (157 lines). Work package 1.
+//! Go: `internal/scout/account_test.go` (157 lines).
 //!
 //! Every test here goes through the handler (`new_handler`, `test_deps`, `get`, `valid_blob`).
 

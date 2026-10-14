@@ -1,4 +1,4 @@
-//! Go: `internal/scout/playreserve_test.go` (248 lines). Work package 4.
+//! Go: `internal/scout/playreserve_test.go` (248 lines).
 //!
 //! Exercises `addbudget` through the handler. The budget's clock is injected (`AddBudget::now`), the process-wide
 //! budget is swapped with `install_budget` (a per-thread budget in a test build, as Go's tests swap
