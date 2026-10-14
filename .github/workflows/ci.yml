@@ -69,6 +69,7 @@ jobs:
           sha=$(grep -oP '^ARG DENO_SHA256_AMD64=\K\S+' Dockerfile)
           curl -fsSL "https://github.com/denoland/deno/releases/download/v${version}/deno-x86_64-unknown-linux-gnu.zip" -o deno.zip
           echo "${sha}  deno.zip" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
           unzip -q -d "$HOME/.local/bin" deno.zip
           rm deno.zip
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
