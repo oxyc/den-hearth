@@ -24,4 +24,6 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 http = "1"
+# Go's `t.TempDir()`.
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "test-util"] }
