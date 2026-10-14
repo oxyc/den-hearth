@@ -112,7 +112,7 @@ fn route_handler(cache: &Arc<dyn Cache>, store: Arc<dyn Store>) -> Handler {
 
 /// Go's `fakeStore`, `answeringStore` and `noAddAwareStore` in one: a store whose answers the test fixes.
 #[derive(Clone)]
-struct Scripted {
+pub(crate) struct Scripted {
     svc: DebridService,
     check: HashMap<String, bool>,
     /// Go `noAddAwareStore.cached`: the one hash the cache check reports held, whichever hashes it is asked about.
@@ -125,7 +125,7 @@ struct Scripted {
 }
 
 impl Scripted {
-    fn new(svc: DebridService) -> Scripted {
+    pub(crate) fn new(svc: DebridService) -> Scripted {
         Scripted {
             svc,
             check: HashMap::new(),
@@ -137,32 +137,32 @@ impl Scripted {
         }
     }
 
-    fn check(mut self, answers: &[(&str, bool)]) -> Scripted {
+    pub(crate) fn check(mut self, answers: &[(&str, bool)]) -> Scripted {
         self.check = answers.iter().map(|(h, held)| ((*h).to_owned(), *held)).collect();
         self
     }
 
-    fn cached(mut self, hash: &str) -> Scripted {
+    pub(crate) fn cached(mut self, hash: &str) -> Scripted {
         self.cached = Some(hash.to_owned());
         self
     }
 
-    fn check_err(mut self, err: StoreError) -> Scripted {
+    pub(crate) fn check_err(mut self, err: StoreError) -> Scripted {
         self.check_err = Some(err);
         self
     }
 
-    fn resolve_with(mut self, f: impl Fn(&ResolveTarget) -> Result<String, StoreError> + Send + Sync + 'static) -> Scripted {
+    pub(crate) fn resolve_with(mut self, f: impl Fn(&ResolveTarget) -> Result<String, StoreError> + Send + Sync + 'static) -> Scripted {
         self.resolve = Arc::new(f);
         self
     }
 
-    fn status(mut self, status: StoreStatus) -> Scripted {
+    pub(crate) fn status(mut self, status: StoreStatus) -> Scripted {
         self.status = Some(status);
         self
     }
 
-    fn answer(mut self, answer: StatusAnswer) -> Scripted {
+    pub(crate) fn answer(mut self, answer: StatusAnswer) -> Scripted {
         self.answer = Some(answer);
         self
     }

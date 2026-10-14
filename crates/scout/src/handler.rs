@@ -1023,10 +1023,10 @@ impl Handler {
         &self,
         config: &Config,
         streams: &mut [RawStream],
-        sid: &StreamId,
+        sid: Option<&StreamId>,
         truth: &CacheTruth,
     ) -> bool {
-        self.inner.hydrate_probe_facts(streams, Some(sid));
+        self.inner.hydrate_probe_facts(streams, sid);
         self.inner.probe_top_for_client(config, streams, sid, truth, None)
     }
 
@@ -1962,7 +1962,7 @@ impl Inner {
         // Ask the top few releases what they actually contain. After ranking, so the probe follows the order
         // the viewer will see; before serialisation, so a cached probe rides along in this same response.
         let phase = Instant::now();
-        if self.probe_top_for_client(config, &ranked, sid, &truth, client.as_ref()) {
+        if self.probe_top_for_client(config, &ranked, Some(sid), &truth, client.as_ref()) {
             timing.push_str(&format!(", probe;dur={}", ms_dur(phase.elapsed())));
         }
 
@@ -2099,7 +2099,7 @@ impl Inner {
         self: &Arc<Self>,
         config: &Config,
         streams: &[RawStream],
-        sid: &StreamId,
+        sid: Option<&StreamId>,
         truth: &CacheTruth,
         client: Option<&ClientPlayable>,
     ) -> bool {
@@ -2124,7 +2124,7 @@ impl Inner {
                 metrics().probe_cache_miss.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let pending = select_probe_jobs(streams, config, Some(sid), truth, client);
+        let pending = select_probe_jobs(streams, config, sid, truth, client);
         if !pending.is_empty() {
             self.probe_behind(config, pending);
         }
