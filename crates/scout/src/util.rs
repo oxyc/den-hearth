@@ -37,7 +37,12 @@ pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
             .with_decode_allow_trailing_bits(true)
             .with_decode_padding_mode(DecodePaddingMode::RequireNone),
     );
-    let cleaned: String = s.trim_end_matches('=').chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    let trimmed = s.trim_end_matches('=');
+    // Nothing but a hand-wrapped segment holds a line break, so the copy that drops them is the rare path.
+    if !trimmed.bytes().any(|b| matches!(b, b'\r' | b'\n')) {
+        return LENIENT.decode(trimmed).map_err(|e| e.to_string());
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
     LENIENT.decode(cleaned).map_err(|e| e.to_string())
 }
 
@@ -82,6 +87,20 @@ pub(crate) static LEAF: Shape = Shape::Leaf;
 pub(crate) fn fold_json_keys(v: &mut serde_json::Value, shape: &Shape) {
     match (v, shape) {
         (serde_json::Value::Object(map), Shape::Object(fields)) => {
+            // Every document an encoder wrote spells its keys exactly. Then nothing is renamed, the map stays as
+            // it is, and only the children the shape looks into are visited.
+            let renames = map.keys().any(|key| {
+                !fields.iter().any(|(name, _)| *name == key.as_str())
+                    && fields.iter().any(|(name, _)| fold_eq(name, key))
+            });
+            if !renames {
+                for (key, child) in map.iter_mut() {
+                    if let Some((_, sub)) = fields.iter().find(|(name, _)| *name == key.as_str()) {
+                        fold_json_keys(child, sub);
+                    }
+                }
+                return;
+            }
             let old = std::mem::take(map);
             for (key, mut child) in old {
                 let field = fields
