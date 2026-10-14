@@ -95,7 +95,11 @@ pub fn startup_summary(s: &Settings, persistent: bool) -> String {
         on_off(!s.metrics_token.is_empty()),
         on_off(s.log_requests),
         on_off(s.log_identity),
-        on_off(!s.config_key.is_empty()),
+        match SealKeyring::parse(&s.config_key, &s.config_keys_prev, &|_| {}) {
+            Ok(Some(_)) => "on",
+            Ok(None) => "off",
+            Err(_) => "invalid",
+        },
         s.revocation.revoked_count(),
         s.revocation.epoch(),
         on_off(s.revocation.requires_install_id()),
@@ -338,6 +342,8 @@ pub struct Deps {
     /// Decrypts a sealed config path segment (docs/SEALED-CONFIG.md). None = sealed URLs disabled (legacy
     /// plaintext still works); the current key's public half is served at /config-key.
     pub seal_keyring: Option<Arc<SealKeyring>>,
+    /// CONFIG_KEY is set but malformed: install configs are refused and /health is degraded.
+    pub config_key_invalid: bool,
     /// Gates /metrics. Empty disables the route entirely (404).
     pub metrics_token: String,
     /// One redacted line per response (reqlog.go).
@@ -412,6 +418,7 @@ fn build_deps_with(
     let indexer_urls = settings.indexer_urls.clone();
     let scraper_doer = doer.clone();
     let (store_doer, store_cache) = (doer.clone(), cache.clone());
+    let (seal_keyring, config_key_invalid) = build_keyring(&settings.config_key, &settings.config_keys_prev);
     Deps {
         probe_doer: Some(doer.clone()),
         meta: Some(Arc::new(cinemeta_meta(doer, &settings.cinemeta_url, cache.clone()))),
@@ -424,7 +431,8 @@ fn build_deps_with(
             make_scrapers(c, scraper_doer.clone(), source_doer.clone(), &indexer_urls)
         }),
         make_stores: Arc::new(move |c| build_stores(c, store_doer.clone(), Some(store_cache.clone()))),
-        seal_keyring: build_keyring(&settings.config_key, &settings.config_keys_prev).map(Arc::new),
+        seal_keyring: seal_keyring.map(Arc::new),
+        config_key_invalid,
         metrics_token: settings.metrics_token.clone(),
         log_requests: settings.log_requests,
         revocation: settings.revocation.clone(),
@@ -434,14 +442,19 @@ fn build_deps_with(
     }
 }
 
-/// Go `buildKeyring`: parses the sealed-config keyring from env. A malformed key disables sealed URLs (legacy
-/// plaintext keeps working) and logs loudly rather than crashing the addon.
-pub(crate) fn build_keyring(current: &str, prev: &str) -> Option<SealKeyring> {
+/// Go `buildKeyring`: parses the sealed-config keyring from env. Unset gives no keyring (sealing off). Set but
+/// malformed fails CLOSED rather than crashing the addon (hearth serves other services from the same process):
+/// no keyring and `true`, which makes every request carrying an install config a 503 `config_key_invalid` and
+/// /health degraded. Sealing off would accept plaintext configs anyone can mint.
+pub(crate) fn build_keyring(current: &str, prev: &str) -> (Option<SealKeyring>, bool) {
     match parse_seal_keyring(current, prev) {
-        Ok(kr) => kr,
+        Ok(kr) => (kr, false),
         Err(e) => {
-            emit(&format!("CONFIG_KEY invalid — sealed configs disabled: {e}"));
-            None
+            emit(&format!(
+                "CONFIG_KEY (SCOUT_CONFIG_KEY under hearth) is set but invalid — refusing every install config \
+                 until it is fixed: {e}"
+            ));
+            (None, true)
         }
     }
 }

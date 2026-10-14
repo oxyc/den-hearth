@@ -85,6 +85,8 @@ pub struct AppState {
     /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
     /// disabled (legacy plaintext still works); the current key's public half is served at `/config-key`.
     pub config_keyring: Option<Keyring>,
+    /// `CONFIG_KEY` is set but malformed: install configs are refused and /health is degraded.
+    pub config_key_invalid: bool,
     /// Cache the STABLE ytId (the expensive lookup); playback is just our /play proxy for it.
     /// In-memory (24h TTL), parked to `cfg.resolve_cache` at shutdown and read back at boot so a
     /// redeploy does not make the next browse re-ask TMDB for every title on screen. Empty ids =
@@ -216,14 +218,21 @@ impl AppState {
         let upstream = Box::new(HttpUpstream::new(cfg.clone(), http.clone()));
         let probe_sem = Arc::new(Semaphore::new(crate::PROBE_CONCURRENCY));
         let prewarm_sem = Arc::new(Semaphore::new(crate::PREWARM_MAX));
-        // A malformed key disables sealed URLs (legacy plaintext keeps working) rather than crashing.
-        let config_keyring = match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
-            Ok(kr) => kr,
-            Err(e) => {
-                eprintln!("warning: CONFIG_KEY invalid ({e}) — sealed configs disabled");
-                None
-            }
-        };
+        // Unset = sealing off. Set but malformed = fail CLOSED: no keyring, and every request that carries
+        // an install config is refused (503 `config_key_invalid`) with /health degraded. Falling back to
+        // "sealing off" would accept plaintext configs anyone can mint. The process keeps running, since
+        // hearth serves other services from it.
+        let (config_keyring, config_key_invalid) =
+            match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
+                Ok(kr) => (kr, false),
+                Err(e) => {
+                    eprintln!(
+                        "error: CONFIG_KEY (REEL_CONFIG_KEY under hearth) is set but invalid ({e}) — \
+                         refusing every install config until it is fixed"
+                    );
+                    (None, true)
+                }
+            };
         let media_gate = Arc::new(crate::media_gate::MediaGate::new(
             cfg.direct_media_concurrency,
             cfg.direct_media_idle,
@@ -232,6 +241,7 @@ impl AppState {
         Arc::new(AppState {
             cfg: cfg.clone(),
             config_keyring,
+            config_key_invalid,
             yt_cache: Mutex::new(HashMap::new()),
             ids: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
@@ -306,7 +316,11 @@ impl AppState {
     /// polls. Returns the line it wrote, so a test can see it.
     pub fn note_health(&self) -> Option<String> {
         let (key, upstream, extract, local, paused) = self.health_inputs();
-        let verdict = crate::health_verdict(key, upstream, extract, local, paused.is_some());
+        let verdict = if self.config_key_invalid {
+            Some(crate::CONFIG_KEY_INVALID)
+        } else {
+            crate::health_verdict(key, upstream, extract, local, paused.is_some())
+        };
         let reason = verdict.map(|(reason, _)| reason);
         {
             let mut last = self.health_logged.lock().unwrap_or_else(|e| e.into_inner());

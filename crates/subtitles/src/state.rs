@@ -40,6 +40,8 @@ pub struct AppState {
     /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
     /// disabled (legacy plaintext still works); the current key's public half is served at `/config-key`.
     pub config_keyring: Option<Keyring>,
+    /// `CONFIG_KEY` is set but malformed: install configs are refused and /health is degraded.
+    pub config_key_invalid: bool,
     /// The pooled HTTP client. `None` if TLS init failed at boot — health/manifest/configure still
     /// serve; the subtitle/translate routes 503 instead of the whole process refusing to boot.
     pub http: Option<reqwest::Client>,
@@ -90,17 +92,25 @@ impl AppState {
         };
         // Disk tier under CACHE_DIR/store so a restart/redeploy doesn't cold-start the cache.
         let cache = Cache::new(cfg.cache_max_bytes as usize, Some(cfg.cache_dir.join("store")));
-        // A malformed key disables sealed URLs (legacy plaintext keeps working) rather than crashing.
-        let config_keyring = match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
-            Ok(kr) => kr,
-            Err(e) => {
-                eprintln!("warning: CONFIG_KEY invalid ({e}) — sealed configs disabled");
-                None
-            }
-        };
+        // Unset = sealing off. Set but malformed = fail CLOSED: no keyring, and every request that carries
+        // an install config is refused (503 `config_key_invalid`) with /health degraded. Falling back to
+        // "sealing off" would accept plaintext configs anyone can mint. The process keeps running, since
+        // hearth serves other services from it.
+        let (config_keyring, config_key_invalid) =
+            match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
+                Ok(kr) => (kr, false),
+                Err(e) => {
+                    eprintln!(
+                        "error: CONFIG_KEY (SUBS_CONFIG_KEY under hearth) is set but invalid ({e}) — \
+                         refusing every install config until it is fixed"
+                    );
+                    (None, true)
+                }
+            };
         Arc::new(AppState {
             cfg,
             config_keyring,
+            config_key_invalid,
             http,
             cache,
             inflight: Arc::new(InFlight::default()),

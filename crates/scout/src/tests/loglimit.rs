@@ -70,7 +70,7 @@ async fn health_flip_is_logged_once_each_way() {
 fn startup_summary() {
     let env = [
         ("MEDIAFUSION_URL", "https://mf.self/SECRET-CONFIG"),
-        ("CONFIG_KEY", "key-secret"),
+        ("CONFIG_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="),
         ("METRICS_TOKEN", "metrics-secret"),
         ("CACHE_DIR", "/cache"),
     ];
@@ -92,11 +92,26 @@ fn startup_summary() {
     ] {
         assert!(line.contains(want), "startup line lacks {want:?}: {line}");
     }
-    for leak in ["SECRET-CONFIG", "mf.self", "key-secret", "metrics-secret"] {
+    for leak in ["SECRET-CONFIG", "mf.self", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=", "metrics-secret"]
+    {
         assert!(!line.contains(leak), "startup line carries {leak:?}: {line}");
     }
     let unwritable = startup_line(&s, false);
     assert!(unwritable.contains("cache_persistent=off"), "an unwritable cache should say so: {unwritable}");
+}
+
+// A set-but-malformed CONFIG_KEY is `sealed=invalid` (not `on`), and unset is `off`.
+#[test]
+fn startup_summary_names_an_invalid_config_key() {
+    let line = |key: &'static str| {
+        startup_line(
+            &settings_from_env(move |k| if k == "CONFIG_KEY" { key.to_owned() } else { String::new() }),
+            true,
+        )
+    };
+    assert!(line("not-a-key").contains("sealed=invalid"));
+    assert!(line("").contains("sealed=off"));
+    assert!(!line("not-a-key").contains("not-a-key"));
 }
 
 // One condition, many occurrences: one line a minute, and the next line admits what it held back.

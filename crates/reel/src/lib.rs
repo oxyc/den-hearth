@@ -210,6 +210,23 @@ fn health_body(
     }
 }
 
+/// `CONFIG_KEY` is set but malformed: the verdict that wins over every other, since no install config
+/// can be trusted until it is fixed.
+pub(crate) const CONFIG_KEY_INVALID: (&str, &str) = (
+    "config_key_invalid",
+    "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
+);
+
+/// The 503 an install-config request gets while `CONFIG_KEY` is malformed. Retry-After is a hint to
+/// clients, not a promise: only an operator fixing the variable and restarting clears it.
+fn config_key_invalid_response() -> Response<Body> {
+    httputil::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({"error": "config_key_invalid"}),
+        &[("cache-control", "no-store"), ("retry-after", "60")],
+    )
+}
+
 /// The /health verdict: `None` when ok, else its reason and detail. Shared by the body above and by
 /// the line `AppState::note_health` writes when the verdict changes.
 fn health_verdict(
@@ -703,7 +720,12 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         // no server TMDB key AND no sealed-config keyring, or TMDB failing. KinoCheck is a
         // fallback: its outage does not mean trailers are broken, so it does not move this.
         let (tmdb_available, recent_failures, extract_fails, local_fails, paused) = state.health_inputs();
-        let body = health_body(tmdb_available, recent_failures, extract_fails, local_fails, paused);
+        let body = if state.config_key_invalid {
+            let (reason, detail) = CONFIG_KEY_INVALID;
+            serde_json::json!({"status": "degraded", "reason": reason, "detail": detail})
+        } else {
+            health_body(tmdb_available, recent_failures, extract_fails, local_fails, paused)
+        };
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     // Operational detail /health has no room for. /health answers one question — can this instance
@@ -759,6 +781,11 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // CONFIG_EPOCH, which the page stamps into every link it builds, sealed or not: a link stamped
     // below it would be refused the moment it was built.
     if path == "/config-key" {
+        // A malformed key has no public half to hand out; /configure then builds plaintext links, which
+        // are refused like every other config until the key is fixed.
+        if state.config_key_invalid {
+            return config_key_invalid_response();
+        }
         let epoch = state.cfg.revocation.epoch();
         return match state.config_keyring.as_ref().map(|kr| kr.current_pub_base64()) {
             Some(k) if !k.is_empty() => httputil::json(
@@ -793,6 +820,9 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // URL; Stremio then derives the /meta calls from the same base. Fail CLOSED on a bad config.
     if let Some((cfg_seg, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) {
         if rest == "manifest.json" || rest.starts_with("meta/") || rest.starts_with("prepare/") {
+            if state.config_key_invalid {
+                return config_key_invalid_response();
+            }
             let cfg = match userconfig::decode_checked(
                 state.config_keyring.as_ref(),
                 &state.cfg.revocation,
@@ -1249,6 +1279,7 @@ pub async fn finish(state: &Arc<AppState>) {
 pub fn startup_line(state: &AppState) -> String {
     let on = |b: bool| if b { "on" } else { "off" };
     let cfg = &state.cfg;
+    let sealed = if state.config_key_invalid { "invalid" } else { on(state.config_keyring.is_some()) };
     format!(
         "den-reel {} listening on :{} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
          require_iid={} play_signing={} direct_media_max={} env_tmdb_key={} cache={} max_height={}",
@@ -1256,7 +1287,7 @@ pub fn startup_line(state: &AppState) -> String {
         cfg.port,
         on(cfg.metrics_token.is_some()),
         on(cfg.log_requests),
-        on(state.config_keyring.is_some()),
+        sealed,
         cfg.revocation.revoked_count(),
         cfg.revocation.epoch(),
         on(cfg.revocation.requires_install_id()),

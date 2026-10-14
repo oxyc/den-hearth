@@ -88,6 +88,28 @@ fn health_body(os_fails: u32) -> serde_json::Value {
     }
 }
 
+/// The /health body while `CONFIG_KEY` is set but malformed: wins over every other verdict, since no
+/// install config can be trusted until it is fixed.
+fn config_key_invalid_health() -> serde_json::Value {
+    serde_json::json!({
+        "status": "degraded",
+        "reason": "config_key_invalid",
+        "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
+    })
+}
+
+/// The 503 an install-config request gets while `CONFIG_KEY` is malformed. Retry-After is a hint to
+/// clients, not a promise: only an operator fixing the variable and restarting clears it.
+fn config_key_invalid_response() -> Response<Body> {
+    let mut resp = httputil::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({"error": "config_key_invalid"}),
+        "no-store",
+    );
+    resp.headers_mut().insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("60"));
+    resp
+}
+
 // Generic over the request body: this handler routes on path/query only and discards the body, so tests
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
@@ -157,7 +179,11 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when OpenSubtitles has been
         // failing so the app's Plugins screen can surface it.
         "/health" => {
-            let body = health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed));
+            let body = if state.config_key_invalid {
+                config_key_invalid_health()
+            } else {
+                health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed))
+            };
             return httputil::json(StatusCode::OK, &body, "no-store");
         }
         // Prometheus text behind `METRICS_TOKEN`; 404 without it (see metrics.rs).
@@ -171,6 +197,11 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         // Both answers carry CONFIG_EPOCH, which the page stamps into every link it builds, sealed or
         // not: a link stamped below it would be refused the moment it was built.
         "/config-key" => {
+            // A malformed key has no public half to hand out; /configure then builds plaintext links,
+            // which are refused like every other config until the key is fixed.
+            if state.config_key_invalid {
+                return config_key_invalid_response();
+            }
             let epoch = state.cfg.revocation.epoch();
             return match state.config_keyring.as_ref().map(|kr| kr.current_pub_base64()) {
                 Some(pub_b64) if !pub_b64.is_empty() => httputil::json(
@@ -191,6 +222,12 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
     let segs = split_path(path);
     let config = segs.first().copied().unwrap_or("");
     let resource = segs.get(1).copied().unwrap_or("");
+
+    if state.config_key_invalid
+        && matches!(resource, "manifest.json" | "subtitles" | "subtitle" | "translate")
+    {
+        return config_key_invalid_response();
+    }
 
     match resource {
         "manifest.json" => match state.decode_config(config) {
@@ -405,7 +442,7 @@ pub fn startup_line(state: &AppState) -> String {
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
         on_off(state.cfg.log_identity),
-        on_off(state.config_keyring.is_some()),
+        if state.config_key_invalid { "invalid" } else { on_off(state.config_keyring.is_some()) },
         state.cfg.revocation.revoked_count(),
         state.cfg.revocation.epoch(),
         on_off(state.cfg.revocation.requires_install_id()),
@@ -683,6 +720,60 @@ mod tests {
         let resp =
             handle_request(test_state(""), Request::builder().uri("/config-key").body(()).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health() {
+        let state = test_state("not-a-key");
+        assert!(state.config_keyring.is_none() && state.config_key_invalid);
+        assert!(startup_line(&state).contains("sealed=invalid"), "{}", startup_line(&state));
+        let plain = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-plain"}"#);
+        for seg in [plain.as_str(), JS_SEG] {
+            for tail in [
+                "manifest.json",
+                "subtitles/movie/tt0111161.json",
+                "subtitle/1.srt",
+                "translate/movie/tt0111161/fi.json",
+            ] {
+                let resp = handle_request(
+                    state.clone(),
+                    Request::builder().uri(format!("/{seg}/{tail}")).body(()).unwrap(),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{tail}");
+                assert_eq!(resp.headers()["retry-after"], "60");
+                assert!(body_string(resp).await.contains("config_key_invalid"));
+            }
+        }
+        let key =
+            handle_request(state.clone(), Request::builder().uri("/config-key").body(()).unwrap()).await;
+        assert_eq!(key.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let health = handle_request(state, Request::builder().uri("/health").body(()).unwrap()).await;
+        let health: serde_json::Value = serde_json::from_str(&body_string(health).await).unwrap();
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["reason"], "config_key_invalid");
+    }
+
+    #[tokio::test]
+    async fn an_unset_key_still_accepts_plaintext_and_a_malformed_prior_key_is_skipped() {
+        let state = test_state("");
+        assert!(!state.config_key_invalid);
+        assert!(startup_line(&state).contains("sealed=off"));
+        let plain = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-plain"}"#);
+        let resp = handle_request(
+            state.clone(),
+            Request::builder().uri(format!("/{plain}/manifest.json")).body(()).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let health = handle_request(state, Request::builder().uri("/health").body(()).unwrap()).await;
+        assert!(body_string(health).await.contains(r#""status":"ok""#));
+
+        let mut cfg = test_config(VEC_PRIV_B64, "");
+        cfg.config_keys_prev = "not-a-key".to_string();
+        let state = AppState::new(cfg);
+        assert!(!state.config_key_invalid && state.config_keyring.is_some());
+        assert!(startup_line(&state).contains("sealed=on"));
     }
 
     #[tokio::test]
