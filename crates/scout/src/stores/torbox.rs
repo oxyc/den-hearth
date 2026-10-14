@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use super::StoreError;
 use crate::cache::Cache;
 use crate::scrape::Doer;
 
@@ -16,4 +17,11 @@ pub struct TorBoxStore {
     pub client: Arc<dyn Doer>,
     pub cache: Option<Arc<dyn Cache>>,
     pub api: String,
+}
+
+impl TorBoxStore {
+    /// Go `torBoxStore.requestDownload`: asks TorBox for the playable link of one file of a torrent.
+    pub(crate) async fn request_download(&self, torrent_id: i64, file_id: Option<i64>) -> Result<String, StoreError> {
+        todo!("stores.go torBoxStore.requestDownload")
+    }
 }
