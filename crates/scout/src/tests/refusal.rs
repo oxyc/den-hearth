@@ -299,50 +299,59 @@ async fn every_store_reports_a_refusal_as_a_refusal() {
 // on the shipped default (mediafusion has no config URL), so every genuinely empty result was reported
 // as an outage, negative caching never ran, and three unavailable titles in a row flipped /health to
 // degraded on a perfectly healthy service. A permanent misconfiguration is not a transient failure.
-#[test]
-#[ignore = "needs scrape.rs scrape_all (package 5)"]
-fn scrape_all_unaskable_indexer_does_not_block_an_empty_verdict() {
-    #[cfg(any())]
-    async fn pending() {
-        let answered_empty = FakeScraper { id: "torrentio", result: Ok(vec![]) };
-        let unaskable = UnaskableScraper { indexer: "mediafusion" };
+#[tokio::test]
+async fn scrape_all_unaskable_indexer_does_not_block_an_empty_verdict() {
+    use crate::config::Indexer;
+    use crate::indexerconfig::UnaskableScraper;
+    use crate::rank::RawStream;
+    use crate::scrape::{scrape_all, ScrapeQuery, Scraper};
 
-        let (_, ok, _) =
-            scrape_all(&[&answered_empty, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
-        assert!(ok, "every askable indexer answered, so the empty result is authoritative");
-
-        // A non-empty list is trusted whatever the coverage: whatever came back is real.
-        let found = FakeScraper {
-            id: "torrentio",
-            result: Ok(vec![RawStream { info_hash: "d".repeat(40), title: "a release".into(), ..Default::default() }]),
-        };
-        let (seeds, ok, _) = scrape_all(&[&found, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
-        assert!(ok && seeds.len() == 1, "a non-empty result stands on its own: {} seeds, ok={ok}", seeds.len());
-
-        // A real failure still withholds the verdict — that is the rule this must not weaken.
-        let failed = FakeScraper { id: "torrentio", result: Err("502".into()) };
-        let (_, ok, _) = scrape_all(&[&failed, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
-        assert!(!ok, "an indexer that failed means the empty result is not authoritative");
+    /// Go `fakeScraper`: answers a fixed result.
+    struct FakeScraper {
+        result: Result<Vec<RawStream>, &'static str>,
     }
-    todo!("pending: refusal_test.go:222")
+
+    #[async_trait::async_trait]
+    impl Scraper for FakeScraper {
+        fn id(&self) -> Indexer {
+            Indexer("torrentio".into())
+        }
+        async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+            self.result.clone().map_err(DoError::from)
+        }
+    }
+
+    let unaskable: Arc<dyn Scraper> = Arc::new(UnaskableScraper { indexer: Indexer("mediafusion".into()), transient: false });
+    let with = |sc: FakeScraper| -> Vec<Arc<dyn Scraper>> { vec![Arc::new(sc), Arc::clone(&unaskable)] };
+
+    let (_, ok, _) = scrape_all(&with(FakeScraper { result: Ok(vec![]) }), &ScrapeQuery::default(), Duration::from_secs(1)).await;
+    assert!(ok, "every askable indexer answered, so the empty result is authoritative");
+
+    // A non-empty list is trusted whatever the coverage: whatever came back is real.
+    let found = FakeScraper {
+        result: Ok(vec![RawStream { info_hash: "d".repeat(40), title: "a release".into(), ..Default::default() }]),
+    };
+    let (seeds, ok, _) = scrape_all(&with(found), &ScrapeQuery::default(), Duration::from_secs(1)).await;
+    assert!(ok && seeds.len() == 1, "a non-empty result stands on its own: {} seeds, ok={ok}", seeds.len());
+
+    // A real failure still withholds the verdict — that is the rule this must not weaken.
+    let (_, ok, _) = scrape_all(&with(FakeScraper { result: Err("502") }), &ScrapeQuery::default(), Duration::from_secs(1)).await;
+    assert!(!ok, "an indexer that failed means the empty result is not authoritative");
 }
 
 // Season and episode are read off the stream id, and a movie has neither. A wrong answer here sends the
 // probe at the wrong episode of a pack.
 #[test]
-#[ignore = "needs probe_fanout.rs seasonOf/episodeOf (package 5)"]
 fn season_episode_of() {
-    #[cfg(any())]
-    fn pending() {
-        // nil, not zero: episode 0 is a real episode on some series, so "no episode" needs its own value.
-        assert!(season_of(None).is_none() && episode_of(None).is_none(), "a nil id has neither a season nor an episode");
-        let sid = StreamId { kind: "series".into(), imdb: "tt1".into(), season: 3, episode: 7, has_ep: true };
-        assert_eq!(season_of(Some(&sid)), Some(3), "season not read");
-        assert_eq!(episode_of(Some(&sid)), Some(7), "episode not read");
-        let movie = StreamId { kind: "movie".into(), imdb: "tt2".into(), ..Default::default() };
-        assert!(season_of(Some(&movie)).is_none() && episode_of(Some(&movie)).is_none(), "a movie has neither");
-    }
-    todo!("pending: refusal_test.go:251")
+    use crate::id::StreamId;
+    use crate::probe_fanout::{episode_of, season_of};
+    // nil, not zero: episode 0 is a real episode on some series, so "no episode" needs its own value.
+    assert!(season_of(None).is_none() && episode_of(None).is_none(), "a nil id has neither a season nor an episode");
+    let sid = StreamId { kind: "series".into(), imdb: "tt1".into(), season: 3, episode: 7, has_ep: true };
+    assert_eq!(season_of(Some(&sid)), Some(3), "season not read");
+    assert_eq!(episode_of(Some(&sid)), Some(7), "episode not read");
+    let movie = StreamId { kind: "movie".into(), imdb: "tt2".into(), season: 0, episode: 0, has_ep: false };
+    assert!(season_of(Some(&movie)).is_none() && episode_of(Some(&movie)).is_none(), "a movie has neither");
 }
 
 // The backoff belongs to every store that can be refused, not just the one whose refusal was noticed
@@ -1411,52 +1420,48 @@ fn probe_and_play_agree_on_a_later_episode_after_premiumize_served_the_first() {
 //
 // Two guards are asserted: the charge is taken (so the fifty an hour sees it), and the mark is dropped
 // (so the next poll does not walk the same path again).
-#[test]
-#[ignore = "needs addbudget.rs (package 3)"]
-fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
-    #[cfg(any())]
-    async fn pending() {
-        let token = "pm-evicted";
-        let hash = "7".repeat(40);
-        let cache = mem();
-        note_held(&*cache, token, &hash); // the account held it when /play last served it
+#[tokio::test]
+async fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
+    use crate::stores::refusal::{held_recently, note_held};
+    let token = "pm-evicted";
+    let hash = "7".repeat(40);
+    let cache = mem();
+    note_held(&*cache, token, &hash); // the account held it when /play last served it
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
-        let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer {
-            c.fetch_add(1, Ordering::SeqCst);
-            // Evicted: directdl succeeds by QUEUEING a fresh transfer, and returns nothing to serve.
-            Ok(resp(200, r#"{"status":"success","content":[]}"#))
-        }));
-        let s = premiumize(token, &cache, client);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer {
+        c.fetch_add(1, Ordering::SeqCst);
+        // Evicted: directdl succeeds by QUEUEING a fresh transfer, and returns nothing to serve.
+        Ok(resp(200, r#"{"status":"success","content":[]}"#))
+    }));
+    let s = premiumize(token, &cache, client);
 
-        let before = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
-        let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
+    let before = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
+    let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
 
-        let after = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
-        assert_ne!(
-            after,
-            before,
-            "a directdl that queued a transfer was not charged (allowance {before} → {after}) — the held mark is suppressing the charge, so the hourly ceiling never sees these and a polling client makes one real add every couple of seconds"
-        );
-        assert!(
-            !held_recently(&*cache, token, &hash),
-            "the held mark survived a directdl that returned no content — that answer proves the account does not hold it, and nothing else can ever clear the mark"
-        );
-        assert!(
-            already_queued(&*cache, token, &hash),
-            "no queue marker was written for a transfer this call queued — nothing bounds the 'coming' claim, so /play answers 202 downloading with no give-up"
-        );
+    let after = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
+    assert_ne!(
+        after,
+        before,
+        "a directdl that queued a transfer was not charged (allowance {before} → {after}) — the held mark is suppressing the charge, so the hourly ceiling never sees these and a polling client makes one real add every couple of seconds"
+    );
+    assert!(
+        !held_recently(&*cache, token, &hash),
+        "the held mark survived a directdl that returned no content — that answer proves the account does not hold it, and nothing else can ever clear the mark"
+    );
+    assert!(
+        already_queued(&*cache, token, &hash),
+        "no queue marker was written for a transfer this call queued — nothing bounds the 'coming' claim, so /play answers 202 downloading with no give-up"
+    );
 
-        // And the next poll must not walk the same path again.
-        let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
-        assert!(
-            calls.load(Ordering::SeqCst) <= 2,
-            "{} directdl calls across two polls — the read-only path is re-queueing on every poll",
-            calls.load(Ordering::SeqCst)
-        );
-    }
-    todo!("pending: refusal_test.go:1325")
+    // And the next poll must not walk the same path again.
+    let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
+    assert!(
+        calls.load(Ordering::SeqCst) <= 2,
+        "{} directdl calls across two polls — the read-only path is re-queueing on every poll",
+        calls.load(Ordering::SeqCst)
+    );
 }
 
 // A Real-Debrid release that is DOWNLOADING must not read as dead on either route.

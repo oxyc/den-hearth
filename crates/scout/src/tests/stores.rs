@@ -14,9 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cache::{Cache, MemoryCache};
-use crate::config::DebridService;
+use crate::config::{Config, DebridAccount, DebridService};
 use crate::scrape::{DoError, Doer};
+use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
+use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
+use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{resolve_key, torrent_id_key};
+use crate::stores::{dead_link, DeadLinkError, StoreError, StoreStatus, ERR_CHECK_FAILED};
 use crate::stores::refusal::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
 use crate::stores::torbox::{
     decode_listing, ListingFault, TorBoxStore, TruncationDetector, CACHE_BATCH, MAX_LISTING_ENTRIES,
@@ -1095,172 +1099,259 @@ fn decode_listing_bounds_entry_count() {
 // The tests below are ignored until the package that owns what they reach lands. Each keeps its full Go
 // body in a compiled-out item, so the port is reviewable now and only needs moving up when enabled.
 
+
 /// Go `fakeStore`: a Store answering from fixed values, for the pool tests.
-#[cfg(any())]
+#[derive(Clone)]
 struct FakeStore {
     svc: DebridService,
     check: HashMap<String, bool>,
     check_err: Option<StoreError>,
     resolve: Option<Result<String, StoreError>>,
     status: Option<StoreStatus>,
+    /// Makes `status` outlast whatever budget it is given, the way a slow account listing does.
     status_blocks: bool,
 }
 
-#[test]
-#[ignore = "needs realdebrid from package 2"]
-fn real_debrid() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // RD cacheCheck is all-false with no error, even on a store with no token.
-        let m = RealDebridStore { token: String::new(), api: REAL_DEBRID_API.into(), client: mock(|_| Ok(resp(200, ""))) }
-            .cache_check(&[H.to_owned()])
-            .await;
-        assert!(m.is_ok_and(|m| !held(&m, H)), "RD cacheCheck should be all-false, no error");
-
-        let infocalls = Arc::new(AtomicUsize::new(0));
-        let ic = infocalls.clone();
-        let d = mock(move |req| {
-            let p = req.url().path().to_owned();
-            if p.contains("addMagnet") {
-                return Ok(resp(201, r#"{"id":"t1"}"#));
-            }
-            if p.contains("/torrents/info/") {
-                let n = ic.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == 1 {
-                    return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":[]}"#));
-                }
-                return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}"#));
-            }
-            if p.contains("selectFiles") {
-                return Ok(resp(204, ""));
-            }
-            if p.contains("unrestrict/link") {
-                return Ok(resp(200, r#"{"download":"https://rd/dl.mkv"}"#));
-            }
-            Ok(resp(404, "{}"))
-        });
-        let link = RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), client: d }
-            .resolve(&target_hash(H))
-            .await;
-        assert_eq!(link.as_deref(), Ok("https://rd/dl.mkv"), "RD resolve");
-
-        // blocked filename → DeadLinkError (pool falls through)
-        let db = mock(|req| {
-            if req.url().path().contains("addMagnet") {
-                return Ok(resp(201, r#"{"id":"t1"}"#));
-            }
-            Ok(resp(200, r#"{"files":[{"id":1,"path":"Movie.WEB-DL.x264.mkv","bytes":999}],"links":[]}"#))
-        });
-        assert!(
-            RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), client: db }.resolve(&target_hash(H)).await.is_err(),
-            "RD-blocked filename should error"
-        );
+impl FakeStore {
+    fn new(svc: DebridService) -> FakeStore {
+        FakeStore { svc, check: HashMap::new(), check_err: None, resolve: None, status: None, status_blocks: false }
     }
-    todo!("pending: stores_test.go:433 TestRealDebrid")
+
+    fn check(mut self, answers: &[(&str, bool)]) -> FakeStore {
+        self.check = answers.iter().map(|(h, held)| ((*h).to_owned(), *held)).collect();
+        self
+    }
+
+    fn check_err(mut self, err: StoreError) -> FakeStore {
+        self.check_err = Some(err);
+        self
+    }
+
+    fn resolve_with(mut self, answer: Result<String, StoreError>) -> FakeStore {
+        self.resolve = Some(answer);
+        self
+    }
+
+    fn status_blocks(mut self) -> FakeStore {
+        self.status_blocks = true;
+        self
+    }
 }
 
-#[test]
-#[ignore = "needs premiumize from package 2"]
-fn premiumize() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let dc = mock(|_| Ok(resp(200, r#"{"status":"success","response":[true,false]}"#)));
-        let m = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), client: dc }
-            .cache_check(&[H.to_owned(), other.to_owned()])
-            .await;
-        assert!(m.as_ref().is_ok_and(|m| held(m, H) && !held(m, other)), "PM cacheCheck: {m:?}");
-
-        let dr = mock(|_| {
-            Ok(resp(
-                200,
-                r#"{"status":"success","content":[{"path":"S01E01.mkv","link":"https://pm/1","size":10},{"path":"S01E02.mkv","link":"https://pm/2","size":20}]}"#,
-            ))
-        });
-        let link = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), client: dr }
-            .resolve(&target_episode(H, 1, 2))
-            .await;
-        assert_eq!(link.as_deref(), Ok("https://pm/2"), "PM resolve");
+#[async_trait::async_trait]
+impl Store for FakeStore {
+    fn service(&self) -> DebridService {
+        self.svc
     }
-    todo!("pending: stores_test.go:474 TestPremiumize")
-}
 
-#[test]
-#[ignore = "needs StorePool, buildStores, hasCacheTruth from package 2"]
-fn store_pool_prefers_the_three_valued_answer() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A store whose two-valued Status always says "no", and whose three-valued answer is set per case.
-        for (name, answer, want_ok, want_unknown) in [
-            ("unknown is carried, not flattened to no", StatusAnswer::Unknown, false, true),
-            ("downloading is carried too", StatusAnswer::Downloading, true, false),
-        ] {
-            let asked = Arc::new(AtomicUsize::new(0));
-            let pool = StorePool { stores: vec![Arc::new(AnsweringStore {
-                svc: DebridService::TorBox,
-                answer,
-                asked: asked.clone(),
-            })] };
-            let (status, ok, unknown) = pool.status(&target_hash(H)).await;
-            assert!(ok == want_ok && unknown == want_unknown, "{name}: pool answered ok={ok} unknown={unknown}");
-            assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback");
-            if want_ok {
-                assert_eq!(status.progress, 0.5, "{name}: the status itself was dropped");
-            }
+    async fn cache_check(&self, _hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        match &self.check_err {
+            Some(err) => Err(err.clone()),
+            None => Ok(self.check.clone()),
         }
     }
-    todo!("pending: stores_test.go:548 TestStorePool_prefersTheThreeValuedAnswer")
+
+    async fn resolve(&self, _t: &ResolveTarget) -> Result<String, StoreError> {
+        self.resolve.clone().expect("this fake store was given no resolve")
+    }
+
+    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+        if self.status_blocks {
+            std::future::pending::<()>().await;
+        }
+        self.status.clone()
+    }
+}
+
+/// Go `answeringStore`: implements the optional three-valued `statusAnswerer`, and DISAGREES with its own two-valued
+/// `Status` (always "no") on purpose — that is the only way a test can tell which one the pool consulted.
+#[derive(Clone)]
+struct AnsweringStore {
+    svc: DebridService,
+    answer: StatusAnswer,
+    asked: Arc<AtomicUsize>,
+    /// Go `onAsk`: runs after the answer is recorded, so a test can make the world change mid-loop — here, the
+    /// clock running past the pool's deadline, which stands in for the caller hanging up.
+    on_ask: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl AnsweringStore {
+    fn new(svc: DebridService, answer: StatusAnswer, asked: Arc<AtomicUsize>) -> AnsweringStore {
+        AnsweringStore { svc, answer, asked, on_ask: None }
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for AnsweringStore {
+    fn service(&self) -> DebridService {
+        self.svc
+    }
+
+    async fn cache_check(&self, _hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        Ok(HashMap::new())
+    }
+
+    async fn resolve(&self, _t: &ResolveTarget) -> Result<String, StoreError> {
+        panic!("not resolved in these tests")
+    }
+
+    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+        None
+    }
+
+    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        if let Some(on_ask) = &self.on_ask {
+            on_ask();
+        }
+        Some((StoreStatus { progress: 0.5, ..Default::default() }, self.answer))
+    }
+}
+
+#[tokio::test]
+async fn real_debrid() {
+    // RD cacheCheck is all-false with no error, even on a store with no token.
+    let m = RealDebridStore { token: String::new(), api: REAL_DEBRID_API.into(), cache: None, client: mock(|_| Ok(resp(200, ""))) }
+        .cache_check(&[H.to_owned()])
+        .await;
+    assert!(m.is_ok_and(|m| !held(&m, H)), "RD cacheCheck should be all-false, no error");
+
+    let infocalls = Arc::new(AtomicUsize::new(0));
+    let ic = infocalls.clone();
+    let d = mock(move |req| {
+        let p = req.url().path().to_owned();
+        if p.contains("addMagnet") {
+            return Ok(resp(201, r#"{"id":"t1"}"#));
+        }
+        if p.contains("/torrents/info/") {
+            let n = ic.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":[]}"#));
+            }
+            return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}"#));
+        }
+        if p.contains("selectFiles") {
+            return Ok(resp(204, ""));
+        }
+        if p.contains("unrestrict/link") {
+            return Ok(resp(200, r#"{"download":"https://rd/dl.mkv"}"#));
+        }
+        Ok(resp(404, "{}"))
+    });
+    let link = RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), cache: None, client: d }
+        .resolve(&target_hash(H))
+        .await;
+    assert_eq!(link.as_deref(), Ok("https://rd/dl.mkv"), "RD resolve");
+
+    // blocked filename → DeadLinkError (pool falls through)
+    let db = mock(|req| {
+        if req.url().path().contains("addMagnet") {
+            return Ok(resp(201, r#"{"id":"t1"}"#));
+        }
+        Ok(resp(200, r#"{"files":[{"id":1,"path":"Movie.WEB-DL.x264.mkv","bytes":999}],"links":[]}"#))
+    });
+    assert!(
+        RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), cache: None, client: db }.resolve(&target_hash(H)).await.is_err(),
+        "RD-blocked filename should error"
+    );
+}
+
+#[tokio::test]
+async fn premiumize() {
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let dc = mock(|_| Ok(resp(200, r#"{"status":"success","response":[true,false]}"#)));
+    let m = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), cache: None, client: dc }
+        .cache_check(&[H.to_owned(), other.to_owned()])
+        .await;
+    assert!(m.as_ref().is_ok_and(|m| held(m, H) && !held(m, other)), "PM cacheCheck: {m:?}");
+
+    let dr = mock(|_| {
+        Ok(resp(
+            200,
+            r#"{"status":"success","content":[{"path":"S01E01.mkv","link":"https://pm/1","size":10},{"path":"S01E02.mkv","link":"https://pm/2","size":20}]}"#,
+        ))
+    });
+    let link = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), cache: None, client: dr }
+        .resolve(&target_episode(H, 1, 2))
+        .await;
+    assert_eq!(link.as_deref(), Ok("https://pm/2"), "PM resolve");
+}
+
+// The pool asks statusAnswerer where a store has one, in preference to the bool Status.
+#[tokio::test]
+async fn store_pool_prefers_the_three_valued_answer() {
+    // A store whose two-valued Status always says "no", and whose three-valued answer is set per case.
+    for (name, answer, want_ok, want_unknown) in [
+        ("unknown is carried, not flattened to no", StatusAnswer::Unknown, false, true),
+        ("downloading is carried too", StatusAnswer::Downloading, true, false),
+    ] {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let pool = StorePool {
+            stores: vec![Box::new(AnsweringStore::new(DebridService::TorBox, answer, asked.clone()))],
+        };
+        let (status, ok, unknown) = pool.status(&target_hash(H), None).await;
+        assert!(ok == want_ok && unknown == want_unknown, "{name}: pool answered ok={ok} unknown={unknown}");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback");
+        if want_ok {
+            assert_eq!(status.progress, 0.5, "{name}: the status itself was dropped");
+        }
+    }
+}
+
+#[tokio::test]
+async fn store_pool() {
+    // buildStores orders TorBox first regardless of config order.
+    let cfg = Config { debrid: vec![
+        DebridAccount { service: DebridService::Premiumize, token: "p".into() },
+        DebridAccount { service: DebridService::TorBox, token: "t".into() },
+        DebridAccount { service: DebridService::RealDebrid, token: "r".into() },
+    ], ..Default::default() };
+    let stores = build_stores(&cfg, mock(|_| Ok(resp(404, ""))), None);
+    assert!(
+        stores.len() == 3 && stores[0].service() == DebridService::TorBox && stores[2].service() == DebridService::Premiumize,
+        "store order"
+    );
+
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let pool = StorePool { stores: vec![
+        Box::new(FakeStore::new(DebridService::TorBox).check(&[(H, true), (other, false)])),
+        Box::new(FakeStore::new(DebridService::Premiumize).check(&[(H, false), (other, true)])),
+    ] };
+    let (m, truth_ok) = pool.cache_check(&[H.to_owned(), other.to_owned()]).await;
+    assert!(m.cached(H) && m.cached(other), "pool union: {:?} / {:?}", m.held_by(H), m.held_by(other));
+    assert!(truth_ok, "pool truthOK should be true when a cache-truth store succeeded");
+
+    // all cache-truth stores erroring → truthOK false (an outage the handler must not cache)
+    let down = StorePool {
+        stores: vec![Box::new(
+            FakeStore::new(DebridService::TorBox).check(&[(H, false)]).check_err(dead_link(ERR_CHECK_FAILED)),
+        )],
+    };
+    let (_, ok) = down.cache_check(&[H.to_owned()]).await;
+    assert!(!ok, "truthOK should be false when every cache-truth store failed");
+    // RD succeeding is not cache truth → truthOK false
+    let rd = StorePool { stores: vec![Box::new(FakeStore::new(DebridService::RealDebrid).check(&[(H, false)]))] };
+    let (_, ok) = rd.cache_check(&[H.to_owned()]).await;
+    assert!(!ok, "RD success is not cache truth");
+
+    let dead = || Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() }));
+    let dead_only = StorePool { stores: vec![Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead()))] };
+    assert!(dead_only.resolve(&target_hash(H)).await.is_err(), "all-fail should error");
+    let fallthr = StorePool { stores: vec![
+        Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead())),
+        Box::new(FakeStore::new(DebridService::TorBox).resolve_with(Ok("https://ok".into()))),
+    ] };
+    assert_eq!(fallthr.resolve(&target_hash(H)).await.as_deref(), Ok("https://ok"), "fallthrough");
 }
 
 #[test]
-#[ignore = "needs StorePool and buildStores from package 2"]
-fn store_pool() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // buildStores orders TorBox first regardless of config order.
-        let cfg = Config { debrid: vec![
-            DebridAccount { service: DebridService::Premiumize, token: "p".into() },
-            DebridAccount { service: DebridService::TorBox, token: "t".into() },
-            DebridAccount { service: DebridService::RealDebrid, token: "r".into() },
-        ], ..Default::default() };
-        let stores = build_stores(&cfg, mock(|_| Ok(resp(404, ""))), None);
-        assert!(
-            stores.len() == 3 && stores[0].service() == DebridService::TorBox && stores[2].service() == DebridService::Premiumize,
-            "store order"
-        );
-
-        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let pool = StorePool { stores: vec![
-            Arc::new(FakeStore::new(DebridService::TorBox).check(&[(H, true), (other, false)])),
-            Arc::new(FakeStore::new(DebridService::Premiumize).check(&[(H, false), (other, true)])),
-        ] };
-        let (m, truth_ok) = pool.cache_check(&[H.to_owned(), other.to_owned()]).await;
-        assert!(m.cached(H) && m.cached(other), "pool union: {:?} / {:?}", m.held_by(H), m.held_by(other));
-        assert!(truth_ok, "pool truthOK should be true when a cache-truth store succeeded");
-
-        // all cache-truth stores erroring → truthOK false (an outage the handler must not cache)
-        let down = StorePool { stores: vec![Arc::new(FakeStore::new(DebridService::TorBox).check_err(StoreError::Other(ERR_CHECK_FAILED.into())))] };
-        let (_, ok) = down.cache_check(&[H.to_owned()]).await;
-        assert!(!ok, "truthOK should be false when every cache-truth store failed");
-        // RD succeeding is not cache truth → truthOK false
-        let rd = StorePool { stores: vec![Arc::new(FakeStore::new(DebridService::RealDebrid).check(&[(H, false)]))] };
-        let (_, ok) = rd.cache_check(&[H.to_owned()]).await;
-        assert!(!ok, "RD success is not cache truth");
-
-        let dead_only = StorePool { stores: vec![Arc::new(FakeStore::new(DebridService::TorBox).resolve_with(Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() }))))] };
-        assert!(dead_only.resolve(&target_hash(H)).await.is_err(), "all-fail should error");
-        let fallthr = StorePool { stores: vec![
-            Arc::new(FakeStore::new(DebridService::TorBox).resolve_with(Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() })))),
-            Arc::new(FakeStore::new(DebridService::TorBox).resolve_with(Ok("https://ok".into()))),
-        ] };
-        assert_eq!(fallthr.resolve(&target_hash(H)).await.as_deref(), Ok("https://ok"), "fallthrough");
-    }
-    todo!("pending: stores_test.go:580 TestStorePool")
+fn has_cache_truth_reads_the_configured_services() {
+    let rd = DebridAccount { service: DebridService::RealDebrid, token: "r".into() };
+    let tb = DebridAccount { service: DebridService::TorBox, token: "t".into() };
+    assert!(!has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }), "RD-only should have no cache truth");
+    assert!(has_cache_truth(&Config { debrid: vec![rd, tb], ..Default::default() }), "torbox present → cache truth");
 }
+
 
 #[test]
 #[ignore = "needs hasCacheTruth and rdOnly from package 2 (handler.rs for rdOnly)"]
@@ -1510,82 +1601,66 @@ fn queued_body_carries_state_and_swarm() {
     todo!("pending: stores_test.go:767 TestQueuedBodyCarriesStateAndSwarm")
 }
 
-#[test]
-#[ignore = "needs StorePool.Status from package 2"]
-fn store_pool_status_reports_when_a_store_could_not_answer() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A store that could not answer is not a store saying "no", and the pool has to report the difference.
-        let wedged = FakeStore::new(DebridService::TorBox).status_blocks();
-        let silent = FakeStore::new(DebridService::RealDebrid);
+#[tokio::test]
+async fn store_pool_status_reports_when_a_store_could_not_answer() {
+    // A store that could not answer is not a store saying "no", and the pool has to report the difference.
+    let wedged = FakeStore::new(DebridService::TorBox).status_blocks();
+    let silent = FakeStore::new(DebridService::RealDebrid); // answers at once: "not downloading"
 
-        // One store that runs out of time → indeterminate, even though the pool returns early.
-        let pool = StorePool { stores: vec![Arc::new(wedged), Arc::new(silent.clone())] };
-        let start = std::time::Instant::now();
-        let (_, ok, unknown) = tokio::time::timeout(Duration::from_millis(80), pool.status(&target_hash(H)))
-            .await
-            .unwrap_or((StoreStatus::default(), false, true));
-        assert!(!ok, "a wedged store reported a download");
-        assert!(unknown, "a store that ran out of time was reported as a definitive 'not downloading'");
-        assert!(start.elapsed() < Duration::from_millis(80), "the first store consumed the whole budget — the slices are not being applied");
+    // One store that runs out of time → indeterminate, even though the pool returns early. The caller's
+    // 80 ms budget is the deadline the pool is given.
+    let pool = StorePool { stores: vec![Box::new(wedged), Box::new(silent.clone())] };
+    let start = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+    let (_, ok, unknown) = pool.status(&target_hash(H), Some(deadline)).await;
+    assert!(!ok, "a wedged store reported a download");
+    assert!(unknown, "a store that ran out of time was reported as a definitive 'not downloading'");
+    assert!(start.elapsed() < Duration::from_millis(80), "the first store consumed the whole budget ({:?}) — the slices are not being applied", start.elapsed());
 
-        // Every store answering promptly → a real answer, not indeterminate.
-        let clean = StorePool { stores: vec![Arc::new(silent.clone()), Arc::new(silent)] };
-        let (_, ok, unknown) = clean.status(&target_hash(H)).await;
-        assert!(!ok && !unknown, "prompt answers reported ok={ok} unknown={unknown}, want false/false");
-    }
-    todo!("pending: stores_test.go:863 TestStorePoolStatus_reportsWhenAStoreCouldNotAnswer")
+    // Every store answering promptly → a real answer, not indeterminate.
+    let clean = StorePool { stores: vec![Box::new(silent.clone()), Box::new(silent)] };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let (_, ok, unknown) = clean.status(&target_hash(H), Some(deadline)).await;
+    assert!(!ok && !unknown, "prompt answers reported ok={ok} unknown={unknown}, want false/false");
 }
 
-#[test]
-#[ignore = "needs StorePool.StatusDetail from package 2"]
-fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // StatusDetail names the stores that could not answer, so the escalated retry asks only those.
-        let uncertain_asks = Arc::new(AtomicUsize::new(0));
-        let definite_asks = Arc::new(AtomicUsize::new(0));
-        let uncertain = AnsweringStore { svc: DebridService::TorBox, answer: StatusAnswer::Unknown, asked: uncertain_asks.clone() };
-        let definite = AnsweringStore { svc: DebridService::RealDebrid, answer: StatusAnswer::No, asked: definite_asks.clone() };
+#[tokio::test]
+async fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() {
+    // StatusDetail names the stores that could not answer, so the escalated retry asks only those.
+    let uncertain_asks = Arc::new(AtomicUsize::new(0));
+    let definite_asks = Arc::new(AtomicUsize::new(0));
+    let uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, uncertain_asks.clone());
+    let definite = AnsweringStore::new(DebridService::RealDebrid, StatusAnswer::No, definite_asks.clone());
 
-        let pool = StorePool { stores: vec![Arc::new(definite.clone()), Arc::new(uncertain), Arc::new(definite.clone())] };
-        let (_, ok, unknown) = pool.status_detail(&target_hash(H)).await;
-        assert!(!ok, "nothing was downloading");
-        assert_eq!(unknown.len(), 1, "reported stores as unable to answer");
-        assert_eq!(unknown[0].service(), DebridService::TorBox, "named the store that could not answer");
+    let pool = StorePool { stores: vec![Box::new(definite.clone()), Box::new(uncertain), Box::new(definite.clone())] };
+    let (_, ok, unknown) = pool.status_detail(&target_hash(H), None).await;
+    assert!(!ok, "nothing was downloading");
+    assert_eq!(unknown.len(), 1, "reported {} stores as unable to answer, want 1", unknown.len());
+    assert_eq!(unknown[0].service(), DebridService::TorBox, "named the store that could not answer");
 
-        // The retry, as handlePlay performs it: only the named store is asked again.
-        let before = definite_asks.load(Ordering::SeqCst);
-        let _ = StorePool { stores: unknown }.status_detail(&target_hash(H)).await;
-        assert_eq!(definite_asks.load(Ordering::SeqCst), before, "the retry asked a store that had already answered definitively");
-        assert_eq!(uncertain_asks.load(Ordering::SeqCst), 2, "the store that could not answer was asked the wrong number of times");
-    }
-    todo!("pending: stores_test.go:900 TestStorePoolStatusDetail_namesOnlyTheStoresThatCouldNotAnswer")
+    // The retry, as handlePlay performs it: only the named store is asked again.
+    let before = definite_asks.load(Ordering::SeqCst);
+    let _ = crate::stores::pool::status_detail_among(&unknown, &target_hash(H), None).await;
+    assert_eq!(definite_asks.load(Ordering::SeqCst), before, "the retry asked a store that had already answered definitively");
+    assert_eq!(uncertain_asks.load(Ordering::SeqCst), 2, "the store that could not answer was asked {} times, want 2", uncertain_asks.load(Ordering::SeqCst));
 }
 
-#[test]
-#[ignore = "needs StorePool.StatusDetail from package 2"]
-fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Running out of time mid-loop keeps the stores that ALREADY said they could not answer, as well as the
-        // ones never reached: three stores — answered, uncertain, never reached — and the caller hangs up.
-        let cancel = tokio_util_cancel_pair();
-        let answered = AnsweringStore { svc: DebridService::Premiumize, answer: StatusAnswer::No, asked: Arc::new(AtomicUsize::new(0)) };
-        let uncertain = AnsweringStore { svc: DebridService::TorBox, answer: StatusAnswer::Unknown, asked: Arc::new(AtomicUsize::new(0)) }
-            .cancel_after_ask(cancel.clone());
-        let unreached = FakeStore::new(DebridService::RealDebrid);
+#[tokio::test]
+async fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
+    // Running out of time mid-loop keeps the stores that ALREADY said they could not answer, as well as the ones
+    // never reached: three stores — answered, uncertain, never reached — and the caller hangs up (here: the clock
+    // passes the deadline while the second store is being asked, which a blocking sleep makes certain).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+    let answered = AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No, Arc::new(AtomicUsize::new(0)));
+    let mut uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, Arc::new(AtomicUsize::new(0)));
+    uncertain.on_ask = Some(Arc::new(|| std::thread::sleep(Duration::from_millis(60))));
+    let unreached = FakeStore::new(DebridService::RealDebrid);
 
-        let pool = StorePool { stores: vec![Arc::new(answered), Arc::new(uncertain), Arc::new(unreached)] };
-        let (_, ok, unknown) = pool.status_detail_until_cancelled(&target_hash(H), cancel).await;
-        assert!(!ok, "nothing was downloading");
-        let named: Vec<DebridService> = unknown.iter().map(|s| s.service()).collect();
-        assert_eq!(named, vec![DebridService::TorBox, DebridService::RealDebrid], "named as unable to answer");
-    }
-    todo!("pending: stores_test.go:935 TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut")
+    let pool = StorePool { stores: vec![Box::new(answered), Box::new(uncertain), Box::new(unreached)] };
+    let (_, ok, unknown) = pool.status_detail(&target_hash(H), Some(deadline)).await;
+    assert!(!ok, "nothing was downloading");
+    let named: Vec<DebridService> = unknown.iter().map(|s| s.service()).collect();
+    assert_eq!(named, vec![DebridService::TorBox, DebridService::RealDebrid], "named as unable to answer");
 }
 
 #[tokio::test]
