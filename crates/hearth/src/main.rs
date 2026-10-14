@@ -299,6 +299,10 @@ async fn run(c: Configs) -> std::io::Result<()> {
         },
     );
     eprintln!("scout: {}", hearth.scout.summary());
+    // Each service's own startup line: operators read `transcode=` and the like from them.
+    eprintln!("{}", den_reel::startup_line(&hearth.reel));
+    eprintln!("{}", den_remux::startup_line(&hearth.remux));
+    eprintln!("{}", den_subtitles::startup_line(&hearth.subs));
 
     let servers: Vec<_> = listeners
         .into_iter()

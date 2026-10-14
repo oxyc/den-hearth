@@ -1129,16 +1129,12 @@ pub async fn finish(state: &Arc<AppState>) {
     }
 }
 
-async fn run(cfg: Config) -> std::io::Result<()> {
-    let state = init(cfg).await;
+/// The line Remux logs once it is listening: its version, port and the switches an operator checks,
+/// `transcode=` among them. Hearth prints it too, since its own startup line only names the services.
+pub fn startup_line(state: &AppState) -> String {
     let transcode = state.transcode_ok.load(Relaxed);
-
-    // Registered before the listener binds: until the handlers exist SIGTERM keeps its default
-    // disposition, and a stop in that window would kill the process outright (den-reel's lesson).
-    let shutdown = shutdown_signal();
-    let listener = TcpListener::bind(("0.0.0.0", state.cfg.port)).await?;
     let on = |b: bool| if b { "on" } else { "off" };
-    eprintln!(
+    format!(
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
          browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
          max_sessions={} per_install={} active_remuxes={} producer_idle={}s uplink={} session_idle={}s scratch={} \
@@ -1169,7 +1165,17 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         } else {
             "off(ffmpeg)".to_string()
         },
-    );
+    )
+}
+
+async fn run(cfg: Config) -> std::io::Result<()> {
+    let state = init(cfg).await;
+
+    // Registered before the listener binds: until the handlers exist SIGTERM keeps its default
+    // disposition, and a stop in that window would kill the process outright (den-reel's lesson).
+    let shutdown = shutdown_signal();
+    let listener = TcpListener::bind(("0.0.0.0", state.cfg.port)).await?;
+    eprintln!("{}", startup_line(&state));
 
     let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;
 

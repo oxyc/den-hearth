@@ -1129,6 +1129,15 @@ fn log_identity_is_on_by_default_and_off_only_for_a_falsey_token() {
     }
 }
 
+#[tokio::test]
+async fn startup_line_names_the_port_and_switches() {
+    let state = AppState::new(Config::from_env());
+    let line = crate::startup_line(&state);
+    assert!(line.starts_with("den-reel "), "{line}");
+    assert!(line.contains(&format!("listening on :{}", state.cfg.port)), "{line}");
+    assert!(line.contains("play_signing="), "{line}");
+}
+
 #[test]
 fn env_opt_trims() {
     std::env::set_var("DEN_REEL_TEST_ENV_OPT_TRIM", "  value \n");

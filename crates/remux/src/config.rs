@@ -329,6 +329,19 @@ mod tests {
         }
     }
 
+    /// Operators read `transcode=` from this line, so it must say what the state holds.
+    #[tokio::test]
+    async fn startup_line_reports_transcode() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = crate::AppState::new(Config::from_env());
+        state.transcode_ok.store(false, Relaxed);
+        assert!(crate::startup_line(&state).contains(" transcode=off "), "{}", crate::startup_line(&state));
+        state.transcode_ok.store(true, Relaxed);
+        let line = crate::startup_line(&state);
+        assert!(line.contains(&format!("transcode=vaapi(max {})", state.cfg.max_transcodes)), "{line}");
+        assert!(line.starts_with("den-remux "), "{line}");
+    }
+
     #[test]
     fn env_opt_trims() {
         std::env::set_var("DEN_REMUX_TEST_ENV_OPT_TRIM", "  value \n");

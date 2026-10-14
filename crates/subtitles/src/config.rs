@@ -110,6 +110,15 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn startup_line_names_the_port_and_switches() {
+        let state = crate::AppState::new(Config::from_env());
+        let line = crate::startup_line(&state);
+        assert!(line.starts_with("den-subtitles "), "{line}");
+        assert!(line.contains(&format!("listening on :{}", state.cfg.port)), "{line}");
+        assert!(line.contains("log_identity="), "{line}");
+    }
+
     #[test]
     fn env_opt_trims() {
         std::env::set_var("DEN_SUBTITLES_TEST_ENV_OPT_TRIM", "  value \n");
