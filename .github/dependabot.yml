@@ -1,0 +1,37 @@
+# Weekly dependency PRs, grouped so a refresh is one reviewable PR rather than twenty.
+#
+# Does NOT cover the tools we download by URL and pin by checksum (yt-dlp, deno) or by commit (GPAC) or build
+# from a checksummed source tarball (ffmpeg) — dependabot has no ecosystem for those. yt-dlp and deno have their
+# own workflows; GPAC and ffmpeg are bumped by hand.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch/minor together: they are the ones that should be boring to review.
+      rust-minor:
+        update-types: [minor, patch]
+    ignore:
+      # blake2 is a direct edge onto the copy crypto_box 0.9 already compiles (see crates/reel/Cargo.toml). 0.11 would be
+      # a second copy of the crate; move both together once a stable crypto_box on blake2 0.11 ships.
+      - dependency-name: blake2
+        update-types: [version-update:semver-major, version-update:semver-minor]
+    labels: [dependencies]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [dependencies]
