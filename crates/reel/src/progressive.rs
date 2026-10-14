@@ -2027,37 +2027,60 @@ pub(crate) mod tests {
         assert!(result.is_err(), "a clean but short 206 must not silently truncate playback");
     }
 
-    /// Upstream that sends half of a 10-byte range, then goes quiet for `pause` before the rest.
-    async fn serve_with_pause(pause: Duration) -> String {
+    /// Upstream that sends half of a 10-byte range, then holds the rest until the returned sender
+    /// fires. The lag before the head is real time, as a loaded machine adds.
+    async fn serve_with_stall() -> (String, tokio::sync::oneshot::Sender<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release, released) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut conn, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
             let _ = conn.read(&mut request).await;
             let head = "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 0-9/20\r\n\r\n01234";
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(50))).await.unwrap();
             conn.write_all(head.as_bytes()).await.unwrap();
-            tokio::time::sleep(pause).await;
+            let _ = released.await;
             let _ = conn.write_all(b"56789").await;
         });
-        base
+        (base, release)
+    }
+
+    /// Relay the stalling upstream through `client`, going quiet for 30 s after the first bytes.
+    ///
+    /// Tokio's paused clock jumps to the next timer whenever the runtime is idle, including while it
+    /// waits on a real socket, so a clock paused for the whole test lets a client timeout fire before
+    /// the loopback bytes arrive on a loaded machine. Time is paused only across the stall, when the
+    /// upstream is gated and no socket I/O is in flight, and real again for the rest of the body.
+    async fn relay_across_a_30s_stall(client: reqwest::Client) -> io::Result<usize> {
+        let (base, release) = serve_with_stall().await;
+        let mut relayed = body(client, vec![base], vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }]);
+        let mut len = 0;
+        let first = relayed.frame().await.expect("the first bytes arrive")?;
+        len += first.into_data().map_or(0, |data| data.len());
+
+        tokio::time::pause();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::resume();
+
+        let _ = release.send(());
+        while let Some(frame) = relayed.frame().await {
+            len += frame?.into_data().map_or(0, |data| data.len());
+        }
+        Ok(len)
     }
 
     /// The metadata client's 15 s total timeout covers the body, so a relay through it ended the
     /// response mid-stream whenever the upstream or player went quiet for longer. The media client
-    /// does not carry that timeout. Paused time lets the 30 s pause run instantly.
-    #[tokio::test(start_paused = true)]
+    /// does not carry that timeout.
+    #[tokio::test]
     async fn a_relay_outlives_the_metadata_clients_total_timeout() {
-        let parts = || vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }];
-
-        let base = serve_with_pause(Duration::from_secs(30)).await;
-        let metadata = body(crate::state::http_client(), vec![base], parts()).collect().await;
+        let metadata = relay_across_a_30s_stall(crate::state::http_client()).await;
         assert!(metadata.is_err(), "premise: the 15 s client cuts a 30 s pause off");
 
-        let base = serve_with_pause(Duration::from_secs(30)).await;
-        let media = body(crate::state::media_client(), vec![base], parts()).collect().await;
-        assert_eq!(media.expect("the media client rides out the pause").to_bytes().len(), 10);
+        let media = relay_across_a_30s_stall(crate::state::media_client()).await;
+        assert_eq!(media.expect("the media client rides out the pause"), 10);
     }
 
     /// Prototype evidence: adjacent chunks share an upstream request, while the metadata fetched
