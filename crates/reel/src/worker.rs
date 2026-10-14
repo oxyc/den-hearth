@@ -48,7 +48,6 @@ pub struct Answer {
     pub urls: Vec<String>,
     pub hls: Option<String>,
 }
-
 /// The wire reply: an answer, or yt-dlp's own words about why there isn't one.
 #[derive(Deserialize)]
 struct Reply {
@@ -66,43 +65,120 @@ struct Resident {
     used: Instant,
 }
 
+/// Which resident process a [`Worker`] is. Both speak the one line protocol; they differ in what
+/// starts them and how long they are given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    YtDlp,
+    Youtubei,
+}
+
+/// What starts a worker: the program, its arguments, and the environment it is given.
+type Launch = (String, Vec<String>, Vec<(&'static str, String)>);
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::YtDlp => "resident yt-dlp",
+            Kind::Youtubei => "resident youtubei.js",
+        }
+    }
+
+    /// A youtubei.js answer is ~0.12 s, so one that has not come in 10 s is wedged, and the request
+    /// it holds is better spent on yt-dlp than waited on.
+    fn timeout(self) -> Duration {
+        match self {
+            Kind::YtDlp => ANSWER_TIMEOUT,
+            Kind::Youtubei => Duration::from_secs(10),
+        }
+    }
+
+    /// The program, its arguments (script last) and its environment, or `None` when this one is not
+    /// configured.
+    fn command(self, cfg: &Config) -> Option<Launch> {
+        match self {
+            Kind::YtDlp => Some((cfg.python.clone(), vec![cfg.ytdlp_worker.clone()?], Vec::new())),
+            Kind::Youtubei => {
+                let script = cfg.youtubei_worker.clone()?;
+                // The packages deno was locked to sit in `deno/` beside the script. Pointed at here
+                // and not image-wide, because yt-dlp's own deno keeps a cache of its own.
+                let cache = std::path::Path::new(&script).parent().map(|d| d.join("deno"));
+                let env =
+                    cache.map(|c| vec![("DENO_DIR", c.to_string_lossy().into_owned())]).unwrap_or_default();
+                let mut args = cfg.deno_args.clone();
+                args.push(script);
+                Some((cfg.deno.clone(), args, env))
+            }
+        }
+    }
+}
+
 /// The resident process, when there is one.
-#[derive(Default)]
-pub struct Worker(Mutex<Option<Resident>>);
+pub struct Worker {
+    kind: Kind,
+    held: Mutex<Option<Resident>>,
+}
+
+impl Default for Worker {
+    fn default() -> Self {
+        Worker { kind: Kind::YtDlp, held: Mutex::new(None) }
+    }
+}
 
 impl Worker {
-    /// Resolve `vid` through the resident process.
+    pub fn youtubei() -> Worker {
+        Worker { kind: Kind::Youtubei, held: Mutex::new(None) }
+    }
+
+    /// Is this one configured at all? One that is not is skipped silently; one that is and does not
+    /// answer is a fallback worth counting.
+    pub fn configured(&self, cfg: &Config) -> bool {
+        self.kind.command(cfg).is_some()
+    }
+
+    /// Resolve `vid` through the resident process. `rungs` is the ladder's heights, tallest first,
+    /// for the resolver that does not read yt-dlp's selector string.
     ///
     /// `None` means "this path is not available" — not configured, could not start, died, or took
-    /// too long — and the caller should spawn the binary. `Some(Err)` is yt-dlp's own failure for
-    /// this video, which the caller classifies exactly as it classifies stderr from the binary.
-    pub async fn resolve(&self, cfg: &Config, vid: &str, format: &str) -> Option<Result<Answer, String>> {
-        let path = cfg.ytdlp_worker.as_deref()?;
-        let mut held = self.0.lock().await;
+    /// too long — and the caller should use the next resolver. `Some(Err)` is the resolver's own
+    /// failure for this video, which the caller classifies exactly as it classifies stderr from the
+    /// binary.
+    pub async fn resolve(
+        &self,
+        cfg: &Config,
+        vid: &str,
+        format: &str,
+        rungs: &[u32],
+    ) -> Option<Result<Answer, String>> {
+        let label = self.kind.label();
+        let (program, args, env) = self.kind.command(cfg)?;
+        let mut held = self.held.lock().await;
         if held.is_none() {
-            *held = start(cfg, path);
+            *held = start(label, &program, &args, &env);
         }
         let resident = held.as_mut()?;
 
         let request = serde_json::json!({
             "id": vid,
             "format": format,
+            "rungs": rungs,
             "cache": cfg.ytdlp_cache.to_string_lossy(),
             "extractor_args": cfg.ytdlp_extractor_args,
         });
-        match tokio::time::timeout(ANSWER_TIMEOUT, exchange(resident, &request.to_string())).await {
+        let patience = self.kind.timeout();
+        match tokio::time::timeout(patience, exchange(resident, &request.to_string())).await {
             Ok(Ok(outcome)) => {
                 resident.used = Instant::now();
                 Some(outcome)
             }
             // The pipe broke, or it answered with something unreadable: it is not a worker any more.
             Ok(Err(why)) => {
-                crate::log_limited("worker lost", || format!("resident yt-dlp: {why}"));
+                crate::log_limited("worker lost", || format!("{label}: {why}"));
                 stop(held.take());
                 None
             }
             Err(_) => {
-                eprintln!("resident yt-dlp: no answer for {vid} in {ANSWER_TIMEOUT:?}; restarting it");
+                eprintln!("{label}: no answer for {vid} in {patience:?}; restarting it");
                 stop(held.take());
                 None
             }
@@ -111,23 +187,24 @@ impl Worker {
 
     /// Shut the worker down if nothing has asked it anything for `IDLE_TIMEOUT`.
     pub async fn reap_idle(&self) {
-        let mut held = self.0.lock().await;
+        let mut held = self.held.lock().await;
         if held.as_ref().is_some_and(|r| r.used.elapsed() >= IDLE_TIMEOUT) {
-            eprintln!("resident yt-dlp: idle for {IDLE_TIMEOUT:?}; shutting it down");
+            eprintln!("{}: idle for {IDLE_TIMEOUT:?}; shutting it down", self.kind.label());
             stop(held.take());
         }
     }
 
     /// Shut it down on the way out, so a redeploy does not leave an interpreter behind.
     pub async fn shutdown(&self) {
-        stop(self.0.lock().await.take());
+        stop(self.held.lock().await.take());
     }
 }
 
-/// Start one, or `None` (said once) if it cannot be started — the caller then uses the binary.
-fn start(cfg: &Config, path: &str) -> Option<Resident> {
-    let mut child = Command::new(&cfg.python)
-        .arg(path)
+/// Start one, or `None` (said once) if it cannot be started — the caller then uses the next resolver.
+fn start(label: &'static str, program: &str, args: &[String], env: &[(&str, String)]) -> Option<Resident> {
+    let mut child = Command::new(program)
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (*k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Inherited, not piped: a traceback belongs in the log, and nothing here drains a third pipe.
@@ -135,9 +212,7 @@ fn start(cfg: &Config, path: &str) -> Option<Resident> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
-            crate::log_limited("worker spawn", || {
-                format!("resident yt-dlp: cannot start {} {path}: {e}", cfg.python)
-            })
+            crate::log_limited("worker spawn", || format!("{label}: cannot start {program} {args:?}: {e}"))
         })
         .ok()?;
     let stdin = child.stdin.take()?;

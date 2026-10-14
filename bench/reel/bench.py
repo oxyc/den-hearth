@@ -51,8 +51,16 @@ def load_candidates():
     path = os.path.join(HERE, "candidates.json")
     if os.path.exists(path):
         with open(path) as f:
-            # {SCRATCH} is where the throwaway installs live (ytjs/, xdg/): BENCH_SCRATCH.
-            CANDIDATES.update(json.loads(f.read().replace("{SCRATCH}", os.environ.get("BENCH_SCRATCH", ""))))
+            # {SCRATCH} is where the throwaway installs live (ytjs/, xdg/): BENCH_SCRATCH. {REPO} is this
+            # checkout, {BINARY} the den-reel build to run (BENCH_BINARY).
+            text = f.read()
+            for key, value in (
+                ("{SCRATCH}", os.environ.get("BENCH_SCRATCH", "")),
+                ("{REPO}", os.path.abspath(os.path.join(HERE, "..", ".."))),
+                ("{BINARY}", os.environ.get("BENCH_BINARY", "")),
+            ):
+                text = text.replace(key, value)
+            CANDIDATES.update(json.loads(text))
 
 
 class Worker:
@@ -81,6 +89,61 @@ class Worker:
             self.proc.wait(timeout=5)
         except Exception:
             pass
+
+
+class Service:
+    """The real den-reel binary, asked over HTTP: `/direct/<id>.json` is the whole integrated path
+    (resolver choice, fallback, the end-of-file check and its retry), answered in a worker's shape.
+
+    Its stderr is kept, because the decision log is where the resolver that answered is written.
+    """
+
+    def __init__(self, spec, cache):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        os.makedirs(cache, exist_ok=True)
+        self.log_path = os.path.join(cache, "stderr.log")
+        env = dict(os.environ)
+        env.update({
+            "PORT": str(self.port), "CACHE_DIR": cache, "METRICS_TOKEN": "bench", "LOG_IDENTITY": "1",
+            "PATH": os.environ.get("DENO_DIR_BIN", "") + os.pathsep + os.environ.get("PATH", ""),
+            **spec["service"],
+        })
+        self.log = open(self.log_path, "wb")
+        self.proc = subprocess.Popen([spec["binary"]], env=env, stdout=self.log, stderr=self.log)
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1).read()
+                return
+            except Exception:  # noqa: BLE001 - not listening yet
+                time.sleep(0.1)
+        raise RuntimeError("den-reel did not start")
+
+    def ask(self, request, timeout=60):
+        url = f"http://127.0.0.1:{self.port}/direct/{request['id']}.json"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                body = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "error": f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}"}
+        urls = [u for u in (body.get("video"), body.get("audio")) if u]
+        return {"ok": True, "urls": urls, "hls": body.get("hls"), "height": body.get("height"), "width": body.get("width")}
+
+    def stats(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/metrics", headers={"Authorization": "Bearer bench"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            text = r.read().decode()
+        keep = ("reel_resolver_answers_total", "reel_youtubei_fallbacks_total", "reel_resolves_total")
+        return [l for l in text.splitlines() if l.startswith(keep)]
+
+    def stop(self):
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        finally:
+            self.log.close()
 
 
 def param(url, key):
@@ -142,7 +205,7 @@ def check(answer, duration):
 
 
 def resolve_one(worker, spec, cache, video, phase, name):
-    request = {"id": video["id"], "format": ladder(), "cache": cache, **spec["request"]}
+    request = {"id": video["id"], "format": ladder(), "cache": cache, **spec.get("request", {})}
     started = time.monotonic()
     answer = worker.ask(request)
     ms = round((time.monotonic() - started) * 1000)
@@ -174,8 +237,10 @@ def run(args):
     scratch = tempfile.mkdtemp(prefix="reel-bench-", dir=os.environ.get("BENCH_SCRATCH"))
     throttled = []
 
-    def start(name):
+    def start(name, cache):
         spec = specs[name]
+        if spec.get("service"):
+            return Service(spec, cache)
         script = spec["worker"]
         script = script if os.path.isabs(script) else os.path.join(HERE, script)
         env = {"YTDLP_ZIP": os.environ["YTDLP_ZIP"], **spec.get("env", {})}
@@ -193,13 +258,14 @@ def run(args):
     # Phase 1 - cold: a fresh process and an empty yt-dlp cache each time.
     for i in range(args.cold):
         for name in names:
-            w = start(name)
-            emit(resolve_one(w, specs[name], os.path.join(scratch, f"cold-{name}-{i}"), corpus[i], "cold", name))
+            cache = os.path.join(scratch, f"cold-{name}-{i}")
+            w = start(name, cache)
+            emit(resolve_one(w, specs[name], cache, corpus[i], "cold", name))
             w.stop()
 
     # Phase 2 - warm: one long-lived worker per candidate over the whole corpus. The first answer pays
     # the cold start and is labelled `first`; the rest are the steady state.
-    workers = {n: start(n) for n in names}
+    workers = {n: start(n, os.path.join(scratch, f"warm-{n}")) for n in names}
     for i, video in enumerate(corpus):
         for name in names[i % len(names):] + names[: i % len(names)]:
             emit(resolve_one(workers[name], specs[name], os.path.join(scratch, f"warm-{name}"), video,
@@ -207,14 +273,20 @@ def run(args):
         if throttled:
             print("YouTube is throttling; stopping.", flush=True)
             break
-    for w in workers.values():
+    for name, w in workers.items():
+        if hasattr(w, "stats"):
+            # Which resolver answered, and how often the fast one fell back: the service's own counters.
+            emit({"candidate": name, "phase": "stats", "ok": True, "metrics": w.stats()})
+            kept = os.path.join(os.path.dirname(os.path.abspath(args.out)), f"{name}.decision-log.txt")
+            shutil.copyfile(w.log_path, kept)
         w.stop()
 
     # Phase 3 - restart: a new process, but the cache directory survives (a redeploy on the /cache volume).
     for i in range(args.cold if not throttled else 0):
         for name in names:
-            w = start(name)
-            emit(resolve_one(w, specs[name], os.path.join(scratch, f"warm-{name}"), corpus[-1 - i], "restart", name))
+            cache = os.path.join(scratch, f"warm-{name}")
+            w = start(name, cache)
+            emit(resolve_one(w, specs[name], cache, corpus[-1 - i], "restart", name))
             w.stop()
     shutil.rmtree(scratch, ignore_errors=True)
 
@@ -234,7 +306,8 @@ def summarize(paths):
         with open(p) as f:
             for line in f:
                 r = json.loads(line)
-                by.setdefault(r["candidate"], []).append(r)
+                if r["phase"] != "stats":
+                    by.setdefault(r["candidate"], []).append(r)
     print("| candidate | n | success | playable | cold p50 (n) | restart p50 (n) | warm p50 | warm p95 | 360p-or-lower |")
     print("|---|---|---|---|---|---|---|---|---|")
     for name, rows in by.items():

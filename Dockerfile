@@ -1,7 +1,8 @@
 # den-hearth — Scout, Reel, Subtitles and Remux in one binary, one image.
 #
 # One Rust binary (crates/hearth) and every tool the services shell out to (Scout shells out to none):
-#   Reel       yt-dlp (+ its deno JS runtime, + a resident python resolver), MP4Box (clap box), ffmpeg
+#   Reel       yt-dlp (+ its deno JS runtime, + a resident python resolver), youtubei.js (a resident deno
+#              resolver, asked first), MP4Box (clap box), ffmpeg
 #   Subtitles  alass, ffmpeg
 #   Remux      a minimal, source-built ffmpeg with VAAPI, and Intel's media driver for a GPU transcode
 #
@@ -99,6 +100,20 @@ RUN set -eux; \
     curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
       -o /usr/local/lib/yt-dlp.zip; \
     echo "${YTDLP_SHA256_ZIPAPP}  /usr/local/lib/yt-dlp.zip" | sha256sum -c -
+
+# youtubei.js, Reel's fast resolver (crates/reel/worker/youtubei). Its four npm packages are fetched HERE,
+# at build time, with the deno above — the one runtime the image already trusts — into a cache the runtime
+# stage copies and the running container only reads: nothing is installed at runtime (`--cached-only`), and
+# a package that is not in the lockfile, or whose bytes do not match its integrity hash, is not loaded
+# (`--frozen`). The lockfile is the pin; its SHA-256 below ties it to this Dockerfile the way the sums above
+# tie the binaries, so a changed lockfile cannot ride in without this line changing with it. Kept in
+# lockstep with deno.json + deno.lock by .github/workflows/youtubei-update.yml.
+ARG YOUTUBEI_LOCK_SHA256=9bcd07416709f28439d51d1164045bcd3f7cd6c97b91f6125151a31e816fc7b5
+COPY crates/reel/worker/youtubei/ /youtubei/
+RUN set -eux; \
+    cd /youtubei; \
+    echo "${YOUTUBEI_LOCK_SHA256}  deno.lock" | sha256sum -c -; \
+    DENO_DIR=/youtubei/deno deno cache --quiet --frozen --config=deno.json --lock=deno.lock main.mjs
 
 # ---- build alass (static Rust CLI) — Subtitles' aligner -----------------------------------------------
 FROM rust:1-trixie AS alass
@@ -215,6 +230,10 @@ COPY --from=tools /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp
 # falls back to when the resident one cannot be started or has died.
 COPY --from=tools /usr/local/lib/yt-dlp.zip /usr/local/lib/yt-dlp.zip
 COPY crates/reel/worker/resolve.py /app/resolve.py
+# The fast resolver, the packages it was locked to, and deno's cache of them (`deno/`, which the worker is
+# pointed at as DENO_DIR and which only it uses: yt-dlp's own deno keeps its cache elsewhere).
+COPY --from=tools /youtubei/main.mjs /youtubei/quiet.mjs /youtubei/errors.mjs /youtubei/select.mjs /youtubei/deno.json /youtubei/deno.lock /app/youtubei/
+COPY --from=tools /youtubei/deno /app/youtubei/deno
 # MP4Box + its shared lib (clap writer). ldconfig regenerates the libgpac.so.12 SONAME link.
 COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box
 COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
@@ -252,6 +271,8 @@ ENV SCOUT_CACHE_DIR=/cache/scout \
     REEL_FFMPEG_PATH=/usr/bin/ffmpeg \
     REEL_YTDLP_PATH=/usr/local/bin/yt-dlp \
     REEL_YTDLP_WORKER=/app/resolve.py \
+    REEL_YOUTUBEI_WORKER=/app/youtubei/main.mjs \
+    REEL_DENO_PATH=/usr/local/bin/deno \
     REEL_MAX_HEIGHT=1080 \
     SUBS_CACHE_DIR=/cache/subs \
     SUBS_FFMPEG_PATH=/usr/bin/ffmpeg \

@@ -167,6 +167,7 @@ which a deploy overrides as needed:
 SCOUT_CACHE_DIR=/cache/scout
 REEL_CACHE_DIR=/cache/reel      REEL_FFMPEG_PATH=/usr/bin/ffmpeg  REEL_YTDLP_PATH=/usr/local/bin/yt-dlp
 REEL_YTDLP_WORKER=/app/resolve.py   REEL_MAX_HEIGHT=1080
+REEL_YOUTUBEI_WORKER=/app/youtubei/main.mjs   REEL_DENO_PATH=/usr/local/bin/deno
 SUBS_CACHE_DIR=/cache/subs      SUBS_FFMPEG_PATH=/usr/bin/ffmpeg  SUBS_ALASS_PATH=/usr/local/bin/alass
 REMUX_SCRATCH_DIR=/cache/remux  REMUX_FFMPEG_PATH=/usr/local/bin/ffmpeg-remux
 LIBVA_DRIVER_NAME=iHD           DEN_VERSION=<VERSION>

@@ -268,10 +268,105 @@ pub(crate) async fn refuses_its_end(http: &reqwest::Client, url: &str) -> bool {
     matches!(asked, Ok(res) if res.status() == reqwest::StatusCode::FORBIDDEN)
 }
 
-/// One extraction: the resident worker first, and the binary whenever it cannot answer — which is
-/// every way it can fail, including not being configured at all.
-async fn extract(st: &AppState, vid: &str, format: &str) -> Result<Direct, PlayError> {
-    match st.worker.resolve(&st.cfg, vid, format).await {
+/// Which resolver answered an extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resolver {
+    Youtubei,
+    YtDlp,
+}
+
+impl Resolver {
+    fn name(self) -> &'static str {
+        match self {
+            Resolver::Youtubei => "youtubei",
+            Resolver::YtDlp => "ytdlp",
+        }
+    }
+}
+
+/// One decision-log line for the choice of resolver. Only written when youtubei.js is configured: a
+/// deployment without it has one resolver and nothing to decide. `vid` is an identity field
+/// (`LOG_IDENTITY`); the rest is written either way.
+fn resolver_line(
+    cfg: &Config,
+    outcome: &str,
+    resolver: Resolver,
+    reason: &str,
+    dur_ms: u128,
+    vid: &str,
+) -> String {
+    let mut line = format!(
+        "event=resolver outcome={outcome} resolver={} reason={reason} upstream=youtube dur_ms={dur_ms}",
+        resolver.name()
+    );
+    if cfg.log_identity {
+        line.push_str(&format!(" vid={vid}"));
+    }
+    line
+}
+
+/// The youtubei.js resolver's try at one extraction: its answer, or the short reason yt-dlp is being
+/// asked instead (already counted and logged).
+async fn extract_youtubei(st: &AppState, vid: &str, format: &str, rungs: &[u32]) -> Result<Direct, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let (fallback, why) = match st.youtubei.resolve(&st.cfg, vid, format, rungs).await {
+        Some(Ok(spoken)) => match from_worker(spoken, (st.clock)()) {
+            Some(direct) => {
+                st.resolver.youtubei_answers.fetch_add(1, Relaxed);
+                eprintln!(
+                    "{}",
+                    resolver_line(
+                        &st.cfg,
+                        "served",
+                        Resolver::Youtubei,
+                        "primary",
+                        started.elapsed().as_millis(),
+                        vid
+                    )
+                );
+                return Ok(direct);
+            }
+            None => (&st.resolver.fallback_unusable, "unusable".to_string()),
+        },
+        // Its own words about this video, in the categories `classify` has for yt-dlp's.
+        Some(Err(said)) => (&st.resolver.fallback_error, format!("error_{}", classify(None, &said).reason)),
+        None => (&st.resolver.fallback_unavailable, "unavailable".to_string()),
+    };
+    fallback.fetch_add(1, Relaxed);
+    eprintln!(
+        "{}",
+        resolver_line(&st.cfg, "fallback", Resolver::Youtubei, &why, started.elapsed().as_millis(), vid)
+    );
+    Err(why)
+}
+
+/// One extraction. When youtubei.js is configured it is asked first, and ANY failure of it — a
+/// failure for this video, an unusable answer, a worker that will not start, died or timed out —
+/// hands the same request to yt-dlp, so the fast resolver can only ever make a resolve quicker.
+/// yt-dlp is the resident worker, and the binary whenever that cannot answer either — which is every
+/// way it can fail, including not being configured at all.
+///
+/// `retry` is the second look after an answer googlevideo refused the end of, and it goes straight to
+/// yt-dlp: either youtubei.js gave the refused answer, and a second look from the same place is the
+/// least likely to differ, or it had already failed and yt-dlp gave it, and asking it again would only
+/// spend another failure.
+async fn extract(
+    st: &AppState,
+    vid: &str,
+    format: &str,
+    rungs: &[u32],
+    retry: bool,
+) -> Result<Direct, PlayError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let fast = !retry && st.youtubei.configured(&st.cfg);
+    if fast {
+        if let Ok(direct) = extract_youtubei(st, vid, format, rungs).await {
+            return Ok(direct);
+        }
+    }
+    let started = std::time::Instant::now();
+    let answer = match st.worker.resolve(&st.cfg, vid, format, rungs).await {
         Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
             status: 502,
             reason: "no_direct_url".into(),
@@ -281,7 +376,19 @@ async fn extract(st: &AppState, vid: &str, format: &str) -> Result<Direct, PlayE
         // Its own words about this video, classified exactly as the binary's stderr is.
         Some(Err(said)) => Err(classify(None, &said)),
         None => resolve(&st.cfg, vid, format, (st.clock)()).await,
+    };
+    if answer.is_ok() {
+        st.resolver.ytdlp_answers.fetch_add(1, Relaxed);
     }
+    if fast {
+        let outcome = if answer.is_ok() { "served" } else { "refused" };
+        let reason = if answer.is_ok() { "fallback" } else { "error" };
+        eprintln!(
+            "{}",
+            resolver_line(&st.cfg, outcome, Resolver::YtDlp, reason, started.elapsed().as_millis(), vid)
+        );
+    }
+    answer
 }
 
 /// The rung a request's `?height=` caps the answer at, or `None` for the full `MAX_HEIGHT` ladder.
@@ -436,13 +543,15 @@ pub(crate) async fn answer(
                     // rather than on the budget: one permit is spent per video, not per caller.
                     let _permit = st.probe_sem.acquire().await;
                     let started = std::time::Instant::now();
-                    let mut answer = extract(&st, &v, &format).await;
+                    let rungs = crate::config::ladder_rungs(cap.unwrap_or_else(|| st.cfg.top_rung()));
+                    let mut answer = extract(&st, &v, &format, &rungs, false).await;
                     // A capped extraction stays capped for its URLs' whole six hours, and a fresh one
                     // usually is not (`refuses_its_end`), so it is worth one more — once, so a video
                     // that is capped every time still plays its first minute rather than nothing.
+                    // Whoever answered, the check is the same, and the second look is yt-dlp's.
                     if let Ok(d) = &answer {
                         if refuses_its_end(&st.http, &d.video).await {
-                            let again = extract(&st, &v, &format).await;
+                            let again = extract(&st, &v, &format, &rungs, true).await;
                             let still = match &again {
                                 Ok(d) => refuses_its_end(&st.http, &d.video).await.to_string(),
                                 Err(e) => e.reason.clone(),

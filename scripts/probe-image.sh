@@ -64,6 +64,17 @@ case "$reason" in
     ffmpeg_unavailable | scratch_unwritable | transcode_unavailable) echo "::error::/health reports remux $reason"; exit 1 ;;
 esac
 
+# Reel's youtubei.js worker: deno starts under the permissions Reel gives it (config.rs `deno_args`), loads the
+# packages the image locked from the cache it only reads, and answers. A malformed id is refused before any request
+# is made, so this needs no network. Run read-only with a tmpfs home, as the box does.
+reply=$(printf '%s\n' '{"id":"x"}' | docker run --rm -i --read-only --tmpfs /home/nonroot:uid=65532 \
+    --entrypoint deno -e DENO_DIR=/app/youtubei/deno "$image" run --quiet --no-prompt --cached-only --frozen \
+    --config=/app/youtubei/deno.json --lock=/app/youtubei/deno.lock \
+    --allow-net=www.youtube.com,youtubei.googleapis.com /app/youtubei/main.mjs)
+jq -e '.ok == false and (.error | test("not a video id"))' <<<"$reply" >/dev/null \
+    || { echo "::error::Reel's youtubei.js worker did not answer from the image: $reply"; exit 1; }
+echo "youtubei: worker starts and answers from the image"
+
 # The GPU transcode, for real. ffmpeg listing h264_vaapi proves nothing about the driver under it: Debian's free
 # intel-media-va-driver lists it and then refuses every bitrate-controlled encode, and has no scale_vaapi kernels.
 # So with a render node on this host, run Remux's own flags (job.rs) on a six-frame clip. A runner without one

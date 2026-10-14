@@ -59,6 +59,25 @@ jobs:
           CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
       - name: Load harness checks
         run: python3 bench/http/test.py
+      # Reel's two resident resolvers. The python one against a stub yt-dlp; the youtubei.js one with the deno the
+      # image pins (checked against the Dockerfile's own sum) and the packages its lockfile pins.
+      - name: Reel's yt-dlp worker tests
+        run: python3 crates/reel/worker/test_resolve.py
+      - name: Install the pinned deno
+        run: |
+          version=$(grep -oP '^ARG DENO_VERSION=\K\S+' Dockerfile)
+          sha=$(grep -oP '^ARG DENO_SHA256_AMD64=\K\S+' Dockerfile)
+          curl -fsSL "https://github.com/denoland/deno/releases/download/v${version}/deno-x86_64-unknown-linux-gnu.zip" -o deno.zip
+          echo "${sha}  deno.zip" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          unzip -q -d "$HOME/.local/bin" deno.zip
+          rm deno.zip
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Reel's youtubei.js worker tests
+        working-directory: crates/reel/worker/youtubei
+        env:
+          DENO_DIR: ${{ runner.temp }}/deno
+        run: deno test --frozen --config=deno.json --lock=deno.lock .
 
   # Remux's #[ignore]d end-to-end tests, in the Dockerfile's e2e stage: the ffmpeg the image ships, because another
   # version seeks differently and the segment alignment depends on exactly how it seeks. The stage builds no

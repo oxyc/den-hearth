@@ -2,7 +2,8 @@
 #
 # Does NOT cover the tools we download by URL and pin by checksum (yt-dlp, deno) or by commit (GPAC) or build
 # from a checksummed source tarball (ffmpeg) — dependabot has no ecosystem for those. yt-dlp and deno have their
-# own workflows; GPAC and ffmpeg are bumped by hand.
+# own workflows, and so does youtubei.js (deno.lock + the lock's SHA-256 in the Dockerfile must move together);
+# GPAC and ffmpeg are bumped by hand.
 version: 2
 updates:
   - package-ecosystem: cargo

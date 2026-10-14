@@ -135,6 +135,18 @@ pub struct Config {
     pub ytdlp_worker: Option<String>,
     /// `PYTHON_PATH` — the interpreter that runs the worker. Only consulted when one is configured.
     pub python: String,
+    /// `YOUTUBEI_WORKER` — a resident youtubei.js resolver (`worker/youtubei/main.mjs`), asked BEFORE
+    /// yt-dlp: one player call instead of a page, a player call and a manifest, so ~0.12 s a resolve
+    /// against ~1.1 s. Any failure of it — it will not start, it died, it timed out, it could not
+    /// answer this video — falls through to yt-dlp, so it only ever makes a resolve faster.
+    /// Unset disables it.
+    pub youtubei_worker: Option<String>,
+    /// `DENO_PATH` — the runtime that runs it. Only consulted when `YOUTUBEI_WORKER` is set.
+    pub deno: String,
+    /// What goes between the runtime and the script path: the lockfile it must match and the
+    /// permissions it runs under. Not an environment knob on purpose — network to YouTube's API hosts
+    /// and nothing else is the point of it.
+    pub deno_args: Vec<String>,
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
     pub kinocheck_base: String,
@@ -262,6 +274,39 @@ pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<u64> {
     u64::try_from(secs * 1000 + ms).ok()
 }
 
+/// The YouTube hosts the youtubei.js resolver may reach: the site (session, visitor data) and the
+/// player API. Googlevideo is not among them — it never fetches media, only names it.
+const YOUTUBEI_HOSTS: &str = "www.youtube.com,youtubei.googleapis.com";
+
+/// The deno arguments that pin the resolver to its lockfile and give it network to `YOUTUBEI_HOSTS`
+/// and nothing else: no filesystem, no environment, no subprocesses, no prompts, no downloads. The
+/// config and lock sit beside the script, which is how the image lays them out.
+fn deno_args(script: &str) -> Vec<String> {
+    let dir = std::path::Path::new(script).parent().unwrap_or_else(|| std::path::Path::new("."));
+    let beside = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    vec![
+        "run".into(),
+        "--quiet".into(),
+        "--no-prompt".into(),
+        "--cached-only".into(),
+        "--frozen".into(),
+        format!("--config={}", beside("deno.json")),
+        format!("--lock={}", beside("deno.lock")),
+        format!("--allow-net={YOUTUBEI_HOSTS}"),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn deno_args_for_test(script: &str) -> Vec<String> {
+    deno_args(script)
+}
+
+/// The rungs of the format ladder under a cap, tallest first — what the youtubei.js resolver walks
+/// instead of parsing `format_ladder`'s selector string.
+pub fn ladder_rungs(cap: u32) -> Vec<u32> {
+    std::iter::once(cap).chain(LADDER_STEPS.into_iter().filter(|s| *s < cap)).collect()
+}
+
 /// Fallback when MAX_HEIGHT is unset or not a number. avc1's practical ceiling on YouTube.
 const DEFAULT_MAX_HEIGHT: u32 = 1080;
 
@@ -291,6 +336,12 @@ pub fn format_ladder(cap: u32) -> String {
 }
 
 impl Config {
+    /// The ladder's top rung: `MAX_HEIGHT`, or the default when it is unset or not usable (the same
+    /// reading `from_env` builds `ytdlp_format` from).
+    pub fn top_rung(&self) -> u32 {
+        self.max_height.parse().ok().filter(|c| *c >= 144).unwrap_or(DEFAULT_MAX_HEIGHT)
+    }
+
     pub fn from_env() -> Config {
         let port = env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8092);
         let cache_dir =
@@ -333,6 +384,7 @@ impl Config {
         } else {
             Some(format!("youtube:player_client={ytdlp_extractor_args}"))
         };
+        let youtubei_worker = env_opt("YOUTUBEI_WORKER");
         let play_secret = env_opt("PLAY_SECRET");
         let play_signing_grace =
             play_grace(play_secret.is_some(), env_opt("PLAY_SIGNING_GRACE_UNTIL").as_deref());
@@ -395,6 +447,9 @@ impl Config {
             ytdlp_extractor_args,
             ytdlp_worker: env_opt("YTDLP_WORKER"),
             python: env_opt("PYTHON_PATH").unwrap_or_else(|| "python3".to_string()),
+            deno_args: youtubei_worker.as_deref().map(deno_args).unwrap_or_default(),
+            youtubei_worker,
+            deno: env_opt("DENO_PATH").unwrap_or_else(|| "deno".to_string()),
             tmdb_base: "https://api.themoviedb.org/3".to_string(),
             kinocheck_base: "https://api.kinocheck.com".to_string(),
             cache_ok_until: std::sync::atomic::AtomicU64::new(0),

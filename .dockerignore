@@ -5,3 +5,4 @@ target
 **/.env
 bench/fixtures
 bench/results
+crates/reel/worker/youtubei/deno

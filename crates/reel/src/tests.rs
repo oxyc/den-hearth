@@ -225,6 +225,9 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         // Never the resident one in a test: it would want an interpreter and the pinned zipapp.
         ytdlp_worker: None,
         python: "python3".into(),
+        youtubei_worker: None,
+        deno: "deno".into(),
+        deno_args: Vec::new(),
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
         cache_ok_until: std::sync::atomic::AtomicU64::new(0),
@@ -293,6 +296,8 @@ fn build_state_full(
         direct_inflight: Mutex::new(HashMap::new()),
         progressive: Mutex::new(HashMap::new()),
         worker: Default::default(),
+        youtubei: crate::worker::Worker::youtubei(),
+        resolver: Default::default(),
         upstream,
         // Never used by a test: nothing here reaches the HLS proxy, and a client builds no
         // connection until something asks it for one.
@@ -6719,4 +6724,248 @@ fn a_symlinked_trailer_is_not_swept_away() {
 
     assert!(link.exists(), "a symlinked trailer the serve path would happily open was removed");
     assert!(real.exists(), "the symlink's target was removed");
+}
+
+/// A resident worker run by `sh`: it logs each request line it is sent, then answers with `reply`
+/// (a shell command). Returns the script and the log.
+fn fake_worker(dir: &std::path::Path, name: &str, reply: &str) -> (String, PathBuf) {
+    let log = dir.join(format!("{name}-requests"));
+    let script = dir.join(format!("{name}.sh"));
+    std::fs::write(
+        &script,
+        format!("while read -r line; do\necho \"$line\" >> {}\n{reply}\ndone\n", log.display()),
+    )
+    .unwrap();
+    (script.to_string_lossy().into_owned(), log)
+}
+
+/// A worker answer naming one URL under `base`: `/whole` serves to its end, `/capped` refuses it.
+fn url_reply(base: &str, kind: &str) -> String {
+    format!(
+        "echo '{{\"ok\": true, \"width\": 1920, \"height\": 1080, \"urls\": \
+         [\"{base}/{kind}?itag=137&clen=100&expire=4000000000\"], \"hls\": null}}'"
+    )
+}
+
+/// Both resident resolvers, each run by `sh` (standing in for python and for deno).
+fn resolver_state(dir: &std::path::Path, ytdlp: Option<String>, youtubei: Option<String>) -> Arc<AppState> {
+    let mut cfg = test_cfg(dir.to_path_buf());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = ytdlp;
+    cfg.deno = "sh".into();
+    cfg.youtubei_worker = youtubei;
+    build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm())
+}
+
+fn counted(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// youtubei.js is asked first, and when it answers yt-dlp is not asked at all.
+#[tokio::test]
+async fn the_fast_resolver_answers_before_yt_dlp_is_asked() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, fast_log) = fake_worker(&dir, "fast", &url_reply(&base, "whole"));
+    let (slow, slow_log) = fake_worker(&dir, "slow", &url_reply(&base, "other"));
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.unwrap().video.contains("/whole?"), "the answer did not come from youtubei.js");
+    assert_eq!((spawn_count(&fast_log), spawn_count(&slow_log)), (1, 0));
+    assert_eq!(counted(&state.resolver.youtubei_answers), 1);
+    assert_eq!(counted(&state.resolver.ytdlp_answers), 0);
+}
+
+/// A failure for THIS video is not the end of it: yt-dlp is asked the same question, whatever the
+/// fast one said, and the failure is counted by what it was.
+#[tokio::test]
+async fn a_failure_of_the_fast_resolver_falls_back_to_yt_dlp() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let said = "echo '{\"ok\": false, \"error\": \"ERROR: [youtube] x: Video unavailable\"}'";
+    let (fast, fast_log) = fake_worker(&dir, "fast", said);
+    let (slow, slow_log) = fake_worker(&dir, "slow", &url_reply(&base, "whole"));
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.unwrap().video.contains("/whole?"));
+    assert_eq!((spawn_count(&fast_log), spawn_count(&slow_log)), (1, 1));
+    assert_eq!(counted(&state.resolver.fallback_error), 1);
+    assert_eq!(counted(&state.resolver.youtubei_answers), 0);
+    assert_eq!(counted(&state.resolver.ytdlp_answers), 1);
+}
+
+/// A resolver that cannot be asked — it dies on the first request — costs one counted fallback, not
+/// the resolve.
+#[tokio::test]
+async fn a_dead_fast_resolver_falls_back_to_yt_dlp() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, _) = fake_worker(&dir, "fast", "exit 1");
+    let (slow, _) = fake_worker(&dir, "slow", &url_reply(&base, "whole"));
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.is_ok(), "{answer:?}");
+    assert_eq!(counted(&state.resolver.fallback_unavailable), 1);
+    assert_eq!(counted(&state.resolver.ytdlp_answers), 1);
+}
+
+/// "Ok" with no URL in it is not an answer, so yt-dlp is asked.
+#[tokio::test]
+async fn an_answer_with_no_url_falls_back_to_yt_dlp() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, _) = fake_worker(&dir, "fast", "echo '{\"ok\": true, \"urls\": [], \"hls\": null}'");
+    let (slow, _) = fake_worker(&dir, "slow", &url_reply(&base, "whole"));
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.is_ok());
+    assert_eq!(counted(&state.resolver.fallback_unusable), 1);
+}
+
+/// Neither resolver able to answer is yt-dlp's verdict, in yt-dlp's category — the fast resolver's
+/// failure never becomes the video's.
+#[tokio::test]
+async fn when_both_fail_the_verdict_is_yt_dlps() {
+    let dir = temp_dir();
+    let (fast, _) = fake_worker(
+        &dir,
+        "fast",
+        "echo '{\"ok\": false, \"error\": \"ERROR: [youtube] x: Video unavailable\"}'",
+    );
+    let (slow, _) = fake_worker(
+        &dir,
+        "slow",
+        "echo '{\"ok\": false, \"error\": \"ERROR: [youtube] x: Private video. Sign in if you have access\"}'",
+    );
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert_eq!(answer.unwrap_err().reason, "restricted");
+}
+
+/// The fast resolver's answer gets the same end-of-file check as any other, and when it is the one
+/// refused, yt-dlp takes the second look.
+#[tokio::test]
+async fn a_capped_fast_answer_is_resolved_again_by_yt_dlp() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, fast_log) = fake_worker(&dir, "fast", &url_reply(&base, "capped"));
+    let (slow, slow_log) = fake_worker(&dir, "slow", &url_reply(&base, "whole"));
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.unwrap().video.contains("/whole?"), "the capped answer was kept");
+    assert_eq!((spawn_count(&fast_log), spawn_count(&slow_log)), (1, 1));
+}
+
+/// When youtubei.js had already failed and yt-dlp gave the answer that is then refused, the second
+/// look goes straight to yt-dlp: asking the resolver that just failed would only spend another failure.
+#[tokio::test]
+async fn a_second_look_after_a_fallback_does_not_ask_the_fast_resolver_again() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, fast_log) = fake_worker(
+        &dir,
+        "fast",
+        "echo '{\"ok\": false, \"error\": \"ERROR: [youtube] x: Video unavailable\"}'",
+    );
+    // yt-dlp's first answer is capped, its second whole.
+    let slow_log = dir.join("slow-requests");
+    let reply = format!(
+        "if [ $(wc -l < {}) -le 1 ]; then kind=capped; else kind=whole; fi\n\
+         echo \"{{\\\"ok\\\": true, \\\"width\\\": 1920, \\\"height\\\": 1080, \\\"urls\\\": \
+         [\\\"{base}/$kind?itag=137&clen=100&expire=4000000000\\\"], \\\"hls\\\": null}}\"",
+        slow_log.display()
+    );
+    let (slow, _) = fake_worker(&dir, "slow", &reply);
+    let state = resolver_state(&dir, Some(slow), Some(fast));
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.unwrap().video.contains("/whole?"), "the capped answer was kept");
+    assert_eq!(spawn_count(&slow_log), 2, "yt-dlp was not asked for the second look");
+    assert_eq!(spawn_count(&fast_log), 1, "the resolver that had failed was asked again");
+    assert_eq!(counted(&state.resolver.fallback_error), 1);
+}
+
+/// `?height=` reaches the fast resolver as the rungs of the ladder under it, tallest first.
+#[tokio::test]
+async fn the_fast_resolver_is_told_the_rungs_to_walk() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (fast, log) = fake_worker(&dir, "fast", &url_reply(&base, "whole"));
+    let state = resolver_state(&dir, None, Some(fast));
+
+    let _ = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    let _ = crate::direct::answer(&state, "dQw4w9WgXcQ", Some(720)).await;
+    let asked = std::fs::read_to_string(&log).unwrap();
+    let mut lines = asked.lines();
+    assert!(lines.next().unwrap().contains("\"rungs\":[1080,720,480]"), "{asked}");
+    assert!(lines.next().unwrap().contains("\"rungs\":[720,480]"), "{asked}");
+    assert_eq!(crate::config::ladder_rungs(480), vec![480]);
+}
+
+/// Without YOUTUBEI_WORKER nothing about the resolve changes and nothing is counted against it.
+#[tokio::test]
+async fn without_the_fast_resolver_nothing_is_counted_against_it() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (slow, _) = fake_worker(&dir, "slow", &url_reply(&base, "whole"));
+    let state = resolver_state(&dir, Some(slow), None);
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.is_ok());
+    let r = &state.resolver;
+    assert_eq!(
+        (counted(&r.fallback_error), counted(&r.fallback_unavailable), counted(&r.fallback_unusable)),
+        (0, 0, 0)
+    );
+    assert_eq!(counted(&r.ytdlp_answers), 1);
+}
+
+/// What `worker/youtubei/errors.mjs` says (pinned there by `errors.test.mjs`) lands in the category
+/// yt-dlp's own words for the same failure would.
+#[test]
+fn the_fast_resolvers_errors_land_in_yt_dlps_categories() {
+    let said = |line: &str| crate::ytdlp::classify(None, line).reason;
+    assert_eq!(said("ERROR: [youtube] x: Sign in to confirm you\u{2019}re not a bot"), "throttled");
+    assert_eq!(said("ERROR: [youtube] x: HTTP Error 429: Too Many Requests"), "throttled");
+    assert_eq!(said("ERROR: [youtube] x: Sign in to confirm your age"), "restricted");
+    assert_eq!(
+        said("ERROR: [youtube] x: Private video. Sign in if you've been granted access to this video"),
+        "restricted"
+    );
+    assert_eq!(said("ERROR: [youtube] x: Video unavailable"), "unavailable");
+    assert_eq!(
+        said("ERROR: [youtube] x: This video is no longer available (has been removed)"),
+        "unavailable"
+    );
+    assert_eq!(
+        said("ERROR: [youtube] x: The uploader has not made this video available in your country"),
+        "geo_blocked"
+    );
+    assert_eq!(said("ERROR: [youtube] x: TypeError: y is undefined"), "extraction_failed");
+}
+
+/// The resolver runs with the lockfile it was built from and network to YouTube's API hosts: no `-A`,
+/// no filesystem, no environment.
+#[test]
+fn the_fast_resolver_gets_the_narrowest_permissions() {
+    let cfg_args = crate::config::deno_args_for_test("/app/youtubei/main.mjs");
+    assert!(cfg_args.contains(&"--allow-net=www.youtube.com,youtubei.googleapis.com".to_string()));
+    assert!(cfg_args.contains(&"--lock=/app/youtubei/deno.lock".to_string()));
+    assert!(cfg_args.contains(&"--frozen".to_string()) && cfg_args.contains(&"--cached-only".to_string()));
+    assert!(cfg_args.contains(&"--no-prompt".to_string()));
+    assert!(
+        !cfg_args.iter().any(|a| a == "-A"
+            || a.starts_with("--allow-all")
+            || a.starts_with("--allow-read")
+            || a.starts_with("--allow-write")
+            || a.starts_with("--allow-env")
+            || a.starts_with("--allow-run")),
+        "{cfg_args:?}"
+    );
 }

@@ -2,3 +2,5 @@
 .env
 cache/
 /crates/reel/*.mp4
+# deno's cache of the locked youtubei.js packages: built by the Dockerfile, or by hand for local runs.
+/crates/reel/worker/youtubei/deno/
