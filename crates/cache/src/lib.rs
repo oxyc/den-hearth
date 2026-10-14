@@ -320,7 +320,7 @@ impl<V: Value> Cache<V> {
 
     /// Whether the disk tier is configured and currently accepting writes.
     pub fn disk_enabled(&self) -> bool {
-        self.disk.as_ref().is_some_and(|d| !d.disabled())
+        self.disk.as_ref().is_some_and(|d| !d.writes_off())
     }
 
     /// Whether a disk tier was asked for at all.

@@ -370,6 +370,44 @@ fn a_failed_write_turns_persistence_off_until_the_next_sweep() {
 }
 
 #[test]
+fn files_already_on_disk_are_still_served_after_a_failed_write() {
+    let dir = TempDir::new().unwrap();
+    put(&open(dir.path()), "old", "paid for", DAY);
+    // No memory tier, so every answer below comes off disk.
+    let c = C::new(options(1, dir.path()));
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+    put(&c, "new", "v", DAY);
+    assert!(!c.disk_enabled(), "the failed write did not turn writes off");
+    let served = get(&c, "old");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(served.as_deref(), Some("paid for"), "a failed write stopped existing files being served");
+}
+
+#[test]
+fn a_shorter_ttl_than_the_file_holds_is_written() {
+    let dir = TempDir::new().unwrap();
+    let c = open(dir.path());
+    put(&c, "k", "v", 10 * DAY);
+    put(&c, "k", "v", Duration::from_secs(15 * 60));
+    assert_eq!(c.disk_counts().writes, 2, "the old long expiry was kept");
+    let raw = fs::read_to_string(c.path_for("k").unwrap()).unwrap();
+    let expiry: u64 = raw.split_once(' ').unwrap().0.parse().unwrap();
+    assert!(expiry <= now_secs() + 15 * 60 + 1, "the file still expires in {}s", expiry - now_secs());
+}
+
+#[test]
+fn a_sweep_started_with_a_stale_clock_leaves_a_fresh_temp_alone() {
+    let dir = TempDir::new().unwrap();
+    let behind: Clock = Arc::new(|| SystemTime::now() - Duration::from_secs(100));
+    let c = open(dir.path()).with_clock(behind);
+    let inflight = dir.path().join(".tmp-written-while-the-sweep-ran");
+    fs::write(&inflight, "x".repeat(1000)).unwrap();
+    c.set_disk_bytes(10);
+    c.sweep();
+    assert!(inflight.exists(), "the sweep took a write that began after it started");
+}
+
+#[test]
 fn a_directory_that_cannot_be_made_stays_off() {
     let base = TempDir::new().unwrap();
     let file = base.path().join("not-a-dir");

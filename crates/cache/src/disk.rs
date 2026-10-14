@@ -86,8 +86,12 @@ impl DiskStats {
 
 #[derive(Default)]
 struct State {
-    /// Persistence is off until the next sweep (a write or a retire failed), or for good when `unusable`.
+    /// Reads and writes are off until the next sweep (a retire failed, so a stale file could come back), or for good
+    /// when `unusable`.
     off: bool,
+    /// Writes alone are off until the next sweep (a write or create failed, e.g. ENOSPC or a read-only volume). The
+    /// files already there are still sound, so they are still served.
+    write_off: bool,
     /// The directory could not be created: nothing a sweep does will change that.
     unusable: bool,
     /// Bytes written since the last sweep.
@@ -169,7 +173,7 @@ impl Disk {
             cost: o.cost,
             log: o.log,
             max_bytes: AtomicI64::new(o.disk_bytes),
-            state: Mutex::new(State { off: unusable, unusable, written: 0 }),
+            state: Mutex::new(State { off: unusable, write_off: false, unusable, written: 0 }),
             once: Once::new(),
             stats: DiskStats::default(),
             index: Mutex::new(Index::new()),
@@ -206,13 +210,30 @@ impl Disk {
         self.index.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether reads are off.
     pub(crate) fn disabled(&self) -> bool {
         self.lock().off
     }
 
-    /// Turns persistence off after a failure and logs why, once per process.
+    /// Whether the tier is accepting writes.
+    pub(crate) fn writes_off(&self) -> bool {
+        let st = self.lock();
+        st.off || st.write_off
+    }
+
+    /// Turns reads and writes off after a failure that could resurrect a stale file, and logs why, once per process.
     pub(crate) fn disable(&self, op: &str, err: &dyn Display) {
         self.lock().off = true;
+        self.said(op, err);
+    }
+
+    /// Turns writes off after a failed write; what is on disk is still served.
+    fn disable_writes(&self, op: &str, err: &dyn Display) {
+        self.lock().write_off = true;
+        self.said(op, err);
+    }
+
+    fn said(&self, op: &str, err: &dyn Display) {
         self.once.call_once(|| {
             (self.log)(&format!("cache {op} failed ({err}) — persistence disabled, memory still serving"))
         });
@@ -287,7 +308,7 @@ impl Disk {
             self.retire(&name);
             return false;
         }
-        if self.disabled() {
+        if self.writes_off() {
             return false;
         }
         // Skipping the rewrite keeps the file's older expiry: after a restart the entry can lapse up to a quarter of
@@ -303,8 +324,11 @@ impl Disk {
     /// Whether the file for `name` already holds `value` with most of a `ttl` still ahead of it.
     fn on_disk_is_current(&self, name: &str, value: &str, ttl: Duration, now: i64) -> bool {
         let Some(meta) = self.index().get(name).copied() else { return false };
-        let lasts = u64::try_from(meta.expires - now)
-            .is_ok_and(|left| u128::from(left) * 4 >= u128::from(ttl.as_secs()) * 3);
+        // Most of the asked life is left, and the file does not outlive what is asked now: a shorter TTL than the file
+        // holds must be written, or the old long expiry would stand.
+        let lasts = u64::try_from(meta.expires - now).is_ok_and(|left| {
+            u128::from(left) * 4 >= u128::from(ttl.as_secs()) * 3 && left <= ttl.as_secs() + 1
+        });
         lasts && meta.value == Some(self.fingerprint(value))
     }
 
@@ -315,7 +339,7 @@ impl Disk {
         body.push_str(value);
         if let Err((op, e)) = write_entry(&self.dir, &self.dir.join(name), &body) {
             self.stats.write_failures.fetch_add(1, Ordering::Relaxed);
-            self.disable(op, &e);
+            self.disable_writes(op, &e);
             return false;
         }
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
@@ -418,6 +442,7 @@ impl Disk {
             let mut st = self.lock();
             if !st.unusable {
                 st.off = false;
+                st.write_off = false;
             }
         }
         self.stats.readdirs.fetch_add(1, Ordering::Relaxed);
@@ -462,7 +487,9 @@ impl Disk {
                 // A temp file outlives its put only if the process died between create and rename. The grace period
                 // keeps the sweep from racing a write that is legitimately in flight.
                 let Ok(info) = entry.metadata() else { continue };
-                match info.modified().ok().map(|m| now.duration_since(m)) {
+                // Judged against the real time at this file, not the `now` the sweep was started with: a temp's mtime
+                // is a real one, and a long sweep must not find a write that began meanwhile to be "in the future".
+                match info.modified().ok().map(|m| SystemTime::now().duration_since(m)) {
                     Some(Ok(age)) if age >= TEMP_FILE_GRACE => {
                         self.stats.unlink();
                         if fs::remove_file(&path).is_ok() {
