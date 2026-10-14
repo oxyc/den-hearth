@@ -423,6 +423,7 @@ name = "den-hearth"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "blake2",
  "bytes",
  "den-http",
  "den-reel",

@@ -180,6 +180,60 @@ async fn a_media_capability_is_honoured_only_where_it_was_minted() {
     // Revoked by the Den addon.
     let revoked = den_terms(IID, "0");
     assert_eq!(open(crate::sources::seal(Some(&signer), &media(true)), Some(&revoked)).await, 403);
+    // The Den addon mints only for an install, so a Den capability naming none is not one it minted.
+    let unbound = crate::sources::Media { i: None, e: None, ..media(true) };
+    assert_eq!(open(crate::sources::seal(Some(&signer), &unbound), Some(&den)).await, 403);
+}
+
+/// Reel's unbound links (its config-less `/meta` and `/prepare`) verify only on Reel's routes: the Den addon
+/// mints none, and its `/sources` must not mint Den capabilities from one.
+#[tokio::test]
+async fn an_unbound_link_plays_only_on_reel_s_routes() {
+    use crate::sign::Binding;
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let state = signed_state(dir, "", "0", false);
+    let reel = spawn_server(state.clone()).await;
+    let den = spawn_den_server(state, den_terms("", "0")).await;
+    let tag = bound_tag("cachedVid07", Binding::Unbound);
+    let play = format!("/play/cachedVid07.mp4?s={tag}");
+    let sources = format!("/sources/cachedVid07.json?s={tag}&surface=silent&player=hls.js");
+    let status = |url: String| async move { reqwest::get(url).await.unwrap().status().as_u16() };
+    assert_eq!(status(format!("{reel}{play}")).await, 200);
+    assert_eq!(status(format!("{den}{play}")).await, 403, "an unbound link played on the Den addon's route");
+    assert_eq!(status(format!("{den}{sources}")).await, 403, "Den media minted from an unbound link");
+    assert_eq!(status(format!("{den}/play/cachedVid07.mp4")).await, 403, "untagged");
+}
+
+/// The LAN relay's capability check, on the Den addon's terms: only Den capabilities validate there, and only
+/// Reel's on Reel's own route.
+#[test]
+fn the_den_validate_route_accepts_only_den_capabilities() {
+    let state = signed_state(temp_dir(), "", "0", false);
+    let den = den_terms("", "0");
+    let signer = crate::sign::Signer::new("s3cret");
+    let media = |den: bool| crate::sources::Media {
+        v: "dQw4w9WgXcQ".into(),
+        f: "p".into(),
+        h: Some(720),
+        a: false,
+        n: false,
+        p: None,
+        i: Some(IID.into()),
+        e: Some(0),
+        x: 4_000_000_000,
+        den,
+    };
+    let validate = |media: &crate::sources::Media, terms: Option<&den_seal::Addon>| {
+        let sealed = crate::sources::seal(Some(&signer), media);
+        let (blob, query) = sealed.strip_prefix("m/s/").unwrap().split_once('?').unwrap();
+        crate::sources::validate_direct_capability(&state, terms, blob, query).status()
+    };
+    assert_eq!(validate(&media(true), Some(&den)), 204);
+    assert_eq!(validate(&media(false), None), 204);
+    assert_eq!(validate(&media(false), Some(&den)), 403);
+    assert_eq!(validate(&media(true), None), 403);
+    assert_eq!(validate(&media(true), Some(&den_terms(IID, "0"))), 403, "revoked by the Den addon");
 }
 
 /// The message Reel signs for its own links is the one it always signed: installs in the field hold them.

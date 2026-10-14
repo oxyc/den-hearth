@@ -136,11 +136,21 @@ refused on the other's routes; every per-service route, key, revocation list and
 
 | Env | |
 |---|---|
-| `HEARTH_CONFIG_KEY`, `HEARTH_CONFIG_KEYS_PREV` | The addon's sealing key and prior keys. Unset: a ring derived from Scout's `CONFIG_KEY`/`CONFIG_KEYS_PREV` (HKDF), so a node that seals Scout seals this too and neither opens the other's configs or play tickets. Neither set: plaintext configs. A malformed key refuses every Den config (503 `config_key_invalid`). |
+| `HEARTH_CONFIG_KEY`, `HEARTH_CONFIG_KEYS_PREV` | The addon's sealing key and prior keys. Unset: a ring derived from Scout's `CONFIG_KEY`/`CONFIG_KEYS_PREV` (HKDF), so a node that seals Scout seals this too and neither opens the other's configs or play tickets. Neither set: plaintext configs. A malformed key refuses every Den config (503 `config_key_invalid`). Play tickets are keyed with the addon's own HKDF info, so they stay apart from Scout's even if both keys are equal (hearth warns at startup when they are). |
 | `HEARTH_REVOKED_INSTALLS`, `HEARTH_CONFIG_EPOCH`, `HEARTH_REQUIRE_INSTALL_ID` | The addon's revocation, as each service's `*_REVOKED_INSTALLS` etc. |
 | `HEARTH_PUBLIC_BASE_URL` | The addon's links go under `<it>/den`; unset, under the request's origin and `/den`. |
 
 The startup line `den addon at /den — sealed=… key=…` shows what is in force.
+
+**Moving from the derived key to one of its own breaks every Den install** unless the derived ring is kept: its
+private half is never written anywhere, so it cannot be copied into `HEARTH_CONFIG_KEYS_PREV`. Name it instead —
+`HEARTH_CONFIG_KEYS_PREV=scout` (beside any other prior keys) keeps installs sealed under the ring derived from
+Scout's current and prior keys opening, for as long as Scout keeps those keys. Changing Scout's `CONFIG_KEY`
+while the Den addon derives from it rotates the Den key with it: put Scout's old key in Scout's
+`CONFIG_KEYS_PREV`, as for Scout's own installs.
+
+`/den/_internal/validate/m/s/<blob>` is Reel's capability check for den-edge's LAN relay, on the Den addon's terms:
+it validates only capabilities Reel minted for a Den install, as Reel's own route validates only Reel's.
 
 ## Listeners
 

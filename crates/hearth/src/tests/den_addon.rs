@@ -296,31 +296,174 @@ fn the_den_key_is_its_own_or_derived_from_scout_s() {
     assert_eq!((terms.scout.slice, terms.subs.slice, terms.reel.slice), ("scout", "subs", "reel"));
 }
 
-/// Every per-service route answers byte for byte as it did, whatever the Den addon is configured with.
+// --- The services on their own keys -------------------------------------------------------------------------
+
+/// Scout's, Reel's and Subtitles' own sealing keys, each its own, and none of them the Den addon's.
+const SCOUT_PRIV: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
+const REEL_PRIV: &str = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
+const SUBS_PRIV: &str = "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=";
+/// An install every service's own revocation names.
+const REVOKED: &str = "_-_-_-_-_-_-_-_-_-_-_w";
+/// Reel's `PLAY_SECRET` in these tests.
+const PLAY_SECRET: &str = "s3cret";
+const VID: &str = "dQw4w9WgXcQ";
+
+/// A loopback OpenSubtitles answering every search with one English subtitle, file 4242.
+async fn opensubtitles_stub() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let service = service_fn(|_req: Request<Incoming>| async {
+                let body = r#"{"data":[{"attributes":{"language":"en","download_count":1,"release":"Film.2020.1080p","files":[{"file_id":4242}]}}]}"#;
+                let resp = Response::builder()
+                    .header("content-type", "application/json")
+                    .body(http_body_util::Full::new(Bytes::from_static(body.as_bytes())))
+                    .unwrap();
+                Ok::<_, Infallible>(resp)
+            });
+            tokio::spawn(
+                hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service),
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A hearth whose Scout, Reel and Subtitles seal with their own keys, Reel signs its links, and each revokes
+/// `REVOKED`; with `den` as the Den addon.
+fn configured_hearth(den: Den, opensubtitles: &str) -> Arc<Hearth> {
+    let revocation = || den_seal::Revocation::from_env(REVOKED, Some("0"));
+    let settings = || {
+        let mut s = den_scout::deps::settings_from_env(|_| String::new());
+        s.cache_dir = String::new();
+        s.config_key = SCOUT_PRIV.into();
+        s.revocation = revocation();
+        s
+    };
+    let mut reel = den_reel::Config::from_env();
+    reel.config_key = REEL_PRIV.into();
+    reel.play_secret = Some(PLAY_SECRET.into());
+    reel.revocation = revocation();
+    let mut subs = den_subtitles::Config::from_env();
+    subs.config_key = SUBS_PRIV.into();
+    subs.revocation = revocation();
+    subs.os_api_base = opensubtitles.into();
+    subs.public_base_url = Some("http://node.test/subs".into());
+    Hearth::new(
+        den_reel::AppState::new(reel),
+        den_subtitles::AppState::new(subs),
+        den_remux::AppState::new(den_remux::Config::from_env()),
+        scout::Scout::new(settings(), settings(), &den.scout),
+        den,
+        Limits::default(),
+        None,
+    )
+}
+
+/// Reel's link tag for `message` under `PLAY_SECRET`: keyed BLAKE2b-96 over the message, its key the first half
+/// of BLAKE2b-512 of the secret — computed here apart from Reel, so the wire format is what is pinned.
+fn reel_tag(message: &str) -> String {
+    use blake2::digest::{consts::U12, Mac};
+    use blake2::{Blake2b512, Blake2bMac, Digest};
+    let key = Blake2b512::digest(PLAY_SECRET.as_bytes());
+    let mut mac = <Blake2bMac<U12> as Mac>::new_from_slice(&key[..32]).unwrap();
+    mac.update(message.as_bytes());
+    mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A Reel install-bound play link for `iid`: Reel's own kind, or the Den addon's.
+fn play_link(iid: &str, den: bool) -> String {
+    let kind = if den { "den" } else { "v2" };
+    let ep = 0;
+    let tag = reel_tag(&format!("{kind}\0{VID}\0{iid}\0{ep}"));
+    format!("/play/{VID}.mp4?s={tag}&i={iid}&e=0")
+}
+
+/// A Reel media capability for `iid`, in a form no handler plays: one that passes every check answers 404
+/// without fetching anything.
+fn media_link(iid: &str, den: bool) -> String {
+    let flag = if den { r#","den":true"# } else { "" };
+    let blob = plain(&format!(r#"{{"v":"{VID}","f":"none","i":"{iid}","e":0,"x":4000000000{flag}}}"#));
+    format!("/m/s/{blob}?s={}", reel_tag(&format!("m\0{blob}")))
+}
+
+/// A Scout play ticket for install `iid` under `ring`, with ticket keys of `info`, good until `exp`.
+fn ticket(ring: &den_seal::Keyring, info: &str, iid: &str, exp: std::time::SystemTime) -> String {
+    use den_scout::config::{Config, DebridAccount, DebridService};
+    let config = Config {
+        debrid: vec![DebridAccount { service: DebridService::TorBox, token: "tb".into() }],
+        iid: iid.into(),
+        ..Default::default()
+    };
+    let target = den_scout::play::PlayTarget { info_hash: "a".repeat(40), ..Default::default() };
+    den_scout::ticket::TicketKeys::with_info(Some(ring), info).unwrap().mint(&config, &target, exp)
+}
+
+/// A while ago: a ticket that opens answers 410 for it, one that does not 400, and neither reaches a debrid.
+fn expired() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)
+}
+
+fn later() -> std::time::SystemTime {
+    std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
+}
+
+/// Every per-service route answers byte for byte as it did, whatever the Den addon is configured with —
+/// including the ones a key, a signature or a revocation decides, on services sealing, signing and revoking.
 #[tokio::test]
 async fn the_services_own_routes_are_untouched_by_the_den_addon() {
-    let before = hearth();
-    let after = hearth_den(Limits::default(), None, den_with(Some(VEC_PRIV), IID, "7", true));
-    let scout = plain(&format!(r#"{{"debrid":[{{"service":"torbox","token":"tb"}}],"iid":"{IID}"}}"#));
-    let subs = plain(&format!(r#"{{"osKey":"os","iid":"{IID}"}}"#));
-    let reel = plain(&format!(r#"{{"tmdbKey":"tm","iid":"{IID}"}}"#));
-    let paths = [
-        "/scout/manifest.json".to_string(),
-        "/scout/configure".to_string(),
-        "/scout/config-key".to_string(),
-        format!("/scout/{scout}/manifest.json"),
-        "/reel/manifest.json".to_string(),
-        "/reel/configure".to_string(),
-        "/reel/config-key".to_string(),
-        format!("/reel/{reel}/manifest.json"),
-        format!("/reel/{reel}/meta/movie/not-an-id.json"),
-        "/subs/manifest.json".to_string(),
-        "/subs/configure".to_string(),
-        "/subs/config-key".to_string(),
-        format!("/subs/{subs}/manifest.json"),
-        format!("/subs/{subs}/translate/movie/tt1/Swedish.status"),
-        "/remux/health".to_string(),
-        "/nope".to_string(),
+    let opensubtitles = opensubtitles_stub().await;
+    let before = configured_hearth(Den::new(None, false, Default::default(), None, "none"), &opensubtitles);
+    let after = configured_hearth(den_with(Some(VEC_PRIV), IID, "7", true), &opensubtitles);
+    let scout =
+        sealed(SCOUT_PRIV, &format!(r#"{{"debrid":[{{"service":"torbox","token":"tb"}}],"iid":"{IID}"}}"#));
+    let scoped = sealed(
+        SCOUT_PRIV,
+        &format!(
+            r#"{{"debrid":[{{"service":"torbox","token":"tb"}}],"scope":"availability","iid":"{IID}"}}"#
+        ),
+    );
+    let scout_revoked = sealed(
+        SCOUT_PRIV,
+        &format!(r#"{{"debrid":[{{"service":"torbox","token":"tb"}}],"iid":"{REVOKED}"}}"#),
+    );
+    let subs = sealed(SUBS_PRIV, &format!(r#"{{"osKey":"os","iid":"{IID}"}}"#));
+    let reel = sealed(REEL_PRIV, &format!(r#"{{"tmdbKey":"tm","iid":"{IID}"}}"#));
+    let scout_ring = keyring(SCOUT_PRIV);
+    let scout_info = den_scout::ticket::PLAY_TICKET_INFO;
+    let den_info = den_scout::ticket::DEN_PLAY_TICKET_INFO;
+    let stream = "stream/movie/tt0111161.json";
+    // Each request, and what it answers: a refusal must be the refusal it was, not a 404 both happen to give.
+    let requests = [
+        ("/scout/manifest.json".to_string(), 200),
+        ("/scout/configure".to_string(), 200),
+        ("/scout/config-key".to_string(), 200),
+        (format!("/scout/{scout}/manifest.json"), 200),
+        (format!("/scout/{scoped}/{stream}"), 403),
+        (format!("/scout/{scout_revoked}/{stream}"), 400),
+        (format!("/scout/p/{}", ticket(&scout_ring, scout_info, IID, expired())), 410),
+        (format!("/scout/p/{}", ticket(&scout_ring, scout_info, REVOKED, later())), 400),
+        (format!("/scout/p/{}", ticket(&scout_ring, den_info, IID, expired())), 400),
+        ("/reel/manifest.json".to_string(), 200),
+        ("/reel/configure".to_string(), 200),
+        ("/reel/config-key".to_string(), 200),
+        (format!("/reel/{reel}/manifest.json"), 200),
+        (format!("/reel/{reel}/meta/movie/not-an-id.json"), 200),
+        (format!("/reel{}", play_link(REVOKED, false)), 403),
+        (format!("/reel{}", play_link(IID, true)), 403),
+        (format!("/reel/play/{VID}.mp4?s=deadbeefdeadbeefdeadbeef"), 403),
+        (format!("/reel{}", media_link(IID, false)), 404),
+        (format!("/reel{}", media_link(REVOKED, false)), 403),
+        (format!("/reel{}", media_link(IID, true)), 403),
+        ("/subs/manifest.json".to_string(), 200),
+        ("/subs/configure".to_string(), 200),
+        ("/subs/config-key".to_string(), 200),
+        (format!("/subs/{subs}/manifest.json"), 200),
+        (format!("/subs/{subs}/subtitles/movie/tt0111161.json"), 200),
+        (format!("/subs/{subs}/translate/movie/tt1/Swedish.status"), 400),
+        ("/remux/health".to_string(), 200),
+        ("/nope".to_string(), 404),
     ];
     let answer = |hearth: Arc<Hearth>, own: Option<Service>, path: String| async move {
         let resp = send_on(&hearth, own, &path).await;
@@ -335,13 +478,18 @@ async fn the_services_own_routes_are_untouched_by_the_den_addon() {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, headers, body)
     };
-    for path in &paths {
+    for (path, status) in &requests {
         let was = answer(before.clone(), None, path.clone()).await;
+        assert_eq!(was.0.as_u16(), *status, "{path}: {:?}", was.2);
         assert_eq!(answer(after.clone(), None, path.clone()).await, was, "{path}");
     }
+    // The subtitle list's URLs are built from the service's own base, as they always were.
+    let (_, list) = get_from(&after, &format!("/subs/{subs}/subtitles/movie/tt0111161.json")).await;
+    let url = list["subtitles"][0]["url"].as_str().expect("a subtitle url");
+    assert!(url.starts_with(&format!("http://node.test/subs/{subs}/subtitle/4242.srt")), "{url}");
     // The services' own listeners too, at the root.
     for (service, mount) in [(Service::Scout, "/scout"), (Service::Reel, "/reel"), (Service::Subs, "/subs")] {
-        for path in paths.iter().filter_map(|p| p.strip_prefix(mount)) {
+        for path in requests.iter().filter_map(|(p, _)| p.strip_prefix(mount)) {
             let was = answer(before.clone(), Some(service), path.to_string()).await;
             assert_eq!(
                 answer(after.clone(), Some(service), path.to_string()).await,
@@ -350,4 +498,102 @@ async fn the_services_own_routes_are_untouched_by_the_den_addon() {
             );
         }
     }
+}
+
+/// A play ticket opens only on the routes of the addon that minted it, and the Den addon's revocation reaches
+/// its own: with the Den key derived from Scout's, and with the very same key, where only the ticket keys'
+/// own HKDF info keeps the two apart. (An expired ticket that opens answers 410, one that does not 400; neither
+/// reaches a debrid.)
+#[tokio::test]
+async fn a_ticket_opens_only_where_it_was_minted() {
+    let opensubtitles = opensubtitles_stub().await;
+    let scout_ring = keyring(SCOUT_PRIV);
+    let derived = Den::from_env(
+        |name| if name == "HEARTH_REVOKED_INSTALLS" { REVOKED.into() } else { String::new() },
+        SCOUT_PRIV,
+        "",
+    );
+    let same_key = Den::new(
+        Some(keyring(SCOUT_PRIV)),
+        false,
+        den_seal::Revocation::from_env(REVOKED, Some("0")),
+        None,
+        "own",
+    );
+    for (what, den) in [("derived", derived), ("the same key", same_key)] {
+        let den_ring = den.scout.keyring.clone().unwrap();
+        let hearth = configured_hearth(den, &opensubtitles);
+        let status = |path: String| {
+            let hearth = hearth.clone();
+            async move { send(&hearth, &path).await.status().as_u16() }
+        };
+        let den_ticket = ticket(&den_ring, den_scout::ticket::DEN_PLAY_TICKET_INFO, IID, expired());
+        let scout_ticket = ticket(&scout_ring, den_scout::ticket::PLAY_TICKET_INFO, IID, expired());
+        assert_eq!(
+            status(format!("/den/p/{den_ticket}")).await,
+            410,
+            "{what}: a Den ticket on the Den addon"
+        );
+        assert_eq!(status(format!("/scout/p/{scout_ticket}")).await, 410, "{what}: Scout's on Scout's");
+        assert_eq!(
+            status(format!("/scout/p/{den_ticket}")).await,
+            400,
+            "{what}: a Den ticket opened on /scout"
+        );
+        assert_eq!(
+            status(format!("/den/p/{scout_ticket}")).await,
+            400,
+            "{what}: a Scout ticket opened on /den"
+        );
+        // Revoked by the Den addon: refused before any debrid is asked.
+        let revoked = ticket(&den_ring, den_scout::ticket::DEN_PLAY_TICKET_INFO, REVOKED, later());
+        assert_eq!(status(format!("/den/p/{revoked}")).await, 400, "{what}: a revoked Den ticket");
+    }
+}
+
+/// den-edge's LAN relay can check a Den media capability at `/den/_internal/validate`, as it checks Reel's at
+/// Reel's; each validates only its own kind.
+#[tokio::test]
+async fn the_den_validate_route_checks_den_capabilities_only() {
+    let hearth = configured_hearth(den_with(Some(VEC_PRIV), "", "0", false), "http://127.0.0.1:1");
+    let capability = |den: bool| {
+        let flag = if den { r#","den":true"# } else { "" };
+        let blob =
+            plain(&format!(r#"{{"v":"{VID}","f":"p","h":720,"i":"{IID}","e":0,"x":4000000000{flag}}}"#));
+        format!("/_internal/validate/m/s/{blob}?s={}", reel_tag(&format!("m\0{blob}")))
+    };
+    let status = |path: String| {
+        let hearth = hearth.clone();
+        async move { send(&hearth, &path).await.status().as_u16() }
+    };
+    assert_eq!(status(format!("/den{}", capability(true))).await, 204);
+    assert_eq!(status(format!("/reel{}", capability(false))).await, 204);
+    assert_eq!(status(format!("/den{}", capability(false))).await, 403);
+    assert_eq!(status(format!("/reel{}", capability(true))).await, 403);
+}
+
+/// A node that moves from the key derived from Scout's to one of its own names `scout` among its prior keys,
+/// and every install sealed under the derived key keeps opening; without it they stop, as any rotated-out key's.
+#[test]
+fn moving_to_an_own_key_keeps_the_derived_one_by_name() {
+    let env = |prev: &str| {
+        let prev = prev.to_string();
+        move |name: &str| match name {
+            "HEARTH_CONFIG_KEY" => VEC_PRIV.to_string(),
+            "HEARTH_CONFIG_KEYS_PREV" => prev.clone(),
+            _ => String::new(),
+        }
+    };
+    let derived = Den::from_env(|_| String::new(), SCOUT_PRIV, "").scout.keyring.unwrap();
+    let to_derived = den_seal::seal(&derived.keys[0].pub_key, b"x").unwrap();
+    let kept = Den::from_env(env("scout"), SCOUT_PRIV, "").scout.keyring.unwrap();
+    assert_eq!(kept.keys[0].priv_key, keyring(VEC_PRIV).keys[0].priv_key, "the own key is current");
+    assert_eq!(kept.open(&to_derived).as_deref(), Some(&b"x"[..]));
+    let dropped = Den::from_env(env(""), SCOUT_PRIV, "").scout.keyring.unwrap();
+    assert!(dropped.open(&to_derived).is_none());
+    // Alongside other prior keys, and with no Scout key to derive from it is skipped, not fatal.
+    let mixed = Den::from_env(env(&format!("{SUBS_PRIV}, scout")), SCOUT_PRIV, "");
+    assert_eq!(mixed.scout.keyring.unwrap().keys.len(), 3);
+    let none = Den::from_env(env("scout"), "", "");
+    assert_eq!(none.scout.keyring.unwrap().keys.len(), 1);
 }

@@ -8,7 +8,8 @@
 //!   /den/<config>/stream|play|account|availability…, /den/p/<ticket>, /den/validate → Scout (its Den handler)
 //!   /den/<config>/subtitles|subtitle|translate…                                     → Subtitles
 //!   /den/<config>/meta|prepare…, and the links Reel mints for them
-//!   (/den/play|sources|m|hls|progressive|direct|crop…)                              → Reel
+//!   (/den/play|sources|m|hls|progressive|direct|crop…), and the LAN relay's
+//!   capability check (/den/_internal/validate/m/s/…)                                → Reel
 //!
 //! Each service reads its own member of the combined config (`den_seal::addon`) with the code that reads its own
 //! config, and mints the links it answers with under `/den`, signed or sealed as the Den addon's: they come back
@@ -17,7 +18,9 @@
 //!
 //! Keys: `HEARTH_CONFIG_KEY` (+ `HEARTH_CONFIG_KEYS_PREV`), or when it is unset a ring derived from Scout's
 //! (`Keyring::derive`), so a node that seals Scout seals this too, rotates with it, and neither opens the other's
-//! configs or play tickets. A malformed key refuses every combined config, as each service does. Revocation:
+//! configs or play tickets; `scout` among the prior keys keeps that ring after moving to a key of its own. Play
+//! tickets are keyed under the addon's own HKDF info, so they stay apart from Scout's even under one key. A
+//! malformed key refuses every combined config, as each service does. Revocation:
 //! `HEARTH_REVOKED_INSTALLS`, `HEARTH_CONFIG_EPOCH`, `HEARTH_REQUIRE_INSTALL_ID`.
 
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -60,6 +63,10 @@ pub fn route(path: &str) -> Route {
         // The page's "Test token" button: a pasted token, no config.
         "/validate" => return Route::Scout(path.to_string()),
         _ => {}
+    }
+    // The LAN relay's check of a Reel media capability, as Reel's own: only the Den addon's validate here.
+    if path.starts_with("/_internal/validate/m/s/") {
+        return Route::Reel(path.to_string());
     }
     let mut segments = path.strip_prefix('/').unwrap_or(path).split('/');
     let (first, second, third) = (segments.next().unwrap_or(""), segments.next(), segments.next());
@@ -124,8 +131,34 @@ impl Den {
                 Err(_) => (None, true, "scout's, invalid"),
             }
         } else {
-            match Keyring::from_env(&own, &get("HEARTH_CONFIG_KEYS_PREV")) {
-                Ok(keyring) => (keyring, false, "own"),
+            // `scout` among the prior keys is the ring derived from Scout's key: what a node that sealed under it
+            // names to keep those installs opening after it moves to a key of its own (its private half is
+            // nowhere to copy from).
+            let prev = get("HEARTH_CONFIG_KEYS_PREV");
+            let (scout_named, prev): (Vec<&str>, Vec<&str>) =
+                prev.split(',').map(str::trim).filter(|p| !p.is_empty()).partition(|p| *p == "scout");
+            match Keyring::from_env(&own, &prev.join(",")) {
+                Ok(Some(mut keyring)) => {
+                    let scout = Keyring::parse(scout_key, scout_prev, &|_| {}).ok().flatten();
+                    if scout.as_ref().is_some_and(|scout| scout.keys[0].priv_key == keyring.keys[0].priv_key)
+                    {
+                        eprintln!(
+                            "warning: HEARTH_CONFIG_KEY is Scout's CONFIG_KEY — each opens the other's configs, \
+                             kept apart only by their shape; give the Den addon a key of its own (play tickets \
+                             stay apart either way)"
+                        );
+                    }
+                    match (scout, scout_named.is_empty()) {
+                        (Some(scout), false) => keyring.keys.extend(scout.derive(DERIVED_FROM_SCOUT).keys),
+                        (None, false) => eprintln!(
+                            "warning: HEARTH_CONFIG_KEYS_PREV names `scout`, but Scout has no valid CONFIG_KEY to \
+                             derive it from — skipped"
+                        ),
+                        _ => {}
+                    }
+                    (Some(keyring), false, "own")
+                }
+                Ok(None) => (None, false, "none"),
                 Err(e) => {
                     eprintln!(
                         "error: HEARTH_CONFIG_KEY is set but invalid ({e}) — refusing every Den addon config until \
@@ -459,6 +492,7 @@ mod tests {
             "/progressive/dQw4w9WgXcQ.mp4",
             "/direct/dQw4w9WgXcQ.json",
             "/crop/dQw4w9WgXcQ.json",
+            "/_internal/validate/m/s/blob",
         ] {
             assert_eq!(route(path), Route::Reel(path.into()), "{path}");
         }
@@ -471,7 +505,7 @@ mod tests {
             "/metrics",
             "/meta/movie/tt1.json",
             "/prepare/movie/tt1.json",
-            "/_internal/validate/m/s/blob",
+            "/_internal/validate/m/n/blob",
             "/CFG/manifest.json/more",
             "/CFG/unknown/x",
             "/CFG",

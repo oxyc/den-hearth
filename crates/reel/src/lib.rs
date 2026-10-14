@@ -932,13 +932,16 @@ fn refusal_condition(why: &userconfig::Rejected) -> &'static str {
 /// client can carry the query it was handed on the play URL straight over to `/crop`.
 ///
 /// On the Den addon's routes (`terms`) an install-bound link is read as a Den one (`sign::Binding::Den`) and
-/// admitted by that addon's revocation, so a link verifies only on the routes of the addon that minted it.
+/// admitted by that addon's revocation, so a link verifies only on the routes of the addon that minted it. The
+/// Den addon mints only install-bound links, so there an unbound, untagged or pre-binding link is refused: those
+/// are Reel's own (its config-less `/meta` and `/prepare`, and its grace), and verify only on Reel's routes.
 fn signature_ok(state: &Arc<AppState>, terms: &userconfig::Terms, vid: &str, query: &str) -> bool {
     let Some(secret) = state.cfg.play_secret.as_deref() else { return true };
     let prev = &state.cfg.play_secrets_prev;
+    let den = terms.addon.is_some();
     let Some(presented) = query_param(query, "s") else {
         // A missing tag rides the grace window: a URL issued before signing was turned on carries none.
-        if in_grace(&state.cfg, (state.clock)()) {
+        if !den && in_grace(&state.cfg, (state.clock)()) {
             note_served_in_grace(vid, "without a tag");
             return true;
         }
@@ -946,6 +949,7 @@ fn signature_ok(state: &Arc<AppState>, terms: &userconfig::Terms, vid: &str, que
     };
     let iid = query_param(query, "i");
     let binding = match query_param(query, "e") {
+        None if den => return false,
         None if iid.is_none() => sign::Binding::Unbound,
         // Never minted: an install id always travels with its epoch.
         None => return false,

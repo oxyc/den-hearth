@@ -331,7 +331,8 @@ fn checked_media(
         return Err(if require_signed { CapabilityError::Refused } else { CapabilityError::NotFound });
     }
     // Minted for one addon, refused on the other's routes, where the other's revocation would be asked.
-    if media.den != terms.addon.is_some() {
+    // And the Den addon mints only for an install, so one of its capabilities names one.
+    if media.den != terms.addon.is_some() || (media.den && media.e.is_none()) {
         return Err(CapabilityError::Refused);
     }
     if media.x.saturating_mul(1000) <= (state.clock)() {

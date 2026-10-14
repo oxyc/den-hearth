@@ -37,7 +37,8 @@ tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
-# Config segments for the Den addon's tests (`den_tests.rs`).
+# Config segments, and Reel's link tags, for the Den addon's tests (`tests/den_addon.rs`).
 base64 = "0.23"
+blake2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tokio = { version = "1", features = ["test-util", "io-util"] }
