@@ -248,8 +248,7 @@ impl Cache {
     /// An owned copy of the value. For small markers and counters; a body that is served should go
     /// through `get_shared`, which copies nothing.
     pub fn get(&self, key: &str) -> Option<String> {
-        // Only `String`s go in, so the bytes are always valid UTF-8 and this never substitutes.
-        self.get_shared(key).map(|v| String::from_utf8_lossy(&v).into_owned())
+        self.get_shared(key).map(into_string)
     }
 
     /// The value as a refcounted view of the cached allocation: no copy, and it stays valid after the
@@ -336,7 +335,7 @@ impl Cache {
     /// a disk probe that, for a key only ever written by `put_mem`, cannot hit — a blocking `open`
     /// per lookup, ~150 of them per resumed film, all of them ENOENT.
     pub fn get_mem(&self, key: &str) -> Option<String> {
-        self.mem_get(key).map(|v| String::from_utf8_lossy(&v).into_owned())
+        self.mem_get(key).map(into_string)
     }
 
     // ---- memory tier -------------------------------------------------------
@@ -485,6 +484,11 @@ impl Cache {
             let _ = std::fs::remove_file(&tmp);
         }
     }
+}
+
+/// Only `String`s go in, so the bytes are always valid UTF-8 and the fallback never substitutes.
+fn into_string(v: Bytes) -> String {
+    String::from_utf8(v.to_vec()).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn unix_now() -> u64 {
