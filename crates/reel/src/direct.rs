@@ -43,6 +43,7 @@ use futures_util::FutureExt;
 
 use crate::config::Config;
 use crate::httputil::{self, Body};
+use crate::resolver::{fallback_line, resolve_with, Resolved};
 use crate::state::{AppState, BoxFuture, SharedResolve};
 use crate::ytdlp::{classify, PlayError};
 
@@ -157,7 +158,7 @@ fn first_url_in(line: &str) -> Option<&str> {
 
 /// The resident worker's answer as a `Direct` — by the same rules the printed one goes through, so
 /// one place decides what counts as an answer and when it stops being good.
-fn from_worker(answer: crate::worker::Answer, now: u64) -> Option<Direct> {
+pub(crate) fn from_worker(answer: crate::worker::Answer, now: u64) -> Option<Direct> {
     let urls: Vec<&str> = answer.urls.iter().map(String::as_str).collect();
     let (video, audio) = match urls.as_slice() {
         [only] => (only.to_string(), None),
@@ -268,9 +269,41 @@ pub(crate) async fn refuses_its_end(http: &reqwest::Client, url: &str) -> bool {
     matches!(asked, Ok(res) if res.status() == reqwest::StatusCode::FORBIDDEN)
 }
 
-/// One extraction: the resident worker first, and the binary whenever it cannot answer — which is
-/// every way it can fail, including not being configured at all.
-async fn extract(st: &AppState, vid: &str, format: &str) -> Result<Direct, PlayError> {
+/// One extraction by whichever resolver `REEL_RESOLVER` names, and which one answered. In `auto`, a
+/// rustypipe failure of any kind is followed by yt-dlp, and the failure is logged.
+pub(crate) async fn extract(st: &AppState, vid: &str, format: &str) -> Resolved {
+    let resolved = resolve_with(
+        st.cfg.resolver,
+        || async {
+            // rustypipe without a PO token is left with YouTube's iOS and TV clients, whose URLs
+            // googlevideo serves for about a minute and then refuses (measured 2026-10-14: every
+            // answer). In `auto` that is not an answer, so it is asked here, once, and yt-dlp gets
+            // the video instead of the cache holding a capped one for hours. `rustypipe` alone is
+            // the raw measurement and keeps what it was told.
+            let auto = st.cfg.resolver == crate::resolver::ResolverMode::Auto;
+            match st.rustypipe.resolve(&st.cfg, vid, format, (st.clock)()).await {
+                Ok(d) if auto && refuses_its_end(&st.http, &d.video).await => {
+                    Err(crate::resolver::play_error(
+                        crate::resolver::Why::Capped,
+                        "googlevideo refuses the end of the resolved file".into(),
+                    ))
+                }
+                other => other,
+            }
+        },
+        || extract_ytdlp(st, vid, format),
+    )
+    .await;
+    if let Some(why) = &resolved.fallback {
+        eprintln!("{}", fallback_line(&st.cfg, why, vid));
+        crate::log_limited("rustypipe fallback", || format!("[{vid}] {}", why.detail));
+    }
+    resolved
+}
+
+/// The resident worker first, and the binary whenever it cannot answer — which is every way it can
+/// fail, including not being configured at all.
+async fn extract_ytdlp(st: &AppState, vid: &str, format: &str) -> Result<Direct, PlayError> {
     match st.worker.resolve(&st.cfg, vid, format).await {
         Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
             status: 502,
@@ -436,13 +469,15 @@ pub(crate) async fn answer(
                     // rather than on the budget: one permit is spent per video, not per caller.
                     let _permit = st.probe_sem.acquire().await;
                     let started = std::time::Instant::now();
-                    let mut answer = extract(&st, &v, &format).await;
+                    let first = extract(&st, &v, &format).await;
+                    let (mut answer, mut by) = (first.answer, first.resolver);
                     // A capped extraction stays capped for its URLs' whole six hours, and a fresh one
                     // usually is not (`refuses_its_end`), so it is worth one more — once, so a video
                     // that is capped every time still plays its first minute rather than nothing.
                     if let Ok(d) = &answer {
                         if refuses_its_end(&st.http, &d.video).await {
-                            let again = extract(&st, &v, &format).await;
+                            let second = extract(&st, &v, &format).await;
+                            let (again, again_by) = (second.answer, second.resolver);
                             let still = match &again {
                                 Ok(d) => refuses_its_end(&st.http, &d.video).await.to_string(),
                                 Err(e) => e.reason.clone(),
@@ -450,6 +485,7 @@ pub(crate) async fn answer(
                             eprintln!("[{v}] googlevideo refused the end of the resolved file; resolved again (still capped: {still})");
                             if again.is_ok() {
                                 answer = again;
+                                by = again_by;
                             }
                         }
                     }
@@ -459,10 +495,14 @@ pub(crate) async fn answer(
                     let dur_ms = started.elapsed().as_millis();
                     eprintln!(
                         "{}",
-                        match &answer {
-                            Ok(d) => resolve_cache_line(&st.cfg, "served", "cache_miss", dur_ms, &v, Some(d)),
-                            Err(e) => resolve_cache_line(&st.cfg, "refused", &e.reason, dur_ms, &v, None),
-                        }
+                        crate::resolver::tag(
+                            &match &answer {
+                                Ok(d) =>
+                                    resolve_cache_line(&st.cfg, "served", "cache_miss", dur_ms, &v, Some(d)),
+                                Err(e) => resolve_cache_line(&st.cfg, "refused", &e.reason, dur_ms, &v, None),
+                            },
+                            by
+                        )
                     );
                     answer
                 };

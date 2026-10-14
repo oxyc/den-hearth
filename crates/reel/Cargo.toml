@@ -48,6 +48,15 @@ subtle = "2"
 # HTTP dates for /play's Last-Modified, If-Modified-Since and If-Range. hyper already builds it for
 # the Date header, so this too is a direct edge rather than new code.
 httpdate = "1"
+# In-process YouTube resolver (innertube client + embedded QuickJS for signature deobfuscation), tried
+# before yt-dlp when REEL_RESOLVER selects it. Optional: the default build and image are unchanged.
+# GPL-3.0 — see the README before this feature ships in a distributed image. rustls like reqwest above,
+# so no OpenSSL; PO tokens come from the separate `rustypipe-botguard` binary (found on PATH), never linked.
+rustypipe = { version = "0.11.4", optional = true, default-features = false, features = ["rustls-tls-webpki-roots"] }
+
+[features]
+default = []
+rustypipe = ["dep:rustypipe"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }

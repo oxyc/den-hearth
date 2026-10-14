@@ -576,6 +576,11 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 | `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold; below 256 MB (under one trailer) it falls back to the default |
 | `CACHE_TTL_SECS` | `1209600` (14 days) | Drop a trailer this many seconds after it was last served; `0` = size cap only |
 | `YTDLP_PLAYER_CLIENTS` | *(unset — yt-dlp chooses)* | Pin the YouTube innertube client(s) for `--extractor-args player_client`, comma-separated. **Normally leave this alone.** It used to default to `tv_embedded,android`; yt-dlp has since retired `tv_embedded`, and an unrecognised client is answered with a *warning* (`Skipping unsupported client`) that `--no-warnings` hides — so the pin silently degraded to `android` alone, which now needs a PO token for both HTTPS and DASH. Which client works is a judgement about what YouTube is enforcing this month, it is the judgement the yt-dlp team makes daily, and bumping `YTDLP_VERSION` is how we receive it. Set this only to ride out a specific outage, and check the name against the yt-dlp release you have pinned — a retired one fails quietly. |
+| `REEL_RESOLVER` | `ytdlp` | Who resolves `/direct`'s URLs: `ytdlp`, `rustypipe` (in-process, no subprocess) or `auto` (rustypipe first, yt-dlp on any rustypipe failure). The latter two need a build with `--features rustypipe` (**GPL-3.0** dependency — read `src/rp.rs` and the spike's PR before shipping it in an image); without it they fail and `auto` is yt-dlp. `/play` downloads and the probe always use yt-dlp. Decision lines carry `resolver=ytdlp\|rustypipe`, and a fallback writes `event=resolver_fallback`. |
+| `REEL_BOTGUARD_BIN` | *(unset)* | Path to a `rustypipe-botguard` binary, which mints PO tokens for rustypipe's web client. Unset, rustypipe uses only its iOS and TV clients, which need none. Never found on `PATH` by itself, so a build behaves the same wherever it runs. |
+
+Measuring the resolvers against each other is an `#[ignore]`d test (`src/resolver_bench.rs`) fed by
+`bench/trailer-ids.txt`; its module doc has the commands.
 
 ## Run
 

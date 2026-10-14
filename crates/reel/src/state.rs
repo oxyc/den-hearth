@@ -119,6 +119,9 @@ pub struct AppState {
     /// The resident yt-dlp, when one is configured and running (`worker.rs`). Every failure of it
     /// falls back to spawning the binary, so this is only ever an optimisation.
     pub worker: crate::worker::Worker,
+    /// The in-process rustypipe client, built on first use. Inert unless `REEL_RESOLVER` asks for it
+    /// and the `rustypipe` feature is compiled in.
+    pub rustypipe: crate::rp::Rp,
     pub upstream: Box<dyn Upstream>,
     /// The same HTTP client the upstream lookups use, for the HLS proxy's own fetches (`hls.rs`).
     /// Shared rather than a second one: a client is a connection pool, and googlevideo and TMDB are
@@ -227,6 +230,7 @@ impl AppState {
             direct_inflight: Mutex::new(HashMap::new()),
             progressive: Mutex::new(HashMap::new()),
             worker: Default::default(),
+            rustypipe: Default::default(),
             upstream,
             http,
             prober: default_prober(cfg.clone(), probe_sem.clone()),

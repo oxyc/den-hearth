@@ -135,6 +135,13 @@ pub struct Config {
     pub ytdlp_worker: Option<String>,
     /// `PYTHON_PATH` — the interpreter that runs the worker. Only consulted when one is configured.
     pub python: String,
+    /// `REEL_RESOLVER` — `ytdlp` (default), `rustypipe` or `auto` (rustypipe first, yt-dlp on any
+    /// failure). Only `/direct`'s resolve consults it; `rustypipe` and `auto` need a build with the
+    /// `rustypipe` cargo feature, and without one rustypipe simply fails, so `auto` is yt-dlp.
+    pub resolver: crate::resolver::ResolverMode,
+    /// `REEL_BOTGUARD_BIN` — the `rustypipe-botguard` binary that mints PO tokens for rustypipe's web
+    /// client. Unset means none: rustypipe then uses only the iOS and TV clients, which need no token.
+    pub botguard_bin: Option<String>,
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
     pub kinocheck_base: String,
@@ -395,6 +402,8 @@ impl Config {
             ytdlp_extractor_args,
             ytdlp_worker: env_opt("YTDLP_WORKER"),
             python: env_opt("PYTHON_PATH").unwrap_or_else(|| "python3".to_string()),
+            resolver: crate::resolver::ResolverMode::parse(env_opt("REEL_RESOLVER").as_deref()),
+            botguard_bin: env_opt("REEL_BOTGUARD_BIN"),
             tmdb_base: "https://api.themoviedb.org/3".to_string(),
             kinocheck_base: "https://api.kinocheck.com".to_string(),
             cache_ok_until: std::sync::atomic::AtomicU64::new(0),

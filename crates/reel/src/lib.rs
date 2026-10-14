@@ -29,6 +29,8 @@ mod media_gate;
 mod play;
 mod prepare;
 mod progressive;
+mod resolver;
+mod rp;
 mod seal;
 mod sign;
 mod sources;
@@ -40,6 +42,10 @@ mod ytdlp;
 
 #[cfg(test)]
 mod tests;
+
+// Opt-in measurement, `#[ignore]`d: never part of a default `cargo test`. See the module doc.
+#[cfg(test)]
+mod resolver_bench;
 
 use std::convert::Infallible;
 use std::future::Future;

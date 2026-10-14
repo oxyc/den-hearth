@@ -189,7 +189,7 @@ pub(crate) fn temp_dir() -> PathBuf {
     p
 }
 
-fn test_cfg(cache_dir: PathBuf) -> Config {
+pub(crate) fn test_cfg(cache_dir: PathBuf) -> Config {
     Config {
         port: 8092,
         ytdlp_cache: cache_dir.join("yt-dlp"),
@@ -225,6 +225,8 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         // Never the resident one in a test: it would want an interpreter and the pinned zipapp.
         ytdlp_worker: None,
         python: "python3".into(),
+        resolver: Default::default(),
+        botguard_bin: None,
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
         cache_ok_until: std::sync::atomic::AtomicU64::new(0),
@@ -293,6 +295,7 @@ fn build_state_full(
         direct_inflight: Mutex::new(HashMap::new()),
         progressive: Mutex::new(HashMap::new()),
         worker: Default::default(),
+        rustypipe: Default::default(),
         upstream,
         // Never used by a test: nothing here reaches the HLS proxy, and a client builds no
         // connection until something asks it for one.

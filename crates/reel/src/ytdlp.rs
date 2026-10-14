@@ -96,7 +96,7 @@ impl PlayError {
     }
 }
 
-const THROTTLED_MESSAGE: &str = "Trailers can't be fetched right now. Try again later.";
+pub(crate) const THROTTLED_MESSAGE: &str = "Trailers can't be fetched right now. Try again later.";
 
 /// Is this YouTube refusing the BOX rather than the video? A 429, the "confirm you're not a bot"
 /// wall (spelled with a straight or a typographic apostrophe, depending on the release), or its
