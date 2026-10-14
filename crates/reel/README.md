@@ -579,55 +579,15 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 
 ## Run
 
-```bash
-docker build -t den-reel .
-docker run -d --name trailers -p 8092:8092 -v den-reel-cache:/cache \
-  -e TMDB_KEY=<your-tmdb-key> den-reel
-curl http://localhost:8092/meta/movie/tt0111161.json          # → a /play URL
-curl -o t.mp4 http://localhost:8092/play/dSdWpY2Bxsc.mp4       # playback smoke test
-```
+Reel runs inside den-hearth: see the repository README for building the image, running it and the env
+prefixes (`REEL_*`). Without Docker it needs `ffmpeg`, `yt-dlp` and a JS runtime such as `deno` on PATH.
 
-Without Docker (needs `ffmpeg`, `yt-dlp`, and a JS runtime like `deno` on PATH):
-`TMDB_KEY=… cargo run --release`.
-
-Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, no yt-dlp).
+Tests: `cargo test -p den-reel` (hermetic: a fake upstream and a stubbed prober, no network, no yt-dlp).
 
 ## Deploy
 
-The homelab runs it as a Podman Quadlet unit, `den-reel.container`, from the `den` repo's
-`deploy/`: LAN host port 8092, a 1 GiB memory cap, every capability dropped, `no-new-privileges`,
-uid 65532 (the image's non-root user), and the cache bind-mounted from `/var/lib/den/reel-cache`
-(owned by 65532). New images reach it through the health-gated `den-update` script. The env files,
-digest pinning and rollback are described once, in that repo's `deploy/README.md`.
-
-**Release images.** Main CI builds an immutable `:candidate-<sha>` image for every main commit, starts it,
-checks that `/manifest.json` reports the `VERSION` file's release, and scans it with Trivy (a CRITICAL with a
-fix available fails the run; fixable HIGH and CRITICAL findings go to code scanning). Release with
-`scripts/release.sh X.Y.Z`: it commits `VERSION` (and only that — `Cargo.toml` keeps its number, so a release
-never invalidates the Docker dependency layer; the image carries the release as `DEN_VERSION`), waits for that
-commit's own main CI, then tags `vX.Y.Z`. The tag's `docker-publish` run finds that exact successful CI run,
-verifies the candidate digest, signs it, tags it `:X.Y.Z`, `:X.Y`, `:X` and `:sha-<7>` and moves `:latest` —
-it neither compiles nor tests again.
-
-`docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) with the
-base images re-pulled, no build cache and a fresh `apt-get upgrade`, scans it (a CRITICAL with a fix
-available fails the run, here only in OS packages, the part a rebuild can fix), and publishes it as
-`:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Debian security fix — ffmpeg parses every trailer
-downloaded here — reaches the box between releases, through `den-update`'s probe and rollback like any
-release. It rebuilds the tag's pinned yt-dlp and deno; a newer yt-dlp still ships only with a release. If the
-newest tag predates this pipeline (no `VERSION`), the rebuild refuses until one release has been cut from
-current `main`. A finding that does not apply goes in `.trivyignore` with a reason. Every image carries SLSA
-provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
-
-```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/oxyc/den-reel/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/oxyc/den-reel@sha256:<digest>
-```
-
-Nothing sits in front of it, so play URLs are built from the host the client asked for
-(`http://<den-ip>:8092/play/…`). Add the URL `/configure` gives you —
-`http://<den-ip>:8092/<config>/manifest.json` — to Den (Settings → Plugins, or `dev-addons.json`).
-The config-less `/manifest.json` works only while `TMDB_KEY` is still set, and resolves with that
-shared key rather than the install's own.
+Released, signed and deployed as part of den-hearth (the repository README and the den repo's `deploy/`).
+Play URLs are built from the host the client asked for (`http://<den-ip>:8092/play/…` on Reel's own
+listener). Add the URL `/configure` gives you, `http://<den-ip>:8092/<config>/manifest.json`, to Den
+(Settings → Plugins, or `dev-addons.json`). The config-less `/manifest.json` works only while `TMDB_KEY` is
+set, and resolves with that shared key rather than the install's own.
