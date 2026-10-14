@@ -434,6 +434,9 @@ impl Cache for TieredCache {
             return;
         }
         let now = unix_secs((self.clock)());
+        // Skipping the rewrite keeps the file's older expiry: after a restart the entry can lapse up to a quarter
+        // of `ttl` early. Refreshing only the expiry would still mean rewriting the file (`<expiry>\n<value>`),
+        // and saving that write is the point of the rule. Deliberate; see PORTING.md.
         if self.on_disk_is_current(&name, value, ttl, now) {
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
             return;
