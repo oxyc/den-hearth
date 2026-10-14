@@ -916,8 +916,8 @@ fn stamp_at(t: SystemTime) -> String {
     t.duration_since(UNIX_EPOCH).unwrap().as_secs().to_string()
 }
 
-/// A transfer queued and not yet produced anything: "coming" until the give-up deadline.
-/// A transfer already queued is never PAID FOR again, however long it goes on failing.
+// A transfer queued and not yet produced anything: "coming" until the give-up deadline.
+// A transfer already queued is never PAID FOR again, however long it goes on failing.
 
 // Queued-marker and Real-Debrid / Premiumize tests (addbudget_test.go lines 733-1479 in the Go file).
 

@@ -2133,7 +2133,7 @@ fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
         assert!(ok && ids.is_empty(), "a genuinely empty account must stay an ANSWER");
 
         // The filter keeps 32 (base32) and 40 (hex) character hashes, and nothing else.
-        assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds");
+        const { assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds") };
         for n in [32usize, 40] {
             assert!(hash_norm_matches(&"b".repeat(n)), "hashNorm rejects a {n}-char hash the listing keeps");
             let (got, ok, _) = decode_listing(
@@ -2269,7 +2269,7 @@ fn decode_listing_drops_unusable_hashes_functional_half() {
     assert!(ok && ids.is_empty(), "a genuinely empty account must stay an ANSWER");
 
     // The filter keeps 32 (base32) and 40 (hex) character hashes, and nothing else.
-    assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds");
+    const { assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds") };
     for n in [32usize, 40] {
         assert!(
             normalize_hash(&"b".repeat(n)).is_some(),

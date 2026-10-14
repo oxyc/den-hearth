@@ -170,7 +170,7 @@ pub(crate) fn junk_class_of(t: &str) -> &'static str {
     let t = CONTAINER_EXT.replace_all(t, "${1}");
     for (class, re) in UNAMBIGUOUS_JUNK.iter() {
         if re.is_match(&t) {
-            return *class;
+            return class;
         }
     }
     if !RE_GOOD_SOURCE.is_match(&t) {
@@ -754,7 +754,7 @@ pub(crate) fn rank_streams_debug(
         out.truncate(cap);
     }
     // After the cap, so the recorded scores are the ones that actually ordered what the viewer sees.
-    if let Some(d) = debug.as_deref_mut() {
+    if let Some(d) = debug {
         d.ranked = out.len() as i64;
         d.kept = out
             .iter()

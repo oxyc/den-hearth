@@ -338,7 +338,7 @@ impl RebuildGate {
         // A cool-off is also why this cannot be derived from the map: it keeps the KEY reserved with no
         // task behind it.
         self.live = self.live.saturating_sub(1);
-        if !self.rebuilds.get(key).is_some_and(|l| l.gen == gen) {
+        if self.rebuilds.get(key).is_none_or(|l| l.gen != gen) {
             return;
         }
         match cooloff_until {
@@ -1516,15 +1516,9 @@ impl Inner {
     }
 
     /// The future of one shared build: everything it needs is owned, so it can outlive the request that started it.
-    fn build_task(
-        self: Arc<Self>,
-        job: ListJob,
-        debug: bool,
-    ) -> impl Future<Output = BuildResult> + Send + 'static {
-        async move {
-            let deadline = Self::deadline_in(self.deps.scrape_timeout + LIST_BUILD_SLACK);
-            self.build_stream_list(deadline, &job, debug).await
-        }
+    async fn build_task(self: Arc<Self>, job: ListJob, debug: bool) -> BuildResult {
+        let deadline = Self::deadline_in(self.deps.scrape_timeout + LIST_BUILD_SLACK);
+        self.build_stream_list(deadline, &job, debug).await
     }
 
     /// Go `sf.Do`: concurrent callers of one key share one run of the build and its result. The build runs on a task
@@ -2648,7 +2642,7 @@ impl Inner {
         if config.debrid.len() > 1 {
             let check_deadline = Self::deadline_in(status_budget).min(resolve_deadline);
             if let Ok((play_truth, _)) =
-                timeout_at(check_deadline, pool.cache_check(&[target.info_hash.clone()])).await
+                timeout_at(check_deadline, pool.cache_check(std::slice::from_ref(&target.info_hash))).await
             {
                 preferred.extend(play_truth.held_by(&target.info_hash));
             }

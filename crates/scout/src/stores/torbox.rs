@@ -172,6 +172,10 @@ static OUTBOUND: Semaphore = Semaphore::const_new(MAX_TORBOX_OUTBOUND);
 /// Go `torboxStatusSlots`.
 static STATUS_SLOT_POOL: Semaphore = Semaphore::const_new(STATUS_SLOTS);
 /// Go `torboxCheckFlights`, `torboxStatusFlights`, `listingFlight`.
+///
+/// listingFlight collapses concurrent fetches of one account's listing into a single round trip. The cache
+/// alone only helps SEQUENTIAL callers, and the case this exists for — a poster grid probing eight releases at
+/// once — is anything but sequential.
 static CHECK_FLIGHTS: DetachedFlight<TorboxCheckResult> = DetachedFlight::new("torbox check-cached round");
 static STATUS_FLIGHTS: DetachedFlight<CachedStatus> = DetachedFlight::new("torbox status read");
 static LISTING_FLIGHTS: DetachedFlight<Option<Arc<HashMap<String, i64>>>> =
@@ -217,6 +221,91 @@ impl Reply {
     }
 }
 
+/// Counts one TorBox call by endpoint and outcome when it ends, however it ends.
+///
+/// Go counts the call beside the request (`metrics.torboxCall(endpoint, err == nil && …)` after `s.do`), and a
+/// cancelled context makes `do` return an error, whether the caller was still waiting for an outbound slot or for
+/// the response. A call its caller walked away from is therefore an `error` in the counters. Cancellation here is
+/// dropping the future, which would otherwise leave the call uncounted.
+struct CallCount {
+    endpoint: &'static str,
+    ok: bool,
+}
+
+impl Drop for CallCount {
+    fn drop(&mut self) {
+        metrics().torbox_call(self.endpoint, self.ok);
+    }
+}
+
+/// What an add that createtorrent answered with a failure leaves behind when its caller goes away before the code
+/// that files the failure has run: the charge handed back (`refundUnusedAdd`) and the refusal `Resolve` writes for
+/// the error `addMagnet` returns. Armed across the one await between the answer and that code.
+struct AbandonedAnswer<'a> {
+    store: &'a TorBoxStore,
+    info_hash: &'a str,
+    err: StoreError,
+    armed: bool,
+}
+
+impl Drop for AbandonedAnswer<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let identity = self.store.account_identity();
+        refund_unused_add(&identity);
+        record_refusal(self.store.cache(), DebridService::TorBox, &identity, self.info_hash, &self.err);
+    }
+}
+
+/// What `CacheCheck` remembers for a caller that goes away before every batch has come back: the held releases it
+/// already knew and those the finished batches reported, which Go writes after `g.Wait()` returns on the cancelled
+/// context. Armed from the first batch until they have all been joined.
+struct AbandonedCacheCheck<'a> {
+    store: &'a TorBoxStore,
+    known: &'a HashMap<String, bool>,
+    hashes: &'a [String],
+    answered: &'a Mutex<Vec<Option<HashMap<String, bool>>>>,
+    armed: bool,
+}
+
+impl Drop for AbandonedCacheCheck<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let answers = lock(self.answered).clone();
+            self.store.settle_cache_check(self.known.clone(), self.hashes, &answers);
+        }
+    }
+}
+
+/// The torrent id `resolveHeldTorrent` remembers unconditionally, written for it when its caller goes away while the
+/// pack's file list is being read: the id (with the status snapshot cleared) is what Go's flow leaves behind once the
+/// cancelled read has come back as "no answer". Armed across that one await.
+struct UnwrittenId<'a> {
+    store: &'a TorBoxStore,
+    info_hash: &'a str,
+    torrent_id: i64,
+    armed: bool,
+}
+
+impl Drop for UnwrittenId<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(cache) = &self.store.cache {
+            let identity = self.store.account_identity();
+            cache.put(
+                &torrent_id_key(&identity, self.info_hash),
+                &self.torrent_id.to_string(),
+                RESOLVE_CACHE_TTL,
+            );
+            clear_torbox_status(cache.as_ref(), &identity, self.info_hash);
+        }
+    }
+}
+
 impl TorBoxStore {
     /// A store's cache, or the one that holds nothing where Go has a nil `Cache`.
     fn cache(&self) -> &dyn Cache {
@@ -244,10 +333,10 @@ impl TorBoxStore {
     /// Go `torBoxStore.do`: every TorBox request waits for an outbound slot first. The call is counted by endpoint
     /// and outcome (Go does it beside the request in `get`, `addMagnet` and `controlRequest`; it is the same count).
     async fn send(&self, req: reqwest::Request) -> Result<Reply, DoError> {
-        let endpoint = torbox_endpoint(req.url());
+        let mut count = CallCount { endpoint: torbox_endpoint(req.url()), ok: false };
         let slot = OUTBOUND.acquire().await.map_err(|_| DoError::from("the outbound limiter is closed"))?;
         let resp = self.client.do_request(req).await;
-        metrics().torbox_call(endpoint, resp.as_ref().is_ok_and(|r| r.status().is_success()));
+        count.ok = resp.as_ref().is_ok_and(|r| r.status().is_success());
         Ok(Reply { resp: resp?, _slot: slot })
     }
 
@@ -295,8 +384,32 @@ impl TorBoxStore {
         TorboxCheckResult { cached: answer, ok: true }
     }
 
+    /// What `CacheCheck` makes of the batches that came back. Only a batch that came back describes its hashes. One
+    /// that failed leaves them ABSENT from the map, which the pool reads as "we do not know" — writing false there
+    /// states that TorBox does not hold them, which is a different and costly claim: it drops a genuinely cached
+    /// release from a cached-only list, or pays an add at play time for a torrent the account already had. With
+    /// 500 seeds in batches of 100, one timed-out batch made that claim about 100 releases and reported no error
+    /// at all. The held releases are remembered whatever came back. Returns the map and which batches answered.
+    fn settle_cache_check(
+        &self,
+        mut result: HashMap<String, bool>,
+        hashes: &[String],
+        answers: &[Option<HashMap<String, bool>>],
+    ) -> (HashMap<String, bool>, Vec<bool>) {
+        let mut batch_ok = vec![false; answers.len()];
+        for (i, (batch, answer)) in hashes.chunks(CACHE_BATCH).zip(answers).enumerate() {
+            let Some(answer) = answer else { continue };
+            batch_ok[i] = true;
+            for h in batch {
+                result.insert(h.clone(), answer.get(&go_to_lower(h)).copied().unwrap_or(false));
+            }
+        }
+        remember_cached(self.cache(), DebridService::TorBox, &self.account_identity(), &result);
+        (result, batch_ok)
+    }
+
     /// Go `torBoxStore.checkCachedBatch`.
-    async fn check_cached_batch(&self, hashes: &[String]) -> Option<HashMap<String, bool>> {
+    pub(crate) async fn check_cached_batch(&self, hashes: &[String]) -> Option<HashMap<String, bool>> {
         let mut set: Vec<String> = hashes.iter().map(|h| go_to_lower(h)).collect();
         set.sort();
         let key = format!("{}:{}", key_hash(&self.account_identity()), key_hash(&set.join(",")));
@@ -435,8 +548,33 @@ impl TorBoxStore {
         let cache = self.cache();
         // An add we already sent and never heard back about must not be sent again — see addAttemptKey.
         add_in_flight(cache, DebridService::TorBox, &identity, info_hash)?;
-        // Go refuses to CHARGE an add the caller's deadline can no longer carry (`addWouldMissTheClock`). Here a
-        // spent deadline drops this future, so there is no spent clock to find.
+        // Go's `addWouldMissTheClock` refuses to CHARGE an add the caller's deadline can no longer carry. Here a
+        // spent deadline drops this future, so there is no spent clock to find; its comment is kept for whoever
+        // adds a deadline seam:
+        //
+        // The charge and the in-flight marker are both written before the request is built, and a dead context
+        // fails at client.Do, which returns without refunding — deliberately, since a request that may have
+        // reached the wire must not be re-sent. So an add attempted on a spent clock costs one of the fifty per
+        // hour, sends nothing at all, and leaves a 90-second marker that has the next poll report a download
+        // nobody queued. Measured on an expired context: zero upstream requests, one add spent per service.
+        //
+        // It guards the CHARGE rather than the store, and that distinction is the whole point. An earlier
+        // version skipped the whole store from ResolvePreferring when the clock was gone, which also discarded
+        // the free cache reads ahead of the charge — addInFlight and the two backoff gates — and so turned a
+        // 202 "downloading" into a 503 naming the viewer's debrid as refusing, for a release scout had queued
+        // moments earlier. Placed here, the free answers still surface and only the pointless purchase stops.
+        // Wrapped in errScoutSide, and that wrap is load-bearing rather than cosmetic. recordRefusal excludes
+        // errScoutSide by name, and without it this error was filed as a REFUSAL BY THE STORE: it wraps neither
+        // a cancellation nor errScoutSide, and it returns before noteAddAttempt, so both of recordRefusal's
+        // guards missed it and TorBox's add-error handler wrote a one-minute refusedKey naming TorBox for a
+        // release TorBox had never been asked about. One spent clock then made a healthy release answer 503 on
+        // /play AND on ?probe=1 for the next sixty seconds, on a fresh clock, with the store skipped as
+        // "backing off". Measured: control 302, treatment 503 twice over.
+        //
+        // That is the laundering this file warns about twice — at recordRefusal itself and at the RD site that
+        // once built a StoreUnavailableError here and hid the cause from isCancellation. It came back because
+        // the guard was placed one line ABOVE noteAddAttempt, and it was the marker that used to route this
+        // error away from recordRefusal.
         spend_add(DebridService::TorBox, &identity, info_hash, prefetch)?;
         let magnet = magnet_for(info_hash);
         let mut form = vec![("magnet", magnet.as_str()), ("seed", "3"), ("allow_zip", "false")];
@@ -496,7 +634,18 @@ impl TorBoxStore {
             // marker, or one whose marker's TTL lapsed) is undiscoverable from createtorrent's error body
             // alone, so the queue's own listing is asked to find it.
             if status == 400 && torbox_already_queued_error(&raw) {
-                if let Ok((qid, true)) = self.find_queued_by_hash(info_hash).await {
+                // The lookup runs on the caller's context in Go, so a caller that goes away during it makes the
+                // lookup fail and the add fall through to the answered-failure code below. Dropping this future
+                // must leave that state: the charge handed back, and the refusal Resolve files for that answer.
+                let mut abandoned = AbandonedAnswer {
+                    store: self,
+                    info_hash,
+                    err: dead_link(format!("torbox createtorrent http {status}{detail}")),
+                    armed: true,
+                };
+                let found = self.find_queued_by_hash(info_hash).await;
+                abandoned.armed = false;
+                if let Ok((qid, true)) = found {
                     refund_unused_add(&identity);
                     mark_added_by_us(cache, &identity, info_hash);
                     cache.put_class(
@@ -1126,32 +1275,53 @@ impl TorBoxStore {
         // concurrent request against the same API+token account in the window between the two reads.
         //
         // A panic in the fetch is abandoned rather than fatal, and every waiter is answered "could not find
-        // out" (Go's `recoverBackground`).
+        // out" (Go's `recoverBackground`). Go's own words for it: this closure is a BACKGROUND goroutine now, and
+        // DoChan makes a panic in it fatal to the process: singleflight re-raises it with `go panic(e)` on a
+        // fresh goroutine whenever anyone is waiting on a channel, where nothing can recover it. Under the
+        // blocking Do it unwound into the caller's stack and the handler's own recover turned it into a 500.
+        // Moving to DoChan quietly converted a recoverable panic into a dead container, which is the rule
+        // probe_fanout.go's recoverBackground was written for; abandoning the fetch is already a first-class
+        // outcome here, so a panic joins it.
+        //
+        // Go builds the fetch's context INSIDE the closure, so its cancel is tied to the lifetime of the fetch
+        // rather than to the leader's own call: constructing it outside and deferring the cancel there undid the
+        // detachment completely, since the deferred cancel fires when the leader's caller returns, which on the
+        // abandonment path is exactly when the fetch still needs to be running for everyone else — measured as
+        // the joiner inheriting "context canceled", the very failure this is here to prevent. Go's fetch also
+        // keeps the LEADER'S DEADLINE (`context.WithDeadline`); the port has no context to read one from, so
+        // the fetch runs on the same fifteen seconds as the other shared reads.
+        //
+        // Go also looks once more at the flight's answer when the caller's own budget runs out in the same
+        // instant the answer lands, because select picks at random when both are ready and the answer is a fact
+        // about the account that does not go stale because the asker ran out of clock. Measured 50.1% lost over
+        // 20,000 trials, and recovered only for the case ready at the moment the select is evaluated. Here the
+        // caller's budget is a timeout around this whole call, which polls the answer before the clock.
         let store = self.clone();
         let memo_key = key.clone();
-        let (answer, _) = LISTING_FLIGHTS
-            .run(&key, move || async move {
-                let (ids, ok, persistent) =
-                    match tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing()).await {
-                        Ok(r) => r,
-                        Err(_) => (HashMap::new(), false, false),
-                    };
-                if !ok {
-                    if persistent {
-                        store.cache().put_class(
-                            &format!("{memo_key}:oversized"),
-                            "1",
-                            LISTING_TTL,
-                            CacheClass::Volatile,
-                        );
+        let (answer, _) =
+            LISTING_FLIGHTS
+                .run(&key, move || async move {
+                    // A fetch past the shared deadline is no answer: empty, not ok, not a persistent fault.
+                    let (ids, ok, persistent) =
+                        tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing())
+                            .await
+                            .unwrap_or((HashMap::new(), false, false));
+                    if !ok {
+                        if persistent {
+                            store.cache().put_class(
+                                &format!("{memo_key}:oversized"),
+                                "1",
+                                LISTING_TTL,
+                                CacheClass::Volatile,
+                            );
+                        }
+                        return None;
                     }
-                    return None;
-                }
-                let ids = Arc::new(ids);
-                put_cached_listing(store.cache.as_ref(), &memo_key, ids.clone());
-                Some(ids)
-            })
-            .await;
+                    let ids = Arc::new(ids);
+                    put_cached_listing(store.cache.as_ref(), &memo_key, ids.clone());
+                    Some(ids)
+                })
+                .await;
         match answer.flatten() {
             Some(ids) => (ids, true),
             None => unanswered(),
@@ -1412,7 +1582,13 @@ impl TorBoxStore {
         let identity = self.account_identity();
         let mut files: Vec<TorrentFile> = Vec::new();
         if need_files {
-            match self.list_files(torrent_id).await {
+            // Go reads the list on the caller's context, so a caller that goes away during it gets errNoFileList
+            // and the id write below still happens. Dropping this future must leave the same id behind: it is
+            // the id createtorrent just handed us, and losing it buys the torrent again on the next poll.
+            let mut unwritten = UnwrittenId { store: self, info_hash: &t.info_hash, torrent_id, armed: true };
+            let listed = self.list_files(torrent_id).await;
+            unwritten.armed = false;
+            match listed {
                 Ok(f) => files = f,
                 Err(err) if is_torrent_gone(&err) => {
                     // Returned HERE, above the id re-stamp below, and left for the caller to act on: this is
@@ -1757,7 +1933,14 @@ struct ListingMemoEntry {
 /// endpoint and token together identify the account, and the answer does not depend on who asked — and it is
 /// only the memo that is cache-scoped, so it is worth saying rather than implying otherwise.
 ///
-/// (Go checks that a `Cache` can be a map key at all, `memoisable`. An `Arc`'s address always can.)
+/// Go's `memoisable` reports whether a Cache can be a map key at all. Comparable() is a STATIC property of the
+/// type and is not sufficient on its own: a struct holding an interface field is comparable as a type and panics
+/// as a value when that field holds a slice or a map. Since the whole point is to avoid a panic in a request
+/// handler, such a value is actually tried. A POINTER never needs that. It hashes by address whatever it points
+/// at, so it cannot panic, and every Cache in this repo is one — the probe therefore costs nothing on any real
+/// path (measured: 1.3 ns for a pointer against 27.6 ns for the probe, next to 25.8 ns for the whole memo
+/// lookup it guards). An `Arc`'s address always can be a key, so the port has no such check and no memo-less
+/// cache.
 fn memo_key(cache: &Arc<dyn Cache>, key: &str) -> (usize, String) {
     (Arc::as_ptr(cache) as *const () as usize, key.to_owned())
 }
@@ -2312,7 +2495,7 @@ impl Rfc3339 {
     }
 
     /// Go's `time.Time.MarshalJSON`: RFC 3339 with the fraction trimmed of trailing zeros, and `Z` for UTC.
-    pub(crate) fn to_rfc3339(&self) -> String {
+    pub(crate) fn to_rfc3339(self) -> String {
         let mut out = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
             self.year, self.month, self.day, self.hour, self.minute, self.second
@@ -2410,27 +2593,40 @@ impl Store for TorBoxStore {
 
     async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
         let identity = self.account_identity();
-        let (mut result, hashes) = known_cached(self.cache(), DebridService::TorBox, &identity, hashes);
+        let (result, hashes) = known_cached(self.cache(), DebridService::TorBox, &identity, hashes);
         if hashes.is_empty() {
             return Ok(result);
         }
         let batches = hashes.len().div_ceil(CACHE_BATCH);
-        let answers =
-            join_all(hashes.chunks(CACHE_BATCH).map(|batch| self.check_cached_batch(batch)).collect()).await;
-        // Only a batch that came back describes its hashes. One that failed leaves them ABSENT from the map,
-        // which the pool reads as "we do not know" — writing false there states that TorBox does not hold
-        // them, which is a different and costly claim: it drops a genuinely cached release from a cached-only
-        // list, or pays an add at play time for a torrent the account already had. With 500 seeds in batches
-        // of 100, one timed-out batch made that claim about 100 releases and reported no error at all.
-        let mut batch_ok = vec![false; batches];
-        for (i, (batch, answer)) in hashes.chunks(CACHE_BATCH).zip(answers).enumerate() {
-            let Some(answer) = answer else { continue };
-            batch_ok[i] = true;
-            for h in batch {
-                result.insert(h.clone(), answer.get(&go_to_lower(h)).copied().unwrap_or(false));
-            }
-        }
-        remember_cached(self.cache(), DebridService::TorBox, &identity, &result);
+        // Each batch leaves its answer here as it lands, so that a caller that goes away part way still has the
+        // batches that came back remembered, as Go's `g.Wait()` and `rememberCached` do after its goroutines have
+        // all returned on the cancelled context.
+        let answered: Mutex<Vec<Option<HashMap<String, bool>>>> = Mutex::new(vec![None; batches]);
+        let mut abandoned = AbandonedCacheCheck {
+            store: self,
+            known: &result,
+            hashes: &hashes,
+            answered: &answered,
+            armed: true,
+        };
+        join_all(
+            hashes
+                .chunks(CACHE_BATCH)
+                .enumerate()
+                .map(|(i, batch)| {
+                    let answered = &answered;
+                    async move {
+                        let answer = self.check_cached_batch(batch).await;
+                        lock(answered)[i] = answer;
+                    }
+                })
+                .collect(),
+        )
+        .await;
+        abandoned.armed = false;
+        drop(abandoned);
+        let answers = std::mem::take(&mut *lock(&answered));
+        let (result, batch_ok) = self.settle_cache_check(result, &hashes, &answers);
         batches_failed(&batch_ok)?;
         Ok(result)
     }

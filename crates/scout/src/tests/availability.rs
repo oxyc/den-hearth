@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::availability::{verdict_prefix, MAX_AVAILABILITY_IDS, VERDICT_UNDETERMINED};
-use crate::config::{Config, DebridService};
+use crate::config::DebridService;
 use crate::deps::Deps;
 use crate::handler::new_handler;
 use crate::rank::RawStream;
-use crate::scrape::{DoError, ScrapeQuery, Scraper};
+use crate::scrape::{DoError, ScrapeQuery};
 use crate::seal::{seal, SealKeyring, SEALED_VERSION};
 use crate::stores::{ResolveTarget, Store, StoreError, StoreStatus};
 use crate::tests::handler::{
@@ -61,7 +61,7 @@ fn counting_scraper(
     n: Arc<AtomicI32>,
     streams: Vec<RawStream>,
     err: Option<&'static str>,
-) -> Arc<dyn Fn(&Config) -> Vec<Box<dyn Scraper>> + Send + Sync> {
+) -> crate::deps::ScraperFactory {
     Arc::new(move |_| {
         let (n, streams) = (n.clone(), streams.clone());
         vec![fake_scraper("torrentio", move || {

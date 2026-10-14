@@ -131,10 +131,7 @@ pub(crate) async fn probe_tracks(client: &reqwest::Client, url: &str) -> Result<
 fn probed_total_size(resp: &reqwest::Response) -> i64 {
     if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         let v = resp.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
-        return match content_range_total(v) {
-            Some(total) => total,
-            None => 0,
-        };
+        return content_range_total(v).unwrap_or_default();
     }
     // The header, as Go's ContentLength is: reqwest's `content_length()` reports the body bytes still
     // unread, which shrink as the head is read.
@@ -312,7 +309,7 @@ pub(crate) fn clean_lang(b: &[u8]) -> String {
         return String::new();
     }
     // "pt-BR" and "pt" are the same shelf for a viewer choosing a track.
-    let base = match s.find(|c: char| c == '-' || c == '_') {
+    let base = match s.find(['-', '_']) {
         Some(i) if i > 0 => &s[..i],
         _ => s.as_str(),
     };

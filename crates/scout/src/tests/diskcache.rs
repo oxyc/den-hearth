@@ -17,7 +17,7 @@ fn disk_bytes(dir: &Path) -> i64 {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let m = e.metadata().ok()?;
-            m.is_file().then(|| m.len() as i64)
+            m.is_file().then_some(m.len() as i64)
         })
         .sum()
 }

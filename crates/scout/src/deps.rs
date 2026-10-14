@@ -295,6 +295,11 @@ pub fn refuse_redirect_replay(
     false
 }
 
+/// Builds the indexer scrapers for one request's config.
+pub type ScraperFactory = Arc<dyn Fn(&Config) -> Vec<Box<dyn Scraper>> + Send + Sync>;
+/// Builds the debrid stores for one request's config.
+pub type StoreFactory = Arc<dyn Fn(&Config) -> Vec<Box<dyn Store>> + Send + Sync>;
+
 /// Go `Deps`: injects the environment (the cache, timeouts, public origin, and the scraper and store
 /// factories, mocked in tests). Go declares it in `handler.go`; it lives here because `BuildDeps` is what
 /// fills it.
@@ -311,8 +316,8 @@ pub struct Deps {
     pub list_ttl: Duration,
     /// Fixed public origin; when empty, fall back to forwarded headers.
     pub public_url: String,
-    pub make_scrapers: Arc<dyn Fn(&Config) -> Vec<Box<dyn Scraper>> + Send + Sync>,
-    pub make_stores: Arc<dyn Fn(&Config) -> Vec<Box<dyn Store>> + Send + Sync>,
+    pub make_scrapers: ScraperFactory,
+    pub make_stores: StoreFactory,
     /// Meta resolves an id → title + release year, for MOVIES only, so mistagged torrents can be dropped. Series are
     /// not looked up at all and get no mistag filter — cinemeta.rs records the two independent reasons, both of
     /// which were verified the hard way. Optional (None = no year/title filter); a lookup failure returns

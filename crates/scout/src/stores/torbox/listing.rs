@@ -725,8 +725,15 @@ fn go_lossy_utf8(mut b: &[u8]) -> String {
 /// would memoise a proxy hiccup for fifteen seconds to save re-reading a body the upstream will probably
 /// stop sending anyway.
 ///
-/// (Go also has `bodyEndedEarly`, to catch the 1.27 decoder reporting a body that stops between values as a
-/// syntax error. `Stop::Early` is that distinction made at the source, so there is nothing to catch.)
+/// Go's `bodyEndedEarly` reports whether a decode error means the input stopped, rather than that it was wrong.
+/// Go 1.26's decoder says so with io.EOF or io.ErrUnexpectedEOF. Go 1.27's reports a body that stops BETWEEN
+/// values — after a complete entry, or right after `[` — as a *json.SyntaxError reading "unexpected end of JSON
+/// input", which wraps neither; measured on both toolchains. Without this check listingFaultFor filed that blip
+/// with the schema changes and memoised it for fifteen seconds, on exactly the retry that rediscovers a queued
+/// torrent. The message is the one encoding/json has always used for truncated input (json.Unmarshal of a cut
+/// body returns it on every version), and the cut cases in
+/// TestAccountListing_remembersOversizedButRetriesTransient pin it. `Stop::Early` is that distinction made at
+/// the source, so there is nothing to catch here.
 fn listing_fault_for(stop: Stop) -> ListingFault {
     match stop {
         Stop::Early => ListingFault::None,
@@ -880,20 +887,23 @@ fn walk<R: Read>(rd: &mut Reader<R>) -> Result<HashMap<String, i64>, ListingFaul
                     }
                     // A hash that could never be asked about is dropped rather than retained. Both caps miss
                     // this, because the key is whatever the upstream sent: one entry carrying a 60 MiB
-                    // "hash" is one entry and 60 MiB, under each of them.
+                    // "hash" is one entry and 60 MiB, under each of them, and it decoded as a valid listing,
+                    // retained the 60 MiB for the memo TTL, and allocated 248 MiB doing it.
                     //
                     // Nothing real is lost: every hash that can reach a lookup is 32 or 40 characters —
                     // play.go's infoHashRe on the /play path, scrape.go's hashNorm on the probe path, which
-                    // does NOT go through infoHashRe. The bounds are shared with play.rs so those two
-                    // cannot drift.
+                    // does NOT go through infoHashRe. The bounds are shared with play.go so those two
+                    // cannot drift; hashNorm is a third copy and is only kept honest by the test.
                     //
                     // Filtering NARROWER than the lookups accept is the direction that costs: a torrent the
                     // account holds becomes an authoritative miss and a fifteen-second marker.
                     //
                     // Two steps, because the length that decides is the LOWERED one: a non-ASCII hash can be
                     // 96 raw bytes and 32 after lowering, and judging it on the raw length would drop a key
-                    // that is perfectly askable. The cheap guard first (in `entry`) bounds what lowering may
-                    // copy — 40 runes of at most 4 bytes each is the most that can lower into range.
+                    // that is perfectly askable. The cheap guard first bounds what ToLower may copy — 40
+                    // runes of at most 4 bytes each is the most that can lower into range — so the 60 MiB
+                    // case is still refused without allocating. (Here that guard is the `string` cap in
+                    // `entry`, which refuses the long value without keeping it.)
                     let Hash::Text(raw) = e.hash else { continue };
                     let hash = go_to_lower(&raw);
                     if hash.len() < MIN_INFO_HASH_LEN || hash.len() > MAX_INFO_HASH_LEN {
@@ -932,10 +942,48 @@ fn walk<R: Read>(rd: &mut Reader<R>) -> Result<HashMap<String, i64>, ListingFaul
                 ids = Some(map);
             }
             _ => {
-                // Walked token by token, NOT decoded into a value tree: nothing STRUCTURED is retained, so a
-                // large unknown top-level field costs no more than the walk. The NESTED shape is a different
-                // mechanism with a different answer — bounded by MAX_SKIP_DEPTH and remembered rather than
-                // retried.
+                // Walked token by token, NOT decoded into a json.RawMessage. RawMessage keeps a full copy of
+                // the field's raw bytes on top of the decoder's own buffer, so a large unknown top-level field
+                // was retained twice: on a 63 MiB array field, 191 MiB allocated before against 67 MiB now.
+                //
+                // Both numbers are TotalAlloc, because mixing a peak against a residency is how this comment
+                // was wrong before — it quoted 3.9 MiB "now", which is the post-GC figure and made the saving
+                // look like 50x rather than the 2.9x it is. Nor is 67 MiB free: Token materialises every
+                // string it steps over, so the walk allocates once per TOKEN and that ratio is a property of
+                // the body's token density, not of the walk. 1.06x holds for the 6 KB strings measured here;
+                // the same 24 MiB written as small tokens measures 13x to 52x depending on how tightly they
+                // are packed, the top of that range being a bare `[0,0,0,…]` array. It is all garbage rather
+                // than live heap, so it costs GC time and not GOMEMLIMIT headroom — which is the actual win
+                // over holding the body twice at once, not a small constant.
+                //
+                // Nothing STRUCTURED is retained — a scalar is not helped, and saying otherwise would be the
+                // kind of comment this file keeps having to correct. A single huge string costs the same
+                // either way, because Token must buffer the whole token and allocate the string.
+                //
+                // That cost is 256.7 MiB: one value just under maxListingBytes, the decoder's buffer having
+                // doubled to 128 MiB while the materialised string is live beside it, so the GC can reclaim
+                // neither. That is above the 230 MiB GOMEMLIMIT and above the container, i.e. an OOM kill,
+                // and it is not reduced by the length filter on `hash` above, which runs only after the token
+                // has been materialised.
+                //
+                // This figure has now been wrong in BOTH directions, so how it is measured matters more than
+                // the number. It was understated at ~159 MiB, corrected to 256.7, then "corrected" again to
+                // 304 — and 304 was the mistake: that probe fed the decoder a strings.Reader, so the fixture
+                // held the whole body live in the heap for the duration and the peak counted the body twice.
+                // Production reads off a socket and never materialises the body. Measure it streamed, or the
+                // number comes out high by exactly one body.
+                //
+                // Left as it is, deliberately: it needs a hostile or broken api.torbox.app rather than a caller
+                // (the base URL is a constant), and the alternative is lowering maxListingBytes, which governs
+                // real large accounts and would turn them oversized. Recorded in FOLLOWUP.md with the options
+                // rather than traded for a functional regression on a threat this package already accepts.
+                //
+                // The NESTED shape is a different mechanism with a different answer — bounded by maxSkipDepth
+                // and remembered rather than retried. See that constant.
+                //
+                // (All of the above is about Go's `json.Decoder`. This walk reads a block at a time and keeps a
+                // byte per open bracket, so a string here costs its length only when it is a key or a hash,
+                // both capped; the bound on depth is kept for the verdict.)
                 rd.colon().map_err(|_| Retry)?;
                 match rd.skip_value(MAX_SKIP_DEPTH) {
                     Ok(()) => {}

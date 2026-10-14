@@ -150,11 +150,16 @@ pub(crate) fn scoped(key: &str) -> String {
 /// closure that panics re-raises on a bare goroutine nothing can recover, so each of these jobs recovers its own,
 /// counts it, and abandons the work.
 pub(crate) struct DetachedFlight<T> {
-    calls:
-        std::sync::Mutex<std::collections::BTreeMap<String, tokio::sync::watch::Receiver<Option<Option<T>>>>>,
+    calls: std::sync::Mutex<std::collections::BTreeMap<String, Call<T>>>,
     /// What the work is, for the log line a panic writes. Always a literal, so it is a fixed vocabulary for the
     /// limiter's key.
     what: &'static str,
+}
+
+/// One run of a flight's work: where its answer will appear, and how many callers joined it (Go `call.dups`).
+struct Call<T> {
+    answer: tokio::sync::watch::Receiver<Option<Option<T>>>,
+    dups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Forgets a flight's key when its task ends, however it ends (a runtime shutting down drops the task mid-flight):
@@ -177,21 +182,27 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
 
     /// Runs `make()` for the first caller of `key`; a caller that arrives while it is in flight waits for the same
     /// answer. The key is forgotten before the answer is published, so a caller arriving after it runs the work
-    /// again: nothing is cached here. The answer is `None` for a run that panicked, and the flag says whether
-    /// this caller shared a flight someone else started (Go's `result.Shared`).
+    /// again: nothing is cached here. The answer is `None` for a run that panicked, and the flag is Go's
+    /// `result.Shared`: the run was handed to more than one caller. Every caller of such a run sees it, the one
+    /// that started the work included (`c.dups > 0` is read when the answer goes out), so a run shared by two
+    /// callers is reported twice.
     pub(crate) async fn run<F, Fut>(&'static self, key: &str, make: F) -> (Option<T>, bool)
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T> + Send + 'static,
     {
         let key = scoped(key);
-        let (mut rx, shared) = {
+        let (mut rx, dups) = {
             let mut calls = self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match calls.get(&key) {
-                Some(rx) => (rx.clone(), true),
+                Some(call) => {
+                    call.dups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (call.answer.clone(), call.dups.clone())
+                }
                 None => {
                     let (tx, rx) = tokio::sync::watch::channel(None);
-                    calls.insert(key.clone(), rx.clone());
+                    let dups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    calls.insert(key.clone(), Call { answer: rx.clone(), dups: dups.clone() });
                     let work = make();
                     let forget = ForgetKey { flight: self, key };
                     tokio::spawn(async move {
@@ -217,16 +228,18 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
                         drop(forget);
                         let _ = tx.send(Some(answer));
                     });
-                    (rx, false)
+                    (rx, dups)
                 }
             }
         };
         let Ok(answered) = rx.wait_for(|v| v.is_some()).await else {
-            return (None, shared);
+            return (None, dups.load(std::sync::atomic::Ordering::SeqCst) > 0);
         };
         let answer = (*answered).clone().flatten();
         drop(answered);
-        (answer, shared)
+        // A joiner is counted in `dups` before the work can finish, and the key is forgotten before the answer is
+        // published, so the count is final by now.
+        (answer, dups.load(std::sync::atomic::Ordering::SeqCst) > 0)
     }
 }
 

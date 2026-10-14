@@ -242,7 +242,10 @@ pub(crate) fn season_only_pattern(season: i64) -> regex::Regex {
 /// library reaches 512 distinct episodes in a process lifetime — so it drops everything and refills.
 pub(crate) const EPISODE_PATTERN_CAP: i64 = 512;
 
-static EPISODE_PATTERN_CACHE: Mutex<Option<HashMap<(i64, i64), Arc<EpisodePatterns>>>> = Mutex::new(None);
+/// Compiled patterns keyed by (season, episode).
+type EpisodePatternMap = HashMap<(i64, i64), Arc<EpisodePatterns>>;
+
+static EPISODE_PATTERN_CACHE: Mutex<Option<EpisodePatternMap>> = Mutex::new(None);
 
 /// Go `cachedEpisodePatterns` keeps one compiled set per (season, episode) for the life of the process.
 ///

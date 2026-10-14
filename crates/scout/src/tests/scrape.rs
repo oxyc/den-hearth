@@ -760,9 +760,9 @@ mod beyond_the_go_suite {
             let body = format!(r#"{{"streams":[{{"url":"{url}","title":"Movie 1080p"}}]}}"#);
             parse_stremio_streams(body.as_bytes(), "own").into_iter().map(|s| s.info_hash).collect::<Vec<_>>()
         };
-        assert_eq!(from(format!("https://x.example/resolve/{h}/f.mkv")), [h.clone()]);
-        assert_eq!(from(format!("/playback/{h}")), [h.clone()]);
-        assert_eq!(from(format!("https://x.example/a%2F{h}")), [h.clone()]);
+        assert_eq!(from(format!("https://x.example/resolve/{h}/f.mkv")), vec![h.clone()]);
+        assert_eq!(from(format!("/playback/{h}")), vec![h.clone()]);
+        assert_eq!(from(format!("https://x.example/a%2F{h}")), vec![h.clone()]);
         assert!(from(format!("https://x.example/play?h={h}")).is_empty());
         assert!(from(format!("https://x.example/play#{h}")).is_empty());
         assert!(from(format!("https://x.example/play/{h}x")).is_empty());

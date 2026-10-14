@@ -240,7 +240,7 @@ pub(crate) fn browser_probe_candidates(
             candidates.push((i, optimistic));
         }
     }
-    candidates.sort_by(|a, b| b.1.cmp(&a.1)); // stable, as sort.SliceStable
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1)); // stable, as sort.SliceStable
     let remaining = BROWSER_PROBE_FRONTIER.saturating_sub(frontier.len());
     frontier.extend(candidates.into_iter().take(remaining).map(|(i, _)| i));
     frontier

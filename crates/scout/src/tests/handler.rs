@@ -305,7 +305,7 @@ impl Store for SlowStatusStore {
     }
 
     async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        if self.status_hits.fetch_add(1, Ordering::SeqCst) + 1 <= self.slow_calls {
+        if self.status_hits.fetch_add(1, Ordering::SeqCst) < self.slow_calls {
             std::future::pending::<()>().await; // outlast the caller's budget, exactly as a slow account listing does
         }
         if self.never_downloading {
@@ -1814,12 +1814,12 @@ async fn stream_list_serves_stale_while_rebuilding() {
     let (complete, _, etag, body) = crate::handler::split_cached(&held);
     cache.put(
         &key,
-        &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body),
+        &crate::handler::join_cached(complete, now_unix() - 1, etag, body),
         Duration::from_secs(60),
     );
     let stale = get(&h, &path, &[]).await;
     assert_eq!(stale.status(), 200, "stale hit");
-    let cached: serde_json::Value = serde_json::from_str(&body).expect("cached body");
+    let cached: serde_json::Value = serde_json::from_str(body).expect("cached body");
     let served: serde_json::Value = serde_json::from_slice(stale.body()).expect("served body");
     assert_eq!(served["streams"], cached["streams"], "the stale hit did not serve the cached streams");
     assert!(
@@ -1871,7 +1871,7 @@ async fn stream_list_a_disconnect_does_not_kill_the_stale_rebuild() {
     let (complete, _, etag, body) = crate::handler::split_cached(&held);
     cache.put(
         &key,
-        &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body),
+        &crate::handler::join_cached(complete, now_unix() - 1, etag, body),
         Duration::from_secs(60),
     );
     let serving = tokio::spawn({
@@ -1916,7 +1916,7 @@ async fn stream_list_stale_window_scales_with_the_ttl() {
     let (complete, _, etag, body) = crate::handler::split_cached(&held);
     cache.put(
         &key,
-        &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body),
+        &crate::handler::join_cached(complete, now_unix() - 1, etag, body),
         Duration::from_secs(60),
     );
     assert_eq!(
@@ -2009,7 +2009,7 @@ async fn stream_list_serves_the_last_complete_list_when_no_indexer_answers() {
     let age = |past: Duration| {
         cache.put(
             &key,
-            &crate::handler::join_cached(complete, now_unix() - past.as_secs() as i64, &etag, &body),
+            &crate::handler::join_cached(complete, now_unix() - past.as_secs() as i64, etag, body),
             Duration::from_secs(24 * 3600),
         )
     };
@@ -2070,7 +2070,7 @@ async fn stream_list_stale_rebuild_spawns_one_goroutine_per_key() {
     let (complete, _, etag, body) = crate::handler::split_cached(&held);
     cache.put(
         &key,
-        &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body),
+        &crate::handler::join_cached(complete, now_unix() - 1, etag, body),
         Duration::from_secs(60),
     );
     // Go counts goroutines; the runtime's live tasks are the same question for this port.
@@ -2235,7 +2235,7 @@ async fn stream_list_outage_does_not_scrape_per_request() {
         // Re-stale the entry before each request, as a real expired entry would be.
         cache.put(
             &key,
-            &crate::handler::join_cached(complete, now_unix() - 1, &etag, &body),
+            &crate::handler::join_cached(complete, now_unix() - 1, etag, body),
             Duration::from_secs(60),
         );
         get(&h, &path, &[]).await;

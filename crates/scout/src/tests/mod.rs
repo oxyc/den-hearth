@@ -1,6 +1,11 @@
 //! The Go test files of `internal/scout`, one Rust module each, declared here so that no porter has to edit
 //! this file. Each module is an empty shell with a header naming its Go file; see PORTING.md for who ports
 //! which. They live inside the crate (not under `tests/`) because the Go tests reach unexported items.
+//!
+//! Two lints are off for tests only: the Go table tests port as tuple arrays, which `type_complexity`
+//! flags, and tests that share process-wide state (log limiter, minted-config map) serialise on a std
+//! mutex held across awaits, which is the intent on a single-threaded test runtime.
+#![allow(clippy::type_complexity, clippy::await_holding_lock)]
 
 mod account;
 mod addbudget;
@@ -44,6 +49,7 @@ mod shape;
 mod sources;
 mod stores;
 mod stores_failure;
+mod stores_fidelity;
 mod stores_pick;
 mod stores_preference;
 mod ticket;

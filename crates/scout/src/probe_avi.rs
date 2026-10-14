@@ -50,31 +50,25 @@ fn walk(buf: &[u8], start: usize, end: usize, depth: usize, p: &mut Probe, last_
             // Follows the strh it belongs to; for audio it is a WAVEFORMATEX whose second field is the
             // channel count.
             // Richest wins, as everywhere else — not the first stream listed.
-            b"strf" => {
-                if *last_kind == *b"auds" && body + 4 <= buf.len() {
-                    let n = i64::from(u16::from_le_bytes([buf[body + 2], buf[body + 3]]));
-                    if n > channel_count(&p.audio_channels) {
-                        p.audio_channels = channel_layout(n).to_string();
-                    }
+            b"strf" if *last_kind == *b"auds" && body + 4 <= buf.len() => {
+                let n = i64::from(u16::from_le_bytes([buf[body + 2], buf[body + 3]]));
+                if n > channel_count(&p.audio_channels) {
+                    p.audio_channels = channel_layout(n).to_string();
                 }
             }
-            b"strh" => {
-                if body + 8 <= buf.len() {
-                    let kind = [buf[body], buf[body + 1], buf[body + 2], buf[body + 3]];
-                    let fourcc = String::from_utf8_lossy(&buf[body + 4..body + 8]).into_owned();
-                    let fourcc = fourcc.trim_end_matches(|c: char| c == '\0' || c == ' ');
-                    match &kind {
-                        b"vids" => {
-                            if p.video_codec.is_empty() {
-                                p.video_codec = codec_from_four_cc(fourcc).to_string();
-                            }
-                        }
-                        // No language to read, but the track exists and the viewer should know it does.
-                        b"auds" => p.untagged_audio += 1,
-                        _ => {}
+            b"strh" if body + 8 <= buf.len() => {
+                let kind = [buf[body], buf[body + 1], buf[body + 2], buf[body + 3]];
+                let fourcc = String::from_utf8_lossy(&buf[body + 4..body + 8]).into_owned();
+                let fourcc = fourcc.trim_end_matches(['\0', ' ']);
+                match &kind {
+                    b"vids" if p.video_codec.is_empty() => {
+                        p.video_codec = codec_from_four_cc(fourcc).to_string();
                     }
-                    *last_kind = kind;
+                    // No language to read, but the track exists and the viewer should know it does.
+                    b"auds" => p.untagged_audio += 1,
+                    _ => {}
                 }
+                *last_kind = kind;
             }
             _ => {}
         }

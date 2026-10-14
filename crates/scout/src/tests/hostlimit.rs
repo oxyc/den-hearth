@@ -76,9 +76,8 @@ fn host_limiter_concurrent_callers_queue() {
     );
     // Each overflow caller waits one interval longer than the one before it, so they leave in order
     // instead of arriving at the host together.
-    for i in 2..delays.len() {
+    for (i, &d) in delays.iter().enumerate().skip(2) {
         let want = Duration::from_millis(20) * (i as u32 - 1);
-        let d = delays[i];
         let lo = want.saturating_sub(Duration::from_millis(1));
         let hi = want + Duration::from_millis(1);
         assert!(
