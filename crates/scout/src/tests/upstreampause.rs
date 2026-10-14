@@ -151,8 +151,11 @@ async fn pause_on_refusal_pauses_the_account_not_the_api() {
 // nothing.
 #[tokio::test]
 async fn pause_on_refusal_doubles_without_retry_after_and_leaves_a_bare_503_alone() {
-    let rt = pause_on_refusal(Arc::new(CountingDoer::new(answering(200, &[]))));
+    let clock = Arc::new(Mutex::new(SystemTime::now()));
+    let mut rt = pause_on_refusal(Arc::new(CountingDoer::new(answering(200, &[]))));
+    rt.now = clock_fn(&clock);
     let first = rt.refused("h", Duration::ZERO, false);
+    *clock.lock().unwrap() += first + Duration::from_secs(1);
     let second = rt.refused("h", Duration::ZERO, false);
     assert!(
         first >= REFUSAL_PAUSE
@@ -162,7 +165,8 @@ async fn pause_on_refusal_doubles_without_retry_after_and_leaves_a_bare_503_alon
         "pauses {first:?} then {second:?}"
     );
     for _ in 0..20 {
-        rt.refused("h", Duration::ZERO, false);
+        let pause = rt.refused("h", Duration::ZERO, false);
+        *clock.lock().unwrap() += pause + Duration::from_secs(1);
     }
     let capped = rt.refused("h", Duration::ZERO, false);
     assert!(capped <= MAX_REFUSAL_PAUSE * 5 / 4, "pause grew past its ceiling: {capped:?}");
@@ -172,6 +176,27 @@ async fn pause_on_refusal_doubles_without_retry_after_and_leaves_a_bare_503_alon
     get(&shed, "https://torrentio.example/a", None).await;
     get(&shed, "https://torrentio.example/b", None).await;
     assert_eq!(next.calls(), 2, "a 503 without Retry-After paused the host");
+}
+
+// Refusals that land while a pause is already running (a burst of requests sent before the first 429 came back) are
+// one refusal, not N: the next window after the pause is the second, not 2^N.
+#[test]
+fn a_burst_of_refusals_inside_one_pause_counts_once() {
+    let clock = Arc::new(Mutex::new(SystemTime::now()));
+    let mut rt = pause_on_refusal(Arc::new(CountingDoer::new(answering(200, &[]))));
+    rt.now = clock_fn(&clock);
+    let first = rt.refused("h", Duration::ZERO, false);
+    for _ in 0..7 {
+        rt.refused("h", Duration::ZERO, false);
+    }
+    assert!(first <= REFUSAL_PAUSE * 5 / 4);
+    // Past the jittered end of the pause the burst extended.
+    *clock.lock().unwrap() += REFUSAL_PAUSE * 5 / 4 + Duration::from_secs(1);
+    let second = rt.refused("h", Duration::ZERO, false);
+    assert!(
+        second >= 2 * REFUSAL_PAUSE && second <= 2 * REFUSAL_PAUSE * 5 / 4,
+        "a burst of 8 escalated the next window to {second:?}"
+    );
 }
 
 #[test]
