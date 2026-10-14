@@ -353,7 +353,14 @@ impl<'a> Client<'a> {
         let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_SUBTITLE_BODY)
             .await
             .map_err(DownloadError::Unavailable)?;
-        let (body, converted) = crate::fetch::subtitle_text(bytes, lang);
+        // Off the runtime thread: guessing a legacy charset reads the whole file at about 30 MB/s
+        // (5 ms for a 220 KB track, ~65 ms at the 2 MiB ceiling), and the serving runtime has only
+        // a few threads. A UTF-8 file costs microseconds either way.
+        let lang = lang.map(str::to_owned);
+        let (body, converted) =
+            tokio::task::spawn_blocking(move || crate::fetch::subtitle_text(bytes, lang.as_deref()))
+                .await
+                .map_err(|e| DownloadError::Unavailable(format!("decode subtitle: {e}")))?;
         // Once per download: the result is cached, so this never repeats per request.
         if let Some(encoding) = converted {
             eprintln!("subtitle: file {file_id} was {}, converted to UTF-8", encoding.name());
@@ -546,13 +553,18 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
 /// timing), with trust/ratings/downloads as tie-breakers. Machine/AI-translated subs are pushed below
 /// everything, foreign-parts-only tracks included.
 pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
+    fit_score_against(s, filename.map(FileFit::new).as_ref())
+}
+
+/// `fit_score` with the playing file's side already read, so ranking a list reads it once.
+fn fit_score_against(s: &Subtitle, file: Option<&FileFit>) -> i64 {
     const HASH: i64 = 1_000_000;
     let mut score = text_score(s);
     if s.hash_match {
         score += HASH;
     }
-    if let Some(f) = filename {
-        score += release_fit(f, &s.release);
+    if let Some(f) = file {
+        score += f.release_fit(&s.release);
     }
     score
 }
@@ -607,15 +619,27 @@ pub fn text_score(s: &Subtitle) -> i64 {
 /// that already knows its own audio language (den-remux does) can rank this track against an
 /// embedded one rather than trust `rank`'s language-blind ordering alone.
 pub(crate) fn looks_dubbed(release: &str) -> bool {
-    tokenize(release).iter().any(|t| t == "dubbed" || t == "dub")
+    tokens(release).any(|t| t.eq_ignore_ascii_case("dubbed") || t.eq_ignore_ascii_case("dub"))
 }
 
 /// Order subtitles for the picker: grouped by language, best-fit first within each language. The
 /// app's own dedupe-keep-first then naturally keeps the optimal sub per language.
+///
+/// Each subtitle is scored once and the playing file is read once; the sort then compares plain
+/// integers and borrowed language codes. Equal scores keep their input order (the sort is stable).
 pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
-    subs.sort_by(|a, b| {
-        a.lang.cmp(&b.lang).then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
-    });
+    let file = filename.map(FileFit::new);
+    let scores: Vec<i64> = subs.iter().map(|s| fit_score_against(s, file.as_ref())).collect();
+    let mut order: Vec<usize> = (0..subs.len()).collect();
+    order.sort_by(|&a, &b| subs[a].lang.cmp(&subs[b].lang).then_with(|| scores[b].cmp(&scores[a])));
+    // Move element `order[i]` to slot `i` in place: swap it in from wherever earlier swaps left it.
+    for i in 0..order.len() {
+        let mut j = order[i];
+        while j < i {
+            j = order[j];
+        }
+        subs.swap(i, j);
+    }
 }
 
 /// Compact, log-safe tokens saying why `rank` placed `s` where it did — the deciding factors behind
@@ -653,24 +677,54 @@ pub fn ranking_factors(s: &Subtitle, filename: Option<&str>) -> Vec<&'static str
 /// Significant release tokens shared between the file name and a sub's release string imply the same
 /// encode (hence the same timing). Weight resolution/source/codec, and reward a matching group tag.
 fn release_fit(filename: &str, release: &str) -> i64 {
-    if release.is_empty() {
-        return 0;
+    FileFit::new(filename).release_fit(release)
+}
+
+/// The playing file's half of `release_fit`: which `SIGNIFICANT` tokens it carries (one bit each) and
+/// its release group. Read once, then every candidate's release string is compared against it
+/// without allocating.
+struct FileFit<'a> {
+    significant: u32,
+    group: Option<&'a str>,
+}
+
+impl<'a> FileFit<'a> {
+    fn new(filename: &'a str) -> Self {
+        FileFit { significant: significant_tokens(filename), group: release_group(filename) }
     }
-    let f = tokenize(filename);
-    let r = tokenize(release);
-    let mut score = 0i64;
-    for (tok, weight) in SIGNIFICANT {
-        if f.iter().any(|t| t == tok) && r.iter().any(|t| t == tok) {
-            score += weight;
+
+    fn release_fit(&self, release: &str) -> i64 {
+        if release.is_empty() {
+            return 0;
+        }
+        let shared = self.significant & significant_tokens(release);
+        let mut score = 0i64;
+        for (bit, (_, weight)) in SIGNIFICANT.iter().enumerate() {
+            if shared & (1 << bit) != 0 {
+                score += weight;
+            }
+        }
+        // The release group (the tag after the last '-') is the strongest same-encode signal.
+        if let (Some(gf), Some(gr)) = (self.group, release_group(release)) {
+            if gf.eq_ignore_ascii_case(gr) {
+                score += 3000;
+            }
+        }
+        score
+    }
+}
+
+/// A bit per `SIGNIFICANT` entry that appears as a token of `s`, whatever its case.
+fn significant_tokens(s: &str) -> u32 {
+    let mut found = 0u32;
+    for t in tokens(s) {
+        for (bit, (tok, _)) in SIGNIFICANT.iter().enumerate() {
+            if t.eq_ignore_ascii_case(tok) {
+                found |= 1 << bit;
+            }
         }
     }
-    // The release group (the tag after the last '-') is the strongest same-encode signal.
-    if let (Some(gf), Some(gr)) = (release_group(filename), release_group(release)) {
-        if gf == gr {
-            score += 3000;
-        }
-    }
-    score
+    found
 }
 
 /// Resolution/source/codec tokens and their weights (higher = stronger same-encode evidence).
@@ -698,19 +752,16 @@ const SIGNIFICANT: &[(&str, i64)] = &[
     ("avc", 200),
 ];
 
-/// Lowercase alphanumeric tokens.
-fn tokenize(s: &str) -> Vec<String> {
-    s.to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
+/// Alphanumeric tokens, borrowed and in their original case (compare with `eq_ignore_ascii_case`).
+fn tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty())
 }
 
-/// The release group tag — the single token after the last '-'. Rejects a hyphen that's part of the
-/// *title* (e.g. "Spider-Man.2002.1080p.BluRay.x264" → tail "Man.2002.1080p…" has dots → not a
-/// group), which would otherwise force a bogus group match between unrelated encodes.
-fn release_group(s: &str) -> Option<String> {
+/// The release group tag — the single token after the last '-', in its original case. Rejects a
+/// hyphen that's part of the *title* (e.g. "Spider-Man.2002.1080p.BluRay.x264" → tail
+/// "Man.2002.1080p…" has dots → not a group), which would otherwise force a bogus group match
+/// between unrelated encodes.
+fn release_group(s: &str) -> Option<&str> {
     // Strip a trailing file extension so "…-GROUP.mkv" → "…-GROUP".
     let stem = match s.rsplit_once('.') {
         Some((head, ext))
@@ -725,7 +776,7 @@ fn release_group(s: &str) -> Option<String> {
     if tail.is_empty() || tail.contains('.') || tail.contains(' ') {
         return None;
     }
-    Some(tail.to_ascii_lowercase())
+    Some(tail)
 }
 
 #[cfg(test)]
@@ -847,8 +898,8 @@ mod tests {
         assert_eq!(release_group("Spider-Man.2002.1080p.BluRay.x264.mkv"), None);
         assert_eq!(release_group("Spider-Man.2002.480p.DVDRip"), None);
         // A real trailing group tag still resolves (with or without extension).
-        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE"), Some("amiable".into()));
-        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv"), Some("amiable".into()));
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE"), Some("AMIABLE"));
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv"), Some("AMIABLE"));
     }
 
     #[test]
@@ -888,6 +939,92 @@ mod tests {
         assert!(subs[0].hearing_impaired);
         assert!(ranking_factors(&subs[0], None).contains(&"hearing_impaired"));
     }
+
+    /// A fixed, varied candidate set: five languages, mixed-case and punctuated release strings, empty
+    /// ones, dubbed and foreign-parts tracks, machine translations and plenty of exact score ties
+    /// (which only the sort's stability orders).
+    fn varied_candidates() -> Vec<Subtitle> {
+        const RELEASES: &[&str] = &[
+            "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264-GRP3",
+            "dune part two 2024 2160p BluRay REMUX HEVC-grp3",
+            "Dune.Part.Two.2024.720p.HDTV.x264-OTHER",
+            "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264-GRP3.mkv",
+            "Dune.Part.Two.2024.DUBBED.1080p.WEB-DL.x265-GRP3",
+            "Dune-Part-Two.2024.480p.DVDRip.XviD",
+            "",
+            "Random.CAM",
+            "DUNE.PART.TWO.2024.1080P.BLURAY.X264-GRP3",
+            "Dune.Part.Two.2024.WEBRip.AVC-Grp3.srt",
+            "Dune.Part.Two.dub.2024.HDRip",
+            "dune_part_two_2024_web_h265-grp9",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..60)
+            .map(|i| {
+                let r = next();
+                Subtitle {
+                    file_id: 1000 + i,
+                    lang: ["en", "sv", "es", "fr", "pt-BR"][(r % 5) as usize].into(),
+                    hash_match: (r >> 8) % 11 == 0,
+                    downloads: [0, 3, 3, 250, 250, 90_000][((r >> 16) % 6) as usize],
+                    release: RELEASES[((r >> 24) % RELEASES.len() as u64) as usize].into(),
+                    hd: false,
+                    fps: 0.0,
+                    from_trusted: (r >> 32) % 4 == 0,
+                    machine_translated: (r >> 36) % 13 == 0,
+                    ai_translated: (r >> 40) % 17 == 0,
+                    foreign_parts_only: (r >> 44) % 15 == 0,
+                    hearing_impaired: false,
+                    ratings: [0.0, 5.0, 5.0, 8.5][((r >> 48) % 4) as usize],
+                }
+            })
+            .collect()
+    }
+
+    /// `rank` is a pure reordering of what the handler serves, so its output is pinned: these orders
+    /// were produced by the implementation that scored each pair inside the comparator, and a faster
+    /// `rank` has to reproduce them byte for byte, ties included.
+    #[test]
+    fn rank_orders_a_fixed_candidate_set_exactly_as_before() {
+        let order = |filename: Option<&str>| {
+            let mut subs = varied_candidates();
+            rank(&mut subs, filename);
+            subs.iter().map(|s| s.file_id).collect::<Vec<_>>()
+        };
+        let with_group = order(Some("Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.H.264-GRP3.mkv"));
+        let no_group = order(Some("dune part two 2024 720p hdtv x264.mkv"));
+        let none = order(None);
+        assert_eq!(with_group, EXPECTED_WITH_GROUP);
+        assert_eq!(no_group, EXPECTED_NO_GROUP);
+        assert_eq!(none, EXPECTED_NONE);
+    }
+    #[rustfmt::skip]
+    const EXPECTED_WITH_GROUP: [i64; 60] = [
+        1033, 1034, 1017, 1002, 1031, 1045, 1046, 1054, 1044, 1004, 1020, 1015, 1037, 1016, 1051, 1008, 1047,
+        1042, 1010, 1024, 1025, 1007, 1005, 1012, 1018, 1011, 1009, 1055, 1053, 1022, 1056, 1039, 1023, 1043,
+        1038, 1026, 1021, 1032, 1013, 1052, 1001, 1014, 1029, 1059, 1019, 1040, 1050, 1058, 1030, 1003, 1048,
+        1036, 1049, 1035, 1006, 1057, 1000, 1027, 1028, 1041,
+    ];
+    #[rustfmt::skip]
+    const EXPECTED_NO_GROUP: [i64; 60] = [
+        1034, 1033, 1015, 1004, 1017, 1020, 1002, 1046, 1054, 1031, 1037, 1045, 1016, 1044, 1051, 1008, 1047,
+        1042, 1005, 1018, 1011, 1025, 1010, 1012, 1024, 1007, 1009, 1055, 1022, 1053, 1026, 1039, 1023, 1043,
+        1021, 1038, 1032, 1056, 1013, 1052, 1001, 1014, 1029, 1019, 1059, 1050, 1058, 1040, 1030, 1003, 1048,
+        1035, 1006, 1049, 1057, 1036, 1000, 1027, 1041, 1028,
+    ];
+    #[rustfmt::skip]
+    const EXPECTED_NONE: [i64; 60] = [
+        1034, 1033, 1004, 1017, 1020, 1015, 1002, 1046, 1031, 1037, 1054, 1045, 1016, 1044, 1051, 1008, 1047,
+        1042, 1005, 1025, 1010, 1018, 1012, 1024, 1007, 1011, 1009, 1055, 1022, 1053, 1026, 1039, 1023, 1043,
+        1021, 1038, 1032, 1056, 1013, 1052, 1001, 1014, 1029, 1019, 1059, 1050, 1058, 1040, 1030, 1003, 1048,
+        1035, 1006, 1049, 1057, 1036, 1000, 1027, 1028, 1041,
+    ];
 
     #[test]
     fn download_error_reason_tag_distinguishes_sparse_from_suspect() {
