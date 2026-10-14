@@ -3181,6 +3181,11 @@ async fn a_failed_test_encode_degrades_health() {
 #[ignore = "needs ffmpeg with VAAPI and a GPU"]
 async fn the_gpu_passes_the_start_up_test_encode() {
     let device = tool("VAAPI_DEVICE", "/dev/dri/renderD128");
+    // The e2e image runs ignored tests too, on runners with no GPU: no device is a skip, not a failure.
+    if !Path::new(&device).exists() {
+        eprintln!("skipped: no {device} on this host");
+        return;
+    }
     let result = crate::state::probe_encode(&tool("FFMPEG_PATH", "ffmpeg"), Path::new(&device)).await;
     assert_eq!(result, Ok(()));
 }

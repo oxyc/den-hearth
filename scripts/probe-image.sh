@@ -49,10 +49,13 @@ for port in 18080 18092 18093; do
     curl -fsS "http://127.0.0.1:$port/health" | jq -e '.status' >/dev/null
 done
 curl -fsS http://127.0.0.1:18095/remux/health | jq -e '.status' >/dev/null
-# Scout's installer page is served at its root too.
-curl -fsS http://127.0.0.1:18080/configure | grep -qi '<html' \
+# Scout's installer page is served at its root too. Read the whole body before matching: `grep -q` stops at the
+# first match and closes the pipe, which fails curl (23) under pipefail on a page that is fine.
+configure="$(curl -fsS http://127.0.0.1:18080/configure)"
+grep -qi '<html' <<<"$configure" \
     || { echo "::error::Scout's /configure on :8080 is not a page"; exit 1; }
-curl -fsS http://127.0.0.1:18090/scout/configure | grep -qi '<html' \
+configure="$(curl -fsS http://127.0.0.1:18090/scout/configure)"
+grep -qi '<html' <<<"$configure" \
     || { echo "::error::Scout's /scout/configure is not a page"; exit 1; }
 
 # Remux's ffmpeg and scratch directory are what a broken image loses first.
