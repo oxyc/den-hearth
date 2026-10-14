@@ -70,6 +70,4 @@ fn path_segment_escape(s: &str) -> String {
 
 /// Go `requestID`: the caller's `X-Request-Id` as it may be logged: only `[A-Za-z0-9_-]` survives, cut at 32.
 /// It comes off the network, so nothing it carries can forge a line or smuggle a credential into the log.
-pub(crate) fn request_id(v: &str) -> String {
-    v.chars().filter(|c| matches!(c, '-' | '_' | '0'..='9' | 'a'..='z' | 'A'..='Z')).take(32).collect()
-}
+pub(crate) use den_http::log::sanitize_request_id as request_id;

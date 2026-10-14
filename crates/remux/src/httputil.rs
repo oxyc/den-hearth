@@ -1,18 +1,15 @@
-//! Tiny HTTP plumbing shared by the handlers, in den-reel's shapes: one body type, JSON and error
-//! builders, and a streamed body over files already opened on disk.
+//! Remux's HTTP plumbing: the shared builders from `den-http`, the response shapes only the session routes need, and
+//! a streamed body over files already opened on disk.
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::{Response, StatusCode};
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
-/// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can fail
-/// mid-flight, full-buffer bodies never do).
-pub type Body = BoxBody<Bytes, std::io::Error>;
+pub use den_http::{error, full, not_found, Body};
 
 /// A satisfied single byte range. Callers still compare all three values with the range they requested and the
 /// identity they already hold; parsing a plausible total is not validation.
@@ -23,35 +20,15 @@ pub fn content_range(value: &str) -> Option<(u64, u64, u64)> {
     (start <= end && end < total).then_some((start, end, total))
 }
 
-pub fn full(data: impl Into<Bytes>) -> Body {
-    Full::new(data.into()).map_err(|never| match never {}).boxed()
-}
-
-/// JSON with an explicit Content-Length and any extra headers. Errors are never cacheable.
+/// JSON with an explicit Content-Length and any extra headers. Every session answer is private to its caller, so
+/// unlike the shared builder a success is `no-store` too unless the caller names a `Cache-Control` of its own.
 pub fn json(status: StatusCode, value: &serde_json::Value, extra: &[(&str, &str)]) -> Response<Body> {
-    let s = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let mut b = Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .header("content-length", s.len());
-    let has_cc = extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("cache-control"));
-    for (k, v) in extra {
-        b = b.header(*k, *v);
+    if extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("cache-control")) {
+        return den_http::json(status, value, extra);
     }
-    if !has_cc {
-        b = b.header("cache-control", "no-store");
-    }
-    b.body(full(s)).unwrap()
-}
-
-/// The one 404 every Den addon answers, for an unknown path and a refused `/metrics` alike.
-pub fn not_found() -> Response<Body> {
-    json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), &[])
-}
-
-/// `{ "error": <code>, "detail": <text> }` — the shape every Den addon answers with.
-pub fn error(status: StatusCode, code: &str, detail: &str) -> Response<Body> {
-    json(status, &serde_json::json!({ "error": code, "detail": detail }), &[])
+    let mut extra = extra.to_vec();
+    extra.push(("cache-control", "no-store"));
+    den_http::json(status, value, &extra)
 }
 
 /// A text body of a given type, with the `Cache-Control` it may be kept under.
@@ -92,4 +69,30 @@ pub fn files_body(parts: Vec<(std::fs::File, u64)>) -> Body {
         .flatten()
         .map_ok(Frame::data);
     BodyExt::boxed(StreamBody::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every session answer is private to its caller: a 200 with no `Cache-Control` of its own is `no-store` and
+    /// carries no validator, where the shared builder would send neither.
+    #[test]
+    fn a_session_answer_is_no_store_unless_it_says_otherwise() {
+        let plain = json(StatusCode::OK, &serde_json::json!({"ok": true}), &[]);
+        assert_eq!(plain.headers()["cache-control"], "no-store");
+        assert!(plain.headers().get("etag").is_none());
+        assert_eq!(plain.headers()["content-type"], "application/json");
+
+        let busy = json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({}), &[("retry-after", "2")]);
+        assert_eq!(busy.headers()["cache-control"], "no-store");
+        assert_eq!(busy.headers()["retry-after"], "2");
+
+        let own =
+            json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({}), &[("cache-control", "no-store")]);
+        assert_eq!(own.headers().get_all("cache-control").iter().count(), 1, "one directive, not two");
+
+        assert_eq!(error(StatusCode::BAD_REQUEST, "bad_request", "x").headers()["cache-control"], "no-store");
+        assert_eq!(not_found().headers()["cache-control"], "no-store");
+    }
 }

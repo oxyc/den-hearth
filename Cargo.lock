@@ -423,6 +423,7 @@ name = "den-hearth"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "den-http",
  "den-reel",
  "den-remux",
  "den-scout",
@@ -434,9 +435,22 @@ dependencies = [
  "reqwest",
  "serde_json",
  "socket2",
- "subtle",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
+ "tokio",
+]
+
+[[package]]
+name = "den-http"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "httpdate",
+ "serde",
+ "serde_json",
+ "subtle",
  "tokio",
 ]
 
@@ -455,6 +469,7 @@ dependencies = [
  "base64 0.23.1",
  "blake2",
  "bytes",
+ "den-http",
  "den-seal",
  "divan",
  "futures-util",
@@ -477,6 +492,7 @@ version = "0.47.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "den-http",
  "den-net",
  "divan",
  "dolby_vision",
@@ -504,6 +520,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chacha20poly1305",
+ "den-http",
  "den-net",
  "den-seal",
  "divan",
@@ -541,6 +558,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chardetng",
+ "den-http",
  "den-net",
  "den-seal",
  "divan",
@@ -552,7 +570,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "subtle",
  "tempfile",
  "tokio",
  "tokio-util",

@@ -419,26 +419,8 @@ impl Req {
     }
 }
 
-/// Go's decoded `URL.Path`: `%XX` escapes resolved, anything malformed left as it came.
-fn percent_decode(s: &str) -> String {
-    if !s.contains('%') {
-        return s.to_owned();
-    }
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
-            let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
-            out.push(hex(b[i + 1]) << 4 | hex(b[i + 2]));
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+/// Go's decoded `URL.Path`: `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
+use den_http::percent_decode_path as percent_decode;
 
 /// A response being built: Go's `ResponseWriter` after its handler has run.
 pub(crate) struct Out {
@@ -3356,12 +3338,7 @@ impl Inner {
     /// constant time: the token is a shared secret and a timing-variable compare on a route anyone can reach
     /// is a needless gift.
     fn metrics_authorized(&self, req: &Req) -> bool {
-        if self.deps.metrics_token.is_empty() {
-            return false;
-        }
-        let header = req.header("authorization");
-        let Some(given) = header.strip_prefix("Bearer ") else { return false };
-        constant_time_eq(given.trim().as_bytes(), self.deps.metrics_token.as_bytes())
+        den_http::bearer_matches(&req.header("authorization"), &self.deps.metrics_token)
     }
 
     /// publicOrigin: PUBLIC_BASE_URL when set (audit #8), else forwarded headers / Host.
@@ -3486,11 +3463,7 @@ fn is_debug_request(req: &Req) -> bool {
 
 /// RFC 9110 §13.1.2: `If-None-Match` compares weakly, so a `W/` prefix on either side is ignored. A
 /// proxy that compresses (Cloudflare) weakens the ETag the client then sends back.
-pub(crate) fn etag_matches(if_none_match: &str, etag: &str) -> bool {
-    let strong = |tag: &str| tag.trim().trim_start_matches("W/").to_owned();
-    let etag = strong(etag);
-    if_none_match.split(',').any(|tag| tag.trim() == "*" || strong(tag) == etag)
-}
+pub(crate) use den_http::if_none_match_matches as etag_matches;
 
 /// beginPlay is what both play routes do first: refuse any verb but GET (see handlePlay for why HEAD is refused
 /// too). Server-Timing is stamped on whatever the route answers, by `stamp_play`.

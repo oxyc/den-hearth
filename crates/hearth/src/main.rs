@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -40,7 +39,7 @@ use tokio::sync::watch;
 use media::Guarded;
 use route::{Service, Target};
 
-pub(crate) type Body = BoxBody<Bytes, std::io::Error>;
+pub(crate) use den_http::Body;
 
 const DEFAULT_PORT: u16 = 8090;
 
@@ -92,13 +91,7 @@ impl Hearth {
 }
 
 fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
-    let body = value.to_string();
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .header("cache-control", "no-store")
-        .body(Body::new(http_body_util::Full::new(Bytes::from(body)).map_err(|never| match never {})))
-        .expect("static response")
+    den_http::json(status, value, &[("cache-control", "no-store")])
 }
 
 /// The request as the service expects it: the same method, headers and body, with `path` in place of
@@ -114,11 +107,6 @@ fn with_path<B>(mut req: Request<B>, path: &str) -> Option<Request<B>> {
 
 fn bad_path() -> Response<Body> {
     json(StatusCode::BAD_REQUEST, &serde_json::json!({"error": "bad_path"}))
-}
-
-/// Subtitles' body can never fail; hearth's can, so say so.
-fn boxed(resp: Response<http_body_util::Full<Bytes>>) -> Response<Body> {
-    resp.map(|body| Body::new(body.map_err(|never| match never {})))
 }
 
 // Generic over the request body only so tests can drive it with an empty one; the bounds are Remux's.
@@ -193,7 +181,7 @@ where
             None => bad_path(),
         },
         Target::Subs(path) => match with_path(req, &path) {
-            Some(req) => boxed(den_subtitles::handle_request(hearth.subs.clone(), req).await),
+            Some(req) => den_subtitles::handle_request(hearth.subs.clone(), req).await,
             None => bad_path(),
         },
         Target::Remux(path) => match with_path(req, &path) {
@@ -209,18 +197,8 @@ where
 /// bearer token and a plain 404 without it, so nobody is told there is something to poke at; the series
 /// are low-cardinality by construction (two lanes, two media classes), never per-route or per-peer.
 fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
-    use subtle::ConstantTimeEq;
-    let presented = headers
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    let allowed = match (hearth.metrics_token.as_deref(), presented) {
-        (Some(token), Some(presented)) => presented.as_bytes().ct_eq(token.as_bytes()).into(),
-        _ => false,
-    };
-    if !allowed {
-        return json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}));
+    if !den_http::metrics_authorized(headers, hearth.metrics_token.as_deref()) {
+        return den_http::not_found();
     }
     let mut text = String::with_capacity(4096);
     hearth.admission.render(&mut text);
@@ -229,7 +207,7 @@ fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
         .header("cache-control", "no-store")
-        .body(Body::new(http_body_util::Full::new(Bytes::from(text)).map_err(|never| match never {})))
+        .body(den_http::full(text))
         .expect("static response")
 }
 
@@ -238,7 +216,7 @@ fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
 async fn health(hearth: &Hearth) -> serde_json::Value {
     let get = || Request::get("/health").body(Empty::<Bytes>::new()).expect("static request");
     let reel = den_reel::handle_request(hearth.reel.clone(), get()).await;
-    let subs = boxed(den_subtitles::handle_request(hearth.subs.clone(), get()).await);
+    let subs = den_subtitles::handle_request(hearth.subs.clone(), get()).await;
     let remux = den_remux::handle_request(hearth.remux.clone(), get()).await;
     let services = serde_json::json!({
         "scout": report(hearth.scout.health().await).await,

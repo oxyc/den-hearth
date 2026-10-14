@@ -9,6 +9,8 @@ license = "MIT"
 [dependencies]
 # The public-address classifier a play URL's non-scout hops are checked with, shared with Scout and Subtitles.
 den-net = { path = "../net" }
+# Response builders, CORS, the request log line and the metrics bearer check, shared with Reel and Subtitles.
+den-http = { path = "../http" }
 # Single-threaded async runtime: the process only routes requests and watches ffmpeg, which does the
 # actual work in its own process. current_thread keeps the resident thread count (and RAM) minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }

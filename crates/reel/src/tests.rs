@@ -998,6 +998,70 @@ fn the_request_log_redacts_the_config_segment() {
     }
 }
 
+/// A path with extra leading slashes is redacted at the segment the router would read as the config (or the
+/// capability), not logged whole behind an empty first segment.
+#[test]
+fn the_request_log_redacts_behind_extra_leading_slashes() {
+    let r = |p: &str| crate::redact_path(p).into_owned();
+    assert_eq!(r("//sealed.AbC-_9/manifest.json"), "/<config>/manifest.json");
+    assert_eq!(r("//m/s/eyJpIjoiY2FwIn0"), "/m/s/<cap>");
+    assert_eq!(r("//_internal/validate/m/s/eyJpIjoiY2FwIn0"), "/_internal/validate/m/s/<cap>");
+    assert_eq!(r("//health"), "//health", "our own route is not a credential");
+}
+
+/// Nothing after `m` reaches the log except the filed route that was asked for: a capability tried with an
+/// empty or upper-case segment, in upper-case `M`, behind extra slashes or with an encoded slash is still one.
+#[test]
+fn the_request_log_hides_every_form_of_a_capability_path() {
+    let r = |p: &str| crate::redact_path(p).into_owned();
+    // The two filed forms keep their shape and lose the capability.
+    assert_eq!(r("/m/s/CAPSECRET"), "/m/s/<cap>");
+    assert_eq!(r("/m/n/CAPSECRET/more"), "/m/n/<cap>");
+    assert_eq!(r("//m/s/CAPSECRET"), "/m/s/<cap>");
+    assert_eq!(r("///m/n/CAPSECRET"), "/m/n/<cap>");
+    // Anything else under `m`, in any case, is shown as nothing but `/m/<cap>`.
+    for p in [
+        "/m//s/CAPSECRET",
+        "/m/S/CAPSECRET",
+        "/m/N/CAPSECRET",
+        "/M/s/CAPSECRET",
+        "/M/S/CAPSECRET",
+        "/m/x/CAPSECRET",
+        "/m/s",
+        "//m//s/CAPSECRET",
+        "/m/s%2FCAPSECRET",
+        "/m/%73/CAPSECRET",
+    ] {
+        assert_eq!(r(p), "/m/<cap>", "{p}");
+    }
+    assert_eq!(r("/m"), "/m");
+    // An encoded slash or letter is not a route, so the whole path is the first segment's business.
+    assert_eq!(r("/m%2Fs/CAPSECRET"), "/<config>/CAPSECRET");
+    assert_eq!(r("/%6D/s/CAPSECRET"), "/<config>/s/CAPSECRET");
+    assert_eq!(r("//m%2fs%2fCAPSECRET"), "/<config>");
+    for p in ["/_internal/validate/m/s/CAPSECRET", "//_internal/validate/m/s/CAPSECRET"] {
+        assert!(!r(p).contains("CAPSECRET"), "{p}");
+    }
+}
+
+/// Clients and Cloudflare cache on these strings: the validator of a cacheable JSON body is the FNV-1a-64 of the
+/// bytes and their length in hex, quoted, and a `no-store` body has none.
+#[test]
+fn a_cacheable_body_carries_the_pinned_etag() {
+    let cacheable = crate::httputil::json(
+        hyper::StatusCode::OK,
+        &serde_json::json!({"a": 1}),
+        &[("cache-control", "public, max-age=60")],
+    );
+    assert_eq!(cacheable.headers()["etag"], "\"9c3e82dd6fcae8b1-7\"");
+    let private = crate::httputil::json(
+        hyper::StatusCode::OK,
+        &serde_json::json!({"a": 1}),
+        &[("cache-control", "no-store")],
+    );
+    assert!(private.headers().get("etag").is_none());
+}
+
 /// The caller's X-Request-Id ends the line, so it can be matched to the app's own log; a hostile
 /// value is cut down to the safe alphabet and 32 characters, and no header means no `rid`.
 #[test]

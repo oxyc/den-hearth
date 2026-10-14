@@ -10,10 +10,7 @@ use sha2::{Digest, Sha256};
 /// it does not hold; at 32 bits a collision between two versions of a list is within reach of an ordinary
 /// cache's lifetime.
 pub fn etag_hex(s: &str) -> String {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let h = s.bytes().fold(OFFSET_BASIS, |h, b| (h ^ u64::from(b)).wrapping_mul(PRIME));
-    format!("{h:016x}")
+    format!("{:016x}", den_http::stable_hash(s.as_bytes()))
 }
 
 /// Go `keyHash`: 128 bits of SHA-256 as hex, the collision-resistant digest for cache keys.
