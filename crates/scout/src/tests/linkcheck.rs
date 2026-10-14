@@ -78,6 +78,25 @@ async fn check_link_its_own_failure_does_not_condemn_the_link() {
     assert_eq!(got, LinkVerdict::Unverified, "a timed-out check gave verdict {got:?}, want unverified");
 }
 
+// Not in the Go suite. Go's `http.NewRequest` refuses only what `url.Parse` refuses (a control byte, a bad escape, a
+// space in the host); a link it takes but cannot dial is a failure of the check, which never condemns the link.
+#[tokio::test]
+async fn check_link_condemns_only_what_go_cannot_parse() {
+    let unreached = MockDoer(|_req: reqwest::Request| -> Result<reqwest::Response, DoError> { panic!("no request expected") });
+    for (link, want) in [
+        ("/relative/f.mkv", LinkVerdict::Unverified),
+        ("ftp-less-host/f.mkv", LinkVerdict::Unverified),
+        ("http://cdn.test:99999/f.mkv", LinkVerdict::Unverified),
+        ("http://cdn.test/f\u{7f}.mkv", LinkVerdict::Broken),
+        ("http://cdn test/f.mkv", LinkVerdict::Broken),
+        ("http://cdn.test/%zz", LinkVerdict::Broken),
+        ("://cdn.test/f.mkv", LinkVerdict::Broken),
+    ] {
+        let (got, reason) = check_link(&unreached, link, 0, 0).await;
+        assert_eq!(got, want, "{link:?}: {got:?} ({reason})");
+    }
+}
+
 // Handler- and store-level helpers for the `/play` tests below. They need `handler::serve`, `Deps::for_test`,
 // the stores (packages 1, 2 and 4) and a loopback CDN, so they stay compiled out until those land. Names follow
 // the assumptions in the coordinator's note; package 4 reconciles them.

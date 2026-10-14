@@ -194,7 +194,10 @@ pub fn exhausted_for(h: &HeaderMap, now: SystemTime) -> (Duration, bool) {
 
 /// Go `pauseKey` is the upstream a request goes to: its host, and a hash of the credential it carries, if any.
 fn pause_key(req: &reqwest::Request) -> String {
-    // Go keys by `url.Host`, which carries the port when the URL names one.
+    // Go keys by `url.Host`, which carries the port when the URL names one. DIVERGENCE kept: Go's is the host exactly
+    // as written, and a `reqwest::Request` only holds the WHATWG-normalised URL (host lower-cased, a default port
+    // such as `:443` dropped), so two spellings of one host share a pause here where Go gives them two. The text the
+    // caller wrote is gone before it reaches this seam; the only effect is that the pause is the more cautious one.
     let url = req.url();
     let host = match (url.host_str(), url.port()) {
         (Some(h), Some(p)) => format!("{h}:{p}"),
