@@ -140,6 +140,36 @@ fn play_ticket_carries_the_release_size() {
     assert!(got.release_size == 0 && got.file_idx == Some(0), "a ticket from before the size: {got:?}");
 }
 
+// Go reads a payload's keys case-insensitively and takes the last of a repeated one; a payload that spells every
+// key exactly takes a shorter route. Whichever route a payload takes, it must open to the same ticket.
+#[test]
+fn play_ticket_payload_keys_open_whatever_their_spelling() {
+    let kr = ticket_keyring();
+    let tk = ticket_keys(&kr);
+    let hash = "a".repeat(40);
+    let x = unix_secs(SystemTime::now() + Duration::from_secs(3600));
+    let payloads = [
+        ("exact", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
+        ("upper case", format!(r#"{{"H":"{hash}","F":4,"D":[["torbox","tb"]],"X":{x}}}"#)),
+        ("one key off", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"X":{x}}}"#)),
+        ("an unknown key", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x},"extra":[1]}}"#)),
+        ("an escaped key", format!(r#"{{"h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
+        ("a repeated key", format!(r#"{{"h":"nope","h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#)),
+        (
+            "a repeated spelling",
+            format!(r#"{{"H":"nope","h":"{hash}","f":4,"d":[["torbox","tb"]],"x":{x}}}"#),
+        ),
+    ];
+    for (name, payload) in payloads {
+        let ticket = legacy_ticket(&tk.keys[0], payload.as_bytes());
+        let (config, target) =
+            tk.open(&ticket, SystemTime::now()).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(target.info_hash, hash, "{name}");
+        assert_eq!(target.file_idx, Some(4), "{name}");
+        assert_eq!(config.debrid.len(), 1, "{name}");
+    }
+}
+
 // A ticket carries the release title and title id purely for the play/probe/cancel decision lines
 // (decisionlog.go) — round-tripped like every other field, and absent (zero value) on a ticket minted
 // before they existed, the same backward-compat shape the release size above already has.
