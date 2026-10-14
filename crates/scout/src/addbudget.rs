@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+#[cfg(not(test))]
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use crate::config::DebridService;
@@ -193,18 +195,44 @@ pub(crate) fn budget_remaining(budget: Option<&AddBudget>, account: &str) -> i64
 /// hourly ceiling keeps counting, so a restart hands back an allowance the service has not. The gap
 /// between this limit and the real 60 is what absorbs that, which is one more reason not to close it.
 /// A budget held on the store would be worse still — the stores are rebuilt per request.
+#[cfg(not(test))]
 static GLOBAL_ADD_BUDGET: LazyLock<Mutex<Arc<AddBudget>>> =
     LazyLock::new(|| Mutex::new(Arc::new(AddBudget::new(ADD_BUDGET_WINDOW, ADD_BUDGET_LIMIT))));
 
+// A TEST build keeps the budget per thread instead. Go's tests run one at a time and swap `globalAddBudget` around
+// the ones that care, while cargo runs ours in parallel: a shared budget lets one test's limit of zero refuse
+// another's add, and every test that uses the token "tok" spends from the same fifty. Each test runs on its own
+// thread (and a `#[tokio::test]` keeps all its tasks there), so a thread's budget is that test's, fresh and
+// unshared, and the assertions about it need no lock.
+#[cfg(test)]
+thread_local! {
+    static GLOBAL_ADD_BUDGET: std::cell::RefCell<Arc<AddBudget>> =
+        std::cell::RefCell::new(Arc::new(AddBudget::new(ADD_BUDGET_WINDOW, ADD_BUDGET_LIMIT)));
+}
+
 /// Go `globalAddBudget`: one per process, keyed by service and account.
 pub(crate) fn global_add_budget() -> Arc<AddBudget> {
-    Arc::clone(&GLOBAL_ADD_BUDGET.lock().unwrap_or_else(PoisonError::into_inner))
+    #[cfg(not(test))]
+    {
+        Arc::clone(&GLOBAL_ADD_BUDGET.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        GLOBAL_ADD_BUDGET.with(|b| Arc::clone(&b.borrow()))
+    }
 }
 
 /// Replaces the process-wide budget and returns the one it replaced. Go assigns `globalAddBudget` directly;
 /// the Rust form returns the previous value so a test can put it back.
 pub(crate) fn set_global_add_budget(budget: Arc<AddBudget>) -> Arc<AddBudget> {
-    std::mem::replace(&mut *GLOBAL_ADD_BUDGET.lock().unwrap_or_else(PoisonError::into_inner), budget)
+    #[cfg(not(test))]
+    {
+        std::mem::replace(&mut *GLOBAL_ADD_BUDGET.lock().unwrap_or_else(PoisonError::into_inner), budget)
+    }
+    #[cfg(test)]
+    {
+        GLOBAL_ADD_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget))
+    }
 }
 
 /// Go `SetPlayReserve` sets how many adds of the hour a prefetch may not spend. Called once at startup, from
