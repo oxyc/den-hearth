@@ -1,0 +1,14 @@
+[package]
+name = "den-scout"
+version = "0.0.0"
+edition = "2021"
+description = "Port of den-scout's internal/scout (Go) to Rust. A skeleton: shared types and one empty module per Go file, no logic yet"
+publish = false
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+# The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with
+# `http::Response` and hand it over, as the Go tests do with `mockDoer`.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }

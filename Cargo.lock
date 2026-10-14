@@ -382,6 +382,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "den-scout"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "serde",
+]
+
+[[package]]
 name = "den-subtitles"
 version = "0.24.7"
 dependencies = [
