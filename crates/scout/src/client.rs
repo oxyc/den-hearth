@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attributes::{container_of, StreamAttributes};
 use crate::rank::RawStream;
+use crate::util::go_to_lower;
 
 /// A browser's report of what it plays, as Den Web sends it to den-remux and den-remux passes on in
 /// X-Den-Playable (den-edge web/src/lib/playable.ts). With it a stream list is ranked for that browser rather
@@ -159,7 +160,7 @@ fn remux_opens(s: &RawStream) -> bool {
     if matches!(container_of(s.clone()).as_str(), "avi" | "webm") {
         return false;
     }
-    let name = s.title.to_lowercase();
+    let name = go_to_lower(&s.title);
     !REMUX_REFUSED_EXT.iter().any(|ext| name.ends_with(ext))
 }
 

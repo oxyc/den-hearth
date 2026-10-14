@@ -1,5 +1,7 @@
 //! Port of `internal/scout/probe_mp4.go`. Work package 5.
 
+use std::borrow::Cow;
+
 use crate::probe::{
     append_unique, bit_depth_from_config, channel_count, channel_layout, clean_lang, dovi_profile, hdr_from_transfer,
     round_rate, video_shape, Probe,
@@ -7,10 +9,13 @@ use crate::probe::{
 use crate::probe_avi::codec_from_four_cc;
 
 /// Go `mp4Box`: one box read from a head. `body` is what the box carries after its header.
+///
+/// `body` borrows the head, as Go's does: a box that holds boxes is walked again at each level, and copying the
+/// bodies each time would copy a one-megabyte head from untrusted bytes a dozen times over.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Mp4Box {
-    pub typ: String,
-    pub body: Vec<u8>,
+pub(crate) struct Mp4Box<'a> {
+    pub typ: Cow<'a, str>,
+    pub body: &'a [u8],
 }
 
 /// Go `parseMP4`: the probe read from an MP4 head, and whether the head described a parseable file.
@@ -123,22 +128,22 @@ fn sample_codec(mdia: &[u8]) -> &'static str {
 }
 
 /// Go `findBox`: the payload of the first child box with this type.
-fn find_box(buf: &[u8], want: &str) -> Option<Vec<u8>> {
+fn find_box<'a>(buf: &'a [u8], want: &str) -> Option<&'a [u8]> {
     boxes(buf).into_iter().find(|b| b.typ == want).map(|b| b.body)
 }
 
 /// Go `allBoxes`: the payloads of every child box with this type.
-fn all_boxes(buf: &[u8], want: &str) -> Vec<Vec<u8>> {
+fn all_boxes<'a>(buf: &'a [u8], want: &str) -> Vec<&'a [u8]> {
     boxes(buf).into_iter().filter(|b| b.typ == want).map(|b| b.body).collect()
 }
 
 /// Go `boxes`: the top-level boxes in a buffer. A wrong size stops the walk; it never indexes past the end.
-pub(crate) fn boxes(buf: &[u8]) -> Vec<Mp4Box> {
+pub(crate) fn boxes(buf: &[u8]) -> Vec<Mp4Box<'_>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 8 <= buf.len() {
         let size32 = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
-        let typ = String::from_utf8_lossy(&buf[i + 4..i + 8]).into_owned();
+        let typ = String::from_utf8_lossy(&buf[i + 4..i + 8]);
         let mut body = i + 8;
         let size: u64 = match size32 {
             // 64-bit size follows the type
@@ -168,17 +173,17 @@ pub(crate) fn boxes(buf: &[u8]) -> Vec<Mp4Box> {
         if size == 0 || end > buf.len() || body > end {
             return out;
         }
-        out.push(Mp4Box { typ, body: buf[body..end].to_vec() });
+        out.push(Mp4Box { typ, body: &buf[body..end] });
         i = end;
     }
     out
 }
 
 /// Go `firstSampleEntry`: the body of the first sample entry in a track's `stsd`.
-fn first_sample_entry(mdia: &[u8]) -> Option<Vec<u8>> {
+fn first_sample_entry(mdia: &[u8]) -> Option<&[u8]> {
     let minf = find_box(mdia, "minf")?;
-    let stbl = find_box(&minf, "stbl")?;
-    let stsd = find_box(&stbl, "stsd")?;
+    let stbl = find_box(minf, "stbl")?;
+    let stsd = find_box(stbl, "stsd")?;
     if stsd.len() < 8 {
         return None;
     }
@@ -213,9 +218,9 @@ fn mp4_video_config(mdia: &[u8], p: &mut Probe) {
         p.frame_rate = mp4_frame_rate(mdia);
     }
     for b in boxes(&entry[78..]) {
-        match b.typ.as_str() {
+        match &*b.typ {
             "avcC" | "hvcC" | "av1C" => {
-                let codec = match b.typ.as_str() {
+                let codec = match &*b.typ {
                     "avcC" => "h264",
                     "hvcC" => "hevc",
                     _ => "av1",

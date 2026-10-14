@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::indexerconfig::null_default;
+use crate::util::go_to_lower;
+
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
@@ -52,9 +55,11 @@ pub struct Probe {
     pub height: i32,
     #[serde(rename = "frameRate", default, skip_serializing_if = "is_zero_f64")]
     pub frame_rate: f64,
-    #[serde(rename = "audioLanguages", default)]
+    /// Go writes a probe with no languages as `null` (a nil slice, and no `omitempty`), so a cached one reads as
+    /// empty here.
+    #[serde(rename = "audioLanguages", default, deserialize_with = "null_default")]
     pub audio: Vec<String>,
-    #[serde(rename = "subtitleLanguages", default)]
+    #[serde(rename = "subtitleLanguages", default, deserialize_with = "null_default")]
     pub subtitles: Vec<String>,
     /// How many tracks carried no language at all.
     #[serde(rename = "untaggedAudioTracks", default)]
@@ -142,7 +147,8 @@ fn probed_total_size(resp: &reqwest::Response) -> i64 {
 }
 
 /// Go `contentRangeTotal` (linkcheck.go): the total after the first `/` of a Content-Range value, when it
-/// parses as a positive integer. A private copy until the linkcheck port lands.
+/// parses as a positive integer. A private copy of linkcheck.go's function of the same name, which belongs to
+/// linkcheck.rs; the two are to be one function once that module offers it.
 fn content_range_total(v: &str) -> Option<i64> {
     let (_, total) = v.split_once('/')?;
     let n: i64 = total.trim().parse().ok()?;
@@ -270,7 +276,10 @@ pub(crate) fn parse_track_entry(entry: &[u8]) -> (u8, String) {
         if id == u32::from(ID_TRACK_TYPE) {
             kind = uint_from(body);
         } else if id == ID_LANGUAGE || id == ID_LANGUAGE_BCP {
-            // Each tag replaces the one before it, so the last one in the entry wins.
+            // Each tag replaces the one before it, so the last one in the entry wins. Go's comment on the BCP-47
+            // case says "BCP-47 wins where both exist: it is the field a modern muxer fills in", but its code
+            // is this same last-wins assignment for both elements, so a BCP-47 tag written BEFORE the ISO 639-2 one
+            // loses to it. The code is what Go does, so it is what this does.
             let s = clean_lang(body);
             if !s.is_empty() {
                 lang = s;
@@ -293,8 +302,8 @@ pub(crate) fn parse_track_entry(entry: &[u8]) -> (u8, String) {
 /// group or match on. Everything lands on ISO 639-1 where a mapping exists; anything else passes through
 /// as given rather than being dropped.
 pub(crate) fn clean_lang(b: &[u8]) -> String {
-    let raw = String::from_utf8_lossy(b);
-    let s = raw.trim_end_matches('\0').trim().to_lowercase();
+    let raw = go_lossy_utf8(b);
+    let s = go_to_lower(raw.trim_end_matches('\0').trim());
     if s == "und" || s.is_empty() {
         return String::new();
     }
@@ -307,6 +316,28 @@ pub(crate) fn clean_lang(b: &[u8]) -> String {
         Some((_, two)) => (*two).to_string(),
         None => base.to_string(),
     }
+}
+
+/// Go's reading of bytes that may not be UTF-8: `strings.ToLower` and friends turn each byte that is not part of a
+/// valid sequence into its own U+FFFD, where `String::from_utf8_lossy` turns a whole broken sequence into one. A
+/// language tag is whatever bytes the muxer wrote, and it is passed through as given, so the count shows.
+fn go_lossy_utf8(mut b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    while !b.is_empty() {
+        match std::str::from_utf8(b) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(e) => {
+                let (valid, rest) = b.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                out.push('\u{FFFD}');
+                b = rest.get(1..).unwrap_or_default();
+            }
+        }
+    }
+    out
 }
 
 /// Go `iso639`: ISO 639-2 (bibliographic AND terminological — muxers emit both) to 639-1, for the languages
