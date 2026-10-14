@@ -37,6 +37,33 @@ fn a_config_sealed_by_den_seal_opens() {
     assert!(matches!(&c, Some(c) if c.debrid[0].token == "fresh-sealed"), "{c:?}");
 }
 
+// The Den addon's handler reads Scout's member of a combined config, with the config's install id and epoch, and
+// neither decoder opens the other's kind of config.
+#[test]
+fn a_combined_config_opens_through_its_scout_member_only() {
+    let kr = parse_seal_keyring(VEC_PRIV_B64, "").unwrap().unwrap();
+    let seal_json = |json: &str| {
+        let mut framed = vec![SEALED_VERSION];
+        framed.extend(den_seal::seal(&kr.keys[0].pub_key, json.as_bytes()).unwrap());
+        b64url_encode(&framed)
+    };
+    let iid = "AAECAwQFBgcICQoLDA0ODw";
+    let combined = seal_json(&format!(
+        r#"{{"iid":"{iid}","ep":3,"scout":{{"debrid":[{{"service":"torbox","token":"den"}}],"scope":"availability"}},"subs":{{"osKey":"o"}}}}"#
+    ));
+    let own = seal_json(r#"{"debrid":[{"service":"torbox","token":"own"}]}"#);
+    let c =
+        crate::config::decode_config_slice(Some(&kr), &combined, Some("scout")).expect("the member opens");
+    assert_eq!((c.debrid[0].token.as_str(), c.iid.as_str(), c.epoch), ("den", iid, 3));
+    // Sealed, so its scope stands.
+    assert_eq!(c.scope, "availability");
+    assert!(crate::config::decode_config_slice(Some(&kr), &own, Some("scout")).is_none());
+    assert!(decode_config(Some(&kr), &combined).is_none());
+    // A member's scope is refused in plaintext, as Scout's own config's is.
+    let plain = blob(r#"{"scout":{"debrid":[{"service":"torbox","token":"t"}],"scope":"availability"}}"#);
+    assert!(crate::config::decode_config_slice(None, &plain, Some("scout")).is_none());
+}
+
 // A fixed segment MINTED by the /configure browser bundle (tweetnacl + blake2b crypto_box_seal) to
 // vecPub — the JS→Go interop gate, complementing the PyNaCl (libsodium→Go) vector above. Regenerate with
 // scratch/sealsrc/entry.js's denSeal() if the wire format ever changes.

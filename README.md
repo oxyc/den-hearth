@@ -114,6 +114,7 @@ commits `VERSION`, waits for that commit's CI and tags it.
 | `/subs/...` | Subtitles | `/...` (prefix removed) |
 | `/remux/...` | Remux | unchanged (Remux already serves everything under `/remux`) |
 | `/remux/metrics` | Remux | `/metrics` (its one route outside `/remux`) |
+| `/den/...` | the Den addon: hearth, or the service a resource belongs to | see "The Den addon" |
 | `/health` | hearth | all four side by side, below |
 | `/metrics` | hearth | its own admission counters (see Bounds); needs `HEARTH_METRICS_TOKEN` (or `METRICS_TOKEN`), else 404 |
 | anything else | hearth | 404 |
@@ -121,6 +122,35 @@ commits `VERSION`, waits for that commit's CI and tags it.
 `/health` answers 200 with `{"status": "ok"|"degraded", "services": {"scout": {...}, "reel": {...}, "subs": {...},
 "remux": {...}}}`, each entry being that service's own `/health` body. It is `degraded` when any service
 says anything but `ok`. Each service's own `/health` and `/metrics` stay reachable under its prefix.
+
+## The Den addon
+
+One Stremio addon for what were three installs ([oxyc/den#286](https://github.com/oxyc/den/issues/286)): one
+manifest, one `/den/configure` and one sealed config holding a member per service — `scout` (streams), `subs`
+(subtitles), `reel` (trailers), each exactly the config that service's own `/configure` builds — with one install
+id (`iid`) and epoch (`ep`) at the top. The manifest at `/den/<config>/manifest.json` declares only the members the
+install has. Hearth answers the page, `/den/config-key` and both manifests; each resource goes to its service in
+process (`crates/hearth/src/den.rs`), which reads its member with the code that reads its own config and mints its
+links under `/den`, so they come back there and answer to the addon's revocation. A config or link of either kind is
+refused on the other's routes; every per-service route, key, revocation list and response is unchanged.
+
+| Env | |
+|---|---|
+| `HEARTH_CONFIG_KEY`, `HEARTH_CONFIG_KEYS_PREV` | The addon's sealing key and prior keys. Unset: a ring derived from Scout's `CONFIG_KEY`/`CONFIG_KEYS_PREV` (HKDF), so a node that seals Scout seals this too and neither opens the other's configs or play tickets. Neither set: plaintext configs. A malformed key refuses every Den config (503 `config_key_invalid`). Play tickets are keyed with the addon's own HKDF info, so they stay apart from Scout's even if both keys are equal (hearth warns at startup when they are). |
+| `HEARTH_REVOKED_INSTALLS`, `HEARTH_CONFIG_EPOCH`, `HEARTH_REQUIRE_INSTALL_ID` | The addon's revocation, as each service's `*_REVOKED_INSTALLS` etc. |
+| `HEARTH_PUBLIC_BASE_URL` | The addon's links go under `<it>/den`; unset, under the request's origin and `/den`. |
+
+The startup line `den addon at /den — sealed=… key=…` shows what is in force.
+
+**Moving from the derived key to one of its own breaks every Den install** unless the derived ring is kept: its
+private half is never written anywhere, so it cannot be copied into `HEARTH_CONFIG_KEYS_PREV`. Name it instead —
+`HEARTH_CONFIG_KEYS_PREV=scout` (beside any other prior keys) keeps installs sealed under the ring derived from
+Scout's current and prior keys opening, for as long as Scout keeps those keys. Changing Scout's `CONFIG_KEY`
+while the Den addon derives from it rotates the Den key with it: put Scout's old key in Scout's
+`CONFIG_KEYS_PREV`, as for Scout's own installs.
+
+`/den/_internal/validate/m/s/<blob>` is Reel's capability check for den-edge's LAN relay, on the Den addon's terms:
+it validates only capabilities Reel minted for a Den install, as Reel's own route validates only Reel's.
 
 ## Listeners
 

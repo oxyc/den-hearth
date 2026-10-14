@@ -2,6 +2,8 @@
 
 use hyper::Method;
 
+use crate::den::Route;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Target {
     /// Hearth's own `/health`, which reports every service.
@@ -16,6 +18,8 @@ pub enum Target {
     Scout(String),
     /// `/remux/<rest>`, served as it came: Remux's routes already live under `/remux`.
     Remux(String),
+    /// `/den/<rest>`: the combined Den addon (`den.rs`), answered by hearth or by the service it routes to.
+    Den(Route),
     NotFound,
 }
 
@@ -64,6 +68,9 @@ pub fn target(path: &str) -> Target {
         } else {
             path.to_string()
         });
+    }
+    if let Some(rest) = mounted(path, den_seal::addon::MOUNT) {
+        return Target::Den(crate::den::route(&rest));
     }
     Target::NotFound
 }
@@ -130,6 +137,16 @@ pub fn classify(target: &Target, method: &Method) -> Class {
         Target::Subs(_) => bulk(None),
         Target::Remux(path) if remux_control(path, method) => control,
         Target::Remux(path) => bulk(remux_media(path).then_some(MediaClass::Remux)),
+        // A resource is admitted exactly as the same path on its service's own mount; the addon's own pages,
+        // key and manifests are answered from no upstream, like each service's.
+        Target::Den(route) => match route {
+            Route::Scout(path) => classify(&Target::Scout(path.clone()), method),
+            Route::Subs(path) => classify(&Target::Subs(path.clone()), method),
+            Route::Reel(path) => classify(&Target::Reel(path.clone()), method),
+            Route::NotFound => bulk(None),
+            Route::Configure | Route::Manifest | Route::ConfigKey | Route::Installed(_) if read => control,
+            _ => bulk(None),
+        },
     }
 }
 
@@ -413,8 +430,54 @@ mod tests {
 
     #[test]
     fn a_longer_name_is_not_a_mount() {
-        for path in ["/reeling", "/subsonic", "/remuxed", "/", "/play/x.mp4", "/CONFIG/manifest.json"] {
+        for path in
+            ["/reeling", "/subsonic", "/remuxed", "/dentist", "/", "/play/x.mp4", "/CONFIG/manifest.json"]
+        {
             assert_eq!(target(path), Target::NotFound, "{path}");
         }
+    }
+
+    #[test]
+    fn the_den_addon_loses_its_mount() {
+        assert_eq!(target("/den"), Target::Den(Route::Configure));
+        assert_eq!(target("/den/CFG/manifest.json"), Target::Den(Route::Installed("CFG".into())));
+        assert_eq!(
+            target("/den/CFG/stream/movie/tt1.json"),
+            Target::Den(Route::Scout("/CFG/stream/movie/tt1.json".into()))
+        );
+    }
+
+    /// A resource under `/den` is admitted exactly as the same path under its service's own mount.
+    #[test]
+    fn the_den_addon_is_classified_like_the_services_it_routes_to() {
+        let get = Method::GET;
+        for path in [
+            "/CFG/stream/movie/tt1.json",
+            "/p/ticket",
+            "/CFG/subtitles/movie/tt1.json",
+            "/CFG/meta/movie/tt1.json",
+            "/play/x.mp4",
+            "/progressive/x.mp4",
+            "/m/s/blob",
+            "/hls/x.m3u8",
+        ] {
+            let den = classify(&target(&format!("/den{path}")), &get);
+            let own = match crate::den::route(path) {
+                Route::Scout(p) => classify(&Target::Scout(p), &get),
+                Route::Subs(p) => classify(&Target::Subs(p), &get),
+                Route::Reel(p) => classify(&Target::Reel(p), &get),
+                other => panic!("{path} routed to {other:?}"),
+            };
+            assert_eq!(den, own, "{path}");
+        }
+        assert_eq!(class(target("/den/play/x.mp4"), get.clone()), (Lane::Bulk, Some(MediaClass::Reel)));
+        assert_eq!(class(target("/den/CFG/stream/movie/tt1.json"), get.clone()), (Lane::Bulk, None));
+        for path in
+            ["/den", "/den/configure", "/den/manifest.json", "/den/config-key", "/den/CFG/manifest.json"]
+        {
+            assert_eq!(class(target(path), get.clone()).0, Lane::Control, "{path}");
+            assert_eq!(class(target(path), Method::POST).0, Lane::Bulk, "{path}");
+        }
+        assert_eq!(class(target("/den/nope/nope"), get).0, Lane::Bulk);
     }
 }

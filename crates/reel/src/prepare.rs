@@ -15,6 +15,7 @@ use crate::state::AppState;
 pub async fn handle_prepare(
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    den: Option<&den_seal::Addon>,
     cfg: Option<&crate::userconfig::UserConfig>,
     ty: &str,
     raw_id: &str,
@@ -35,9 +36,9 @@ pub async fn handle_prepare(
         return httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail);
     }
     let warm = intent == "warm";
-    let discovered = crate::addon::prepare_discovery(state, headers, cfg, ty, raw_id, query).await;
+    let discovered = crate::addon::prepare_discovery(state, headers, den, cfg, ty, raw_id, query).await;
     let binding = match cfg {
-        Some(c) => crate::sign::Binding::Install { iid: c.iid.as_deref(), ep: c.ep },
+        Some(c) => crate::sign::Binding::install(c.iid.as_deref(), c.ep, den.is_some()),
         None => crate::sign::Binding::Unbound,
     };
     let mut meta = crate::addon::build_meta(
@@ -89,6 +90,7 @@ pub async fn handle_prepare(
         primary_id.clone(),
         query,
         Some(binding),
+        den.is_some(),
         warm,
         !discovered.head_dead,
     )

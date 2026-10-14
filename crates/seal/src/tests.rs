@@ -214,6 +214,95 @@ fn the_order_is_id_then_epoch_then_missing_id() {
     assert_eq!(revocation.check(None, 2), Err(Rejected::NoInstallId));
 }
 
+fn slice(json: &str, member: &str) -> Option<serde_json::Value> {
+    addon::slice_json(json.as_bytes(), member).map(|j| serde_json::from_slice(&j).unwrap())
+}
+
+#[test]
+fn a_service_reads_its_member_with_the_install_identity_put_in() {
+    let combined = format!(
+        r#"{{"iid":"{IID}","ep":3,"scout":{{"debrid":[]}},"subs":{{"osKey":"o"}},"reel":{{"tmdbKey":"t"}}}}"#
+    );
+    assert_eq!(slice(&combined, "subs").unwrap(), serde_json::json!({"osKey": "o", "iid": IID, "ep": 3}));
+    assert_eq!(slice(&combined, "reel").unwrap(), serde_json::json!({"tmdbKey": "t", "iid": IID, "ep": 3}));
+    // No identity at the top: none in the member either.
+    assert_eq!(slice(r#"{"reel":{"tmdbKey":"t"}}"#, "reel").unwrap(), serde_json::json!({"tmdbKey": "t"}));
+}
+
+#[test]
+fn a_member_cannot_name_an_install_of_its_own() {
+    let combined = format!(r#"{{"iid":"{IID}","scout":{{"IID":"{OTHER_IID}","iid":"{OTHER_IID}","Ep":9}}}}"#);
+    assert_eq!(slice(&combined, "scout").unwrap(), serde_json::json!({"iid": IID}));
+}
+
+#[test]
+fn a_missing_or_malformed_member_is_no_config() {
+    for json in [r#"{"subs":{"osKey":"o"}}"#, r#"{"reel":"tmdb"}"#, r#"{"reel":null}"#, "[1]", "not json"] {
+        assert!(slice(json, "reel").is_none(), "{json}");
+    }
+    // A service's own config is not a combined one: its fields are not a member.
+    assert!(slice(r#"{"tmdbKey":"t"}"#, "reel").is_none());
+}
+
+#[test]
+fn a_combined_segment_opens_on_the_addon_s_terms_and_fails_closed() {
+    let kr = ring();
+    let mut framed = vec![SEALED_VERSION];
+    framed.extend(seal(&kr.keys[0].pub_key, br#"{"ep":1,"reel":{"tmdbKey":"t"}}"#).unwrap());
+    let segment = encode(&framed);
+    let addon = Addon {
+        keyring: Some(kr.clone()),
+        key_invalid: false,
+        revocation: Revocation::default(),
+        public_base: None,
+        slice: "reel",
+    };
+    let opened = addon.open(&segment).unwrap();
+    assert!(opened.sealed);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&opened.json).unwrap(),
+        serde_json::json!({"tmdbKey": "t", "ep": 1})
+    );
+    // A member this install does not have.
+    assert_eq!(Addon { slice: "subs", ..addon.clone() }.open(&segment).err(), Some(Rejected::Undecodable));
+    // Plaintext while sealing is on, and a sealed segment with no keyring.
+    assert_eq!(addon.open(&encode(r#"{"reel":{"tmdbKey":"t"}}"#)).err(), Some(Rejected::Plaintext));
+    assert_eq!(Addon { keyring: None, ..addon.clone() }.open(&segment).err(), Some(Rejected::Undecodable));
+}
+
+#[test]
+fn the_base_is_the_public_one_or_the_request_s_origin_under_the_mount() {
+    let mut addon = Addon {
+        keyring: None,
+        key_invalid: false,
+        revocation: Revocation::default(),
+        public_base: Some("https://node.example/den/".into()),
+        slice: "subs",
+    };
+    assert_eq!(addon.base("http://ignored"), "https://node.example/den");
+    addon.public_base = None;
+    assert_eq!(addon.base("http://lan:8090/"), "http://lan:8090/den");
+}
+
+#[test]
+fn a_derived_ring_is_another_ring_that_rotates_with_its_source() {
+    let source = Keyring::from_env(&STD.encode([0x40u8; 32]), VEC_PRIV_B64).unwrap().unwrap();
+    let derived = source.derive(b"den-test");
+    assert_eq!(derived.keys.len(), 2);
+    // Deterministic, and specific to the info string.
+    assert_eq!(derived.current_pub_base64(), source.derive(b"den-test").current_pub_base64());
+    assert_ne!(derived.current_pub_base64(), source.derive(b"other").current_pub_base64());
+    // Neither ring opens what was sealed to the other.
+    let to_derived = seal(&derived.keys[0].pub_key, b"x").unwrap();
+    let to_source = seal(&source.keys[0].pub_key, b"x").unwrap();
+    assert!(source.open(&to_derived).is_none());
+    assert!(derived.open(&to_source).is_none());
+    assert_eq!(derived.open(&to_derived).as_deref(), Some(&b"x"[..]));
+    // A link sealed to the derived key of a rotated-out source key still opens.
+    let old = ring().derive(b"den-test");
+    assert_eq!(derived.open(&seal(&old.keys[0].pub_key, b"old").unwrap()).as_deref(), Some(&b"old"[..]));
+}
+
 #[test]
 fn an_epoch_that_is_not_an_integer_in_range_enforces_zero() {
     assert_eq!(Revocation::from_env("", None).epoch(), 0);

@@ -440,9 +440,11 @@ pub(crate) struct PreparedDiscovery {
     pub timing: String,
 }
 
+/// `den`: the request came under the combined Den addon (hearth's `/den`), whose links are minted under its base.
 pub(crate) async fn prepare_discovery(
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    den: Option<&den_seal::Addon>,
     cfg: Option<&crate::userconfig::UserConfig>,
     ty: &str,
     raw_id: &str,
@@ -454,7 +456,10 @@ pub(crate) async fn prepare_discovery(
         Some(rest) => format!("tmdb:{}", rest.split(':').next().unwrap_or("")),
         None => raw_id.split(':').next().unwrap_or("").to_string(),
     };
-    let base = self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port);
+    let base = match den {
+        Some(den) => den.base(&self_base(None, headers, state.cfg.port)),
+        None => self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port),
+    };
     if !is_supported_id(&id) {
         return PreparedDiscovery {
             id,
@@ -497,14 +502,15 @@ pub(crate) async fn prepare_discovery(
 pub async fn handle_meta(
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    den: Option<&den_seal::Addon>,
     cfg: Option<&crate::userconfig::UserConfig>,
     ty: &str,
     raw_id: &str,
     query: &str,
 ) -> Response<Body> {
-    let prepared = prepare_discovery(state, headers, cfg, ty, raw_id, query).await;
+    let prepared = prepare_discovery(state, headers, den, cfg, ty, raw_id, query).await;
     let binding = match cfg {
-        Some(c) => crate::sign::Binding::Install { iid: c.iid.as_deref(), ep: c.ep },
+        Some(c) => crate::sign::Binding::install(c.iid.as_deref(), c.ep, den.is_some()),
         None => crate::sign::Binding::Unbound,
     };
     // Only an imdb or a tmdb id reaches the upstreams (and our URLs) — reject anything else so a

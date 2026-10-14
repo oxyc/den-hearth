@@ -21,6 +21,9 @@ use crate::seal::SealKeyring;
 use crate::util::{b64url_decode, b64url_encode, fold_json_keys, Shape, LEAF};
 
 pub const PLAY_TICKET_INFO: &str = "den-scout/play/v1";
+/// The ticket-key info of the handler that reads the combined Den addon's configs (`Deps::config_slice`). Its own,
+/// so a Den ticket never opens on Scout's routes, nor Scout's on the Den addon's, even under one sealing key.
+pub const DEN_PLAY_TICKET_INFO: &str = "den-hearth/den-addon/play/v1";
 /// The first path segment of a ticketed play URL. No config segment can be "p" — it does not decode.
 pub const TICKET_ROUTE: &str = "p";
 /// How long a ticket stays good (PLAY_TICKET_TTL_SECS). It must outlast the stream list that carries it,
@@ -177,6 +180,11 @@ pub struct TicketKeys {
 impl TicketKeys {
     /// Go `newTicketKeys`: `None` with no keyring, which is what turns tickets off.
     pub fn new(kr: Option<&SealKeyring>) -> Option<TicketKeys> {
+        TicketKeys::with_info(kr, PLAY_TICKET_INFO)
+    }
+
+    /// `new`, with the keys expanded under `info` (`DEN_PLAY_TICKET_INFO` for the Den addon's handler).
+    pub fn with_info(kr: Option<&SealKeyring>, info: &str) -> Option<TicketKeys> {
         match kr {
             Some(kr) if !kr.keys.is_empty() => {
                 let keys = kr
@@ -186,7 +194,7 @@ impl TicketKeys {
                         // HKDF only refuses an output longer than 255 hashes, so a 32-byte key cannot fail.
                         let mut key = [0u8; 32];
                         Hkdf::<Sha256>::new(None, &k.priv_key)
-                            .expand(PLAY_TICKET_INFO.as_bytes(), &mut key)
+                            .expand(info.as_bytes(), &mut key)
                             .expect("32 bytes is within HKDF-SHA256's output limit");
                         key
                     })

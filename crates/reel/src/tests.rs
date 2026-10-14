@@ -20,6 +20,8 @@ use crate::upstream::NoAnswer;
 use crate::upstream::{pick_trailer_candidates, Upstream};
 use crate::ytdlp::classify;
 
+mod den;
+
 // --- fakes / builders -------------------------------------------------------
 
 struct FakeInner {
@@ -2364,9 +2366,9 @@ async fn an_uppercase_language_is_the_same_language() {
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
     let headers = hyper::header::HeaderMap::new();
 
-    let _ = crate::addon::handle_meta(&state, &headers, None, "movie", "tt0111161", "lang=de").await;
+    let _ = crate::addon::handle_meta(&state, &headers, None, None, "movie", "tt0111161", "lang=de").await;
     let after_lower = fake.calls();
-    let _ = crate::addon::handle_meta(&state, &headers, None, "movie", "tt0111161", "lang=DE").await;
+    let _ = crate::addon::handle_meta(&state, &headers, None, None, "movie", "tt0111161", "lang=DE").await;
     assert_eq!(
         fake.calls(),
         after_lower,
@@ -4190,6 +4192,7 @@ async fn prepare_returns_a_signed_primary_ladder_with_its_exact_resolution_base(
     let response = crate::prepare::handle_prepare(
         &state,
         &headers,
+        None,
         Some(&install),
         "movie",
         "tt0111161",
@@ -4248,7 +4251,8 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
     headers.insert("host", "reel.example".parse().unwrap());
     let query = "v=2&surface=silent&player=hls.js&intent=play&height=540&playable=%7B%22h264%22%3A51%7D";
     let response =
-        crate::prepare::handle_prepare(&state, &headers, Some(&install), "movie", "tt0111161", query).await;
+        crate::prepare::handle_prepare(&state, &headers, None, Some(&install), "movie", "tt0111161", query)
+            .await;
     assert_eq!(response.status(), 200);
     let body = direct_body(response).await;
     assert_eq!(body["v"], 2);
@@ -4278,7 +4282,7 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
     let plan_url = body["primary"]["planUrl"].as_str().unwrap();
     let plan_query = plan_url.split_once('?').unwrap().1;
     let source_response =
-        crate::sources::handle_sources(state.clone(), &headers, "dQw4w9WgXcQ".into(), plan_query).await;
+        crate::sources::handle_sources(state.clone(), None, &headers, "dQw4w9WgXcQ".into(), plan_query).await;
     assert_eq!(source_response.status(), 200);
     assert_eq!(direct_body(source_response).await, body["primaryPlan"]);
 
@@ -4288,6 +4292,7 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
         crate::prepare::handle_prepare(
             &empty,
             &hyper::HeaderMap::new(),
+            None,
             None,
             "movie",
             "tt0111161",
@@ -4318,6 +4323,7 @@ async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() 
         &state,
         &hyper::HeaderMap::new(),
         None,
+        None,
         "movie",
         "tt0111161",
         "surface=audible&player=hls.js&intent=play",
@@ -4332,6 +4338,7 @@ async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() 
     let response = crate::prepare::handle_prepare(
         &empty,
         &hyper::HeaderMap::new(),
+        None,
         None,
         "series",
         "tt0111161",
@@ -4391,6 +4398,7 @@ async fn prepare_rejects_the_ask_before_discovery() {
             &state,
             &hyper::HeaderMap::new(),
             None,
+            None,
             "movie",
             "tt0111161",
             query,
@@ -4427,6 +4435,7 @@ async fn a_resolved_silent_native_warm_neither_builds_nor_advertises_an_unready_
     let response = crate::prepare::handle_prepare(
         &state,
         &hyper::HeaderMap::new(),
+        None,
         None,
         "movie",
         "tt0111161",
@@ -4467,6 +4476,7 @@ async fn prepare_keeps_alternates_when_the_primary_source_prep_fails() {
         &state,
         &hyper::HeaderMap::new(),
         None,
+        None,
         "movie",
         "tt0111161",
         "surface=audible&player=native&intent=play",
@@ -4491,6 +4501,7 @@ async fn prepare_keeps_alternates_when_the_primary_source_prep_fails() {
     let response = crate::prepare::handle_prepare(
         &state,
         &hyper::HeaderMap::new(),
+        None,
         None,
         "movie",
         "tt0111161",
@@ -4533,6 +4544,7 @@ async fn prepare_caps_demoted_answers_and_does_not_warm_an_all_dead_list() {
         &state,
         &hyper::HeaderMap::new(),
         None,
+        None,
         "movie",
         "tt0111161",
         "surface=audible&player=native&intent=warm",
@@ -4554,6 +4566,7 @@ async fn prepare_caps_demoted_answers_and_does_not_warm_an_all_dead_list() {
     let response = crate::prepare::handle_prepare(
         &all_dead,
         &hyper::HeaderMap::new(),
+        None,
         None,
         "movie",
         "tt0111161",
@@ -4892,7 +4905,8 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     let ask = |query: &'static str| {
         let state = state.clone();
         async move {
-            crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await
+            crate::sources::handle_sources(state, None, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query)
+                .await
         }
     };
 
@@ -4975,6 +4989,7 @@ async fn sources_v2_is_explicit_and_ends_with_a_download_capability() {
     let state = direct_state(&dir, yt);
     let response = crate::sources::handle_sources(
         state.clone(),
+        None,
         &hyper::HeaderMap::new(),
         "dQw4w9WgXcQ".into(),
         "v=2&surface=silent&player=hls.js",
@@ -5022,6 +5037,7 @@ async fn sources_v2_is_explicit_and_ends_with_a_download_capability() {
 
     let legacy = crate::sources::handle_sources(
         state.clone(),
+        None,
         &hyper::HeaderMap::new(),
         "dQw4w9WgXcQ".into(),
         "v=1&surface=silent&player=hls.js",
@@ -5035,6 +5051,7 @@ async fn sources_v2_is_explicit_and_ends_with_a_download_capability() {
 
     let invalid = crate::sources::handle_sources(
         state,
+        None,
         &hyper::HeaderMap::new(),
         "dQw4w9WgXcQ".into(),
         "v=7&surface=silent&player=hls.js",
@@ -5338,7 +5355,8 @@ async fn a_press_builds_the_index_the_open_after_it_will_need() {
     let ask = |query: &'static str| {
         let state = state.clone();
         async move {
-            crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await
+            crate::sources::handle_sources(state, None, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query)
+                .await
         }
     };
     let taken = || warmed.lock().unwrap().drain(..).collect::<Vec<_>>();
@@ -5365,7 +5383,8 @@ async fn an_audible_answer_still_refuses_a_video_known_to_be_gone() {
 
     let query = "surface=audible&player=native";
     let resp =
-        crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await;
+        crate::sources::handle_sources(state, None, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query)
+            .await;
     assert_eq!(resp.status(), 404, "the verdict already standing, not a list of URLs that cannot play");
     assert_eq!(spawn_count(&runs), 1, "and without resolving it again");
 }
@@ -5390,13 +5409,16 @@ async fn a_media_url_opens_only_as_minted_and_until_it_expires() {
         i: None,
         e: None,
         x,
+        den: false,
     };
     let open = |path: String| {
         let state = state.clone();
         async move {
             let (filed, rest) = path.strip_prefix("m/").unwrap().split_once('/').unwrap();
             let (blob, query) = rest.split_once('?').unwrap();
-            crate::sources::handle_media(state, &hyper::HeaderMap::new(), filed, blob, query).await.status()
+            crate::sources::handle_media(state, None, &hyper::HeaderMap::new(), filed, blob, query)
+                .await
+                .status()
         }
     };
     // Carried by this server, so filed under `s`; the same URL under `n` would be metered as a playlist.
@@ -5422,7 +5444,7 @@ fn direct_media_validation_is_signed_expiring_and_revocable() {
         let sealed = crate::sources::seal(signer, &media);
         let (_, rest) = sealed.split_once("m/s/").expect("a carried media path");
         let (blob, query) = rest.split_once('?').unwrap_or((rest, ""));
-        crate::sources::validate_direct_capability(state, blob, query)
+        crate::sources::validate_direct_capability(state, None, blob, query)
     };
     let progressive = |x| crate::sources::Media {
         v: "dQw4w9WgXcQ".into(),
@@ -5434,6 +5456,7 @@ fn direct_media_validation_is_signed_expiring_and_revocable() {
         i: None,
         e: None,
         x,
+        den: false,
     };
     let signer = crate::sign::Signer::new("s3cret");
     let state = signed_state(temp_dir(), "", "0", false);
