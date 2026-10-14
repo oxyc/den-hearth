@@ -14,11 +14,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cache::{Cache, MemoryCache};
+use crate::config::{Config, DebridAccount, DebridService};
 use crate::scrape::{DoError, Doer};
+use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
+use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
+use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
+use crate::stores::refusal::{resolve_key, torrent_id_key};
+use crate::stores::{dead_link, DeadLinkError, StoreError, StoreStatus, ERR_CHECK_FAILED};
+use crate::stores::refusal::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
 use crate::stores::torbox::{
     decode_listing, ListingFault, TorBoxStore, TruncationDetector, CACHE_BATCH, MAX_LISTING_ENTRIES,
     MAX_TORBOX_OUTBOUND, TORBOX_API,
 };
+use crate::util::key_hash;
 use crate::stores::{
     rd_fetch_state, torbox_fetch_state, ResolveTarget, Store, StatusAnswer, FETCH_DOWNLOADING, FETCH_FAILED,
     FETCH_FETCHING, FETCH_QUEUED, FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
@@ -1091,172 +1099,259 @@ fn decode_listing_bounds_entry_count() {
 // The tests below are ignored until the package that owns what they reach lands. Each keeps its full Go
 // body in a compiled-out item, so the port is reviewable now and only needs moving up when enabled.
 
+
 /// Go `fakeStore`: a Store answering from fixed values, for the pool tests.
-#[cfg(any())]
+#[derive(Clone)]
 struct FakeStore {
     svc: DebridService,
     check: HashMap<String, bool>,
     check_err: Option<StoreError>,
     resolve: Option<Result<String, StoreError>>,
     status: Option<StoreStatus>,
+    /// Makes `status` outlast whatever budget it is given, the way a slow account listing does.
     status_blocks: bool,
 }
 
-#[test]
-#[ignore = "needs realdebrid from package 2"]
-fn real_debrid() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // RD cacheCheck is all-false with no error, even on a store with no token.
-        let m = RealDebridStore { token: String::new(), api: REAL_DEBRID_API.into(), client: mock(|_| Ok(resp(200, ""))) }
-            .cache_check(&[H.to_owned()])
-            .await;
-        assert!(m.is_ok_and(|m| !held(&m, H)), "RD cacheCheck should be all-false, no error");
-
-        let infocalls = Arc::new(AtomicUsize::new(0));
-        let ic = infocalls.clone();
-        let d = mock(move |req| {
-            let p = req.url().path().to_owned();
-            if p.contains("addMagnet") {
-                return Ok(resp(201, r#"{"id":"t1"}"#));
-            }
-            if p.contains("/torrents/info/") {
-                let n = ic.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == 1 {
-                    return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":[]}"#));
-                }
-                return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}"#));
-            }
-            if p.contains("selectFiles") {
-                return Ok(resp(204, ""));
-            }
-            if p.contains("unrestrict/link") {
-                return Ok(resp(200, r#"{"download":"https://rd/dl.mkv"}"#));
-            }
-            Ok(resp(404, "{}"))
-        });
-        let link = RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), client: d }
-            .resolve(&target_hash(H))
-            .await;
-        assert_eq!(link.as_deref(), Ok("https://rd/dl.mkv"), "RD resolve");
-
-        // blocked filename → DeadLinkError (pool falls through)
-        let db = mock(|req| {
-            if req.url().path().contains("addMagnet") {
-                return Ok(resp(201, r#"{"id":"t1"}"#));
-            }
-            Ok(resp(200, r#"{"files":[{"id":1,"path":"Movie.WEB-DL.x264.mkv","bytes":999}],"links":[]}"#))
-        });
-        assert!(
-            RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), client: db }.resolve(&target_hash(H)).await.is_err(),
-            "RD-blocked filename should error"
-        );
+impl FakeStore {
+    fn new(svc: DebridService) -> FakeStore {
+        FakeStore { svc, check: HashMap::new(), check_err: None, resolve: None, status: None, status_blocks: false }
     }
-    todo!("pending: stores_test.go:433 TestRealDebrid")
+
+    fn check(mut self, answers: &[(&str, bool)]) -> FakeStore {
+        self.check = answers.iter().map(|(h, held)| ((*h).to_owned(), *held)).collect();
+        self
+    }
+
+    fn check_err(mut self, err: StoreError) -> FakeStore {
+        self.check_err = Some(err);
+        self
+    }
+
+    fn resolve_with(mut self, answer: Result<String, StoreError>) -> FakeStore {
+        self.resolve = Some(answer);
+        self
+    }
+
+    fn status_blocks(mut self) -> FakeStore {
+        self.status_blocks = true;
+        self
+    }
 }
 
-#[test]
-#[ignore = "needs premiumize from package 2"]
-fn premiumize() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let dc = mock(|_| Ok(resp(200, r#"{"status":"success","response":[true,false]}"#)));
-        let m = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), client: dc }
-            .cache_check(&[H.to_owned(), other.to_owned()])
-            .await;
-        assert!(m.as_ref().is_ok_and(|m| held(m, H) && !held(m, other)), "PM cacheCheck: {m:?}");
-
-        let dr = mock(|_| {
-            Ok(resp(
-                200,
-                r#"{"status":"success","content":[{"path":"S01E01.mkv","link":"https://pm/1","size":10},{"path":"S01E02.mkv","link":"https://pm/2","size":20}]}"#,
-            ))
-        });
-        let link = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), client: dr }
-            .resolve(&target_episode(H, 1, 2))
-            .await;
-        assert_eq!(link.as_deref(), Ok("https://pm/2"), "PM resolve");
+#[async_trait::async_trait]
+impl Store for FakeStore {
+    fn service(&self) -> DebridService {
+        self.svc
     }
-    todo!("pending: stores_test.go:474 TestPremiumize")
-}
 
-#[test]
-#[ignore = "needs StorePool, buildStores, hasCacheTruth from package 2"]
-fn store_pool_prefers_the_three_valued_answer() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A store whose two-valued Status always says "no", and whose three-valued answer is set per case.
-        for (name, answer, want_ok, want_unknown) in [
-            ("unknown is carried, not flattened to no", StatusAnswer::Unknown, false, true),
-            ("downloading is carried too", StatusAnswer::Downloading, true, false),
-        ] {
-            let asked = Arc::new(AtomicUsize::new(0));
-            let pool = StorePool { stores: vec![Arc::new(AnsweringStore {
-                svc: DebridService::TorBox,
-                answer,
-                asked: asked.clone(),
-            })] };
-            let (status, ok, unknown) = pool.status(&target_hash(H)).await;
-            assert!(ok == want_ok && unknown == want_unknown, "{name}: pool answered ok={ok} unknown={unknown}");
-            assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback");
-            if want_ok {
-                assert_eq!(status.progress, 0.5, "{name}: the status itself was dropped");
-            }
+    async fn cache_check(&self, _hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        match &self.check_err {
+            Some(err) => Err(err.clone()),
+            None => Ok(self.check.clone()),
         }
     }
-    todo!("pending: stores_test.go:548 TestStorePool_prefersTheThreeValuedAnswer")
+
+    async fn resolve(&self, _t: &ResolveTarget) -> Result<String, StoreError> {
+        self.resolve.clone().expect("this fake store was given no resolve")
+    }
+
+    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+        if self.status_blocks {
+            std::future::pending::<()>().await;
+        }
+        self.status.clone()
+    }
+}
+
+/// Go `answeringStore`: implements the optional three-valued `statusAnswerer`, and DISAGREES with its own two-valued
+/// `Status` (always "no") on purpose — that is the only way a test can tell which one the pool consulted.
+#[derive(Clone)]
+struct AnsweringStore {
+    svc: DebridService,
+    answer: StatusAnswer,
+    asked: Arc<AtomicUsize>,
+    /// Go `onAsk`: runs after the answer is recorded, so a test can make the world change mid-loop — here, the
+    /// clock running past the pool's deadline, which stands in for the caller hanging up.
+    on_ask: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl AnsweringStore {
+    fn new(svc: DebridService, answer: StatusAnswer, asked: Arc<AtomicUsize>) -> AnsweringStore {
+        AnsweringStore { svc, answer, asked, on_ask: None }
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for AnsweringStore {
+    fn service(&self) -> DebridService {
+        self.svc
+    }
+
+    async fn cache_check(&self, _hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        Ok(HashMap::new())
+    }
+
+    async fn resolve(&self, _t: &ResolveTarget) -> Result<String, StoreError> {
+        panic!("not resolved in these tests")
+    }
+
+    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+        None
+    }
+
+    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        if let Some(on_ask) = &self.on_ask {
+            on_ask();
+        }
+        Some((StoreStatus { progress: 0.5, ..Default::default() }, self.answer))
+    }
+}
+
+#[tokio::test]
+async fn real_debrid() {
+    // RD cacheCheck is all-false with no error, even on a store with no token.
+    let m = RealDebridStore { token: String::new(), api: REAL_DEBRID_API.into(), cache: None, client: mock(|_| Ok(resp(200, ""))) }
+        .cache_check(&[H.to_owned()])
+        .await;
+    assert!(m.is_ok_and(|m| !held(&m, H)), "RD cacheCheck should be all-false, no error");
+
+    let infocalls = Arc::new(AtomicUsize::new(0));
+    let ic = infocalls.clone();
+    let d = mock(move |req| {
+        let p = req.url().path().to_owned();
+        if p.contains("addMagnet") {
+            return Ok(resp(201, r#"{"id":"t1"}"#));
+        }
+        if p.contains("/torrents/info/") {
+            let n = ic.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":[]}"#));
+            }
+            return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}"#));
+        }
+        if p.contains("selectFiles") {
+            return Ok(resp(204, ""));
+        }
+        if p.contains("unrestrict/link") {
+            return Ok(resp(200, r#"{"download":"https://rd/dl.mkv"}"#));
+        }
+        Ok(resp(404, "{}"))
+    });
+    let link = RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), cache: None, client: d }
+        .resolve(&target_hash(H))
+        .await;
+    assert_eq!(link.as_deref(), Ok("https://rd/dl.mkv"), "RD resolve");
+
+    // blocked filename → DeadLinkError (pool falls through)
+    let db = mock(|req| {
+        if req.url().path().contains("addMagnet") {
+            return Ok(resp(201, r#"{"id":"t1"}"#));
+        }
+        Ok(resp(200, r#"{"files":[{"id":1,"path":"Movie.WEB-DL.x264.mkv","bytes":999}],"links":[]}"#))
+    });
+    assert!(
+        RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), cache: None, client: db }.resolve(&target_hash(H)).await.is_err(),
+        "RD-blocked filename should error"
+    );
+}
+
+#[tokio::test]
+async fn premiumize() {
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let dc = mock(|_| Ok(resp(200, r#"{"status":"success","response":[true,false]}"#)));
+    let m = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), cache: None, client: dc }
+        .cache_check(&[H.to_owned(), other.to_owned()])
+        .await;
+    assert!(m.as_ref().is_ok_and(|m| held(m, H) && !held(m, other)), "PM cacheCheck: {m:?}");
+
+    let dr = mock(|_| {
+        Ok(resp(
+            200,
+            r#"{"status":"success","content":[{"path":"S01E01.mkv","link":"https://pm/1","size":10},{"path":"S01E02.mkv","link":"https://pm/2","size":20}]}"#,
+        ))
+    });
+    let link = PremiumizeStore { token: "t".into(), api: PREMIUMIZE_API.into(), cache: None, client: dr }
+        .resolve(&target_episode(H, 1, 2))
+        .await;
+    assert_eq!(link.as_deref(), Ok("https://pm/2"), "PM resolve");
+}
+
+// The pool asks statusAnswerer where a store has one, in preference to the bool Status.
+#[tokio::test]
+async fn store_pool_prefers_the_three_valued_answer() {
+    // A store whose two-valued Status always says "no", and whose three-valued answer is set per case.
+    for (name, answer, want_ok, want_unknown) in [
+        ("unknown is carried, not flattened to no", StatusAnswer::Unknown, false, true),
+        ("downloading is carried too", StatusAnswer::Downloading, true, false),
+    ] {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let pool = StorePool {
+            stores: vec![Box::new(AnsweringStore::new(DebridService::TorBox, answer, asked.clone()))],
+        };
+        let (status, ok, unknown) = pool.status(&target_hash(H), None).await;
+        assert!(ok == want_ok && unknown == want_unknown, "{name}: pool answered ok={ok} unknown={unknown}");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback");
+        if want_ok {
+            assert_eq!(status.progress, 0.5, "{name}: the status itself was dropped");
+        }
+    }
+}
+
+#[tokio::test]
+async fn store_pool() {
+    // buildStores orders TorBox first regardless of config order.
+    let cfg = Config { debrid: vec![
+        DebridAccount { service: DebridService::Premiumize, token: "p".into() },
+        DebridAccount { service: DebridService::TorBox, token: "t".into() },
+        DebridAccount { service: DebridService::RealDebrid, token: "r".into() },
+    ], ..Default::default() };
+    let stores = build_stores(&cfg, mock(|_| Ok(resp(404, ""))), None);
+    assert!(
+        stores.len() == 3 && stores[0].service() == DebridService::TorBox && stores[2].service() == DebridService::Premiumize,
+        "store order"
+    );
+
+    let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let pool = StorePool { stores: vec![
+        Box::new(FakeStore::new(DebridService::TorBox).check(&[(H, true), (other, false)])),
+        Box::new(FakeStore::new(DebridService::Premiumize).check(&[(H, false), (other, true)])),
+    ] };
+    let (m, truth_ok) = pool.cache_check(&[H.to_owned(), other.to_owned()]).await;
+    assert!(m.cached(H) && m.cached(other), "pool union: {:?} / {:?}", m.held_by(H), m.held_by(other));
+    assert!(truth_ok, "pool truthOK should be true when a cache-truth store succeeded");
+
+    // all cache-truth stores erroring → truthOK false (an outage the handler must not cache)
+    let down = StorePool {
+        stores: vec![Box::new(
+            FakeStore::new(DebridService::TorBox).check(&[(H, false)]).check_err(dead_link(ERR_CHECK_FAILED)),
+        )],
+    };
+    let (_, ok) = down.cache_check(&[H.to_owned()]).await;
+    assert!(!ok, "truthOK should be false when every cache-truth store failed");
+    // RD succeeding is not cache truth → truthOK false
+    let rd = StorePool { stores: vec![Box::new(FakeStore::new(DebridService::RealDebrid).check(&[(H, false)]))] };
+    let (_, ok) = rd.cache_check(&[H.to_owned()]).await;
+    assert!(!ok, "RD success is not cache truth");
+
+    let dead = || Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() }));
+    let dead_only = StorePool { stores: vec![Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead()))] };
+    assert!(dead_only.resolve(&target_hash(H)).await.is_err(), "all-fail should error");
+    let fallthr = StorePool { stores: vec![
+        Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead())),
+        Box::new(FakeStore::new(DebridService::TorBox).resolve_with(Ok("https://ok".into()))),
+    ] };
+    assert_eq!(fallthr.resolve(&target_hash(H)).await.as_deref(), Ok("https://ok"), "fallthrough");
 }
 
 #[test]
-#[ignore = "needs StorePool and buildStores from package 2"]
-fn store_pool() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // buildStores orders TorBox first regardless of config order.
-        let cfg = Config { debrid: vec![
-            DebridAccount { service: DebridService::Premiumize, token: "p".into() },
-            DebridAccount { service: DebridService::TorBox, token: "t".into() },
-            DebridAccount { service: DebridService::RealDebrid, token: "r".into() },
-        ], ..Default::default() };
-        let stores = build_stores(&cfg, mock(|_| Ok(resp(404, ""))), None);
-        assert!(
-            stores.len() == 3 && stores[0].service() == DebridService::TorBox && stores[2].service() == DebridService::Premiumize,
-            "store order"
-        );
-
-        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let pool = StorePool { stores: vec![
-            Arc::new(FakeStore::new(DebridService::TorBox).check(&[(H, true), (other, false)])),
-            Arc::new(FakeStore::new(DebridService::Premiumize).check(&[(H, false), (other, true)])),
-        ] };
-        let (m, truth_ok) = pool.cache_check(&[H.to_owned(), other.to_owned()]).await;
-        assert!(m.cached(H) && m.cached(other), "pool union: {:?} / {:?}", m.held_by(H), m.held_by(other));
-        assert!(truth_ok, "pool truthOK should be true when a cache-truth store succeeded");
-
-        // all cache-truth stores erroring → truthOK false (an outage the handler must not cache)
-        let down = StorePool { stores: vec![Arc::new(FakeStore::new(DebridService::TorBox).check_err(StoreError::Other(ERR_CHECK_FAILED.into())))] };
-        let (_, ok) = down.cache_check(&[H.to_owned()]).await;
-        assert!(!ok, "truthOK should be false when every cache-truth store failed");
-        // RD succeeding is not cache truth → truthOK false
-        let rd = StorePool { stores: vec![Arc::new(FakeStore::new(DebridService::RealDebrid).check(&[(H, false)]))] };
-        let (_, ok) = rd.cache_check(&[H.to_owned()]).await;
-        assert!(!ok, "RD success is not cache truth");
-
-        let dead_only = StorePool { stores: vec![Arc::new(FakeStore::new(DebridService::TorBox).resolve_with(Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() }))))] };
-        assert!(dead_only.resolve(&target_hash(H)).await.is_err(), "all-fail should error");
-        let fallthr = StorePool { stores: vec![
-            Arc::new(FakeStore::new(DebridService::TorBox).resolve_with(Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() })))),
-            Arc::new(FakeStore::new(DebridService::TorBox).resolve_with(Ok("https://ok".into()))),
-        ] };
-        assert_eq!(fallthr.resolve(&target_hash(H)).await.as_deref(), Ok("https://ok"), "fallthrough");
-    }
-    todo!("pending: stores_test.go:580 TestStorePool")
+fn has_cache_truth_reads_the_configured_services() {
+    let rd = DebridAccount { service: DebridService::RealDebrid, token: "r".into() };
+    let tb = DebridAccount { service: DebridService::TorBox, token: "t".into() };
+    assert!(!has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }), "RD-only should have no cache truth");
+    assert!(has_cache_truth(&Config { debrid: vec![rd, tb], ..Default::default() }), "torbox present → cache truth");
 }
+
 
 #[test]
 #[ignore = "needs hasCacheTruth and rdOnly from package 2 (handler.rs for rdOnly)"]
@@ -1274,238 +1369,215 @@ fn has_cache_truth_and_rd_only() {
     todo!("pending: stores_test.go:625 TestHasCacheTruthAndRDOnly")
 }
 
-#[test]
-#[ignore = "needs torrent_id_key and resolve_key from refusal.rs (package 2) and KnownFileSize (unplaced in the split)"]
-fn torbox_account_state_is_isolated_by_api_and_token() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Account state is keyed by API endpoint and token: two endpoints sharing a token must not share facts.
-        const TOKEN: &str = "shared-token";
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
-        let client = mock(move |req| {
-            c.fetch_add(1, Ordering::SeqCst);
-            let id = if req.url().host_str().unwrap_or("").contains("torbox-b") { 22 } else { 11 };
-            Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":{id},"hash":"{H}"}}]}}"#)))
-        });
-        let a = tb(TOKEN, "https://torbox-a.invalid/v1", Some(cache.clone()), client.clone());
-        let b = tb(TOKEN, "https://torbox-b.invalid/v1", Some(cache.clone()), client);
+#[tokio::test]
+async fn torbox_account_state_is_isolated_by_api_and_token() {
+    // Account state is keyed by API endpoint and token: two endpoints sharing a token must not share facts.
+    const TOKEN: &str = "shared-token";
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let client = mock(move |req| {
+        c.fetch_add(1, Ordering::SeqCst);
+        let id = if req.url().host_str().unwrap_or("").contains("torbox-b") { 22 } else { 11 };
+        Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":{id},"hash":"{H}"}}]}}"#)))
+    });
+    let a = tb(TOKEN, "https://torbox-a.invalid/v1", Some(cache.clone()), client.clone());
+    let b = tb(TOKEN, "https://torbox-b.invalid/v1", Some(cache.clone()), client);
 
-        // The whole-account listing memo and its singleflight must not hand endpoint B endpoint A's ids.
-        let (ids_a, ok_a) = a.account_listing().await;
-        let (ids_b, ok_b) = b.account_listing().await;
-        assert!(ok_a && ok_b && id_of(&ids_a, H) == 11 && id_of(&ids_b, H) == 22, "cross-API listings");
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "two API accounts made listing calls, want 2");
+    // The whole-account listing memo and its singleflight must not hand endpoint B endpoint A's ids.
+    let (ids_a, ok_a) = a.account_listing().await;
+    let (ids_b, ok_b) = b.account_listing().await;
+    assert!(ok_a && ok_b && id_of(&ids_a, H) == 11 && id_of(&ids_b, H) == 22, "cross-API listings");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "two API accounts made listing calls, want 2");
 
-        // Per-hash ids and resolve/file facts are account data, not facts about the token string itself.
-        cache.put(&torrent_id_key(&a.account_identity(), H), "11", Duration::from_secs(3600));
-        let (id, held_b, _) = b.known_torrent_id(H);
-        assert!(!held_b, "endpoint B accepted endpoint A's torrent id {id}");
-        cache.put(
-            &resolve_key(&a.account_identity(), H),
-            r#"{"torrentId":11,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":123}]}"#,
-            Duration::from_secs(3600),
-        );
-        assert!(b.known_file_size(&target_hash(H)).is_none(), "endpoint B accepted endpoint A's resolve/file fact");
+    // Per-hash ids and resolve/file facts are account data, not facts about the token string itself.
+    cache.put(&torrent_id_key(&a.account_identity(), H), "11", Duration::from_secs(3600));
+    let (id, held_b) = b.known_torrent_id(H);
+    assert!(!held_b, "endpoint B accepted endpoint A's torrent id {id}");
+    cache.put(
+        &resolve_key(&a.account_identity(), H),
+        r#"{"torrentId":11,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":123}]}"#,
+        Duration::from_secs(3600),
+    );
+    assert!(b.known_file_size(&target_hash(H)).is_none(), "endpoint B accepted endpoint A's resolve/file fact");
 
-        // A positive cache check is scoped the same way.
-        cache.put(&cached_key(DebridService::TorBox, &a.account_identity(), H), "1", CACHED_TTL);
-        let (known, ask) = known_cached(&*cache, DebridService::TorBox, &b.account_identity(), &[H.to_owned()]);
-        assert!(!held(&known, H) && ask.len() == 1, "endpoint B reused endpoint A's positive");
+    // A positive cache check is scoped the same way.
+    cache.put(&cached_key(DebridService::TorBox, &a.account_identity(), H), "1", CACHED_TTL);
+    let (known, ask) = known_cached(&*cache, DebridService::TorBox, &b.account_identity(), &[H.to_owned()]);
+    assert!(!held(&known, H) && ask.len() == 1, "endpoint B reused endpoint A's positive");
 
-        // Migration is fail-cold: a pre-v2 token-only file is never accepted under either arbitrary API.
-        cache.put(&format!("torbox:torrent:{}:{H}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
-        assert!(a.known_torrent_id(H).1, "endpoint A lost its canonical torrent id");
-        let other_hash = "b".repeat(40);
-        cache.put(&format!("torbox:torrent:{}:{other_hash}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
-        assert!(!a.known_torrent_id(&other_hash).1, "accepted a legacy token-only TorBox fact");
-    }
-    todo!("pending: stores_test.go:99 TestTorBoxAccountStateIsIsolatedByAPIAndToken")
+    // Migration is fail-cold: a pre-v2 token-only file is never accepted under either arbitrary API.
+    cache.put(&format!("torbox:torrent:{}:{H}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
+    assert!(a.known_torrent_id(H).1, "endpoint A lost its canonical torrent id");
+    let other_hash = "b".repeat(40);
+    cache.put(&format!("torbox:torrent:{}:{other_hash}", key_hash(TOKEN)), "99", Duration::from_secs(3600));
+    assert!(!a.known_torrent_id(&other_hash).1, "accepted a legacy token-only TorBox fact");
 }
 
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
-        for (name, body, want_ok, want_prog) in [
-            ("downloading", r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#, true, 0.42),
-            ("array payload", r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#, true, 0.1),
-            ("finished but unresolvable", r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#, false, 0.0),
-            ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
-            ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
-            ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
-        ] {
-            let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-            cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
-            let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
-            let got = s.status(&target_hash(H)).await;
-            assert_eq!(got.is_some(), want_ok, "{name}: ok");
-            if let (true, Some(g)) = (want_ok, got) {
-                assert_eq!(g.progress, want_prog, "{name}: progress");
-            }
-        }
-        // No torrent id remembered, and the account doesn't hold it either → nothing to report.
-        let empty = tb("t", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 16))), mock(|_| Ok(resp(200, r#"{"data":[]}"#))));
-        assert!(empty.status(&target_hash(H)).await.is_none(), "an unknown infohash must not report a download");
-    }
-    todo!("pending: stores_test.go:644 TestTorBoxStatus")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_carries_state_and_swarm() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Status carries TorBox's state and swarm through, rather than reducing every wait to a percentage.
-        for (name, body, want_state, want_seeds, want_peers) in [
-            (
-                "stalled, empty swarm",
-                r#"{"data":{"progress":0,"download_finished":false,"eta":8640000,"download_speed":0,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#,
-                FETCH_STALLED,
-                Some(0),
-                Some(0),
-            ),
-            ("failed", r#"{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}"#, FETCH_FAILED, None, None),
-            ("metadata", r#"{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}"#, FETCH_FETCHING, Some(4), None),
-            ("no state named", r#"{"data":{"progress":0.4,"download_finished":false}}"#, "", None, None),
-        ] {
-            let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-            cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
-            let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
-            let got = s.status(&target_hash(H)).await.expect("a download TorBox reports on must be a wait");
-            assert_eq!(got.state, want_state, "{name}: state");
-            assert!(same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers), "{name}: seeds/peers");
-        }
-    }
-    todo!("pending: stores_test.go:731 TestTorBoxStatusCarriesStateAndSwarm")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_rediscovers_lost_torrent_id() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Losing the cached torrent id is not losing the download: the id is rediscovered from the account's
-        // own list, and remembered, so the next poll is a single-id lookup again.
-        let list_calls = Arc::new(AtomicUsize::new(0));
-        let lc = list_calls.clone();
-        // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
-        let target = H.to_uppercase();
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
-        let s = tb("t", TORBOX_API, Some(cache.clone()), mock(move |req| {
-            if req.url().query().unwrap_or("").contains("id=") {
-                return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
-            }
-            lc.fetch_add(1, Ordering::SeqCst);
-            Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
-        }));
-        let got = s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
-        assert_eq!(got.progress, 0.25, "progress");
-        assert_eq!(cache.get(&torrent_id_key("t", &target)).as_deref(), Some("7"), "the rediscovered id must be remembered");
-        // Second call must reuse the cache rather than list the whole account again.
-        assert!(s.status(&target_hash(&target)).await.is_some(), "second status");
-        assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
-    }
-    todo!("pending: stores_test.go:797 TestTorBoxStatusRediscoversLostTorrentID")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_remembers_torrent_id_for_queued_episode() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // The series path: Resolve refuses to cache an entry whose file list is empty, and a just-queued torrent
-        // has no files yet. The id must survive that anyway.
+#[tokio::test]
+async fn torbox_status() {
+    // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
+    for (name, body, want_ok, want_prog) in [
+        ("downloading", r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#, true, 0.42),
+        ("array payload", r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#, true, 0.1),
+        ("finished but unresolvable", r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#, false, 0.0),
+        ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
+        ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
+        ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
+    ] {
         let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-        let s = tb("t", TORBOX_API, Some(cache.clone()), mock(|req| {
-            let p = req.url().path().to_owned();
-            if p.contains("createtorrent") {
-                return Ok(resp(200, r#"{"data":{"torrent_id":7}}"#));
-            }
-            if p.contains("mylist") {
-                return Ok(resp(200, r#"{"success":true,"data":{"files":[]}}"#)); // queued: no files yet
-            }
-            Ok(resp(200, r#"{"success":false}"#)) // link not ready
+        cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
+        let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
+        let got = s.status(&target_hash(H)).await;
+        assert_eq!(got.is_some(), want_ok, "{name}: ok");
+        if let (true, Some(g)) = (want_ok, got) {
+            assert_eq!(g.progress, want_prog, "{name}: progress");
+        }
+    }
+    // No torrent id remembered, and the account doesn't hold it either → nothing to report.
+    let empty = tb("t", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 16))), mock(|_| Ok(resp(200, r#"{"data":[]}"#))));
+    assert!(empty.status(&target_hash(H)).await.is_none(), "an unknown infohash must not report a download");
+}
+
+#[tokio::test]
+async fn torbox_status_carries_state_and_swarm() {
+    // Status carries TorBox's state and swarm through, rather than reducing every wait to a percentage.
+    for (name, body, want_state, want_seeds, want_peers) in [
+        (
+            "stalled, empty swarm",
+            r#"{"data":{"progress":0,"download_finished":false,"eta":8640000,"download_speed":0,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#,
+            FETCH_STALLED,
+            Some(0),
+            Some(0),
+        ),
+        ("failed", r#"{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}"#, FETCH_FAILED, None, None),
+        ("metadata", r#"{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}"#, FETCH_FETCHING, Some(4), None),
+        ("no state named", r#"{"data":{"progress":0.4,"download_finished":false}}"#, "", None, None),
+    ] {
+        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
+        cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
+        let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
+        let got = s.status(&target_hash(H)).await.expect("a download TorBox reports on must be a wait");
+        assert_eq!(got.state, want_state, "{name}: state");
+        assert!(same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers), "{name}: seeds/peers");
+    }
+}
+
+/// Go `sameCount`: two optional counts are the same when both are absent or both are present and equal.
+fn same_count(a: Option<i64>, b: Option<i64>) -> bool {
+    a == b
+}
+
+#[tokio::test]
+async fn torbox_status_rediscovers_lost_torrent_id() {
+    // Losing the cached torrent id is not losing the download: the id is rediscovered from the account's
+    // own list, and remembered, so the next poll is a single-id lookup again.
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let lc = list_calls.clone();
+    // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
+    let target = H.to_uppercase();
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
+    let s = tb("t", TORBOX_API, Some(cache.clone()), mock(move |req| {
+        if req.url().query().unwrap_or("").contains("id=") {
+            return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
+        }
+        lc.fetch_add(1, Ordering::SeqCst);
+        Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
+    }));
+    let got = s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
+    assert_eq!(got.progress, 0.25, "progress");
+    assert_eq!(cache.get(&torrent_id_key("t", &target)).as_deref(), Some("7"), "the rediscovered id must be remembered");
+    // Second call must reuse the cache rather than list the whole account again.
+    assert!(s.status(&target_hash(&target)).await.is_some(), "second status");
+    assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
+}
+
+#[tokio::test]
+async fn torbox_remembers_torrent_id_for_queued_episode() {
+    // The series path: Resolve refuses to cache an entry whose file list is empty, and a just-queued torrent
+    // has no files yet. The id must survive that anyway.
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
+    let s = tb("t", TORBOX_API, Some(cache.clone()), mock(|req| {
+        let p = req.url().path().to_owned();
+        if p.contains("createtorrent") {
+            return Ok(resp(200, r#"{"data":{"torrent_id":7}}"#));
+        }
+        if p.contains("mylist") {
+            return Ok(resp(200, r#"{"success":true,"data":{"files":[]}}"#)); // queued: no files yet
+        }
+        Ok(resp(200, r#"{"success":false}"#)) // link not ready
+    }));
+    let target = target_episode(H, 1, 3);
+    assert!(s.resolve(&target).await.is_err(), "expected the link request to fail while the torrent is still queued");
+    assert!(cache.get(&torrent_id_key("t", H)).is_some(), "the torrent id must be remembered so Status can report the download");
+}
+
+/// Go's status test doer: every call takes 20 ms, counts itself and reports a download at half way.
+struct SlowStatusDoer {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Doer for SlowStatusDoer {
+    async fn do_request(&self, _req: reqwest::Request) -> Result<reqwest::Response, DoError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#))
+    }
+}
+
+#[tokio::test]
+async fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
+    // 20 concurrent viewers of one download make one status call; a warm snapshot makes no further call.
+    const TOKEN: &str = "status-coordination-test";
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    cache.put(&torrent_id_key(TOKEN, H), "77", Duration::from_secs(3600));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let store = Arc::new(tb(TOKEN, TORBOX_API, Some(cache), Arc::new(SlowStatusDoer { calls: c })));
+    let barrier = Arc::new(tokio::sync::Barrier::new(21));
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let (store, barrier) = (store.clone(), barrier.clone());
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
+            assert_eq!(answer, StatusAnswer::Downloading, "answer");
         }));
-        let target = target_episode(H, 1, 3);
-        assert!(s.resolve(&target).await.is_err(), "expected the link request to fail while the torrent is still queued");
-        assert!(cache.get(&torrent_id_key("t", H)).is_some(), "the torrent id must be remembered so Status can report the download");
     }
-    todo!("pending: stores_test.go:832 TestTorBoxRemembersTorrentIDForQueuedEpisode")
+    barrier.wait().await;
+    for t in tasks {
+        t.await.expect("task");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "20 concurrent viewers made status calls, want 1");
+    let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
+    assert_eq!(answer, StatusAnswer::Downloading, "snapshot answer");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "warm snapshot made another call");
 }
 
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // 20 concurrent viewers of one download make one status call; a warm snapshot makes no further call.
-        const TOKEN: &str = "status-coordination-test";
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        cache.put(&torrent_id_key(TOKEN, H), "77", Duration::from_secs(3600));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
-        let store = Arc::new(tb(TOKEN, TORBOX_API, Some(cache), Arc::new(SlowStatusDoer { calls: c })));
-        let barrier = Arc::new(tokio::sync::Barrier::new(21));
-        let mut tasks = Vec::new();
-        for _ in 0..20 {
-            let (store, barrier) = (store.clone(), barrier.clone());
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-                assert_eq!(answer, StatusAnswer::Downloading, "answer");
-            }));
-        }
-        barrier.wait().await;
-        for t in tasks {
-            t.await.expect("task");
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "20 concurrent viewers made status calls, want 1");
-        let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-        assert_eq!(answer, StatusAnswer::Downloading, "snapshot answer");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "warm snapshot made another call");
+#[tokio::test]
+async fn torbox_status_answer_coordination_includes_api_identity() {
+    // Two API identities sharing one token must not share status coordination.
+    const TOKEN: &str = "same-status-token-different-api";
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for api in ["https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"] {
+        cache.put(&torrent_id_key(&torbox_account_identity(api, TOKEN), H), "77", Duration::from_secs(3600));
+        let store = tb(TOKEN, api, Some(cache.clone()), Arc::new(SlowStatusDoer { calls: calls.clone() }));
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
+            assert_eq!(answer, StatusAnswer::Downloading, "{api} answer");
+        }));
     }
-    todo!("pending: stores_test.go:1329 TestTorBoxStatusAnswer_coalescesViewersAndReusesSnapshot")
-}
-
-#[test]
-#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
-fn torbox_status_answer_coordination_includes_api_identity() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Two API identities sharing one token must not share status coordination.
-        const TOKEN: &str = "same-status-token-different-api";
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
-        let mut tasks = Vec::new();
-        for api in ["https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"] {
-            cache.put(&torrent_id_key(&torbox_account_identity(api, TOKEN), H), "77", Duration::from_secs(3600));
-            let store = tb(TOKEN, api, Some(cache.clone()), Arc::new(SlowStatusDoer { calls: calls.clone() }));
-            let barrier = barrier.clone();
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-                assert_eq!(answer, StatusAnswer::Downloading, "{api} answer");
-            }));
-        }
-        barrier.wait().await;
-        for t in tasks {
-            t.await.expect("task");
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "two API identities shared status coordination");
+    barrier.wait().await;
+    for t in tasks {
+        t.await.expect("task");
     }
-    todo!("pending: stores_test.go:1365 TestTorBoxStatusAnswer_coordinationIncludesAPIIdentity")
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "two API identities shared status coordination");
 }
 
 #[test]
@@ -1529,108 +1601,86 @@ fn queued_body_carries_state_and_swarm() {
     todo!("pending: stores_test.go:767 TestQueuedBodyCarriesStateAndSwarm")
 }
 
-#[test]
-#[ignore = "needs StorePool.Status from package 2"]
-fn store_pool_status_reports_when_a_store_could_not_answer() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A store that could not answer is not a store saying "no", and the pool has to report the difference.
-        let wedged = FakeStore::new(DebridService::TorBox).status_blocks();
-        let silent = FakeStore::new(DebridService::RealDebrid);
+#[tokio::test]
+async fn store_pool_status_reports_when_a_store_could_not_answer() {
+    // A store that could not answer is not a store saying "no", and the pool has to report the difference.
+    let wedged = FakeStore::new(DebridService::TorBox).status_blocks();
+    let silent = FakeStore::new(DebridService::RealDebrid); // answers at once: "not downloading"
 
-        // One store that runs out of time → indeterminate, even though the pool returns early.
-        let pool = StorePool { stores: vec![Arc::new(wedged), Arc::new(silent.clone())] };
-        let start = std::time::Instant::now();
-        let (_, ok, unknown) = tokio::time::timeout(Duration::from_millis(80), pool.status(&target_hash(H)))
-            .await
-            .unwrap_or((StoreStatus::default(), false, true));
-        assert!(!ok, "a wedged store reported a download");
-        assert!(unknown, "a store that ran out of time was reported as a definitive 'not downloading'");
-        assert!(start.elapsed() < Duration::from_millis(80), "the first store consumed the whole budget — the slices are not being applied");
+    // One store that runs out of time → indeterminate, even though the pool returns early. The caller's
+    // 80 ms budget is the deadline the pool is given.
+    let pool = StorePool { stores: vec![Box::new(wedged), Box::new(silent.clone())] };
+    let start = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+    let (_, ok, unknown) = pool.status(&target_hash(H), Some(deadline)).await;
+    assert!(!ok, "a wedged store reported a download");
+    assert!(unknown, "a store that ran out of time was reported as a definitive 'not downloading'");
+    assert!(start.elapsed() < Duration::from_millis(80), "the first store consumed the whole budget ({:?}) — the slices are not being applied", start.elapsed());
 
-        // Every store answering promptly → a real answer, not indeterminate.
-        let clean = StorePool { stores: vec![Arc::new(silent.clone()), Arc::new(silent)] };
-        let (_, ok, unknown) = clean.status(&target_hash(H)).await;
-        assert!(!ok && !unknown, "prompt answers reported ok={ok} unknown={unknown}, want false/false");
-    }
-    todo!("pending: stores_test.go:863 TestStorePoolStatus_reportsWhenAStoreCouldNotAnswer")
+    // Every store answering promptly → a real answer, not indeterminate.
+    let clean = StorePool { stores: vec![Box::new(silent.clone()), Box::new(silent)] };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let (_, ok, unknown) = clean.status(&target_hash(H), Some(deadline)).await;
+    assert!(!ok && !unknown, "prompt answers reported ok={ok} unknown={unknown}, want false/false");
 }
 
-#[test]
-#[ignore = "needs StorePool.StatusDetail from package 2"]
-fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // StatusDetail names the stores that could not answer, so the escalated retry asks only those.
-        let uncertain_asks = Arc::new(AtomicUsize::new(0));
-        let definite_asks = Arc::new(AtomicUsize::new(0));
-        let uncertain = AnsweringStore { svc: DebridService::TorBox, answer: StatusAnswer::Unknown, asked: uncertain_asks.clone() };
-        let definite = AnsweringStore { svc: DebridService::RealDebrid, answer: StatusAnswer::No, asked: definite_asks.clone() };
+#[tokio::test]
+async fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() {
+    // StatusDetail names the stores that could not answer, so the escalated retry asks only those.
+    let uncertain_asks = Arc::new(AtomicUsize::new(0));
+    let definite_asks = Arc::new(AtomicUsize::new(0));
+    let uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, uncertain_asks.clone());
+    let definite = AnsweringStore::new(DebridService::RealDebrid, StatusAnswer::No, definite_asks.clone());
 
-        let pool = StorePool { stores: vec![Arc::new(definite.clone()), Arc::new(uncertain), Arc::new(definite.clone())] };
-        let (_, ok, unknown) = pool.status_detail(&target_hash(H)).await;
-        assert!(!ok, "nothing was downloading");
-        assert_eq!(unknown.len(), 1, "reported stores as unable to answer");
-        assert_eq!(unknown[0].service(), DebridService::TorBox, "named the store that could not answer");
+    let pool = StorePool { stores: vec![Box::new(definite.clone()), Box::new(uncertain), Box::new(definite.clone())] };
+    let (_, ok, unknown) = pool.status_detail(&target_hash(H), None).await;
+    assert!(!ok, "nothing was downloading");
+    assert_eq!(unknown.len(), 1, "reported {} stores as unable to answer, want 1", unknown.len());
+    assert_eq!(unknown[0].service(), DebridService::TorBox, "named the store that could not answer");
 
-        // The retry, as handlePlay performs it: only the named store is asked again.
-        let before = definite_asks.load(Ordering::SeqCst);
-        let _ = StorePool { stores: unknown }.status_detail(&target_hash(H)).await;
-        assert_eq!(definite_asks.load(Ordering::SeqCst), before, "the retry asked a store that had already answered definitively");
-        assert_eq!(uncertain_asks.load(Ordering::SeqCst), 2, "the store that could not answer was asked the wrong number of times");
-    }
-    todo!("pending: stores_test.go:900 TestStorePoolStatusDetail_namesOnlyTheStoresThatCouldNotAnswer")
+    // The retry, as handlePlay performs it: only the named store is asked again.
+    let before = definite_asks.load(Ordering::SeqCst);
+    let _ = crate::stores::pool::status_detail_among(&unknown, &target_hash(H), None).await;
+    assert_eq!(definite_asks.load(Ordering::SeqCst), before, "the retry asked a store that had already answered definitively");
+    assert_eq!(uncertain_asks.load(Ordering::SeqCst), 2, "the store that could not answer was asked {} times, want 2", uncertain_asks.load(Ordering::SeqCst));
 }
 
-#[test]
-#[ignore = "needs StorePool.StatusDetail from package 2"]
-fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // Running out of time mid-loop keeps the stores that ALREADY said they could not answer, as well as the
-        // ones never reached: three stores — answered, uncertain, never reached — and the caller hangs up.
-        let cancel = tokio_util_cancel_pair();
-        let answered = AnsweringStore { svc: DebridService::Premiumize, answer: StatusAnswer::No, asked: Arc::new(AtomicUsize::new(0)) };
-        let uncertain = AnsweringStore { svc: DebridService::TorBox, answer: StatusAnswer::Unknown, asked: Arc::new(AtomicUsize::new(0)) }
-            .cancel_after_ask(cancel.clone());
-        let unreached = FakeStore::new(DebridService::RealDebrid);
+#[tokio::test]
+async fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
+    // Running out of time mid-loop keeps the stores that ALREADY said they could not answer, as well as the ones
+    // never reached: three stores — answered, uncertain, never reached — and the caller hangs up (here: the clock
+    // passes the deadline while the second store is being asked, which a blocking sleep makes certain).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+    let answered = AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No, Arc::new(AtomicUsize::new(0)));
+    let mut uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, Arc::new(AtomicUsize::new(0)));
+    uncertain.on_ask = Some(Arc::new(|| std::thread::sleep(Duration::from_millis(60))));
+    let unreached = FakeStore::new(DebridService::RealDebrid);
 
-        let pool = StorePool { stores: vec![Arc::new(answered), Arc::new(uncertain), Arc::new(unreached)] };
-        let (_, ok, unknown) = pool.status_detail_until_cancelled(&target_hash(H), cancel).await;
-        assert!(!ok, "nothing was downloading");
-        let named: Vec<DebridService> = unknown.iter().map(|s| s.service()).collect();
-        assert_eq!(named, vec![DebridService::TorBox, DebridService::RealDebrid], "named as unable to answer");
-    }
-    todo!("pending: stores_test.go:935 TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut")
+    let pool = StorePool { stores: vec![Box::new(answered), Box::new(uncertain), Box::new(unreached)] };
+    let (_, ok, unknown) = pool.status_detail(&target_hash(H), Some(deadline)).await;
+    assert!(!ok, "nothing was downloading");
+    let named: Vec<DebridService> = unknown.iter().map(|s| s.service()).collect();
+    assert_eq!(named, vec![DebridService::TorBox, DebridService::RealDebrid], "named as unable to answer");
 }
 
-#[test]
-#[ignore = "needs metrics.backgroundPanic from package 6"]
-fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
-    // Enable when package 6 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    async fn pending() {
-        // A panic inside the listing fetch is abandoned, not fatal.
-        let before = metrics::background_panic();
-        let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
-        let s = Arc::new(s);
-        let mut tasks = Vec::new();
-        for _ in 0..2 {
-            let s = s.clone();
-            tasks.push(tokio::spawn(async move {
-                let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
-                ok || !ids.is_empty()
-            }));
-        }
-        for t in tasks {
-            assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
-        }
-        assert!(metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
+#[tokio::test]
+async fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
+    // A panic inside the listing fetch is abandoned, not fatal.
+    let before = crate::metrics::background_panic();
+    let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
+    let s = Arc::new(s);
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
+            ok || !ids.is_empty()
+        }));
     }
-    todo!("pending: stores_test.go:1231 TestAccountListing_aPanicInTheFetchIsAbandonedNotFatal")
+    for t in tasks {
+        assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
+    }
+    assert!(crate::metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
 }
 
 #[test]

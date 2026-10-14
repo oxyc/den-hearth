@@ -35,8 +35,9 @@ serde = { version = "1", features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http = "1"
 # Go `time.NewTicker` (`TieredCache::sweep_every`), `sync/singleflight` (indexerconfig.rs, cinemeta.rs),
-# and the name lookups household sources are guarded at (sources.rs).
-tokio = { version = "1", features = ["net", "sync", "time"] }
+# and the name lookups household sources are guarded at (sources.rs). `rt` is Go's `go func()`: the shared indexer
+# question outlives the caller that started it (scrape.rs, stores/torbox).
+tokio = { version = "1", features = ["net", "sync", "time", "rt"] }
 # Go `regexp` (RE2 syntax, linear time): the release-title patterns in rank.go, attributes.go and label.go.
 regex = "1"
 # Go `regexp2`: the patterns that need lookaround, which RE2 lacks (rank.go's "upscaled" junk pattern,
@@ -44,8 +45,14 @@ regex = "1"
 fancy-regex = "0.19"
 # Go `net/url`, for the household source links in sources.go.
 url = "2"
+# Go `http.ParseTime` for a Retry-After date (upstreampause.go): IMF-fixdate, RFC 850 and asctime.
+httpdate = "1"
+# Go `math/rand` for the jitter on an unnamed pause (upstreampause.go).
+fastrand = "2"
 
 [dev-dependencies]
 # Go's `t.TempDir()`.
 tempfile = "3"
+# A response whose body fails mid-read (`brokenBodyResponse`, `cancelledBodyResponse`): a stream that yields an error.
+futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }

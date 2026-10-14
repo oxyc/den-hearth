@@ -9,16 +9,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::addbudget::{budget_account, global_add_budget, ADD_BUDGET_LIMIT};
 use crate::cache::{Cache, MemoryCache};
 use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
+use crate::stores::pool::StorePool;
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
-use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
+use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{
-    add_outcome_unknown, already_queued, backed_off, note_add_attempt, pm_queued_key, record_refusal,
-    unknown_outcome_key, ADD_GIVE_UP, PENDING_GIVE_UP, QUEUED_TTL, UNKNOWN_OUTCOME_TTL,
+    add_outcome_unknown, already_queued, backed_off, note_add_attempt, pm_queued_key, record_refusal, refused_key,
+    unknown_outcome_key, ADD_GIVE_UP, PENDING_GIVE_UP, QUEUED_TTL, REFUSAL_BACKOFF, UNKNOWN_OUTCOME_TTL,
 };
-use crate::stores::{DeadLinkError, ResolveTarget, Store, StoreError, StoreUnavailableError};
+use crate::stores::torbox::{TorBoxStore, TORBOX_API};
+use crate::stores::{DeadLinkError, ResolveTarget, Store, StoreError, StoreUnavailableError, ERR_WOULD_ADD};
 
 use super::mock::{resp, MockDoer};
 
@@ -97,11 +100,8 @@ fn store_unavailable_error_names_the_service() {
 // refuses. It reads the backoff the queueing path wrote, so a throttled account reads as "the service
 // refused us" rather than as an absence, which the client cannot tell from a dead release.
 #[test]
-#[ignore = "needs stores/torbox.rs (package 1) and the pool reporter"]
 fn recent_refusal_reads_what_the_queueing_path_wrote() {
-    #[cfg(any())]
-    fn pending() {
-        let cache = MemoryCache::new(1 << 20);
+        let cache = Arc::new(MemoryCache::new(1 << 20));
         let store = TorBoxStore {
             token: "tok".into(),
             cache: Some(cache.clone()),
@@ -130,8 +130,6 @@ fn recent_refusal_reads_what_the_queueing_path_wrote() {
             })],
         };
         assert!(bare.recent_refusal("hash-refused").is_none(), "a store with no cache cannot report a refusal");
-    }
-    todo!("pending: refusal_test.go:33")
 }
 
 // The disk tier turns itself off on the first write failure rather than logging the same fact per entry.
@@ -301,50 +299,59 @@ async fn every_store_reports_a_refusal_as_a_refusal() {
 // on the shipped default (mediafusion has no config URL), so every genuinely empty result was reported
 // as an outage, negative caching never ran, and three unavailable titles in a row flipped /health to
 // degraded on a perfectly healthy service. A permanent misconfiguration is not a transient failure.
-#[test]
-#[ignore = "needs scrape.rs scrape_all (package 5)"]
-fn scrape_all_unaskable_indexer_does_not_block_an_empty_verdict() {
-    #[cfg(any())]
-    async fn pending() {
-        let answered_empty = FakeScraper { id: "torrentio", result: Ok(vec![]) };
-        let unaskable = UnaskableScraper { indexer: "mediafusion" };
+#[tokio::test]
+async fn scrape_all_unaskable_indexer_does_not_block_an_empty_verdict() {
+    use crate::config::Indexer;
+    use crate::indexerconfig::UnaskableScraper;
+    use crate::rank::RawStream;
+    use crate::scrape::{scrape_all, ScrapeQuery, Scraper};
 
-        let (_, ok, _) =
-            scrape_all(&[&answered_empty, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
-        assert!(ok, "every askable indexer answered, so the empty result is authoritative");
-
-        // A non-empty list is trusted whatever the coverage: whatever came back is real.
-        let found = FakeScraper {
-            id: "torrentio",
-            result: Ok(vec![RawStream { info_hash: "d".repeat(40), title: "a release".into(), ..Default::default() }]),
-        };
-        let (seeds, ok, _) = scrape_all(&[&found, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
-        assert!(ok && seeds.len() == 1, "a non-empty result stands on its own: {} seeds, ok={ok}", seeds.len());
-
-        // A real failure still withholds the verdict — that is the rule this must not weaken.
-        let failed = FakeScraper { id: "torrentio", result: Err("502".into()) };
-        let (_, ok, _) = scrape_all(&[&failed, &unaskable], &ScrapeQuery::default(), Duration::from_secs(1)).await;
-        assert!(!ok, "an indexer that failed means the empty result is not authoritative");
+    /// Go `fakeScraper`: answers a fixed result.
+    struct FakeScraper {
+        result: Result<Vec<RawStream>, &'static str>,
     }
-    todo!("pending: refusal_test.go:222")
+
+    #[async_trait::async_trait]
+    impl Scraper for FakeScraper {
+        fn id(&self) -> Indexer {
+            Indexer("torrentio".into())
+        }
+        async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+            self.result.clone().map_err(DoError::from)
+        }
+    }
+
+    let unaskable: Arc<dyn Scraper> = Arc::new(UnaskableScraper { indexer: Indexer("mediafusion".into()), transient: false });
+    let with = |sc: FakeScraper| -> Vec<Arc<dyn Scraper>> { vec![Arc::new(sc), Arc::clone(&unaskable)] };
+
+    let (_, ok, _) = scrape_all(&with(FakeScraper { result: Ok(vec![]) }), &ScrapeQuery::default(), Duration::from_secs(1)).await;
+    assert!(ok, "every askable indexer answered, so the empty result is authoritative");
+
+    // A non-empty list is trusted whatever the coverage: whatever came back is real.
+    let found = FakeScraper {
+        result: Ok(vec![RawStream { info_hash: "d".repeat(40), title: "a release".into(), ..Default::default() }]),
+    };
+    let (seeds, ok, _) = scrape_all(&with(found), &ScrapeQuery::default(), Duration::from_secs(1)).await;
+    assert!(ok && seeds.len() == 1, "a non-empty result stands on its own: {} seeds, ok={ok}", seeds.len());
+
+    // A real failure still withholds the verdict — that is the rule this must not weaken.
+    let (_, ok, _) = scrape_all(&with(FakeScraper { result: Err("502") }), &ScrapeQuery::default(), Duration::from_secs(1)).await;
+    assert!(!ok, "an indexer that failed means the empty result is not authoritative");
 }
 
 // Season and episode are read off the stream id, and a movie has neither. A wrong answer here sends the
 // probe at the wrong episode of a pack.
 #[test]
-#[ignore = "needs probe_fanout.rs seasonOf/episodeOf (package 5)"]
 fn season_episode_of() {
-    #[cfg(any())]
-    fn pending() {
-        // nil, not zero: episode 0 is a real episode on some series, so "no episode" needs its own value.
-        assert!(season_of(None).is_none() && episode_of(None).is_none(), "a nil id has neither a season nor an episode");
-        let sid = StreamId { kind: "series".into(), imdb: "tt1".into(), season: 3, episode: 7, has_ep: true };
-        assert_eq!(season_of(Some(&sid)), Some(3), "season not read");
-        assert_eq!(episode_of(Some(&sid)), Some(7), "episode not read");
-        let movie = StreamId { kind: "movie".into(), imdb: "tt2".into(), ..Default::default() };
-        assert!(season_of(Some(&movie)).is_none() && episode_of(Some(&movie)).is_none(), "a movie has neither");
-    }
-    todo!("pending: refusal_test.go:251")
+    use crate::id::StreamId;
+    use crate::probe_fanout::{episode_of, season_of};
+    // nil, not zero: episode 0 is a real episode on some series, so "no episode" needs its own value.
+    assert!(season_of(None).is_none() && episode_of(None).is_none(), "a nil id has neither a season nor an episode");
+    let sid = StreamId { kind: "series".into(), imdb: "tt1".into(), season: 3, episode: 7, has_ep: true };
+    assert_eq!(season_of(Some(&sid)), Some(3), "season not read");
+    assert_eq!(episode_of(Some(&sid)), Some(7), "episode not read");
+    let movie = StreamId { kind: "movie".into(), imdb: "tt2".into(), season: 0, episode: 0, has_ep: false };
+    assert!(season_of(Some(&movie)).is_none() && episode_of(Some(&movie)).is_none(), "a movie has neither");
 }
 
 // The backoff belongs to every store that can be refused, not just the one whose refusal was noticed
@@ -525,11 +532,8 @@ fn handle_play_names_scout_not_the_debrid_for_its_own_refusals() {
 
 // A read-only resolve is answered before the ADD backoff, and is never blocked by an add already in
 // flight — both describe a state a NoAdd caller cannot have caused.
-#[test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
-fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
-    #[cfg(any())]
-    async fn pending() {
+#[tokio::test]
+async fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
         let cache = mem();
         record_refusal(&*cache, DebridService::TorBox, "tok", H, &refused(DebridService::TorBox, "429"));
         note_add_attempt(&*cache, DebridService::TorBox, "tok", H);
@@ -545,8 +549,6 @@ fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
             matches!(&err, Err(StoreError::DeadLink(d)) if d.reason == ERR_WOULD_ADD),
             "a read-only resolve was blocked by an add-path guard: {err:?}"
         );
-    }
-    todo!("pending: refusal_test.go:485")
 }
 
 // An add scout already sent is answered 202 "coming", not 503 "refused".
@@ -666,10 +668,7 @@ fn add_in_flight_stops_believing_an_add_at_the_give_up() {
 // that answered false for any pool with more than one store passed the whole suite, and would have made
 // the probe blind to in-flight adds on exactly the multi-account installs it matters for.
 #[test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
 fn store_pool_add_in_flight_asks_every_store() {
-    #[cfg(any())]
-    fn pending() {
         let token = "pool-loop";
         let hash = "6".repeat(40);
         let cache = mem();
@@ -688,8 +687,6 @@ fn store_pool_add_in_flight_asks_every_store() {
             ],
         };
         assert!(pool.add_in_flight(&hash), "the pool missed an add in flight on a store that was not the first one asked");
-    }
-    todo!("pending: refusal_test.go:607")
 }
 
 // A release Real-Debrid already holds is READY on the probe route, not "not queued".
@@ -782,10 +779,7 @@ fn premiumize_add_in_flight_believes_a_queued_transfer_only_until_the_give_up() 
 // whole suite; and the only test used a movie target, so dropping season/episode from the RD key — which
 // would make the fix silently do nothing for series, most of the traffic — also passed.
 #[test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
 fn holding_services_asks_every_store_and_keys_episodes_correctly() {
-    #[cfg(any())]
-    fn pending() {
         let token = "holding";
         let hash = "3".repeat(40);
         let cache = mem();
@@ -821,8 +815,6 @@ fn holding_services_asks_every_store_and_keys_episodes_correctly() {
             pool.holding_services(&other_season).is_empty(),
             "S03E05 matched S02E05's entry — the key is not discriminating on season"
         );
-    }
-    todo!("pending: refusal_test.go:721")
 }
 
 // EveryAddRefusedByScout means EVERY, and an empty pool refuses nothing.
@@ -832,10 +824,9 @@ fn holding_services_asks_every_store_and_keys_episodes_correctly() {
 // while /play serves a 302 from the healthy account. That is a fresh disagreement of exactly the kind
 // the branch was added to remove.
 #[test]
-#[ignore = "needs stores/torbox.rs (package 1), addbudget.rs (package 3)"]
 fn every_add_refused_by_scout_needs_every_account_spent() {
-    #[cfg(any())]
-    fn pending() {
+        // The process-wide budget, held for this test: other tests swap it, and Go's ran one at a time.
+        let _budget = crate::tests::addbudget::install_budget(crate::tests::addbudget::HOUR, ADD_BUDGET_LIMIT);
         let spent = "spent-every_add_refused_by_scout_needs_every_account_spent";
         let healthy = "healthy-every_add_refused_by_scout_needs_every_account_spent";
         for _ in 0..ADD_BUDGET_LIMIT {
@@ -873,8 +864,6 @@ fn every_add_refused_by_scout_needs_every_account_spent() {
             !StorePool { stores: vec![] }.every_add_refused_by_scout(),
             "an empty pool refused every add — vacuously true is not true here"
         );
-    }
-    todo!("pending: refusal_test.go:760")
 }
 
 // A refusal on record outranks the queue marker, and NOT the other way round.
@@ -1245,11 +1234,8 @@ fn probe_and_play_agree_when_one_accounts_key_is_dead_and_another_is_fetching() 
 // states in as many words. Both markers can be live at once without planting anything: /play has no
 // singleflight and Stremio races requests, so one poll's createtorrent can be answered 429 (settling its
 // attempt and recording the refusal) while another's connection resets, leaving its attempt marker.
-#[test]
-#[ignore = "needs stores/torbox.rs (package 1)"]
-fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
-    #[cfg(any())]
-    async fn pending() {
+#[tokio::test]
+async fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
         let token = "tb-order";
         let hash = "a".repeat(40);
         let cache = mem();
@@ -1288,8 +1274,6 @@ fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
             matches!(&late, Err(e) if is_refusal(e)),
             "past addGiveUp torbox answered {late:?}, want the recorded refusal — a dead link here is /play calling a release dead while the probe reports the refusal, and it comes from trusting a marker past the point scout stops believing it"
         );
-    }
-    todo!("pending: refusal_test.go:1139")
 }
 
 // /play must not buy a release another configured account already holds.
@@ -1436,52 +1420,48 @@ fn probe_and_play_agree_on_a_later_episode_after_premiumize_served_the_first() {
 //
 // Two guards are asserted: the charge is taken (so the fifty an hour sees it), and the mark is dropped
 // (so the next poll does not walk the same path again).
-#[test]
-#[ignore = "needs addbudget.rs (package 3)"]
-fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
-    #[cfg(any())]
-    async fn pending() {
-        let token = "pm-evicted";
-        let hash = "7".repeat(40);
-        let cache = mem();
-        note_held(&*cache, token, &hash); // the account held it when /play last served it
+#[tokio::test]
+async fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
+    use crate::stores::refusal::{held_recently, note_held};
+    let token = "pm-evicted";
+    let hash = "7".repeat(40);
+    let cache = mem();
+    note_held(&*cache, token, &hash); // the account held it when /play last served it
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
-        let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer {
-            c.fetch_add(1, Ordering::SeqCst);
-            // Evicted: directdl succeeds by QUEUEING a fresh transfer, and returns nothing to serve.
-            Ok(resp(200, r#"{"status":"success","content":[]}"#))
-        }));
-        let s = premiumize(token, &cache, client);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer {
+        c.fetch_add(1, Ordering::SeqCst);
+        // Evicted: directdl succeeds by QUEUEING a fresh transfer, and returns nothing to serve.
+        Ok(resp(200, r#"{"status":"success","content":[]}"#))
+    }));
+    let s = premiumize(token, &cache, client);
 
-        let before = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
-        let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
+    let before = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
+    let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
 
-        let after = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
-        assert_ne!(
-            after,
-            before,
-            "a directdl that queued a transfer was not charged (allowance {before} → {after}) — the held mark is suppressing the charge, so the hourly ceiling never sees these and a polling client makes one real add every couple of seconds"
-        );
-        assert!(
-            !held_recently(&*cache, token, &hash),
-            "the held mark survived a directdl that returned no content — that answer proves the account does not hold it, and nothing else can ever clear the mark"
-        );
-        assert!(
-            already_queued(&*cache, token, &hash),
-            "no queue marker was written for a transfer this call queued — nothing bounds the 'coming' claim, so /play answers 202 downloading with no give-up"
-        );
+    let after = global_add_budget().remaining(&budget_account(DebridService::Premiumize, token));
+    assert_ne!(
+        after,
+        before,
+        "a directdl that queued a transfer was not charged (allowance {before} → {after}) — the held mark is suppressing the charge, so the hourly ceiling never sees these and a polling client makes one real add every couple of seconds"
+    );
+    assert!(
+        !held_recently(&*cache, token, &hash),
+        "the held mark survived a directdl that returned no content — that answer proves the account does not hold it, and nothing else can ever clear the mark"
+    );
+    assert!(
+        already_queued(&*cache, token, &hash),
+        "no queue marker was written for a transfer this call queued — nothing bounds the 'coming' claim, so /play answers 202 downloading with no give-up"
+    );
 
-        // And the next poll must not walk the same path again.
-        let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
-        assert!(
-            calls.load(Ordering::SeqCst) <= 2,
-            "{} directdl calls across two polls — the read-only path is re-queueing on every poll",
-            calls.load(Ordering::SeqCst)
-        );
-    }
-    todo!("pending: refusal_test.go:1325")
+    // And the next poll must not walk the same path again.
+    let _ = s.resolve(&ResolveTarget { no_add: true, ..target(&hash) }).await;
+    assert!(
+        calls.load(Ordering::SeqCst) <= 2,
+        "{} directdl calls across two polls — the read-only path is re-queueing on every poll",
+        calls.load(Ordering::SeqCst)
+    );
 }
 
 // A Real-Debrid release that is DOWNLOADING must not read as dead on either route.

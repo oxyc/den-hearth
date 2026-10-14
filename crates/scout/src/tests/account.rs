@@ -192,3 +192,103 @@ fn account_non_torbox_service() {
     }
     todo!("pending: account_test.go:144 TestAccount_nonTorBoxService")
 }
+
+// ---- The store's AccountSummary, without the handler -------------------------------------------------------------
+//
+// /<config>/account renders what the store reports. These pin what the store reports, with the same upstream replies
+// the handler tests above use.
+
+mod store {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::cache::MemoryCache;
+    use crate::stores::torbox::{TorBoxStore, TORBOX_API};
+    use crate::stores::StoreError;
+    use crate::tests::mock::{resp, MockDoer};
+
+    fn base(req: &reqwest::Request) -> String {
+        req.url().path().rsplit('/').next().unwrap_or("").to_owned()
+    }
+
+    fn store(
+        token: &str,
+        reply: impl Fn(&reqwest::Request) -> reqwest::Response + Send + Sync + 'static,
+    ) -> (TorBoxStore, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let s = TorBoxStore {
+            token: token.to_owned(),
+            api: TORBOX_API.to_owned(),
+            cache: Some(Arc::new(MemoryCache::new(1 << 20))),
+            client: Arc::new(MockDoer(move |req| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(reply(&req))
+            })),
+        };
+        (s, calls)
+    }
+
+    // Active entries are told apart from finished and idle ones, and the queue length is the account's own
+    // queued-torrents list — not scout's add budget.
+    #[tokio::test]
+    async fn summary_counts_active_and_queued() {
+        let (s, calls) = store("tb-account-known-plan", |req| match base(req).as_str() {
+            "me" => resp(
+                200,
+                r#"{"success":true,"data":{"plan":2,"cooldown_until":null,"premium_expires_at":"2027-01-02T00:00:00Z"}}"#,
+            ),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":[{"active":true,"download_finished":false},{"active":true,"download_finished":true},{"active":false,"download_finished":false}]}"#,
+            ),
+            "getqueued" => resp(200, r#"{"success":true,"data":[{"id":1},{"id":2}]}"#),
+            _ => resp(404, "{}"),
+        });
+        let sum = s.account_summary().await.expect("summary");
+        assert_eq!(sum.plan, 2);
+        assert_eq!((sum.active, sum.queued), (1, 2), "active counts the active, unfinished entries only");
+        assert_eq!(sum.premium_expires_at.map(|t| t.to_rfc3339()).as_deref(), Some("2027-01-02T00:00:00Z"));
+        assert!(sum.cooldown_until.is_none(), "a null cooldown is omitted");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "upstream calls (user/me, mylist, getqueued)");
+    }
+
+    // Cached for 30s per account: a second request within the window costs no further upstream reads.
+    #[tokio::test]
+    async fn summary_is_reused_within_the_window() {
+        let (s, calls) = store("tb-account-cache-reuse", |req| match base(req).as_str() {
+            "me" => resp(200, r#"{"success":true,"data":{"plan":1}}"#),
+            "mylist" | "getqueued" => resp(200, r#"{"success":true,"data":[]}"#),
+            _ => resp(404, "{}"),
+        });
+        let first = s.account_summary().await.expect("summary");
+        let made = calls.load(Ordering::SeqCst);
+        let second = s.account_summary().await.expect("summary");
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), made, "a second read within 30s made upstream calls");
+    }
+
+    // A refused upstream is an error the route degrades on, not a summary of nothing.
+    #[tokio::test]
+    async fn summary_of_a_refused_upstream_is_an_error() {
+        let (s, _) = store("tb-account-refused", |_| resp(500, r#"{"error":"server_error"}"#));
+        let err = s.account_summary().await.expect_err("a refused read is no summary");
+        assert!(matches!(&err, StoreError::Unavailable(u) if u.status == 500), "{err:?}");
+    }
+
+    // The times are printed the way Go prints a parsed RFC 3339 time: offset kept, fraction trimmed.
+    #[tokio::test]
+    async fn summary_times_keep_their_offset_and_trim_the_fraction() {
+        let (s, _) = store("tb-account-times", |req| match base(req).as_str() {
+            "me" => resp(
+                200,
+                r#"{"success":true,"data":{"plan":3,"cooldown_until":"2027-01-02T03:04:05.500+02:00","premium_expires_at":"not a time"}}"#,
+            ),
+            "mylist" | "getqueued" => resp(200, r#"{"success":true,"data":[]}"#),
+            _ => resp(404, "{}"),
+        });
+        let sum = s.account_summary().await.expect("summary");
+        assert_eq!(sum.cooldown_until.map(|t| t.to_rfc3339()).as_deref(), Some("2027-01-02T03:04:05.5+02:00"));
+        assert!(sum.premium_expires_at.is_none(), "an unparseable time is unknown, not a failure");
+    }
+}

@@ -276,15 +276,11 @@ fn pick_episode_file() {
         assert!(matches!(got, Ok(None)), "no files → nil: got {got:?}");
 }
 
-// Needs `selectFileID` from stores.go (work package 1, torbox.rs). The body is ported and compiled out until it lands.
 #[test]
-#[ignore = "needs select_file_id from stores/torbox.rs (package 1)"]
 fn select_file_id_torbox() {
-    // Enable when package 1 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
         use crate::season::TorrentFile;
-        use crate::stores::{select_file_id, ResolveTarget};
+        use crate::stores::torbox::select_file_id;
+        use crate::stores::ResolveTarget;
         // TorBox file ids (Index) are NOT positions in Torrentio's list, so a series episode must be
         // name-matched, never resolved via the passed-through fileIdx (FOLLOWUP #13).
         let pack = vec![
@@ -301,8 +297,6 @@ fn select_file_id_torbox() {
         assert!(matches!(got, Ok(Some(7))), "fileIdx passthrough when no list: got {got:?} want 7");
         let got = select_file_id(&pack, &ResolveTarget::default());
         assert!(matches!(got, Ok(None)), "no selector → nil, got {got:?}");
-    }
-    todo!("pending: core_test.go:236 TestSelectFileIDTorBox")
 }
 
 // Needs `realDebridStore.pickFileID` and `premiumizeStore.pickIndex` (work package 2). The body is ported and

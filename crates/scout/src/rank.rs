@@ -385,7 +385,7 @@ pub(crate) fn quality_score_lower(t: &str, s: &RawStream, junk: &str) -> i64 {
 /// highest score quality alone can reach (a 2160p BluRay REMUX with DV + HDR10, DD+ Atmos, at the 600-point
 /// size ceiling, measures 4860), so the preferred bucket sits above every non-preferred release the ranker
 /// does not actively penalise. It stays under cached (+8000), and junk (-100000) is untouched.
-const PREFERENCE_SINK: i64 = 5000;
+pub(crate) const PREFERENCE_SINK: i64 = 5000;
 
 /// Go `wrongShowSink`: what an episode release costs when its own name says it is another show or another
 /// episode. It clears everything a matching release can earn, so any release that names this show and

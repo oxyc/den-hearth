@@ -205,20 +205,14 @@ async fn pause_on_refusal_waits_out_an_allowance_an_answer_says_is_spent() {
 
 // The add budget frees a slot when its oldest charge drains. Package 3 (addbudget.rs) owns the budget.
 #[test]
-#[ignore = "needs add_budget from addbudget.rs (package 3)"]
 fn add_budget_frees_in_when_its_oldest_charge_drains() {
-    // Enable when package 3 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::addbudget::new_add_budget;
-        let mut b = new_add_budget(Duration::from_secs(3600), 2);
-        let clock = Arc::new(Mutex::new(sept_14_noon()));
-        b.now = clock_fn(&clock);
-        b.take("acct", false);
-        assert_eq!(b.frees_in("acct", false), Duration::ZERO, "an account with allowance left must not be told to wait");
-        *clock.lock().unwrap() += Duration::from_secs(600);
-        b.take("acct", false);
-        assert_eq!(b.frees_in("acct", false), Duration::from_secs(50 * 60), "freesIn: want the first charge's 50 minutes left");
-    }
-    todo!("pending: upstreampause_test.go:~166 TestAddBudget_freesInWhenItsOldestChargeDrains")
+    use crate::addbudget::AddBudget;
+    let mut b = AddBudget::new(Duration::from_secs(3600), 2);
+    let clock = Arc::new(Mutex::new(sept_14_noon()));
+    b.now = clock_fn(&clock);
+    b.take("acct", false);
+    assert_eq!(b.frees_in("acct", false), Duration::ZERO, "an account with allowance left must not be told to wait");
+    *clock.lock().unwrap() += Duration::from_secs(600);
+    b.take("acct", false);
+    assert_eq!(b.frees_in("acct", false), Duration::from_secs(50 * 60), "freesIn: want the first charge's 50 minutes left");
 }

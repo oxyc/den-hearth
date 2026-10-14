@@ -3,16 +3,15 @@
 //! Checks a debrid token at the moment it is pasted: one unauthenticated read per service, judged from the right
 //! place for that service. A provider being down is never reported as a wrong token.
 
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
-
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
 use crate::config::DebridService;
-use crate::hostlimit::{Bucket, HostLimiter};
+use crate::hostlimit::HostLimiter;
+use crate::metrics::metrics;
 use crate::scrape::Doer;
+use crate::stores::go_query_escape;
 use crate::stores::premiumize::PREMIUMIZE_API;
 use crate::stores::realdebrid::REAL_DEBRID_API;
 use crate::stores::torbox::TORBOX_API;
@@ -58,7 +57,7 @@ pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: 
         (Some(h), None) => h.to_owned(),
         (None, _) => String::new(),
     };
-    if !allow(limiter, &host) {
+    if !limiter.allow(&host) {
         return ValidateResult {
             reason: "too many checks just now — try again in a moment".to_owned(),
             throttled: true,
@@ -66,8 +65,10 @@ pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: 
         };
     }
     let resp = doer.do_request(req).await;
-    // TODO(metrics): Go records `metrics.torboxCall("user", <2xx>)` here for TorBox, success or failure; metrics.rs
-    // is not ported yet.
+    if svc == DebridService::TorBox {
+        let ok = matches!(&resp, Ok(r) if r.status().is_success());
+        metrics().torbox_call("user", ok);
+    }
     let resp = match resp {
         Ok(resp) => resp,
         // The indexer scrapers log the service name and never the URL, because MediaFusion's carries an
@@ -116,8 +117,9 @@ fn validate_request(svc: DebridService, token: &str) -> Option<reqwest::Request>
         DebridService::TorBox => reqwest::Url::parse(&format!("{TORBOX_API}/user/me")).ok()?,
         DebridService::RealDebrid => reqwest::Url::parse(&format!("{REAL_DEBRID_API}/user")).ok()?,
         // Premiumize authenticates in the query string, so it sends no bearer header.
+        // Go `url.QueryEscape`, not the form encoder's: it keeps `~` and escapes `*`, which the form encoder does not.
         DebridService::Premiumize => {
-            reqwest::Url::parse_with_params(&format!("{PREMIUMIZE_API}/account/info"), &[("apikey", token)]).ok()?
+            reqwest::Url::parse(&format!("{PREMIUMIZE_API}/account/info?apikey={}", go_query_escape(token))).ok()?
         }
     };
     let mut req = reqwest::Request::new(reqwest::Method::GET, url);
@@ -140,37 +142,4 @@ async fn read_prefix(mut resp: reqwest::Response) -> Vec<u8> {
     }
     buf.truncate(MAX_VALIDATE_BODY);
     buf
-}
-
-/// Go `(*hostLimiter).allow`: takes a whole token if one is free right now and never queues. An empty key is never
-/// limited.
-///
-/// TODO(hostlimit): this duplicates `hostLimiter.allow` and `bucket.tryTake`, which belong in `hostlimit.rs` as
-/// `HostLimiter::allow` / `Bucket::try_take`. They are still `todo!()` there, so the logic is kept here, on the
-/// limiter's crate-visible fields, until that file lands; then this function is deleted and the call becomes
-/// `limiter.allow(host)`.
-fn allow(limiter: &HostLimiter, key: &str) -> bool {
-    if key.is_empty() {
-        return true;
-    }
-    let bucket = {
-        // A poisoned lock still holds consistent state: every edit under it finishes before anything can panic.
-        let mut buckets = limiter.buckets.lock().unwrap_or_else(PoisonError::into_inner);
-        let burst = limiter.burst as f64;
-        Arc::clone(buckets.entry(key.to_owned()).or_insert_with(|| {
-            Arc::new(Mutex::new(Bucket { tokens: burst, last: Instant::now() }))
-        }))
-    };
-    let mut b = bucket.lock().unwrap_or_else(PoisonError::into_inner);
-    let now = Instant::now();
-    b.tokens += now.duration_since(b.last).as_secs_f64() / limiter.every.as_secs_f64();
-    if b.tokens > limiter.burst as f64 {
-        b.tokens = limiter.burst as f64;
-    }
-    b.last = now;
-    if b.tokens < 1.0 {
-        return false;
-    }
-    b.tokens -= 1.0;
-    true
 }
