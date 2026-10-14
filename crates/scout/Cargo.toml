@@ -24,6 +24,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http = "1"
+# Go's `regexp2` (lookahead and lookbehind), which the episode matchers in season.go are written in.
+fancy-regex = "0.19"
+# Go's `regexp` (RE2), for the patterns Go compiles with `mustRE2`.
+regex = "1"
+# Go's `net/url`, for the household source links in sources.go.
+url = "2"
+# Go's `sync/singleflight` (indexerconfig.rs, cinemeta.rs) and the name lookups household sources are guarded at (sources.rs).
+tokio = { version = "1", features = ["net", "sync", "time"] }
 
 [dev-dependencies]
 # Go's `t.TempDir()`.
