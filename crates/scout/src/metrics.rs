@@ -149,7 +149,10 @@ pub fn new_metric_set() -> MetricSet {
         torbox_status_avoided: AtomicI64::new(0),
         torbox_status_active: AtomicI64::new(0),
         torbox_status_waiters: AtomicI64::new(0),
-        torbox_calls: METRIC_TORBOX_ENDPOINTS.iter().map(|e| (*e, fixed_series(&METRIC_TORBOX_OUTCOMES))).collect(),
+        torbox_calls: METRIC_TORBOX_ENDPOINTS
+            .iter()
+            .map(|e| (*e, fixed_series(&METRIC_TORBOX_OUTCOMES)))
+            .collect(),
         torbox_avoided: fixed_series(&METRIC_TORBOX_AVOIDED),
         indexer_requests: fixed_series(&metric_indexers().collect::<Vec<_>>()),
         indexer_failures: fixed_series(&metric_indexers().collect::<Vec<_>>()),
@@ -318,7 +321,8 @@ impl MetricSet {
             &[(String::new(), ld(&self.background_panic))],
         );
 
-        let mut torbox_calls = Vec::with_capacity(METRIC_TORBOX_ENDPOINTS.len() * METRIC_TORBOX_OUTCOMES.len());
+        let mut torbox_calls =
+            Vec::with_capacity(METRIC_TORBOX_ENDPOINTS.len() * METRIC_TORBOX_OUTCOMES.len());
         for endpoint in METRIC_TORBOX_ENDPOINTS {
             for outcome in METRIC_TORBOX_OUTCOMES {
                 torbox_calls.push((
@@ -327,7 +331,12 @@ impl MetricSet {
                 ));
             }
         }
-        counter(&mut b, "scout_debrid_calls_total", "Debrid API calls by fixed endpoint and outcome.", &torbox_calls);
+        counter(
+            &mut b,
+            "scout_debrid_calls_total",
+            "Debrid API calls by fixed endpoint and outcome.",
+            &torbox_calls,
+        );
         counter(
             &mut b,
             "scout_debrid_calls_avoided_total",
@@ -344,7 +353,12 @@ impl MetricSet {
         let per_indexer = |counters: &Series| -> Vec<(String, i64)> {
             metric_indexers().map(|id| (format!(r#"indexer="{id}""#), ld(&counters[id]))).collect()
         };
-        counter(&mut b, "scout_indexer_requests_total", "Scrape attempts per indexer.", &per_indexer(&self.indexer_requests));
+        counter(
+            &mut b,
+            "scout_indexer_requests_total",
+            "Scrape attempts per indexer.",
+            &per_indexer(&self.indexer_requests),
+        );
         counter(
             &mut b,
             "scout_indexer_failures_total",
@@ -361,10 +375,18 @@ impl MetricSet {
         let mut cov = Vec::with_capacity((ALL_INDEXERS.len() + 1) * SOURCE_OUTCOMES.len());
         for id in metric_indexers() {
             for outcome in SOURCE_OUTCOMES {
-                cov.push((format!(r#"indexer="{id}",outcome="{outcome}""#), ld(&self.source_coverage[id][outcome])));
+                cov.push((
+                    format!(r#"indexer="{id}",outcome="{outcome}""#),
+                    ld(&self.source_coverage[id][outcome]),
+                ));
             }
         }
-        counter(&mut b, "scout_source_coverage_total", "Configured sources in each list build's coverage, by outcome.", &cov);
+        counter(
+            &mut b,
+            "scout_source_coverage_total",
+            "Configured sources in each list build's coverage, by outcome.",
+            &cov,
+        );
 
         counter(
             &mut b,

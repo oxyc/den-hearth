@@ -7,7 +7,8 @@ use regex::Regex;
 use crate::attributes::detect_source_attr;
 use crate::rank::{
     detect_resolution_lower, re2, RawStream, GIB, RES_1080, RES_1440, RES_2160, RES_480, RES_4K_UHD, RES_540,
-    RES_576, RES_720, RE_ATMOS, RE_BLURAY, RE_BR_RIP, RE_DOVI, RE_HDR10P, RE_REMUX, RE_WEB, RE_WEB_DL, RE_WEB_RIP,
+    RES_576, RES_720, RE_ATMOS, RE_BLURAY, RE_BR_RIP, RE_DOVI, RE_HDR10P, RE_REMUX, RE_WEB, RE_WEB_DL,
+    RE_WEB_RIP,
 };
 use crate::util::go_to_lower;
 
@@ -106,8 +107,8 @@ fn file_ext() -> &'static Regex {
 
 /// Go `groupMetadata`: a name that ends on one of these ends on metadata, not on a group ("…-Pilot-1080p.x265").
 const GROUP_METADATA: &[&str] = &[
-    "1080p", "2160p", "720p", "480p", "4k", "x264", "x265", "h264", "h265", "hevc", "avc", "av1", "webrip", "web-dl",
-    "webdl", "bluray", "hdtv", "aac", "dts", "ddp", "eac3", "atmos",
+    "1080p", "2160p", "720p", "480p", "4k", "x264", "x265", "h264", "h265", "hevc", "avc", "av1", "webrip",
+    "web-dl", "webdl", "bluray", "hdtv", "aac", "dts", "ddp", "eac3", "atmos",
 ];
 
 /// Go `releaseGroup`: the scene group — the token after the final hyphen, before the extension — lowercased, or ""

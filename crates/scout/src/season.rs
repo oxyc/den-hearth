@@ -54,7 +54,8 @@ pub(crate) fn err_episode_not_in_torrent() -> StoreError {
 /// Go `episodePatterns`' result: the matchers for one season and episode, in the order Go builds them.
 pub(crate) type EpisodePatterns = Vec<FancyRegex>;
 
-static VIDEO_EXT_RE: LazyLock<regex::Regex> = LazyLock::new(|| re2(r"\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$"));
+static VIDEO_EXT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| re2(r"\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$"));
 
 /// Go `labelledEpisodeRe` — does a filename DECLARE an episode, in a form that can't be anything else?
 ///
@@ -191,7 +192,8 @@ impl EpisodeNamer {
     }
 
     fn names(&self, name: &str) -> bool {
-        matches_episode(name, &self.patterns) || range_holds_episode(&go_to_lower(base_name(name)), self.season, self.episode)
+        matches_episode(name, &self.patterns)
+            || range_holds_episode(&go_to_lower(base_name(name)), self.season, self.episode)
     }
 }
 
@@ -376,7 +378,11 @@ pub(crate) fn base_name(name: &str) -> &str {
 /// the largest file there serves a confidently wrong episode: the pack holds S01E01–E10, you asked for
 /// E11, and it hands back E07 as though that were the answer. A single-episode release whose filename
 /// carries no marker still falls back, because there the largest file is the only thing it could be.
-pub(crate) fn pick_episode_file(files: &[TorrentFile], season: i64, episode: i64) -> Result<Option<i64>, StoreError> {
+pub(crate) fn pick_episode_file(
+    files: &[TorrentFile],
+    season: i64,
+    episode: i64,
+) -> Result<Option<i64>, StoreError> {
     let pool = episode_file_pool(files);
     if pool.is_empty() {
         return Ok(None);
@@ -405,7 +411,8 @@ pub(crate) fn pick_episode_file(files: &[TorrentFile], season: i64, episode: i64
     // S01E05 it is noise; on one labelled nothing it is all there is.
     if !unlabelled.is_empty() {
         let bare_re = bare_episode_patterns(episode);
-        let bare: Vec<&TorrentFile> = unlabelled.iter().copied().filter(|f| matches_episode(&f.name, &bare_re)).collect();
+        let bare: Vec<&TorrentFile> =
+            unlabelled.iter().copied().filter(|f| matches_episode(&f.name, &bare_re)).collect();
         // Exactly one, and it decides. In a numbered pack the episode's own number appears in one file; a
         // number turning up in several is either something they share — the show's title, which served
         // `Stargate SG-1 - 03` for a request for episode 1 — or the same episode twice, as in a
@@ -448,7 +455,8 @@ pub(crate) fn pick_episode_file(files: &[TorrentFile], season: i64, episode: i64
 /// Go `episodeFilePool`: the files an episode may be picked from: the videos, or everything when a list
 /// carries no recognised video extension.
 fn episode_file_pool(files: &[TorrentFile]) -> Vec<&TorrentFile> {
-    let videos: Vec<&TorrentFile> = files.iter().filter(|f| VIDEO_EXT_RE.is_match(&go_to_lower(&f.name))).collect();
+    let videos: Vec<&TorrentFile> =
+        files.iter().filter(|f| VIDEO_EXT_RE.is_match(&go_to_lower(&f.name))).collect();
     if videos.is_empty() {
         files.iter().collect()
     } else {
@@ -494,7 +502,8 @@ pub(crate) fn ambiguous_episode_guess(files: &[TorrentFile], episode: i64) -> Op
         return None;
     }
     let patterns = bare_episode_patterns(episode);
-    let bare: Vec<&TorrentFile> = candidates.into_iter().filter(|f| matches_episode(&f.name, &patterns)).collect();
+    let bare: Vec<&TorrentFile> =
+        candidates.into_iter().filter(|f| matches_episode(&f.name, &patterns)).collect();
     largest(&bare).map(|f| f.index)
 }
 

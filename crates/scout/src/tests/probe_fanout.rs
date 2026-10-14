@@ -18,8 +18,8 @@ use crate::handler::{new_handler, Handler};
 use crate::id::StreamId;
 use crate::probe::Probe;
 use crate::probe_fanout::{
-    apply_probed_size, browser_probe_candidates, hydrate_pack_only_sizes, probe_cache_key, BROWSER_PROBE_FRONTIER,
-    PROBE_TTL,
+    apply_probed_size, browser_probe_candidates, hydrate_pack_only_sizes, probe_cache_key,
+    BROWSER_PROBE_FRONTIER, PROBE_TTL,
 };
 use crate::rank::RawStream;
 use crate::stores::refusal::resolve_key;
@@ -55,7 +55,10 @@ fn seeded_cache(streams: &[RawStream], value: &str) -> Arc<dyn Cache> {
 }
 
 /// A `make_stores` over one real TorBox store that has a cache and no network.
-fn torbox_stores(token: &str, cache: &Arc<dyn Cache>) -> Arc<dyn Fn(&Config) -> Vec<Box<dyn Store>> + Send + Sync> {
+fn torbox_stores(
+    token: &str,
+    cache: &Arc<dyn Cache>,
+) -> Arc<dyn Fn(&Config) -> Vec<Box<dyn Store>> + Send + Sync> {
     let (token, cache) = (token.to_owned(), cache.clone());
     Arc::new(move |_| {
         vec![Box::new(TorBoxStore {
@@ -68,7 +71,10 @@ fn torbox_stores(token: &str, cache: &Arc<dyn Cache>) -> Arc<dyn Fn(&Config) -> 
 }
 
 /// A store whose resolve is `resolve`, ignoring the target.
-fn fake(svc: DebridService, resolve: impl Fn() -> Result<String, StoreError> + Send + Sync + 'static) -> Scripted {
+fn fake(
+    svc: DebridService,
+    resolve: impl Fn() -> Result<String, StoreError> + Send + Sync + 'static,
+) -> Scripted {
     Scripted::new(svc).resolve_with(move |_| resolve())
 }
 
@@ -123,10 +129,16 @@ fn with_probe_overrides_title_guesses() {
             && got.probed,
         "probe did not override the title: {got:?}"
     );
-    assert!(got.audio_languages.len() == 1 && got.audio_languages[0] == "sv", "languages missing: {:?}", got.audio_languages);
+    assert!(
+        got.audio_languages.len() == 1 && got.audio_languages[0] == "sv",
+        "languages missing: {:?}",
+        got.audio_languages
+    );
     let untouched = with_probe(base, None);
     assert!(
-        !untouched.probed && untouched.audio_languages.is_empty() && untouched.codec.as_deref() == Some("h264"),
+        !untouched.probed
+            && untouched.audio_languages.is_empty()
+            && untouched.codec.as_deref() == Some("h264"),
         "unprobed release was altered: {untouched:?}"
     );
 }
@@ -153,7 +165,11 @@ fn probe_cache_key_identifies_the_file() {
     let b = RawStream { info_hash: "h".into(), file_idx: Some(3), ..Default::default() };
     assert_eq!(probe_cache_key(&a, None), probe_cache_key(&b, None), "same file produced different keys");
     let c = RawStream { info_hash: "h".into(), file_idx: Some(4), ..Default::default() };
-    assert_ne!(probe_cache_key(&a, None), probe_cache_key(&c, None), "different files in one torrent share a key");
+    assert_ne!(
+        probe_cache_key(&a, None),
+        probe_cache_key(&c, None),
+        "different files in one torrent share a key"
+    );
 }
 
 // A small, ordinary mismatch between the title's claim and the probe's reading (rounding, a muxer's
@@ -170,7 +186,11 @@ fn apply_probed_size_close_mismatch_is_not_called_a_pack() {
 
     apply_probed_size(&mut s, Some(&sid));
 
-    assert!(s.pack_size_bytes.is_none(), "PackSizeBytes = {:?}, want nil for a close, non-pack mismatch", s.pack_size_bytes);
+    assert!(
+        s.pack_size_bytes.is_none(),
+        "PackSizeBytes = {:?}, want nil for a close, non-pack mismatch",
+        s.pack_size_bytes
+    );
     assert_eq!(s.size_bytes, Some(1_080_000_000), "SizeBytes = {:?}, want the probed 1.08 GB", s.size_bytes);
 }
 
@@ -191,7 +211,11 @@ fn hydrate_pack_only_sizes_never_opened_pack_loses_its_size_as_an_episodes() {
 
     hydrate_pack_only_sizes(&mut streams, Some(&sid));
 
-    assert!(streams[0].size_bytes.is_none(), "SizeBytes = {:?}, want nil (unknown) rather than the pack's own total", streams[0].size_bytes);
+    assert!(
+        streams[0].size_bytes.is_none(),
+        "SizeBytes = {:?}, want nil (unknown) rather than the pack's own total",
+        streams[0].size_bytes
+    );
     assert_eq!(
         streams[0].pack_size_bytes,
         Some(PACK_HINT),
@@ -214,8 +238,17 @@ fn hydrate_pack_only_sizes_a_plain_episode_file_is_left_alone() {
 
     hydrate_pack_only_sizes(&mut streams, Some(&sid));
 
-    assert_eq!(streams[0].size_bytes, Some(1_136_580_921), "SizeBytes = {:?}, want the indexer's own untouched", streams[0].size_bytes);
-    assert!(streams[0].pack_size_bytes.is_none(), "PackSizeBytes = {:?}, want nil — this title names exactly this episode", streams[0].pack_size_bytes);
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(1_136_580_921),
+        "SizeBytes = {:?}, want the indexer's own untouched",
+        streams[0].size_bytes
+    );
+    assert!(
+        streams[0].pack_size_bytes.is_none(),
+        "PackSizeBytes = {:?}, want nil — this title names exactly this episode",
+        streams[0].pack_size_bytes
+    );
 }
 
 // A movie is never subject to this demotion — there is no pack for its title to have named instead.
@@ -230,7 +263,12 @@ fn hydrate_pack_only_sizes_movie_is_skipped() {
 
     hydrate_pack_only_sizes(&mut streams, Some(&sid_movie()));
 
-    assert_eq!(streams[0].size_bytes, Some(18 << 30), "SizeBytes changed for a movie: {:?}", streams[0].size_bytes);
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(18 << 30),
+        "SizeBytes changed for a movie: {:?}",
+        streams[0].size_bytes
+    );
 }
 
 // The frontier is decision-directed: it carries the current winner and what could displace it, never more
@@ -247,9 +285,17 @@ fn browser_probe_frontier_is_decision_directed_and_bounded() {
         });
     }
     let frontier = browser_probe_candidates(&streams, &Config::default(), Some(&client));
-    assert_eq!(frontier.len(), BROWSER_PROBE_FRONTIER, "frontier has {} candidates, want the bound {BROWSER_PROBE_FRONTIER}: {frontier:?}", frontier.len());
+    assert_eq!(
+        frontier.len(),
+        BROWSER_PROBE_FRONTIER,
+        "frontier has {} candidates, want the bound {BROWSER_PROBE_FRONTIER}: {frontier:?}",
+        frontier.len()
+    );
     assert!(frontier.contains(&0), "the unresolved current winner is absent from its own decision frontier");
-    assert!(frontier.contains(&1), "a compatibility-sunk 4K contender that can displace the winner was not selected");
+    assert!(
+        frontier.contains(&1),
+        "a compatibility-sunk 4K contender that can displace the winner was not selected"
+    );
 }
 
 // Probing resolves, and resolving a release the account does not hold ADDS it, so these handler-driven
@@ -271,13 +317,18 @@ async fn probe_top_opt_in() {
     // Behind the response is where a probe would run; give it every chance to.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let n = resolves.load(Ordering::SeqCst);
-    assert!(n == 0 && streams[0].probe.is_none(), "probed without a client: resolves={n} probe={:?}", streams[0].probe);
+    assert!(
+        n == 0 && streams[0].probe.is_none(),
+        "probed without a client: resolves={n} probe={:?}",
+        streams[0].probe
+    );
 }
 
 // Every already-cached fact is hydrated before ranking; this is local cache IO, not a debrid probe.
 #[tokio::test]
 async fn probe_top_caps_at_top_n() {
-    let mut streams: Vec<RawStream> = (0..20).map(|_| RawStream { info_hash: "hash".into(), cached: true, ..Default::default() }).collect();
+    let mut streams: Vec<RawStream> =
+        (0..20).map(|_| RawStream { info_hash: "hash".into(), cached: true, ..Default::default() }).collect();
     let cache = seeded_cache(&streams, r#"{"audioLanguages":["sv"]}"#);
     // Pre-seed every entry so no resolve is attempted, then count how many were consulted.
     let h = new_handler(test_deps(move |d| {
@@ -331,7 +382,12 @@ async fn hydrate_probe_facts_season_pack_size_corrects_to_the_episode() {
 
     h.hydrate_probe_facts(&mut streams, Some(&sid));
 
-    assert_eq!(streams[0].size_bytes, Some(EPISODE_SIZE), "SizeBytes = {:?}, want the probed episode size {EPISODE_SIZE}", streams[0].size_bytes);
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(EPISODE_SIZE),
+        "SizeBytes = {:?}, want the probed episode size {EPISODE_SIZE}",
+        streams[0].size_bytes
+    );
     assert_eq!(
         streams[0].pack_size_bytes,
         Some(PACK_HINT),
@@ -355,12 +411,18 @@ async fn hydrate_known_sizes_corrects_from_a_stores_file_list_with_no_probe() {
         RESOLVE_CACHE_TTL,
     );
     let sid = sid_series(1, 3);
-    let mut streams = vec![RawStream { info_hash: H.into(), size_bytes: Some(PACK_HINT), ..Default::default() }];
+    let mut streams =
+        vec![RawStream { info_hash: H.into(), size_bytes: Some(PACK_HINT), ..Default::default() }];
     let h = new_handler(test_deps(move |d| d.make_stores = torbox_stores("t", &cache)));
 
     h.hydrate_known_sizes(&Config::default(), &mut streams, Some(&sid));
 
-    assert_eq!(streams[0].size_bytes, Some(EPISODE_SIZE), "SizeBytes = {:?}, want the store's own {EPISODE_SIZE}", streams[0].size_bytes);
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(EPISODE_SIZE),
+        "SizeBytes = {:?}, want the store's own {EPISODE_SIZE}",
+        streams[0].size_bytes
+    );
     assert_eq!(
         streams[0].pack_size_bytes,
         Some(PACK_HINT),
@@ -399,7 +461,11 @@ async fn hydrate_known_sizes_does_not_replace_a_probed_size() {
     h.hydrate_known_sizes(&Config::default(), &mut streams, Some(&sid));
 
     let probed = streams[0].probe.as_ref().map(|p| p.size_bytes);
-    assert_eq!(probed, Some(PROBED_SIZE), "Probe size = {probed:?}, want the ranged measurement {PROBED_SIZE}");
+    assert_eq!(
+        probed,
+        Some(PROBED_SIZE),
+        "Probe size = {probed:?}, want the ranged measurement {PROBED_SIZE}"
+    );
     assert_eq!(
         streams[0].size_bytes,
         Some(PROBED_SIZE),
@@ -414,7 +480,8 @@ async fn hydrate_known_sizes_does_not_replace_a_probed_size() {
 async fn hydrate_known_sizes_movies_are_skipped() {
     let resolves = Arc::new(AtomicUsize::new(0));
     let counter = resolves.clone();
-    let mut streams = vec![RawStream { info_hash: H.into(), size_bytes: Some(18 << 30), ..Default::default() }];
+    let mut streams =
+        vec![RawStream { info_hash: H.into(), size_bytes: Some(18 << 30), ..Default::default() }];
     let h = new_handler(test_deps(move |d| {
         d.make_stores = Arc::new(move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -424,8 +491,17 @@ async fn hydrate_known_sizes_movies_are_skipped() {
 
     h.hydrate_known_sizes(&Config::default(), &mut streams, Some(&sid_movie()));
 
-    assert_eq!(resolves.load(Ordering::SeqCst), 0, "built a store pool for a movie, which has no pack to correct");
-    assert_eq!(streams[0].size_bytes, Some(18 << 30), "SizeBytes changed for a movie: {:?}", streams[0].size_bytes);
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        0,
+        "built a store pool for a movie, which has no pack to correct"
+    );
+    assert_eq!(
+        streams[0].size_bytes,
+        Some(18 << 30),
+        "SizeBytes changed for a movie: {:?}",
+        streams[0].size_bytes
+    );
 }
 
 // A movie's title size and its probed size agree to the byte (or close enough to be rounding); there is
@@ -442,7 +518,11 @@ async fn hydrate_probe_facts_movie_gets_no_pack_size() {
 
     h.hydrate_probe_facts(&mut streams, Some(&sid));
 
-    assert!(streams[0].pack_size_bytes.is_none(), "PackSizeBytes = {:?}, want nil for a movie", streams[0].pack_size_bytes);
+    assert!(
+        streams[0].pack_size_bytes.is_none(),
+        "PackSizeBytes = {:?}, want nil for a movie",
+        streams[0].pack_size_bytes
+    );
     assert_eq!(streams[0].size_bytes, Some(SIZE), "SizeBytes = {:?}, want {SIZE}", streams[0].size_bytes);
 }
 
@@ -463,12 +543,17 @@ async fn probe_top_uncached_is_never_probed() {
             }
         })) as Box<dyn Store>]
     });
-    let mut streams = vec![RawStream { info_hash: "uncached-hash".into(), cached: false, ..Default::default() }];
+    let mut streams =
+        vec![RawStream { info_hash: "uncached-hash".into(), cached: false, ..Default::default() }];
     h.probe_top(&Config::default(), &mut streams, None, &CacheTruth::default());
 
     assert!(streams[0].probe.is_none(), "an uncached release was probed: {:?}", streams[0].probe);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(resolved.load(Ordering::SeqCst), 0, "an uncached release was resolved — that adds the torrent and spends the add quota");
+    assert_eq!(
+        resolved.load(Ordering::SeqCst),
+        0,
+        "an uncached release was resolved — that adds the torrent and spends the add quota"
+    );
 }
 
 // A HELD release still probes behind the response. Probing costs a ranged read apiece, which put ~12s on
@@ -494,7 +579,11 @@ async fn probe_top_cached_probes_behind_the_response() {
     // Returned WITHOUT the probe: that is the whole point — the viewer gets the list now.
     assert!(streams[0].probe.is_none(), "a held release was probed inline: {:?}", streams[0].probe);
     // …and the work still happens, just not in the client's way.
-    wait_for(|| resolved.load(Ordering::SeqCst) > 0, "the background probe never ran — the cache would never warm").await;
+    wait_for(
+        || resolved.load(Ordering::SeqCst) > 0,
+        "the background probe never ran — the cache would never warm",
+    )
+    .await;
 }
 
 // Fauda S1E3: a resolve that fails behind the response left no trace anywhere. This is the line that says so.
@@ -600,7 +689,10 @@ async fn probe_top_resolves_only_against_a_holding_store() {
     tokio::time::sleep(Duration::from_millis(100)).await; // leave room for a wrong second call to happen
 
     let asked = asked.lock().expect("the lock").clone();
-    assert!(!asked.contains(&DebridService::TorBox), "probed through TorBox, which does not hold this — that ADDS the torrent. asked={asked:?}");
+    assert!(
+        !asked.contains(&DebridService::TorBox),
+        "probed through TorBox, which does not hold this — that ADDS the torrent. asked={asked:?}"
+    );
 }
 
 // The probe marks its target NoAdd, so the store refuses rather than queueing.

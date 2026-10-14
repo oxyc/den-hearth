@@ -101,7 +101,10 @@ fn target(hash: &str) -> ResolveTarget {
 /// can't drift apart into a test that passes for the wrong reason.
 fn blocked_name() -> &'static str {
     const NAME: &str = "Show.S01E01.WEB-DL.x264.mkv";
-    assert!(real_debrid_blocked(NAME), "{NAME:?} is no longer a blocked name — pick one from rdBlockSubstrings");
+    assert!(
+        real_debrid_blocked(NAME),
+        "{NAME:?} is no longer a blocked name — pick one from rdBlockSubstrings"
+    );
     NAME
 }
 
@@ -109,16 +112,14 @@ fn blocked_name() -> &'static str {
 #[tokio::test]
 async fn real_debrid_resolve_every_step_can_fail() {
     const ADD_OK: &str = r#"{"id":"abc"}"#;
-    const INFO_OK: &str = r#"{"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900}],"links":["https://rd/l"]}"#;
+    const INFO_OK: &str =
+        r#"{"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900}],"links":["https://rd/l"]}"#;
 
     let cases: Vec<(&str, Arc<dyn Doer>)> = vec![
         ("addMagnet transport error", routed(vec![("addMagnet", boom())])),
         ("addMagnet rejected", routed(vec![("addMagnet", status(401))])),
         ("addMagnet returned no id", routed(vec![("addMagnet", ok("{}"))])),
-        (
-            "info http error",
-            routed(vec![("addMagnet", ok(ADD_OK)), ("torrents/info", status(503))]),
-        ),
+        ("info http error", routed(vec![("addMagnet", ok(ADD_OK)), ("torrents/info", status(503))])),
         (
             "info body is not json",
             routed(vec![("addMagnet", ok(ADD_OK)), ("torrents/info", ok("<html>maintenance</html>"))]),
@@ -140,10 +141,7 @@ async fn real_debrid_resolve_every_step_can_fail() {
             routed(vec![
                 ("addMagnet", ok(ADD_OK)),
                 ("selectFiles", ok("{}")),
-                (
-                    "torrents/info",
-                    ok(r#"{"files":[{"id":1,"path":"a.mkv","bytes":9}],"links":[]}"#),
-                ),
+                ("torrents/info", ok(r#"{"files":[{"id":1,"path":"a.mkv","bytes":9}],"links":[]}"#)),
             ]),
         ),
         (
@@ -196,9 +194,24 @@ async fn real_debrid_resolve_happy_path_returns_the_unrestricted_link() {
 async fn real_debrid_resolve_downloaded_and_selected_skips_select_files() {
     let cases = [
         // already bought: the held path
-        ("downloaded, file selected", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#, 0, 1),
-        ("downloaded, file not selected", r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":0}]}"#, 1, 2),
-        ("still waiting for a selection", r#"{"status":"waiting_files_selection","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#, 1, 2),
+        (
+            "downloaded, file selected",
+            r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#,
+            0,
+            1,
+        ),
+        (
+            "downloaded, file not selected",
+            r#"{"status":"downloaded","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":0}]}"#,
+            1,
+            2,
+        ),
+        (
+            "still waiting for a selection",
+            r#"{"status":"waiting_files_selection","links":["https://rd/l"],"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}"#,
+            1,
+            2,
+        ),
     ];
     for (name, info, want_select, want_info) in cases {
         let calls: Arc<Mutex<HashMap<&'static str, usize>>> = Arc::default();
@@ -232,7 +245,11 @@ async fn real_debrid_resolve_downloaded_and_selected_skips_select_files() {
                 && calls.get("unrestrict").copied().unwrap_or(0) == 1,
             "{name}: calls = {calls:?}, want select={want_select} info={want_info} unrestrict=1"
         );
-        assert_eq!(calls.get("add").copied().unwrap_or(0), 0, "{name}: a held torrent was added again: {calls:?}");
+        assert_eq!(
+            calls.get("add").copied().unwrap_or(0),
+            0,
+            "{name}: a held torrent was added again: {calls:?}"
+        );
     }
 }
 
@@ -245,7 +262,8 @@ async fn real_debrid_resolve_blocked_filename_fails_fast() {
     let unrestricted = Arc::new(AtomicBool::new(false));
     let u = unrestricted.clone();
     let info: &'static str = Box::leak(
-        format!(r#"{{"files":[{{"id":1,"path":"{}","bytes":900}}],"links":["x"]}}"#, blocked_name()).into_boxed_str(),
+        format!(r#"{{"files":[{{"id":1,"path":"{}","bytes":900}}],"links":["x"]}}"#, blocked_name())
+            .into_boxed_str(),
     );
     let s = RealDebridStore {
         token: "k".into(),
@@ -265,7 +283,10 @@ async fn real_debrid_resolve_blocked_filename_fails_fast() {
     };
     let link = s.resolve(&target(H)).await;
     assert!(link.is_err(), "a blocked filename must not resolve");
-    assert!(!unrestricted.load(Ordering::SeqCst), "it reached unrestrict — the point is to give up before spending that call");
+    assert!(
+        !unrestricted.load(Ordering::SeqCst),
+        "it reached unrestrict — the point is to give up before spending that call"
+    );
 }
 
 #[tokio::test]
@@ -276,10 +297,7 @@ async fn premiumize_resolve_failure_modes() {
         ("body is not json", ok("not json at all")),
         ("status not success", ok(r#"{"status":"error","content":[{"path":"a.mkv","link":"x"}]}"#)),
         ("no content", ok(r#"{"status":"success","content":[]}"#)),
-        (
-            "content carries no link",
-            ok(r#"{"status":"success","content":[{"path":"a.mkv","link":""}]}"#),
-        ),
+        ("content carries no link", ok(r#"{"status":"success","content":[{"path":"a.mkv","link":""}]}"#)),
     ];
     for (name, f) in cases {
         let s = PremiumizeStore {
@@ -293,11 +311,9 @@ async fn premiumize_resolve_failure_modes() {
 
     let s = PremiumizeStore {
         token: "k".into(),
-        client: fallback_only(ok(
-            r#"{"status":"success","content":[
+        client: fallback_only(ok(r#"{"status":"success","content":[
 			{"path":"Show.S01E01.mkv","link":"https://pm/1","size":10},
-			{"path":"Show.S01E02.mkv","link":"https://pm/2","size":20}]}"#,
-        )),
+			{"path":"Show.S01E02.mkv","link":"https://pm/2","size":20}]}"#)),
         cache: None,
         api: PREMIUMIZE_API.into(),
     };
@@ -312,37 +328,47 @@ async fn premiumize_resolve_failure_modes() {
 // left `Status` with no torrent id to report during the outage.
 #[tokio::test]
 async fn torbox_resolve_add_failures() {
-        let cases: Vec<(&str, Route)> = vec![
-            ("transport error", boom()),
-            ("rate limited", status(429)),
-            ("service down", status(503)),
-            ("no torrent_id in the body", ok(r#"{"data":{}}"#)),
-            ("body is not json", ok("<html>502</html>")),
-        ];
-        for (name, f) in cases {
-            let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: Some(Arc::new(MemoryCache::new(1 << 16))), client: fallback_only(f) };
-            want_dead(name, s.resolve(&target(H)).await);
-            // Nothing was queued, so nothing may be claimed as downloading — a false "downloading"
-            // here is a wait the viewer sits through forever.
-            assert!(s.status(&target(H)).await.is_none(), "claimed a download after the add failed");
-        }
+    let cases: Vec<(&str, Route)> = vec![
+        ("transport error", boom()),
+        ("rate limited", status(429)),
+        ("service down", status(503)),
+        ("no torrent_id in the body", ok(r#"{"data":{}}"#)),
+        ("body is not json", ok("<html>502</html>")),
+    ];
+    for (name, f) in cases {
+        let s = TorBoxStore {
+            token: "k".into(),
+            api: TORBOX_API.into(),
+            cache: Some(Arc::new(MemoryCache::new(1 << 16))),
+            client: fallback_only(f),
+        };
+        want_dead(name, s.resolve(&target(H)).await);
+        // Nothing was queued, so nothing may be claimed as downloading — a false "downloading"
+        // here is a wait the viewer sits through forever.
+        assert!(s.status(&target(H)).await.is_none(), "claimed a download after the add failed");
+    }
 }
 
 // A lost torrent id is rediscovered from the account list — but only when the account actually holds it.
 #[tokio::test]
 async fn find_torrent_by_hash_failure_modes() {
-        let cases: Vec<(&str, Route)> = vec![
-            ("transport error", boom()),
-            ("http error", status(500)),
-            ("body is not json", ok("nope")),
-            ("account holds nothing", ok(r#"{"data":[]}"#)),
-            ("account holds a different torrent", ok(r#"{"data":[{"id":3,"hash":"beef"}]}"#)),
-        ];
-        for (name, f) in cases {
-            let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: Some(Arc::new(MemoryCache::new(1 << 16))), client: fallback_only(f) };
-            let (_, found, _) = s.find_torrent_by_hash(H).await;
-            assert!(!found, "{name}: claimed to find a torrent id");
-        }
+    let cases: Vec<(&str, Route)> = vec![
+        ("transport error", boom()),
+        ("http error", status(500)),
+        ("body is not json", ok("nope")),
+        ("account holds nothing", ok(r#"{"data":[]}"#)),
+        ("account holds a different torrent", ok(r#"{"data":[{"id":3,"hash":"beef"}]}"#)),
+    ];
+    for (name, f) in cases {
+        let s = TorBoxStore {
+            token: "k".into(),
+            api: TORBOX_API.into(),
+            cache: Some(Arc::new(MemoryCache::new(1 << 16))),
+            client: fallback_only(f),
+        };
+        let (_, found, _) = s.find_torrent_by_hash(H).await;
+        assert!(!found, "{name}: claimed to find a torrent id");
+    }
 }
 
 // listFiles says WHY it has no files, because the callers need different things from each answer. It was
@@ -355,29 +381,33 @@ static LIST_FILES_LOG_TURN: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 async fn torbox_list_files_says_why_it_has_no_files() {
-        let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
-        // A 400 says nothing about the account; a 500 or a 401 does, and is classified separately in
-        // TestTorBoxListFiles_classifiesTheRemainingShapes so it can raise the account-wide backoff.
-        let cases: Vec<(&str, Route, Option<StoreError>)> = vec![
-            ("a transport blip", boom(), Some(err_no_file_list())),
-            ("a 400", status(400), Some(err_no_file_list())),
-            ("an unreadable body", ok("garbage"), Some(err_no_file_list())),
-            ("a 404", status(404), Some(err_torrent_gone())),
-            ("the account no longer holds it", ok(r#"{"success":false,"data":null}"#), Some(err_torrent_gone())),
-            ("a null payload", ok(r#"{"data":null}"#), Some(err_torrent_gone())),
-            // Answered, with an entry that simply lists no files — not a failure, and not gone. The caller
-            // refuses to guess an episode from it, but must not forget the id over it.
-            ("an entry with no files", ok(r#"{"data":{}}"#), None),
-        ];
-        for (name, f, want) in cases {
-            let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: None, client: fallback_only(f) };
-            let (files, err) = match s.list_files(1).await {
-                Ok(files) => (files, None),
-                Err(e) => (Vec::new(), Some(e)),
-            };
-            assert!(files.is_empty(), "{name}: expected no files, got {}", files.len());
-            assert_eq!(err, want, "{name}: got {err:?}, want {want:?} — the caller decides whether to re-add on this");
-        }
+    let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    // A 400 says nothing about the account; a 500 or a 401 does, and is classified separately in
+    // TestTorBoxListFiles_classifiesTheRemainingShapes so it can raise the account-wide backoff.
+    let cases: Vec<(&str, Route, Option<StoreError>)> = vec![
+        ("a transport blip", boom(), Some(err_no_file_list())),
+        ("a 400", status(400), Some(err_no_file_list())),
+        ("an unreadable body", ok("garbage"), Some(err_no_file_list())),
+        ("a 404", status(404), Some(err_torrent_gone())),
+        ("the account no longer holds it", ok(r#"{"success":false,"data":null}"#), Some(err_torrent_gone())),
+        ("a null payload", ok(r#"{"data":null}"#), Some(err_torrent_gone())),
+        // Answered, with an entry that simply lists no files — not a failure, and not gone. The caller
+        // refuses to guess an episode from it, but must not forget the id over it.
+        ("an entry with no files", ok(r#"{"data":{}}"#), None),
+    ];
+    for (name, f, want) in cases {
+        let s =
+            TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: None, client: fallback_only(f) };
+        let (files, err) = match s.list_files(1).await {
+            Ok(files) => (files, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        assert!(files.is_empty(), "{name}: expected no files, got {}", files.len());
+        assert_eq!(
+            err, want,
+            "{name}: got {err:?}, want {want:?} — the caller decides whether to re-add on this"
+        );
+    }
 }
 
 // Fauda S1E3 hit errNoFileList repeatedly with nothing more specific anywhere in the log — every branch
@@ -386,34 +416,50 @@ async fn torbox_list_files_says_why_it_has_no_files() {
 // cause the NEXT time this happens, rather than only ever rediscovering it as "no usable answer" again.
 #[tokio::test]
 async fn torbox_list_files_logs_which_branch_failed() {
-        let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
-        // Each branch writes its own line, keyed by a name the test ages out of the log limiter first.
-        let cases: Vec<(&str, &str, Route, &str)> = vec![
-            ("a transport blip", "mylist-transport", boom(), "torbox mylist 1: connection reset"),
-            ("a 400", "mylist-status", status(400), "torbox mylist 1: http 400"),
-            ("an unreadable body", "mylist-decode", ok("garbage"), "torbox mylist 1: unreadable body"),
-            ("a body with no data field", "mylist-empty", ok("{}"), "torbox mylist 1: no data field"),
-            ("an answer naming another torrent", "mylist-other-id", ok(r#"{"data":{"id":2}}"#), "torbox mylist 1: answer named torrent 2"),
-            ("neither an object nor an array", "mylist-shape", ok(r#"{"data":"garbage"}"#), "answer is neither an object nor an array"),
-            ("an array with no matching entry", "mylist-no-match", ok(r#"{"data":[{"id":5}]}"#), "torbox mylist 1: 1 entries, none named it"),
-        ];
-        for (name, key, f, want) in cases {
-            // Every one of these shares its key with the test above, which exercises the same branches for the
-            // ERROR identity rather than the log line — ageLogLimit keeps that earlier coverage from silencing
-            // this one under logLimited's one-line-a-minute rule.
-            let s = TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: None, client: fallback_only(f) };
-            // The log is captured per thread, so the call is driven from a thread of its own that holds the capture.
-            // The key is aged on that thread, as late as it can be: other tests log these same keys at the same time,
-            // and one line of theirs in between would silence this one.
-            let handle = tokio::runtime::Handle::current();
-            let out = tokio::task::spawn_blocking(move || {
-                age_log_limit(key);
-                crate::loglimit::capture(|| {
-                    let _ = handle.block_on(s.list_files(1));
-                })
+    let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    // Each branch writes its own line, keyed by a name the test ages out of the log limiter first.
+    let cases: Vec<(&str, &str, Route, &str)> = vec![
+        ("a transport blip", "mylist-transport", boom(), "torbox mylist 1: connection reset"),
+        ("a 400", "mylist-status", status(400), "torbox mylist 1: http 400"),
+        ("an unreadable body", "mylist-decode", ok("garbage"), "torbox mylist 1: unreadable body"),
+        ("a body with no data field", "mylist-empty", ok("{}"), "torbox mylist 1: no data field"),
+        (
+            "an answer naming another torrent",
+            "mylist-other-id",
+            ok(r#"{"data":{"id":2}}"#),
+            "torbox mylist 1: answer named torrent 2",
+        ),
+        (
+            "neither an object nor an array",
+            "mylist-shape",
+            ok(r#"{"data":"garbage"}"#),
+            "answer is neither an object nor an array",
+        ),
+        (
+            "an array with no matching entry",
+            "mylist-no-match",
+            ok(r#"{"data":[{"id":5}]}"#),
+            "torbox mylist 1: 1 entries, none named it",
+        ),
+    ];
+    for (name, key, f, want) in cases {
+        // Every one of these shares its key with the test above, which exercises the same branches for the
+        // ERROR identity rather than the log line — ageLogLimit keeps that earlier coverage from silencing
+        // this one under logLimited's one-line-a-minute rule.
+        let s =
+            TorBoxStore { token: "k".into(), api: TORBOX_API.into(), cache: None, client: fallback_only(f) };
+        // The log is captured per thread, so the call is driven from a thread of its own that holds the capture.
+        // The key is aged on that thread, as late as it can be: other tests log these same keys at the same time,
+        // and one line of theirs in between would silence this one.
+        let handle = tokio::runtime::Handle::current();
+        let out = tokio::task::spawn_blocking(move || {
+            age_log_limit(key);
+            crate::loglimit::capture(|| {
+                let _ = handle.block_on(s.list_files(1));
             })
-            .await
-            .expect("the capturing thread");
-            assert!(out.contains(want), "{name}: log = {out:?}, want it to contain {want:?}");
-        }
+        })
+        .await
+        .expect("the capturing thread");
+        assert!(out.contains(want), "{name}: log = {out:?}, want it to contain {want:?}");
+    }
 }

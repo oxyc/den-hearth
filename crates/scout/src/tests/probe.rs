@@ -86,7 +86,10 @@ fn parse_matroska_tracks_no_tracks() {
 fn parse_track_entry_untagged_is_not_english() {
     let entry = [crate::probe::ID_TRACK_TYPE, 0x81, crate::probe::TRACK_TYPE_AUDIO];
     let (kind, lang) = crate::probe::parse_track_entry(&entry);
-    assert!(kind == crate::probe::TRACK_TYPE_AUDIO && lang == "und", "kind={kind} lang={lang:?}, want audio/und");
+    assert!(
+        kind == crate::probe::TRACK_TYPE_AUDIO && lang == "und",
+        "kind={kind} lang={lang:?}, want audio/und"
+    );
 }
 
 // The same file carries both ISO 639-2 and BCP-47 for a track, and across a 30-release sweep the output
@@ -142,7 +145,9 @@ async fn probe_tracks_reads_only_the_head_when_range_is_ignored() {
     let head = testdata("tracks.mkv");
     let url = serve_once(move |conn| {
         // deliberately ignores the Range header
-        if write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {FILE_SIZE}\r\nConnection: close\r\n\r\n").is_err() {
+        if write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {FILE_SIZE}\r\nConnection: close\r\n\r\n")
+            .is_err()
+        {
             return;
         }
         if conn.write_all(&head).is_err() {
@@ -164,7 +169,11 @@ async fn probe_tracks_reads_only_the_head_when_range_is_ignored() {
     assert!(got <= 8 << 20, "pulled {got} bytes for a 1 MiB probe — the drain is unbounded");
     // The server ignored Range and is sending the whole file: Content-Length IS the file's total size,
     // unlike a 206's (which names only the chunk asked for).
-    assert_eq!(p.size_bytes, FILE_SIZE as i64, "SizeBytes = {} (the Content-Length of the ignored-Range response)", p.size_bytes);
+    assert_eq!(
+        p.size_bytes, FILE_SIZE as i64,
+        "SizeBytes = {} (the Content-Length of the ignored-Range response)",
+        p.size_bytes
+    );
 }
 
 // ProbeTracks resolves the EXACT file this stream plays — for an episode picked out of a season pack,
@@ -207,5 +216,9 @@ fn parse_avi_richest_audio_track_wins() {
         avi_chunk("strf", &strf(8)),
     ]);
     let (p, ok) = crate::probe_avi::parse_avi(&file);
-    assert!(ok && p.audio_channels == "7.1", "5.1 listed first won over 7.1: {:?} (ok={ok})", p.audio_channels);
+    assert!(
+        ok && p.audio_channels == "7.1",
+        "5.1 listed first won over 7.1: {:?} (ok={ok})",
+        p.audio_channels
+    );
 }

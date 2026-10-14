@@ -20,20 +20,22 @@ use serde_json::{Map, Value};
 use crate::cache::Cache;
 use crate::config::{Config, Indexer, CONFIG_PATH_INDEXERS};
 use crate::coverage::{
-    excused_from_quorum, SourceReport, OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_REFUSED, OUTCOME_TIMEOUT,
-    OUTCOME_UNREACHABLE,
+    excused_from_quorum, SourceReport, OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_REFUSED,
+    OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE,
 };
 use crate::decisionlog::{decision_line, scrape_identity};
 use crate::hostlimit::{new_host_limiter, wait, HostLimiter};
-use crate::indexerconfig::{indexer_base_with_config, mint_indexer_configs_enabled, read_capped, UnaskableScraper};
+use crate::indexerconfig::{
+    indexer_base_with_config, mint_indexer_configs_enabled, read_capped, UnaskableScraper,
+};
 use crate::label::MIB;
 use crate::loglimit::{emit, log_limited};
+use crate::metrics::metrics;
 use crate::probe::Probe;
 use crate::rank::{re2, RawStream, GIB};
-use crate::stores::join_all;
 use crate::sources::{new_source_client, source_host, ERR_NOT_PUBLIC, OWN_SOURCES, SOURCE_LIMITER};
+use crate::stores::join_all;
 use crate::upstreampause::pause_on_refusal;
-use crate::metrics::metrics;
 use crate::util::{fold_json_keys, go_to_lower, go_url_parse, key_hash, DetachedFlight, Shape, LEAF};
 
 /// What a `Doer` can fail with. Go returns `error`; a mock in a test returns whichever it likes.
@@ -226,7 +228,8 @@ pub(crate) fn parse_seeders(s: &str) -> Option<i64> {
 /// Go `normalizeHash`: a 40- or 32-character lower-case alphanumeric hash, trimmed and lower-cased.
 pub(crate) fn normalize_hash(h: &str) -> Option<String> {
     let h = go_to_lower(h.trim());
-    let well_formed = (h.len() == 40 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let well_formed =
+        (h.len() == 40 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     well_formed.then_some(h)
 }
 
@@ -369,7 +372,11 @@ pub(crate) fn parse_stremio_streams(body: &[u8], source: &str) -> Vec<RawStream>
         // Title/metadata come from the release fields only — NOT s.Name, which is the indexer's label
         // ("Torrentio", "Torrentio\n1080p"): feeding it in made the title fall back to "Torrentio" when
         // no line looked like a release name.
-        let text = [s.title.as_str(), s.description.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n");
+        let text = [s.title.as_str(), s.description.as_str()]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut title = s.hints.as_ref().map_or_else(String::new, |(filename, _)| filename.trim().to_owned());
         if title.is_empty() {
             title = first_meaningful_line(&text);
@@ -437,7 +444,8 @@ const SCRAPE_RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duratio
 /// Burst sized to a household's largest legitimate burst — opening a season is one request per episode,
 /// and 10 turned a 24-episode show into fourteen seconds of queueing against an eight-second budget. The
 /// sustained rate is what actually protects the indexer; the burst only decides whether normal use waits.
-static INDEXER_LIMITER: LazyLock<HostLimiter> = LazyLock::new(|| new_host_limiter(Duration::from_secs(1), 30));
+static INDEXER_LIMITER: LazyLock<HostLimiter> =
+    LazyLock::new(|| new_host_limiter(Duration::from_secs(1), 30));
 
 /// Go `indexerLimiter`.
 pub(crate) fn indexer_limiter() -> &'static HostLimiter {
@@ -471,7 +479,12 @@ impl StremioScraper {
     }
 
     /// Go `stremioScraper.scrape`: one logical scrape, paced by `limiter` and retried while the indexer sheds it.
-    async fn scrape_paced(&self, label: &str, limiter: &HostLimiter, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+    async fn scrape_paced(
+        &self,
+        label: &str,
+        limiter: &HostLimiter,
+        q: &ScrapeQuery,
+    ) -> Result<Vec<RawStream>, DoError> {
         // One token per logical scrape, not per attempt. Pacing inside the retry loop spent up to three, and
         // spent the extra two exactly when the host was already shedding — so the limiter throttled hardest
         // during the one failure it exists for, and each abandoned wait left its token spent, deepening the
@@ -507,8 +520,13 @@ impl StremioScraper {
     }
 
     /// Go `scrapeOnce` performs one request. The second result says whether the failure is worth another attempt.
-    pub(crate) async fn scrape_once(&self, label: &str, q: &ScrapeQuery) -> (Result<Vec<RawStream>, DoError>, bool) {
-        let strem_id = if q.has_ep { format!("{}:{}:{}", q.imdb, q.season, q.episode) } else { q.imdb.clone() };
+    pub(crate) async fn scrape_once(
+        &self,
+        label: &str,
+        q: &ScrapeQuery,
+    ) -> (Result<Vec<RawStream>, DoError>, bool) {
+        let strem_id =
+            if q.has_ep { format!("{}:{}:{}", q.imdb, q.season, q.episode) } else { q.imdb.clone() };
         // The id goes in as Stremio clients send it, colons and all (`tt123:2:1`), not percent-encoded. It needs no
         // escaping — an IMDb id and two numbers — and the encoded form is a different URL to a CDN: with torrentio's
         // origin down, Cloudflare answers from `stale-if-error` only for the URL the whole world requests, so every
@@ -608,7 +626,11 @@ pub(crate) struct SourceScraper {
 impl SourceScraper {
     pub(crate) fn new(base: &str, client: Arc<dyn Doer>) -> SourceScraper {
         SourceScraper {
-            stremio: StremioScraper { indexer: Indexer(OWN_SOURCES.to_owned()), base_url: base.to_owned(), client },
+            stremio: StremioScraper {
+                indexer: Indexer(OWN_SOURCES.to_owned()),
+                base_url: base.to_owned(),
+                client,
+            },
             label: source_host(base),
         }
     }
@@ -661,7 +683,8 @@ impl Scraper for MintingScraper {
     }
 
     async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
-        let (base, transient) = indexer_base_with_config(&self.indexer, &self.config, Some(&*self.client)).await;
+        let (base, transient) =
+            indexer_base_with_config(&self.indexer, &self.config, Some(&*self.client)).await;
         if base.is_empty() {
             // A transient mint failure is an outage, not a misconfiguration — don't tell the operator
             // to configure something that already is. The mint logs its own reason.
@@ -670,7 +693,9 @@ impl Scraper for MintingScraper {
             }
             return Err(Box::new(UnaskableError { indexer: self.indexer.0.clone(), transient }));
         }
-        StremioScraper { indexer: self.indexer.clone(), base_url: base, client: Arc::clone(&self.client) }.scrape(q).await
+        StremioScraper { indexer: self.indexer.clone(), base_url: base, client: Arc::clone(&self.client) }
+            .scrape(q)
+            .await
     }
 
     /// The same answer for the same indexer and account, however many times its minted URL has been re-minted. The
@@ -717,7 +742,9 @@ pub(crate) fn make_scrapers(
         // with an empty list, which counts as a response and votes on whether a release exists. Leaving
         // it out means a genuine "nobody has this" still requires everyone who WAS asked to say so.
         let overridden = urls.get(id).is_some_and(|u| !u.is_empty());
-        if let (Some(&(_, env_var)), false) = (CONFIG_PATH_INDEXERS.iter().find(|(name, _)| *name == id.0), overridden) {
+        if let (Some(&(_, env_var)), false) =
+            (CONFIG_PATH_INDEXERS.iter().find(|(name, _)| *name == id.0), overridden)
+        {
             // Mint one from the debrid account we already hold, when the operator has allowed it. An
             // explicit URL always wins, so a token-free config that was pasted in stays in use.
             if mint_indexer_configs_enabled() {
@@ -773,7 +800,10 @@ fn base_url_for(id: &Indexer, urls: &HashMap<Indexer, String>) -> String {
     // URL it already holds. The bare path is warm because the whole world requests it; a private options
     // path is warm essentially never, so scout got a 502 for an episode that served 50 releases to a
     // plain curl from the same machine, and reported it as "no source found".
-    DEFAULT_INDEXER_URLS.iter().find(|(name, _)| *name == id.0).map_or_else(String::new, |&(_, url)| url.to_owned())
+    DEFAULT_INDEXER_URLS
+        .iter()
+        .find(|(name, _)| *name == id.0)
+        .map_or_else(String::new, |&(_, url)| url.to_owned())
 }
 
 /// Go `scrapeAll` runs every scraper concurrently under a per-indexer timeout; drops those that error/time
@@ -859,7 +889,11 @@ impl From<CachedStream> for RawStream {
 }
 
 /// Go `keptAnswer`.
-pub(crate) fn kept_answer(cache: Option<&dyn Cache>, sc: &dyn Scraper, q: &ScrapeQuery) -> Option<Vec<RawStream>> {
+pub(crate) fn kept_answer(
+    cache: Option<&dyn Cache>,
+    sc: &dyn Scraper,
+    q: &ScrapeQuery,
+) -> Option<Vec<RawStream>> {
     let key = answer_cache_key(sc, q)?;
     let raw = cache?.get(&key)?;
     // Go's nil slice marshals as `null`, which a build of either language may have written.
@@ -868,7 +902,13 @@ pub(crate) fn kept_answer(cache: Option<&dyn Cache>, sc: &dyn Scraper, q: &Scrap
 }
 
 /// Go `keepAnswer`.
-pub(crate) fn keep_answer(cache: Option<&dyn Cache>, ttl: Duration, sc: &dyn Scraper, q: &ScrapeQuery, r: &[RawStream]) {
+pub(crate) fn keep_answer(
+    cache: Option<&dyn Cache>,
+    ttl: Duration,
+    sc: &dyn Scraper,
+    q: &ScrapeQuery,
+    r: &[RawStream],
+) {
     let Some(key) = answer_cache_key(sc, q) else { return };
     let Some(cache) = cache else { return };
     if ttl.is_zero() {
@@ -895,7 +935,13 @@ struct ScrapeAttempt {
 
 impl ScrapeAttempt {
     fn failed(err: SharedError) -> ScrapeAttempt {
-        ScrapeAttempt { streams: Vec::new(), err: Some(err), cached: false, latency_ms: 0, observed_at: Some(now_millis()) }
+        ScrapeAttempt {
+            streams: Vec::new(),
+            err: Some(err),
+            cached: false,
+            latency_ms: 0,
+            observed_at: Some(now_millis()),
+        }
     }
 }
 
@@ -924,7 +970,13 @@ async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, timeout: Duration) -> ScrapeAtte
         Err(_) => (Vec::new(), Some(Arc::new(DeadlineExceeded) as SharedError)),
     };
     metrics().indexer_result(&sc.id().0, err.is_none(), i64::try_from(streams.len()).unwrap_or(i64::MAX));
-    ScrapeAttempt { streams, err, cached: false, latency_ms: millis(start.elapsed()), observed_at: Some(now_millis()) }
+    ScrapeAttempt {
+        streams,
+        err,
+        cached: false,
+        latency_ms: millis(start.elapsed()),
+        observed_at: Some(now_millis()),
+    }
 }
 
 /// The question in flight for each provider and title: Go's `answerFlights` singleflight group.
@@ -1021,7 +1073,8 @@ pub(crate) async fn scrape_covered(
     ttl: Duration,
 ) -> ScrapeResult {
     let attempts =
-        join_all(scrapers.iter().map(|sc| scrape_one_cached(sc, q, timeout, cache.clone(), ttl)).collect()).await;
+        join_all(scrapers.iter().map(|sc| scrape_one_cached(sc, q, timeout, cache.clone(), ttl)).collect())
+            .await;
     let mut all: Vec<RawStream> = Vec::new();
     let mut reports: Vec<SourceReport> = Vec::with_capacity(scrapers.len());
     for (sc, attempt) in scrapers.iter().zip(attempts) {

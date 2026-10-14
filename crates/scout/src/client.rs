@@ -153,7 +153,8 @@ impl ClientPlayable {
 }
 
 /// Go `remuxRefusedExt`: den-remux opens Matroska and MP4 only, and refuses these by name.
-const REMUX_REFUSED_EXT: [&str; 9] = [".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"];
+const REMUX_REFUSED_EXT: [&str; 9] =
+    [".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"];
 
 /// Go `remuxOpens`.
 fn remux_opens(s: &RawStream) -> bool {

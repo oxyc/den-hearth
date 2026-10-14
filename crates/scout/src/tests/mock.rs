@@ -53,7 +53,11 @@ pub(crate) async fn loopback_file(body: Vec<u8>) -> String {
                 let (status, slice, extra) = match range {
                     Some((a, b)) if a < total => {
                         let end = b.map_or(total, |b| (b + 1).min(total));
-                        ("206 Partial Content", &body[a..end], format!("Content-Range: bytes {a}-{}/{total}\r\n", end - 1))
+                        (
+                            "206 Partial Content",
+                            &body[a..end],
+                            format!("Content-Range: bytes {a}-{}/{total}\r\n", end - 1),
+                        )
                     }
                     _ => ("200 OK", &body[..], String::new()),
                 };

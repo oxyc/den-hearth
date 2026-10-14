@@ -59,7 +59,11 @@ pub(crate) fn cancel_path(hash: &str) -> String {
     format!(
         "/{}/play/{}",
         valid_blob(),
-        encode_play_token(&PlayTarget { info_hash: hash.to_owned(), file_idx: Some(0), ..Default::default() })
+        encode_play_token(&PlayTarget {
+            info_hash: hash.to_owned(),
+            file_idx: Some(0),
+            ..Default::default()
+        })
     )
 }
 
@@ -71,7 +75,10 @@ async fn cancel_ours_and_unfinished() {
     let prime_hash = hash.clone();
     let (h, calls) = cancel_torbox_handler(
         |req| match (base(req).as_str(), req.url().query_pairs().any(|(k, _)| k == "id")) {
-            ("mylist", true) => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading"}}"#),
+            ("mylist", true) => resp(
+                200,
+                r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading"}}"#,
+            ),
             // The account listing (no `id`): empty, as it is once the delete below has taken effect.
             ("mylist", false) => resp(200, r#"{"success":true,"data":[]}"#),
             ("controltorrent", _) => resp(200, r#"{"success":true}"#),
@@ -108,8 +115,16 @@ async fn cancel_finished() {
     );
     let rr = delete(&h, &cancel_path(&hash)).await;
     assert_eq!(rr.status(), 409, "cancel finished: want 409");
-    assert!(String::from_utf8_lossy(rr.body()).contains("finished"), "body = {:?}, want an error naming \"finished\"", rr.body());
-    assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a finished torrent must never be deleted: calls = {:?}", calls.lock().unwrap());
+    assert!(
+        String::from_utf8_lossy(rr.body()).contains("finished"),
+        "body = {:?}, want an error naming \"finished\"",
+        rr.body()
+    );
+    assert!(
+        !calls.lock().unwrap().iter().any(|c| c == "controltorrent"),
+        "a finished torrent must never be deleted: calls = {:?}",
+        calls.lock().unwrap()
+    );
 }
 
 // 409 not_ours: the account held this hash before scout ever added it (no addedByUs marker), and it is
@@ -120,7 +135,10 @@ async fn cancel_not_ours() {
     let prime_hash = hash.clone();
     let (h, _) = cancel_torbox_handler(
         |req| match base(req).as_str() {
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":5,"peers":3}}"#),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":5,"peers":3}}"#,
+            ),
             _ => resp(404, "{}"),
         },
         Some(Box::new(move |cache| {
@@ -130,7 +148,11 @@ async fn cancel_not_ours() {
     );
     let rr = delete(&h, &cancel_path(&hash)).await;
     let body = String::from_utf8_lossy(rr.body()).into_owned();
-    assert!(rr.status() == 409 && body.contains("not_ours"), "cancel not-ours: {} {body}, want 409 not_ours", rr.status());
+    assert!(
+        rr.status() == 409 && body.contains("not_ours"),
+        "cancel not-ours: {} {body}, want 409 not_ours",
+        rr.status()
+    );
 }
 
 // The narrow ownership exception: a torrent with no addedByUs marker that is stalled dead (no seeds, no
@@ -144,7 +166,10 @@ async fn cancel_not_ours_but_stalled_is_cancelled() {
     let prime_hash = hash.clone();
     let (h, calls) = cancel_torbox_handler(
         |req| match base(req).as_str() {
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#,
+            ),
             "controltorrent" => resp(200, r#"{"success":true}"#),
             _ => resp(404, "{}"),
         },
@@ -166,7 +191,10 @@ async fn cancel_not_ours_and_not_stalled_is_refused() {
     let prime_hash = hash.clone();
     let (h, calls) = cancel_torbox_handler(
         |req| match base(req).as_str() {
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":12,"peers":4}}"#),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":12,"peers":4}}"#,
+            ),
             _ => resp(404, "{}"),
         },
         Some(Box::new(move |cache| {
@@ -175,8 +203,16 @@ async fn cancel_not_ours_and_not_stalled_is_refused() {
     );
     let rr = delete(&h, &cancel_path(&hash)).await;
     let body = String::from_utf8_lossy(rr.body()).into_owned();
-    assert!(rr.status() == 409 && body.contains("not_ours"), "cancel not-ours, healthy: {} {body}, want 409 not_ours", rr.status());
-    assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a healthy torrent with no addedByUs marker must never be deleted: calls = {:?}", calls.lock().unwrap());
+    assert!(
+        rr.status() == 409 && body.contains("not_ours"),
+        "cancel not-ours, healthy: {} {body}, want 409 not_ours",
+        rr.status()
+    );
+    assert!(
+        !calls.lock().unwrap().iter().any(|c| c == "controltorrent"),
+        "a healthy torrent with no addedByUs marker must never be deleted: calls = {:?}",
+        calls.lock().unwrap()
+    );
 }
 
 // A finished torrent with no addedByUs marker is still kept — "finished" outranks the stalled exception
@@ -187,7 +223,10 @@ async fn cancel_not_ours_and_finished_is_refused() {
     let prime_hash = hash.clone();
     let (h, calls) = cancel_torbox_handler(
         |req| match base(req).as_str() {
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":true,"download_state":"completed"}}"#),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":{"id":42,"download_finished":true,"download_state":"completed"}}"#,
+            ),
             _ => resp(404, "{}"),
         },
         Some(Box::new(move |cache| {
@@ -196,8 +235,16 @@ async fn cancel_not_ours_and_finished_is_refused() {
     );
     let rr = delete(&h, &cancel_path(&hash)).await;
     let body = String::from_utf8_lossy(rr.body()).into_owned();
-    assert!(rr.status() == 409 && body.contains("finished"), "cancel not-ours, finished: {} {body}, want 409 finished", rr.status());
-    assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a finished torrent must never be deleted: calls = {:?}", calls.lock().unwrap());
+    assert!(
+        rr.status() == 409 && body.contains("finished"),
+        "cancel not-ours, finished: {} {body}, want 409 finished",
+        rr.status()
+    );
+    assert!(
+        !calls.lock().unwrap().iter().any(|c| c == "controltorrent"),
+        "a finished torrent must never be deleted: calls = {:?}",
+        calls.lock().unwrap()
+    );
 }
 
 // 404 not_queued: nothing of ours to cancel — no known torrent id, and TorBox's own listing agrees.
@@ -207,7 +254,11 @@ async fn cancel_not_queued() {
     let (h, _) = cancel_torbox_handler(|_| resp(200, r#"{"success":true,"data":[]}"#), None);
     let rr = delete(&h, &cancel_path(&hash)).await;
     let body = String::from_utf8_lossy(rr.body()).into_owned();
-    assert!(rr.status() == 404 && body.contains("not_queued"), "cancel nothing queued: {} {body}, want 404 not_queued", rr.status());
+    assert!(
+        rr.status() == 404 && body.contains("not_queued"),
+        "cancel nothing queued: {} {body}, want 404 not_queued",
+        rr.status()
+    );
 }
 
 // 503: TorBox refuses the delete itself (a throttle or a fault), not a verdict about the release.
@@ -243,7 +294,11 @@ async fn cancel_unsupported_store() {
     let h = new_handler(test_deps(move |d| d.make_stores = shared_stores(store.clone())));
     let rr = delete(&h, &cancel_path(&hash)).await;
     let body = String::from_utf8_lossy(rr.body()).into_owned();
-    assert!(rr.status() == 501 && body.contains("unsupported"), "cancel on an unsupported store: {} {body}, want 501 unsupported", rr.status());
+    assert!(
+        rr.status() == 501 && body.contains("unsupported"),
+        "cancel on an unsupported store: {} {body}, want 501 unsupported",
+        rr.status()
+    );
 }
 
 // ?op=reannounce: the same safety rules, but TorBox is asked to reannounce rather than delete, and the
@@ -256,7 +311,10 @@ async fn cancel_reannounce() {
     let deleted_in_reply = deleted.clone();
     let (h, calls) = cancel_torbox_handler(
         move |req| match base(req).as_str() {
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0}}"#),
+            "mylist" => resp(
+                200,
+                r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0}}"#,
+            ),
             "controltorrent" => {
                 deleted_in_reply.store(true, std::sync::atomic::Ordering::SeqCst);
                 resp(200, r#"{"success":true}"#)
@@ -271,11 +329,18 @@ async fn cancel_reannounce() {
     let rr = delete(&h, &format!("{}?op=reannounce", cancel_path(&hash))).await;
     assert_eq!(rr.status(), 202, "reannounce: want 202");
     assert_eq!(*calls.lock().unwrap(), vec!["mylist", "controltorrent"], "upstream calls");
-    assert!(deleted.load(std::sync::atomic::Ordering::SeqCst), "precondition failed: controltorrent was never called");
+    assert!(
+        deleted.load(std::sync::atomic::Ordering::SeqCst),
+        "precondition failed: controltorrent was never called"
+    );
     // The memo must survive a reannounce: a later plain cancel still finds the torrent ours.
     calls.lock().unwrap().clear();
     let rr2 = delete(&h, &cancel_path(&hash)).await;
-    assert_eq!(rr2.status(), 204, "cancel after reannounce: want 204 (the memo must have survived the reannounce)");
+    assert_eq!(
+        rr2.status(),
+        204,
+        "cancel after reannounce: want 204 (the memo must have survived the reannounce)"
+    );
 }
 
 // ---- The store's Cancel, without the handler --------------------------------------------------------------------
@@ -341,7 +406,10 @@ mod store {
     async fn cancel_ours_and_unfinished() {
         let (s, calls) = store(
             |req| match (base(req).as_str(), has_id(req)) {
-                ("mylist", true) => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading"}}"#),
+                ("mylist", true) => resp(
+                    200,
+                    r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading"}}"#,
+                ),
                 // The account listing: empty, as it is once the delete has taken effect.
                 ("mylist", false) => resp(200, r#"{"success":true,"data":[]}"#),
                 ("controltorrent", _) => resp(200, r#"{"success":true}"#),
@@ -353,7 +421,10 @@ mod store {
         assert!(out.done && !out.reannounced && out.reason.is_empty(), "outcome = {out:?}");
         assert_eq!(*calls.lock().unwrap(), vec!["mylist", "controltorrent"], "upstream calls");
         let again = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
-        assert!(!again.done && again.reason == "not_queued", "cancelling again: {again:?} (the memo should be cleared)");
+        assert!(
+            !again.done && again.reason == "not_queued",
+            "cancelling again: {again:?} (the memo should be cleared)"
+        );
     }
 
     // A completed download holds no slot and is kept, never deleted.
@@ -368,7 +439,10 @@ mod store {
         );
         let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
         assert!(!out.done && out.reason == "finished", "outcome = {out:?}");
-        assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a finished torrent must never be deleted");
+        assert!(
+            !calls.lock().unwrap().iter().any(|c| c == "controltorrent"),
+            "a finished torrent must never be deleted"
+        );
     }
 
     // The account held this hash before scout ever added it (no marker), and it is healthy.
@@ -376,14 +450,20 @@ mod store {
     async fn cancel_not_ours() {
         let (s, calls) = store(
             |req| match base(req).as_str() {
-                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":5,"peers":3}}"#),
+                "mylist" => resp(
+                    200,
+                    r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":5,"peers":3}}"#,
+                ),
                 _ => resp(404, "{}"),
             },
             not_ours,
         );
         let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
         assert!(!out.done && out.reason == "not_ours", "outcome = {out:?}");
-        assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a healthy torrent scout did not add must never be deleted");
+        assert!(
+            !calls.lock().unwrap().iter().any(|c| c == "controltorrent"),
+            "a healthy torrent scout did not add must never be deleted"
+        );
     }
 
     // The narrow exception: a torrent with no marker that is stalled dead and not finished IS cancelled — dead weight
@@ -392,7 +472,10 @@ mod store {
     async fn cancel_not_ours_but_stalled_is_cancelled() {
         let (s, calls) = store(
             |req| match base(req).as_str() {
-                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#),
+                "mylist" => resp(
+                    200,
+                    r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}"#,
+                ),
                 "controltorrent" => resp(200, r#"{"success":true}"#),
                 _ => resp(404, "{}"),
             },
@@ -408,14 +491,20 @@ mod store {
     async fn cancel_not_ours_and_finished_is_refused() {
         let (s, calls) = store(
             |req| match base(req).as_str() {
-                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":true,"download_state":"completed"}}"#),
+                "mylist" => resp(
+                    200,
+                    r#"{"success":true,"data":{"id":42,"download_finished":true,"download_state":"completed"}}"#,
+                ),
                 _ => resp(404, "{}"),
             },
             not_ours,
         );
         let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
         assert!(!out.done && out.reason == "finished", "outcome = {out:?}");
-        assert!(!calls.lock().unwrap().iter().any(|c| c == "controltorrent"), "a finished torrent must never be deleted");
+        assert!(
+            !calls.lock().unwrap().iter().any(|c| c == "controltorrent"),
+            "a finished torrent must never be deleted"
+        );
     }
 
     // Nothing of ours to cancel: no known torrent id, and TorBox's own listing agrees.
@@ -430,7 +519,11 @@ mod store {
     #[tokio::test]
     async fn cancel_an_unreadable_listing_is_not_an_absence() {
         let (s, _) = store(|_| resp(503, "down"), |_| {});
-        let err = s.cancel(HASH, false).await.expect("TorBox can cancel").expect_err("an unreadable listing is no answer");
+        let err = s
+            .cancel(HASH, false)
+            .await
+            .expect("TorBox can cancel")
+            .expect_err("an unreadable listing is no answer");
         assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
     }
 
@@ -445,7 +538,11 @@ mod store {
             },
             ours,
         );
-        let err = s.cancel(HASH, false).await.expect("TorBox can cancel").expect_err("a refused delete is an error");
+        let err = s
+            .cancel(HASH, false)
+            .await
+            .expect("TorBox can cancel")
+            .expect_err("a refused delete is an error");
         assert!(matches!(&err, StoreError::Unavailable(u) if u.status == 500), "{err:?}");
     }
 
@@ -457,7 +554,10 @@ mod store {
         let seen = deleted.clone();
         let (s, calls) = store(
             move |req| match base(req).as_str() {
-                "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0}}"#),
+                "mylist" => resp(
+                    200,
+                    r#"{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0}}"#,
+                ),
                 "controltorrent" => {
                     seen.store(true, std::sync::atomic::Ordering::SeqCst);
                     resp(200, r#"{"success":true}"#)
@@ -503,7 +603,8 @@ mod store {
     #[tokio::test]
     async fn cancel_a_parked_add_that_is_not_ours_is_left_alone() {
         let queue_key = crate::stores::torbox::torbox_queued_key("tb-secret", HASH);
-        let (s, calls) = store(|_| resp(404, "{}"), |cache| cache.put(&queue_key, "7", Duration::from_secs(3600)));
+        let (s, calls) =
+            store(|_| resp(404, "{}"), |cache| cache.put(&queue_key, "7", Duration::from_secs(3600)));
         let out = s.cancel(HASH, false).await.expect("TorBox can cancel").expect("cancel");
         assert!(!out.done && out.reason == "not_ours", "outcome = {out:?}");
         assert!(calls.lock().unwrap().is_empty(), "nothing is sent for a queue entry that is not ours");

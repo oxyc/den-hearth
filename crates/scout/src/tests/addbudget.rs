@@ -16,29 +16,29 @@ use crate::addbudget::{
     budget_account, budget_remaining, budget_take, global_add_budget, refund_add, set_global_add_budget,
     spend_add, AddBudget, RequestNotSent,
 };
-use crate::config::DebridService::{self, Premiumize, RealDebrid, TorBox};
 use crate::cache::{Cache, MemoryCache};
+use crate::config::DebridService::{self, Premiumize, RealDebrid, TorBox};
 use crate::scrape::{DoError, Doer};
-use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
-use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
-use crate::stores::torbox::{TorBoxStore, TORBOX_API};
-use crate::stores::pool::StorePool;
-use crate::stores::realdebrid::rd_torrent_key;
 use crate::season::{err_episode_not_in_torrent, TorrentFile};
+use crate::stores::pool::StorePool;
+use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
+use crate::stores::realdebrid::rd_torrent_key;
+use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{
-    account_backed_off, add_attempt_key, add_in_flight, already_queued, backed_off, note_add_attempt, pending_too_long,
-    pm_queued_key, record_refusal, refusal_is_about_the_account, refused_key, resolve_key, settle_add_attempt,
-    torrent_id_key, torrent_miss_key, unknown_outcome, unknown_outcome_key, ADD_GIVE_UP, PENDING_GIVE_UP, QUEUED_TTL,
-    TORRENT_MISS_TTL, UNKNOWN_OUTCOME_TTL,
+    account_backed_off, add_attempt_key, add_in_flight, already_queued, backed_off, note_add_attempt,
+    pending_too_long, pm_queued_key, record_refusal, refusal_is_about_the_account, refused_key, resolve_key,
+    settle_add_attempt, torrent_id_key, torrent_miss_key, unknown_outcome, unknown_outcome_key, ADD_GIVE_UP,
+    PENDING_GIVE_UP, QUEUED_TTL, TORRENT_MISS_TTL, UNKNOWN_OUTCOME_TTL,
 };
 use crate::stores::torbox::support::no_file_list;
 use crate::stores::torbox::{select_file_id, RESOLVE_CACHE_TTL};
+use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
-    store_refused_us, ResolveTarget, Store, StoreError, StoreUnavailableError, ERR_TORRENT_GONE, ERR_WOULD_ADD,
-    redact_token,
+    redact_token, store_refused_us, ResolveTarget, Store, StoreError, StoreUnavailableError,
+    ERR_TORRENT_GONE, ERR_WOULD_ADD,
 };
-use crate::util::key_hash;
 use crate::tests::mock::{resp, MockDoer};
+use crate::util::key_hash;
 
 pub(crate) const HOUR: Duration = Duration::from_secs(60 * 60);
 
@@ -208,7 +208,10 @@ fn spend_add_is_per_service_and_account() {
 
     for svc in [TorBox, RealDebrid, Premiumize] {
         assert!(spend_add(svc, "tok", H, false).is_ok(), "{svc:?}: first add refused");
-        assert!(spend_add(svc, "tok", H, false).is_err(), "{svc:?}: second add allowed against an allowance of 1");
+        assert!(
+            spend_add(svc, "tok", H, false).is_err(),
+            "{svc:?}: second add allowed against an allowance of 1"
+        );
         // A different account on the same service has its own allowance.
         assert!(
             spend_add(svc, "other-tok", H, false).is_ok(),
@@ -224,7 +227,8 @@ fn spend_add_refusal_names_the_service() {
 
     match spend_add(RealDebrid, "tok", H, false) {
         // `ScoutSide` is Go's `errScoutSide` wrapping the same `StoreUnavailableError`, which `errors.As` finds.
-        Err(StoreError::Unavailable(u) | StoreError::ScoutSide(u)) if u.service == DebridService::RealDebrid => {}
+        Err(StoreError::Unavailable(u) | StoreError::ScoutSide(u))
+            if u.service == DebridService::RealDebrid => {}
         other => panic!("want a realdebrid StoreUnavailableError, got {other:?}"),
     }
 }
@@ -351,7 +355,10 @@ impl Store for StubStore {
         self.svc
     }
 
-    async fn cache_check(&self, _hashes: &[String]) -> Result<std::collections::HashMap<String, bool>, StoreError> {
+    async fn cache_check(
+        &self,
+        _hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, bool>, StoreError> {
         Ok(Default::default())
     }
 
@@ -371,7 +378,10 @@ fn failing_body_response(status: u16, message: &str) -> reqwest::Response {
         Ok::<Vec<u8>, io::Error>(Vec::new()),
         Err(io::Error::other(message.to_owned())),
     ]);
-    let r = http::Response::builder().status(status).body(reqwest::Body::wrap_stream(body)).expect("valid status");
+    let r = http::Response::builder()
+        .status(status)
+        .body(reqwest::Body::wrap_stream(body))
+        .expect("valid status");
     reqwest::Response::from(r)
 }
 
@@ -443,20 +453,23 @@ fn builders() -> [(&'static str, Build); 3] {
 /// already spent and asserts no request reaches the service at all.
 #[tokio::test]
 async fn stores_refuse_to_add_once_the_budget_is_spent() {
-        for (name, build) in builders() {
-            let _budget = install_budget(HOUR, 0); // nothing left this hour
+    for (name, build) in builders() {
+        let _budget = install_budget(HOUR, 0); // nothing left this hour
 
-            let reqs = Arc::new(AtomicUsize::new(0));
-            let r = reqs.clone();
-            let d = doer(move |_| {
-                r.fetch_add(1, Ordering::SeqCst);
-                Ok(resp(200, "{}"))
-            });
-            let res = build(d, new_cache()).resolve(&tgt(H)).await;
-            assert!(unavailable(&res).is_some(), "{name}: want a budget refusal, got {res:?}");
-            let n = reqs.load(Ordering::SeqCst);
-            assert_eq!(n, 0, "{name}: made {n} requests despite a spent allowance — the store is not wired to it");
-        }
+        let reqs = Arc::new(AtomicUsize::new(0));
+        let r = reqs.clone();
+        let d = doer(move |_| {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, "{}"))
+        });
+        let res = build(d, new_cache()).resolve(&tgt(H)).await;
+        assert!(unavailable(&res).is_some(), "{name}: want a budget refusal, got {res:?}");
+        let n = reqs.load(Ordering::SeqCst);
+        assert_eq!(
+            n, 0,
+            "{name}: made {n} requests despite a spent allowance — the store is not wired to it"
+        );
+    }
 }
 
 /// A cancel storm must cost ONE add, not one per poll — and the one it costs must be counted.
@@ -468,28 +481,28 @@ async fn stores_refuse_to_add_once_the_budget_is_spent() {
 /// outcome we never learned is remembered, and the next poll finds that memory instead of the add path.
 #[tokio::test]
 async fn add_budget_a_cancel_storm_costs_one_add() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let sent = Arc::new(AtomicUsize::new(0));
-        let s = sent.clone();
-        let d = doer(move |req| {
-            if !is_add_endpoint(&req) {
-                return Ok(resp(200, r#"{"data":[]}"#)); // the account holds nothing; only the ADD is abandoned
-            }
-            s.fetch_add(1, Ordering::SeqCst); // the request went out; the caller just never gets the answer
-            Err(io::Error::other("context canceled").into())
-        });
-        let store = tb("tok", d, Some(new_cache()));
-        for _ in 0..60 {
-            let _ = store.resolve(&tgt(H)).await;
+    let sent = Arc::new(AtomicUsize::new(0));
+    let s = sent.clone();
+    let d = doer(move |req| {
+        if !is_add_endpoint(&req) {
+            return Ok(resp(200, r#"{"data":[]}"#)); // the account holds nothing; only the ADD is abandoned
         }
-        let n = sent.load(Ordering::SeqCst);
-        assert_eq!(n, 1, "sent {n} createtorrent requests across sixty cancelled polls of one release");
-        let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
-        assert_eq!(left, 49, "remaining = {left}, want 49 — the add that WAS sent must be counted");
-        // Other titles are unaffected: one stuck release must not close the hour.
-        let other = spend_add(TorBox, "tok", &repeat("c", 40), false);
-        assert!(other.is_ok(), "another title was refused: {other:?}");
+        s.fetch_add(1, Ordering::SeqCst); // the request went out; the caller just never gets the answer
+        Err(io::Error::other("context canceled").into())
+    });
+    let store = tb("tok", d, Some(new_cache()));
+    for _ in 0..60 {
+        let _ = store.resolve(&tgt(H)).await;
+    }
+    let n = sent.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "sent {n} createtorrent requests across sixty cancelled polls of one release");
+    let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
+    assert_eq!(left, 49, "remaining = {left}, want 49 — the add that WAS sent must be counted");
+    // Other titles are unaffected: one stuck release must not close the hour.
+    let other = spend_add(TorBox, "tok", &repeat("c", 40), false);
+    assert!(other.is_ok(), "another title was refused: {other:?}");
 }
 
 /// A torrent the account already holds is resolved from the account, not bought again.
@@ -500,31 +513,31 @@ async fn add_budget_a_cancel_storm_costs_one_add() {
 /// consulted by Status; it just was not consulted here.
 #[tokio::test]
 async fn add_budget_a_held_torrent_is_not_bought_again() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let adds = Arc::new(AtomicUsize::new(0));
-        let a = adds.clone();
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                a.fetch_add(1, Ordering::SeqCst);
-                return Ok(resp(200, r#"{"data":{"torrent_id":9}}"#));
-            }
-            if req.url().path().contains("mylist") {
-                return Ok(resp(200, &format!(r#"{{"data":[{{"id":9,"hash":"{H}"}}]}}"#)));
-            }
-            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-        });
-        let store = tb("tok", d, Some(new_cache()));
-        let target = ResolveTarget { file_idx: Some(0), ..tgt(H) };
-        // The sequence /play actually runs: Status first — it finds the torrent in the account and remembers
-        // its id — then Resolve. Resolve must use what Status learned rather than buying the torrent again.
-        assert!(store.status(&target).await.is_none(), "a finished torrent is not downloading");
-        let link = store.resolve(&target).await.expect("a held torrent must resolve");
-        assert!(!link.is_empty(), "a held torrent must resolve to a link");
-        let n = adds.load(Ordering::SeqCst);
-        assert_eq!(n, 0, "spent {n} adds on a torrent the account already holds");
-        let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
-        assert_eq!(left, 50, "allowance dropped to {left} for a torrent that needed no add");
+    let adds = Arc::new(AtomicUsize::new(0));
+    let a = adds.clone();
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            return Ok(resp(200, r#"{"data":{"torrent_id":9}}"#));
+        }
+        if req.url().path().contains("mylist") {
+            return Ok(resp(200, &format!(r#"{{"data":[{{"id":9,"hash":"{H}"}}]}}"#)));
+        }
+        Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+    });
+    let store = tb("tok", d, Some(new_cache()));
+    let target = ResolveTarget { file_idx: Some(0), ..tgt(H) };
+    // The sequence /play actually runs: Status first — it finds the torrent in the account and remembers
+    // its id — then Resolve. Resolve must use what Status learned rather than buying the torrent again.
+    assert!(store.status(&target).await.is_none(), "a finished torrent is not downloading");
+    let link = store.resolve(&target).await.expect("a held torrent must resolve");
+    assert!(!link.is_empty(), "a held torrent must resolve to a link");
+    let n = adds.load(Ordering::SeqCst);
+    assert_eq!(n, 0, "spent {n} adds on a torrent the account already holds");
+    let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
+    assert_eq!(left, 50, "allowance dropped to {left} for a torrent that needed no add");
 }
 
 /// What the ceiling counts is adds that may HAVE HAPPENED, and the dividing line is whether the service
@@ -535,17 +548,17 @@ async fn add_budget_a_held_torrent_is_not_bought_again() {
 /// hourly allowance where RD and Premiumize were immune.
 #[tokio::test]
 async fn add_budget_the_charge_follows_whether_the_service_answered() {
-        let cases: [(&str, fn() -> Reply, i64); 2] = [
-            ("answered, created nothing", || Ok(resp(400, r#"{"error":"NOPE"}"#)), 5),
-            ("never answered", || Err(service_went_quiet().into()), 4),
-        ];
-        for (name, respond, want) in cases {
-            let _budget = install_budget(HOUR, 5);
-            let store = tb("tok", doer(move |_| respond()), Some(new_cache()));
-            let _ = store.resolve(&tgt(H)).await;
-            let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
-            assert_eq!(left, want, "{name}: remaining = {left}, want {want}");
-        }
+    let cases: [(&str, fn() -> Reply, i64); 2] = [
+        ("answered, created nothing", || Ok(resp(400, r#"{"error":"NOPE"}"#)), 5),
+        ("never answered", || Err(service_went_quiet().into()), 4),
+    ];
+    for (name, respond, want) in cases {
+        let _budget = install_budget(HOUR, 5);
+        let store = tb("tok", doer(move |_| respond()), Some(new_cache()));
+        let _ = store.resolve(&tgt(H)).await;
+        let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
+        assert_eq!(left, want, "{name}: remaining = {left}, want {want}");
+    }
 }
 
 /// A NoAdd target can never queue a torrent, whatever the store would otherwise do.
@@ -555,22 +568,22 @@ async fn add_budget_the_charge_follows_whether_the_service_answered() {
 /// ACCOUNT has. A caller cannot promise this by choosing well; only the store can enforce it.
 #[tokio::test]
 async fn no_add_never_reaches_an_add_endpoint() {
-        for (name, build) in builders() {
-            let adds = Arc::new(AtomicUsize::new(0));
-            let a = adds.clone();
-            let d = doer(move |req| {
-                if is_add_endpoint(&req) {
-                    a.fetch_add(1, Ordering::SeqCst);
-                }
-                Ok(resp(200, r#"{"data":[]}"#)) // an empty account: nothing held
-            });
-            let res = build(d, new_cache()).resolve(&ResolveTarget { no_add: true, ..tgt(H) }).await;
-            assert!(res.is_err(), "{name}: nothing is held, so a NoAdd resolve must fail rather than queue it");
-            // Reads are fine and expected — asking the account what it holds is how NoAdd is answered.
-            // What must never happen is the queueing call.
-            let n = adds.load(Ordering::SeqCst);
-            assert_eq!(n, 0, "{name}: made {n} adds for a NoAdd target — the store queued the torrent anyway");
-        }
+    for (name, build) in builders() {
+        let adds = Arc::new(AtomicUsize::new(0));
+        let a = adds.clone();
+        let d = doer(move |req| {
+            if is_add_endpoint(&req) {
+                a.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(resp(200, r#"{"data":[]}"#)) // an empty account: nothing held
+        });
+        let res = build(d, new_cache()).resolve(&ResolveTarget { no_add: true, ..tgt(H) }).await;
+        assert!(res.is_err(), "{name}: nothing is held, so a NoAdd resolve must fail rather than queue it");
+        // Reads are fine and expected — asking the account what it holds is how NoAdd is answered.
+        // What must never happen is the queueing call.
+        let n = adds.load(Ordering::SeqCst);
+        assert_eq!(n, 0, "{name}: made {n} adds for a NoAdd target — the store queued the torrent anyway");
+    }
 }
 
 /// Scout's own ceiling is not the debrid's refusal, and must not be remembered or reported as one.
@@ -632,7 +645,10 @@ fn add_in_flight_is_scout_side_not_the_stores() {
         matches!(err, StoreError::AddInFlight),
         "an add in flight needs its own sentinel, not the budget's: {err:?}"
     );
-    assert!(!matches!(err, StoreError::ScoutSide(_)), "an add in flight is not a refusal; conflating them loses the 202");
+    assert!(
+        !matches!(err, StoreError::ScoutSide(_)),
+        "an add in flight is not a refusal; conflating them loses the 202"
+    );
     record_refusal(&*cache, TorBox, "tok", H, &err);
     assert!(
         backed_off(&*cache, TorBox, "tok", H).is_none(),
@@ -645,25 +661,25 @@ fn add_in_flight_is_scout_side_not_the_stores() {
 /// polls closed THAT account's allowance instead.
 #[tokio::test]
 async fn add_in_flight_applies_to_every_store_that_adds() {
-        for (name, build) in builders() {
-            let _budget = install_budget(HOUR, 50);
+    for (name, build) in builders() {
+        let _budget = install_budget(HOUR, 50);
 
-            let adds = Arc::new(AtomicUsize::new(0));
-            let a = adds.clone();
-            let d = doer(move |req| {
-                if !is_add_endpoint(&req) {
-                    return Ok(resp(200, r#"{"data":[]}"#));
-                }
-                a.fetch_add(1, Ordering::SeqCst);
-                Err(io::Error::other("context canceled").into()) // sent, then abandoned by the client
-            });
-            let store = build(d, new_cache());
-            for _ in 0..30 {
-                let _ = store.resolve(&tgt(H)).await;
+        let adds = Arc::new(AtomicUsize::new(0));
+        let a = adds.clone();
+        let d = doer(move |req| {
+            if !is_add_endpoint(&req) {
+                return Ok(resp(200, r#"{"data":[]}"#));
             }
-            let n = adds.load(Ordering::SeqCst);
-            assert_eq!(n, 1, "{name}: sent {n} adds across thirty cancelled polls of one release");
+            a.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("context canceled").into()) // sent, then abandoned by the client
+        });
+        let store = build(d, new_cache());
+        for _ in 0..30 {
+            let _ = store.resolve(&tgt(H)).await;
         }
+        let n = adds.load(Ordering::SeqCst);
+        assert_eq!(n, 1, "{name}: sent {n} adds across thirty cancelled polls of one release");
+    }
 }
 
 /// Finding the torrent in the account settles the in-flight marker — that add plainly landed.
@@ -673,24 +689,24 @@ async fn add_in_flight_applies_to_every_store_that_adds() {
 /// is refused for a state that has already resolved itself.
 #[tokio::test]
 async fn add_in_flight_discovering_the_torrent_settles_the_marker() {
-        let cache = new_cache();
-        let d = doer(|req| {
-            if req.url().path().contains("mylist") {
-                return Ok(resp(200, &format!(r#"{{"data":[{{"id":9,"hash":"{H}"}}]}}"#)));
-            }
-            Ok(resp(404, "{}"))
-        });
-        let store = tb("tok", d, Some(cache.clone()));
+    let cache = new_cache();
+    let d = doer(|req| {
+        if req.url().path().contains("mylist") {
+            return Ok(resp(200, &format!(r#"{{"data":[{{"id":9,"hash":"{H}"}}]}}"#)));
+        }
+        Ok(resp(404, "{}"))
+    });
+    let store = tb("tok", d, Some(cache.clone()));
 
-        // An add went out and was abandoned, so the marker is set.
-        note_add_attempt(&*cache, TorBox, "tok", H);
-        assert!(add_in_flight(&*cache, TorBox, "tok", H).is_err(), "the marker should be set");
+    // An add went out and was abandoned, so the marker is set.
+    note_add_attempt(&*cache, TorBox, "tok", H);
+    assert!(add_in_flight(&*cache, TorBox, "tok", H).is_err(), "the marker should be set");
 
-        // The account listing then shows the torrent: the add landed, so the marker must go.
-        let (_, found, _) = store.torrent_id(H).await;
-        assert!(found, "the account holds it");
-        let settled = add_in_flight(&*cache, TorBox, "tok", H);
-        assert!(settled.is_ok(), "the marker outlived the discovery it stood in for: {settled:?}");
+    // The account listing then shows the torrent: the add landed, so the marker must go.
+    let (_, found, _) = store.torrent_id(H).await;
+    assert!(found, "the account holds it");
+    let settled = add_in_flight(&*cache, TorBox, "tok", H);
+    assert!(settled.is_ok(), "the marker outlived the discovery it stood in for: {settled:?}");
 }
 
 /// A remembered torrent id is a claim with a six-hour life, not a fact. When the account no longer has
@@ -702,61 +718,61 @@ async fn add_in_flight_discovering_the_torrent_settles_the_marker() {
 /// blacklisted a release that had been playing an hour earlier.
 #[tokio::test]
 async fn known_torrent_id_a_deleted_torrent_is_forgotten_and_re_bought() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let gone = Arc::new(AtomicBool::new(true));
-        let adds = Arc::new(AtomicUsize::new(0));
-        let (g, a) = (gone.clone(), adds.clone());
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                a.fetch_add(1, Ordering::SeqCst);
-                g.store(false, Ordering::SeqCst); // re-bought: the account has it again
-                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
-            }
+    let gone = Arc::new(AtomicBool::new(true));
+    let adds = Arc::new(AtomicUsize::new(0));
+    let (g, a) = (gone.clone(), adds.clone());
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            g.store(false, Ordering::SeqCst); // re-bought: the account has it again
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+        }
+        if req.url().path().contains("mylist") {
+            return Ok(resp(200, r#"{"data":[]}"#));
+        }
+        if g.load(Ordering::SeqCst) {
+            return Ok(resp(404, r#"{"success":false}"#)); // requestdl on a torrent that is not there
+        }
+        Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+    });
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl()); // a stale id from before the deletion
+    let store = tb("tok", d, Some(cache.clone()));
+    let target = ResolveTarget { file_idx: Some(0), ..tgt(H) };
+
+    let link = store.resolve(&target).await.expect("a deleted torrent must be re-bought, not answered dead");
+    assert!(!link.is_empty(), "a deleted torrent must be re-bought, not answered dead");
+    let n = adds.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "made {n} adds; the stale id should have been forgotten and the torrent re-added");
+    assert_ne!(
+        cache.get(&torrent_id_key("tok", H)).as_deref(),
+        Some("42"),
+        "the stale id survived, and every later poll would keep it alive for another six hours"
+    );
+
+    // And when the re-add ALSO fails, the stale id must be gone rather than re-stamped with a fresh
+    // six-hour TTL. That refresh is what made a deleted torrent unplayable indefinitely: the held path
+    // re-Put the id on every poll, so a polling client kept its own poison alive.
+    let stuck = new_cache();
+    stuck.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let dead = tb(
+        "tok",
+        doer(|req| {
             if req.url().path().contains("mylist") {
                 return Ok(resp(200, r#"{"data":[]}"#));
             }
-            if g.load(Ordering::SeqCst) {
-                return Ok(resp(404, r#"{"success":false}"#)); // requestdl on a torrent that is not there
-            }
-            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-        });
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl()); // a stale id from before the deletion
-        let store = tb("tok", d, Some(cache.clone()));
-        let target = ResolveTarget { file_idx: Some(0), ..tgt(H) };
-
-        let link = store.resolve(&target).await.expect("a deleted torrent must be re-bought, not answered dead");
-        assert!(!link.is_empty(), "a deleted torrent must be re-bought, not answered dead");
-        let n = adds.load(Ordering::SeqCst);
-        assert_eq!(n, 1, "made {n} adds; the stale id should have been forgotten and the torrent re-added");
-        assert_ne!(
-            cache.get(&torrent_id_key("tok", H)).as_deref(),
-            Some("42"),
-            "the stale id survived, and every later poll would keep it alive for another six hours"
-        );
-
-        // And when the re-add ALSO fails, the stale id must be gone rather than re-stamped with a fresh
-        // six-hour TTL. That refresh is what made a deleted torrent unplayable indefinitely: the held path
-        // re-Put the id on every poll, so a polling client kept its own poison alive.
-        let stuck = new_cache();
-        stuck.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let dead = tb(
-            "tok",
-            doer(|req| {
-                if req.url().path().contains("mylist") {
-                    return Ok(resp(200, r#"{"data":[]}"#));
-                }
-                Ok(resp(404, r#"{"success":false}"#)) // nothing works: the add fails too
-            }),
-            Some(stuck.clone()),
-        );
-        let _ = dead.resolve(&target).await;
-        assert_ne!(
-            stuck.get(&torrent_id_key("tok", H)).as_deref(),
-            Some("42"),
-            "a failing resolve refreshed the stale id instead of forgetting it"
-        );
+            Ok(resp(404, r#"{"success":false}"#)) // nothing works: the add fails too
+        }),
+        Some(stuck.clone()),
+    );
+    let _ = dead.resolve(&target).await;
+    assert_ne!(
+        stuck.get(&torrent_id_key("tok", H)).as_deref(),
+        Some("42"),
+        "a failing resolve refreshed the stale id instead of forgetting it"
+    );
 }
 
 /// An add going out clears the torrent-miss marker.
@@ -784,47 +800,12 @@ fn note_add_attempt_clears_the_torrent_miss_marker() {
 /// in-flight marker meant to stop the loop, and round it went.
 #[tokio::test]
 async fn known_torrent_id_only_a_confirmed_absence_forgets_the_id() {
-        let cases: [(&str, fn() -> Reply); 3] = [
-            ("cancelled poll", || Err(io::Error::other("context canceled").into())),
-            ("throttled", || Ok(resp(429, r#"{"error":"RATE"}"#))),
-            ("server fault", || Ok(resp(500, "{}"))),
-        ];
-        for (name, respond) in cases {
-            let _budget = install_budget(HOUR, 50);
-
-            let adds = Arc::new(AtomicUsize::new(0));
-            let a = adds.clone();
-            let d = doer(move |req| {
-                if is_add_endpoint(&req) {
-                    a.fetch_add(1, Ordering::SeqCst);
-                    return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
-                }
-                if req.url().path().contains("mylist") {
-                    return Ok(resp(200, r#"{"data":[]}"#));
-                }
-                respond() // requestdl on the held torrent
-            });
-            let cache = new_cache();
-            cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-            let store = tb("tok", d, Some(cache.clone()));
-
-            for _ in 0..10 {
-                let _ = store.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await;
-            }
-            let n = adds.load(Ordering::SeqCst);
-            assert_eq!(n, 0, "{n} adds for a held torrent after a {name} — this says nothing about what the account has");
-            assert_eq!(
-                cache.get(&torrent_id_key("tok", H)).as_deref(),
-                Some("42"),
-                "the id was forgotten on a {name}"
-            );
-        }
-}
-
-/// A pack that does not contain the requested episode is a PERMANENT fact about a torrent the account
-/// has. Re-buying the pack to re-learn it spends an add and returns the identical refusal.
-#[tokio::test]
-async fn known_torrent_id_a_pack_mismatch_does_not_re_buy_the_pack() {
+    let cases: [(&str, fn() -> Reply); 3] = [
+        ("cancelled poll", || Err(io::Error::other("context canceled").into())),
+        ("throttled", || Ok(resp(429, r#"{"error":"RATE"}"#))),
+        ("server fault", || Ok(resp(500, "{}"))),
+    ];
+    for (name, respond) in cases {
         let _budget = install_budget(HOUR, 50);
 
         let adds = Arc::new(AtomicUsize::new(0));
@@ -834,23 +815,61 @@ async fn known_torrent_id_a_pack_mismatch_does_not_re_buy_the_pack() {
                 a.fetch_add(1, Ordering::SeqCst);
                 return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
             }
-            // The pack holds S01E01–E02 and nothing else.
-            Ok(resp(
-                200,
-                r#"{"data":{"files":[{"id":0,"name":"Show.S01E01.mkv","size":10},{"id":1,"name":"Show.S01E02.mkv","size":20}]}}"#,
-            ))
+            if req.url().path().contains("mylist") {
+                return Ok(resp(200, r#"{"data":[]}"#));
+            }
+            respond() // requestdl on the held torrent
         });
         let cache = new_cache();
         cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let store = tb("tok", d, Some(cache));
+        let store = tb("tok", d, Some(cache.clone()));
 
-        let err = store
-            .resolve(&ResolveTarget { season: intp(1), episode: intp(9), ..tgt(H) })
-            .await
-            .expect_err("the pack does not hold that episode");
-        assert_eq!(err, err_episode_not_in_torrent(), "want errEpisodeNotInTorrent, got {err:?}");
+        for _ in 0..10 {
+            let _ = store.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await;
+        }
         let n = adds.load(Ordering::SeqCst);
-        assert_eq!(n, 0, "spent {n} adds re-buying a pack to re-learn what it does not contain");
+        assert_eq!(
+            n, 0,
+            "{n} adds for a held torrent after a {name} — this says nothing about what the account has"
+        );
+        assert_eq!(
+            cache.get(&torrent_id_key("tok", H)).as_deref(),
+            Some("42"),
+            "the id was forgotten on a {name}"
+        );
+    }
+}
+
+/// A pack that does not contain the requested episode is a PERMANENT fact about a torrent the account
+/// has. Re-buying the pack to re-learn it spends an add and returns the identical refusal.
+#[tokio::test]
+async fn known_torrent_id_a_pack_mismatch_does_not_re_buy_the_pack() {
+    let _budget = install_budget(HOUR, 50);
+
+    let adds = Arc::new(AtomicUsize::new(0));
+    let a = adds.clone();
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+        }
+        // The pack holds S01E01–E02 and nothing else.
+        Ok(resp(
+            200,
+            r#"{"data":{"files":[{"id":0,"name":"Show.S01E01.mkv","size":10},{"id":1,"name":"Show.S01E02.mkv","size":20}]}}"#,
+        ))
+    });
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let store = tb("tok", d, Some(cache));
+
+    let err = store
+        .resolve(&ResolveTarget { season: intp(1), episode: intp(9), ..tgt(H) })
+        .await
+        .expect_err("the pack does not hold that episode");
+    assert_eq!(err, err_episode_not_in_torrent(), "want errEpisodeNotInTorrent, got {err:?}");
+    let n = adds.load(Ordering::SeqCst);
+    assert_eq!(n, 0, "spent {n} adds re-buying a pack to re-learn what it does not contain");
 }
 
 /// Every cache key that carries account state is scoped by the account identity.
@@ -860,20 +879,23 @@ async fn known_torrent_id_a_pack_mismatch_does_not_re_buy_the_pack() {
 /// Stripping keyHash(token) from any of these left the whole suite green.
 #[test]
 fn cache_keys_are_scoped_to_the_account() {
-        let cases: [(&str, fn(&str) -> String); 6] = [
-            ("resolve", |t| resolve_key(t, H)),
-            ("torrentID", |t| torrent_id_key(t, H)),
-            ("torrentMiss", |t| torrent_miss_key(t, H)),
-            ("refused", |t| refused_key(TorBox, t, H)),
-            ("addAttempt", |t| add_attempt_key(TorBox, t, H)),
-            ("budget", |t| budget_account(TorBox, t)),
-        ];
-        for (name, key) in cases {
-            let mine = key("my-token");
-            let theirs = key("their-token");
-            assert_ne!(mine, theirs, "{name}: two accounts share the key {mine:?} — one user's state would be served to another");
-            assert!(!mine.contains("my-token"), "{name}: the raw token is in the key: {mine:?}");
-        }
+    let cases: [(&str, fn(&str) -> String); 6] = [
+        ("resolve", |t| resolve_key(t, H)),
+        ("torrentID", |t| torrent_id_key(t, H)),
+        ("torrentMiss", |t| torrent_miss_key(t, H)),
+        ("refused", |t| refused_key(TorBox, t, H)),
+        ("addAttempt", |t| add_attempt_key(TorBox, t, H)),
+        ("budget", |t| budget_account(TorBox, t)),
+    ];
+    for (name, key) in cases {
+        let mine = key("my-token");
+        let theirs = key("their-token");
+        assert_ne!(
+            mine, theirs,
+            "{name}: two accounts share the key {mine:?} — one user's state would be served to another"
+        );
+        assert!(!mine.contains("my-token"), "{name}: the raw token is in the key: {mine:?}");
+    }
 }
 
 /// The Real-Debrid and Premiumize stores, the two that have no Status endpoint of their own.
@@ -1248,7 +1270,10 @@ async fn real_debrid_serves_the_episode_that_was_asked_for() {
     let e2 = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
     assert!(e2.is_ok(), "E02: {e2:?}");
     let un = unrestricted.lock().unwrap().clone();
-    assert!(un.contains("E02"), "E02 unrestricted {un:?} — the pack's first link was served for the second episode");
+    assert!(
+        un.contains("E02"),
+        "E02 unrestricted {un:?} — the pack's first link was served for the second episode"
+    );
 }
 
 /// rdLinkFor maps a file id onto RD's links, which describe the SELECTED files in file order.
@@ -1284,10 +1309,8 @@ fn rd_link_for() {
 /// The two keys HEAD added carry account state and must be scoped to the token like every other one.
 #[test]
 fn cache_keys_the_new_ones_are_scoped_too() {
-    let cases: [(&str, fn(&str) -> String); 2] = [
-        ("rdTorrent", |t| rd_torrent_key(t, H, &tgt(H))),
-        ("pmQueued", |t| pm_queued_key(t, H)),
-    ];
+    let cases: [(&str, fn(&str) -> String); 2] =
+        [("rdTorrent", |t| rd_torrent_key(t, H, &tgt(H))), ("pmQueued", |t| pm_queued_key(t, H))];
     for (name, key) in cases {
         let mine = key("my-token");
         let theirs = key("their-token");
@@ -1337,11 +1360,8 @@ async fn premiumize_pending_expires_and_held_releases_are_free() {
     // A transfer that never produces anything: "coming" until the deadline, then dead so the client can
     // try something else.
     let pending = new_cache();
-    let stuck = pm(
-        "tok",
-        doer(|_| Ok(resp(200, r#"{"status":"success","content":[]}"#))),
-        Some(pending.clone()),
-    );
+    let stuck =
+        pm("tok", doer(|_| Ok(resp(200, r#"{"status":"success","content":[]}"#))), Some(pending.clone()));
     let res = stuck.resolve(&tgt(H)).await;
     assert!(matches!(&res, Err(StoreError::AddInFlight)), "a freshly queued transfer is coming: {res:?}");
     // Backdate the stamp past the give-up window — the marker records WHEN, so it can age.
@@ -1446,7 +1466,10 @@ async fn store_refusal_a_rejected_key_backs_off_the_whole_account() {
     let n = calls.load(Ordering::SeqCst);
     assert_eq!(n, 1, "asked a service that had rejected the key {n} times");
     let left = global_add_budget().remaining(&budget_account(Premiumize, "stale"));
-    assert!(left >= 49, "a rejected key drained the allowance to {left}; replacing it would not restore service");
+    assert!(
+        left >= 49,
+        "a rejected key drained the allowance to {left}; replacing it would not restore service"
+    );
     // A per-release refusal must still be per-release, or one dead torrent silences the account.
     let per_release = new_cache();
     record_refusal(
@@ -1498,11 +1521,7 @@ async fn premiumize_the_give_up_verdict_is_remembered() {
     let _budget = install_budget(HOUR, 50);
 
     let cache = new_cache();
-    let s = pm(
-        "tok",
-        doer(|_| Ok(resp(200, r#"{"status":"success","content":[]}"#))),
-        Some(cache.clone()),
-    );
+    let s = pm("tok", doer(|_| Ok(resp(200, r#"{"status":"success","content":[]}"#))), Some(cache.clone()));
     // Queued long ago and still producing nothing.
     let old = SystemTime::now() - (QUEUED_TTL - Duration::from_secs(60));
     cache.put(&pm_queued_key("tok", H), &stamp_at(old), QUEUED_TTL);
@@ -1519,7 +1538,10 @@ async fn premiumize_the_give_up_verdict_is_remembered() {
     );
     for i in 0..5 {
         let res = s.resolve(&tgt(H)).await;
-        assert!(unavailable(&res).is_none(), "poll {i} blamed the store for a verdict scout reached: {res:?}");
+        assert!(
+            unavailable(&res).is_none(),
+            "poll {i} blamed the store for a verdict scout reached: {res:?}"
+        );
         assert!(res.is_err(), "poll {i} resolved a transfer that produced nothing");
     }
     // And it is not re-queued: the marker keeps suppressing the charge for its full life.
@@ -1539,7 +1561,11 @@ fn refusal_is_about_the_account_reads_the_status_not_the_prose() {
     let cases: [(&str, StoreUnavailableError, bool); 5] = [
         (
             "a rejected key",
-            StoreUnavailableError { service: TorBox, status: 403, reason: "createtorrent http 403 (FORBIDDEN)".into() },
+            StoreUnavailableError {
+                service: TorBox,
+                status: 403,
+                reason: "createtorrent http 403 (FORBIDDEN)".into(),
+            },
             true,
         ),
         (
@@ -1628,7 +1654,10 @@ async fn resolve_add_guards_do_not_block_a_read_path() {
     let d = doer(|req| {
         let path = req.url().path();
         if path.contains("/torrents/info/") {
-            return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":9,"selected":1}],"links":["https://rd/r"]}"#));
+            return Ok(resp(
+                200,
+                r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":9,"selected":1}],"links":["https://rd/r"]}"#,
+            ));
         }
         if path.contains("selectFiles") {
             return Ok(resp(204, ""));
@@ -1707,7 +1736,10 @@ async fn premiumize_a_queued_transfer_is_never_charged_twice() {
         assert!(res.is_err(), "poll {i} resolved a transfer that produced nothing");
     }
     let n = calls.load(Ordering::SeqCst);
-    assert_eq!(n, 30, "asked {n} times; the call is what notices a transfer finishing and must keep happening");
+    assert_eq!(
+        n, 30,
+        "asked {n} times; the call is what notices a transfer finishing and must keep happening"
+    );
     // One charge for the one transfer that was genuinely queued, and none for the twenty-nine repeats.
     let left = global_add_budget().remaining(&budget_account(Premiumize, "tok"));
     assert_eq!(left, 49, "allowance {left} — a queued transfer was paid for more than once");
@@ -1767,7 +1799,10 @@ async fn real_debrid_the_read_path_reports_a_refusal_as_a_refusal() {
     s.remember_torrent(&target, "t1"); // the account holds this one
 
     let err = s.resolve(&target).await;
-    assert!(unavailable(&err).is_some(), "a rejected key is the service refusing, not a dead release: {err:?}");
+    assert!(
+        unavailable(&err).is_some(),
+        "a rejected key is the service refusing, not a dead release: {err:?}"
+    );
     // Remembered, so the poll loop stops — and account-wide, because a 403 is about the key.
     for _ in 0..9 {
         let _ = s.resolve(&target).await;
@@ -1799,7 +1834,10 @@ async fn premiumize_a_slow_transfer_is_still_discovered_when_it_completes() {
         doer(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
             if d.load(Ordering::SeqCst) {
-                return Ok(resp(200, r#"{"status":"success","content":[{"path":"m.mkv","link":"https://pm/late","size":9}]}"#));
+                return Ok(resp(
+                    200,
+                    r#"{"status":"success","content":[{"path":"m.mkv","link":"https://pm/late","size":9}]}"#,
+                ));
             }
             Ok(resp(200, r#"{"status":"success","content":[]}"#))
         }),
@@ -1837,57 +1875,60 @@ async fn premiumize_a_slow_transfer_is_still_discovered_when_it_completes() {
 /// created a backoff its own contract says it cannot cause.
 #[tokio::test]
 async fn tor_box_the_read_path_records_only_a_real_refusal() {
-        // (name, requestdl answer, want recorded)
-        let cases: [(&str, fn() -> Reply, bool); 3] = [
-            ("still downloading", || Ok(resp(200, r#"{"success":false}"#)), false),
-            ("a cancelled poll", || Err(io::Error::other("context canceled").into()), false),
-            ("the service refusing", || Ok(resp(429, r#"{"error":"RATE"}"#)), true),
-        ];
-        for (name, requestdl, want_record) in cases {
-            let _budget = install_budget(HOUR, 50);
-            let cache = new_cache();
-            cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-            let d = doer(move |req| {
-                if req.url().path().contains("requestdl") {
-                    return requestdl();
-                }
-                Ok(resp(200, r#"{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
-            });
-            let s = tb("tok", d, Some(cache.clone()));
-            let _ = s.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await;
-            let recorded = backed_off(&*cache, TorBox, "tok", H).is_some();
-            assert_eq!(recorded, want_record, "{name}: recorded={recorded} — this decides whether the app blames the debrid");
-        }
+    // (name, requestdl answer, want recorded)
+    let cases: [(&str, fn() -> Reply, bool); 3] = [
+        ("still downloading", || Ok(resp(200, r#"{"success":false}"#)), false),
+        ("a cancelled poll", || Err(io::Error::other("context canceled").into()), false),
+        ("the service refusing", || Ok(resp(429, r#"{"error":"RATE"}"#)), true),
+    ];
+    for (name, requestdl, want_record) in cases {
+        let _budget = install_budget(HOUR, 50);
+        let cache = new_cache();
+        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+        let d = doer(move |req| {
+            if req.url().path().contains("requestdl") {
+                return requestdl();
+            }
+            Ok(resp(200, r#"{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
+        });
+        let s = tb("tok", d, Some(cache.clone()));
+        let _ = s.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await;
+        let recorded = backed_off(&*cache, TorBox, "tok", H).is_some();
+        assert_eq!(
+            recorded, want_record,
+            "{name}: recorded={recorded} — this decides whether the app blames the debrid"
+        );
+    }
 }
 
 /// TorBox gets the same account-level gate as the other two: a rejected key makes every request
 /// pointless, reads included.
 #[tokio::test]
 async fn tor_box_a_rejected_key_gates_the_read_path_too() {
-        let cache = new_cache();
-        record_refusal(
-            &*cache,
-            TorBox,
-            "tok",
-            &repeat("f", 40),
-            &StoreError::Unavailable(StoreUnavailableError {
-                service: TorBox,
-                status: 403,
-                reason: "createtorrent http 403".into(),
-            }),
-        );
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|_| {
-                panic!("a rejected key must stop the request before it is made");
-            }),
-            Some(cache),
-        );
-        assert!(
-            s.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await.is_err(),
-            "a rejected key cannot serve even a held torrent"
-        );
+    let cache = new_cache();
+    record_refusal(
+        &*cache,
+        TorBox,
+        "tok",
+        &repeat("f", 40),
+        &StoreError::Unavailable(StoreUnavailableError {
+            service: TorBox,
+            status: 403,
+            reason: "createtorrent http 403".into(),
+        }),
+    );
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|_| {
+            panic!("a rejected key must stop the request before it is made");
+        }),
+        Some(cache),
+    );
+    assert!(
+        s.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await.is_err(),
+        "a rejected key cannot serve even a held torrent"
+    );
 }
 
 /// Premiumize's account gate, which nothing pinned: the existing ordering test seeds a 429, which is a
@@ -1940,7 +1981,10 @@ async fn premiumize_a_refused_magnet_is_not_a_queued_transfer() {
     );
     // The FIRST answer is the one the viewer acts on; the polls behind it meet the backoff.
     let first = s.resolve(&tgt(H)).await;
-    assert!(!matches!(&first, Err(StoreError::AddInFlight)), "a refused magnet was reported as a transfer on its way: {first:?}");
+    assert!(
+        !matches!(&first, Err(StoreError::AddInFlight)),
+        "a refused magnet was reported as a transfer on its way: {first:?}"
+    );
     let dead = match &first {
         Err(StoreError::DeadLink(d)) => d.clone(),
         other => panic!("got {other:?}, want a dead link the client can move past"),
@@ -1956,7 +2000,10 @@ async fn premiumize_a_refused_magnet_is_not_a_queued_transfer() {
     assert!(n <= 1, "made {n} directdl calls over 30 polls — nothing bounds the loop");
     // Its own words, so "Invalid src" and "not enough space" stay tellable apart.
     assert!(dead.to_string().contains("Invalid src"), "the service's own explanation was discarded: {dead}");
-    assert!(!already_queued(&*cache, "tok", H), "a magnet Premiumize refused was marked as queued, blocking any retry for twenty minutes");
+    assert!(
+        !already_queued(&*cache, "tok", H),
+        "a magnet Premiumize refused was marked as queued, blocking any retry for twenty minutes"
+    );
     let left = global_add_budget().remaining(&budget_account(Premiumize, "tok"));
     assert_eq!(left, 50, "allowance {left} — refusals were charged as adds");
 }
@@ -1982,7 +2029,10 @@ async fn real_debrid_only_a_service_refusal_is_recorded_on_the_read_path() {
         s.remember_torrent(&target, "t1");
         assert!(s.resolve(&target).await.is_err(), "{name}: nothing here resolves");
         let recorded = backed_off(&*cache, RealDebrid, "tok", H).is_some();
-        assert_eq!(recorded, want_record, "{name}: recorded={recorded} — this decides whether the app blames the debrid");
+        assert_eq!(
+            recorded, want_record,
+            "{name}: recorded={recorded} — this decides whether the app blames the debrid"
+        );
     }
 }
 
@@ -1991,34 +2041,34 @@ async fn real_debrid_only_a_service_refusal_is_recorded_on_the_read_path() {
 /// during a binge — so ten polls made ten requestdl calls against a key TorBox had already rejected.
 #[tokio::test]
 async fn tor_box_the_account_gate_covers_the_warm_fast_path() {
-        let cache = new_cache();
-        record_refusal(
-            &*cache,
-            TorBox,
-            "tok",
-            &repeat("f", 40),
-            &StoreError::Unavailable(StoreUnavailableError {
-                service: TorBox,
-                status: 403,
-                reason: "createtorrent http 403".into(),
-            }),
-        );
-        cache.put(
-            &resolve_key("tok", H),
-            r#"{"torrentId":42,"files":[{"Index":0,"Name":"Show.S01E01.mkv","SizeBytes":900}]}"#,
-            resolve_cache_ttl(),
-        );
-        let s = tb(
-            "tok",
-            doer(|_| {
-                panic!("a rejected key must stop the request before it is made, warm entry or not");
-            }),
-            Some(cache),
-        );
-        assert!(
-            s.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await.is_err(),
-            "a rejected key cannot serve even a pack played minutes ago"
-        );
+    let cache = new_cache();
+    record_refusal(
+        &*cache,
+        TorBox,
+        "tok",
+        &repeat("f", 40),
+        &StoreError::Unavailable(StoreUnavailableError {
+            service: TorBox,
+            status: 403,
+            reason: "createtorrent http 403".into(),
+        }),
+    );
+    cache.put(
+        &resolve_key("tok", H),
+        r#"{"torrentId":42,"files":[{"Index":0,"Name":"Show.S01E01.mkv","SizeBytes":900}]}"#,
+        resolve_cache_ttl(),
+    );
+    let s = tb(
+        "tok",
+        doer(|_| {
+            panic!("a rejected key must stop the request before it is made, warm entry or not");
+        }),
+        Some(cache),
+    );
+    assert!(
+        s.resolve(&ResolveTarget { file_idx: Some(0), ..tgt(H) }).await.is_err(),
+        "a rejected key cannot serve even a pack played minutes ago"
+    );
 }
 
 /// The read path keeps the service's own words, the same rule the add path follows: an account at its
@@ -2027,24 +2077,27 @@ async fn tor_box_the_account_gate_covers_the_warm_fast_path() {
 /// recorded nothing and re-asked on every poll.
 #[tokio::test]
 async fn tor_box_the_read_path_keeps_the_services_own_words() {
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|req| {
-                if req.url().path().contains("requestdl") {
-                    return Ok(resp(
-                        400,
-                        r#"{"error":"DOWNLOAD_SERVER_ERROR","detail":"active download limit reached"}"#,
-                    ));
-                }
-                Ok(resp(200, r#"{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
-            }),
-            Some(cache),
-        );
-        let res = s.resolve(&ResolveTarget { file_idx: Some(0), no_add: true, ..tgt(H) }).await;
-        let msg = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(msg.contains("active download limit reached"), "got {res:?} — the answer that says WHY was thrown away one layer down");
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|req| {
+            if req.url().path().contains("requestdl") {
+                return Ok(resp(
+                    400,
+                    r#"{"error":"DOWNLOAD_SERVER_ERROR","detail":"active download limit reached"}"#,
+                ));
+            }
+            Ok(resp(200, r#"{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
+        }),
+        Some(cache),
+    );
+    let res = s.resolve(&ResolveTarget { file_idx: Some(0), no_add: true, ..tgt(H) }).await;
+    let msg = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        msg.contains("active download limit reached"),
+        "got {res:?} — the answer that says WHY was thrown away one layer down"
+    );
 }
 
 /// A cached file list that names its episodes is proof about the pack, not a hint: if the requested one
@@ -2052,21 +2105,24 @@ async fn tor_box_the_read_path_keeps_the_services_own_words() {
 /// hourly ceiling on adds.
 #[tokio::test]
 async fn tor_box_a_proven_wrong_pack_is_not_re_added() {
-        let cache = new_cache();
-        cache.put(
+    let cache = new_cache();
+    cache.put(
             &resolve_key("tok", H),
             r#"{"torrentId":42,"files":[{"Index":0,"Name":"Show.S01E01.mkv","SizeBytes":900},{"Index":1,"Name":"Show.S01E02.mkv","SizeBytes":950}]}"#,
             resolve_cache_ttl(),
         );
-        let s = tb(
-            "tok",
-            doer(|req| {
-                panic!("the cached list already proves this pack is wrong; {} was asked anyway", req.url().path());
-            }),
-            Some(cache),
-        );
-        let res = s.resolve(&ResolveTarget { season: intp(1), episode: intp(9), ..tgt(H) }).await;
-        assert_eq!(res.expect_err("the cached list names no S01E09"), err_episode_not_in_torrent());
+    let s = tb(
+        "tok",
+        doer(|req| {
+            panic!(
+                "the cached list already proves this pack is wrong; {} was asked anyway",
+                req.url().path()
+            );
+        }),
+        Some(cache),
+    );
+    let res = s.resolve(&ResolveTarget { season: intp(1), episode: intp(9), ..tgt(H) }).await;
+    assert_eq!(res.expect_err("the cached list names no S01E09"), err_episode_not_in_torrent());
 }
 
 /// Every answer Premiumize gives that is not a 2xx is one that queued nothing, so the charge goes back.
@@ -2090,7 +2146,10 @@ async fn premiumize_an_answered_failure_is_not_a_charge() {
             let _ = s.resolve(&tgt(H)).await;
         }
         let left = global_add_budget().remaining(&budget_account(Premiumize, "tok"));
-        assert_eq!(left, 50, "http {status}: allowance {left} — a poll loop on an answered failure spent the hour's adds");
+        assert_eq!(
+            left, 50,
+            "http {status}: allowance {left} — a poll loop on an answered failure spent the hour's adds"
+        );
         // The allowance still being there is only half of it: what it buys is that ANOTHER release —
         // one the account holds, which directdl serves as a read — still resolves, instead of being
         // refused by scout's own bookkeeping for the rest of the hour. A different infohash, because
@@ -2098,11 +2157,16 @@ async fn premiumize_an_answered_failure_is_not_a_charge() {
         // the account-wide one.
         let held = pm(
             "tok",
-            doer(|_| Ok(resp(200, r#"{"status":"success","content":[{"path":"m.mkv","link":"https://pm/ok"}]}"#))),
+            doer(|_| {
+                Ok(resp(200, r#"{"status":"success","content":[{"path":"m.mkv","link":"https://pm/ok"}]}"#))
+            }),
             Some(cache),
         );
         let other = held.resolve(&tgt(&repeat("b", 40))).await;
-        assert!(matches!(&other, Ok(l) if l == "https://pm/ok"), "a held release answered {other:?} — scout refused what Premiumize would have served");
+        assert!(
+            matches!(&other, Ok(l) if l == "https://pm/ok"),
+            "a held release answered {other:?} — scout refused what Premiumize would have served"
+        );
     }
 }
 
@@ -2112,59 +2176,65 @@ async fn premiumize_an_answered_failure_is_not_a_charge() {
 /// S01E02 with a 302 and no error. The cache-read path already refuses on the same evidence.
 #[tokio::test]
 async fn tor_box_a_failed_file_list_never_guesses_the_episode() {
-        // (name, mylist answer)
-        let cases: [(&str, fn() -> Reply); 3] = [
-            ("a transport blip", || Err("connection reset".into())),
-            ("a 500", || Ok(resp(500, "{}"))),
-            ("an unreadable body", || Ok(resp(200, "<html>"))),
-        ];
-        for (name, mylist) in cases {
-            let cache = new_cache();
-            cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-            let d = doer(move |req| {
-                if req.url().path().contains("mylist") {
-                    return mylist();
-                }
-                Ok(resp(200, r#"{"success":true,"data":"https://tb/link"}"#))
-            });
-            let s = tb("tok", d, Some(cache.clone()));
-            // The indexer says file 0; the pack's own names would have said file 1.
-            let res = s
-                .resolve(&ResolveTarget { season: intp(1), episode: intp(2), file_idx: intp(0), ..tgt(H) })
-                .await;
-            assert!(res.is_err(), "{name}: served blind — this is how the wrong episode plays: {res:?}");
-            assert!(unavailable(&res).is_some(), "{name}: got {res:?}, want the store saying it could not answer");
-            // Status still has to be able to report the download, so the id must survive the refusal.
-            assert!(cache.get(&torrent_id_key("tok", H)).is_some(), "{name}: the torrent id was dropped, so a fetch in progress now reads as dead");
-        }
+    // (name, mylist answer)
+    let cases: [(&str, fn() -> Reply); 3] = [
+        ("a transport blip", || Err("connection reset".into())),
+        ("a 500", || Ok(resp(500, "{}"))),
+        ("an unreadable body", || Ok(resp(200, "<html>"))),
+    ];
+    for (name, mylist) in cases {
+        let cache = new_cache();
+        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+        let d = doer(move |req| {
+            if req.url().path().contains("mylist") {
+                return mylist();
+            }
+            Ok(resp(200, r#"{"success":true,"data":"https://tb/link"}"#))
+        });
+        let s = tb("tok", d, Some(cache.clone()));
+        // The indexer says file 0; the pack's own names would have said file 1.
+        let res = s
+            .resolve(&ResolveTarget { season: intp(1), episode: intp(2), file_idx: intp(0), ..tgt(H) })
+            .await;
+        assert!(res.is_err(), "{name}: served blind — this is how the wrong episode plays: {res:?}");
+        assert!(
+            unavailable(&res).is_some(),
+            "{name}: got {res:?}, want the store saying it could not answer"
+        );
+        // Status still has to be able to report the download, so the id must survive the refusal.
+        assert!(
+            cache.get(&torrent_id_key("tok", H)).is_some(),
+            "{name}: the torrent id was dropped, so a fetch in progress now reads as dead"
+        );
+    }
 }
 
 /// The one TorBox URL carrying the token as a query parameter must not gain a second route into the log
 /// through an upstream error page that quotes the request URI back.
 #[tokio::test]
 async fn tor_box_the_services_words_cannot_carry_the_token() {
-        let token = "supersecrettoken";
-        let cache = new_cache();
-        // Seeded under the store's OWN token: the id key is account-scoped, so seeding it under any other
-        // name leaves the account holding nothing and the request is never made.
-        cache.put(&torrent_id_key(token, H), "42", resolve_cache_ttl());
-        let reached = Arc::new(AtomicBool::new(false));
-        let r = reached.clone();
-        let s = tb(
-            token,
-            doer(move |req| {
-                if req.url().path().contains("requestdl") {
-                    r.store(true, Ordering::SeqCst);
-                    return Ok(resp(400, &format!("Bad Request on {}", req.url())));
-                }
-                Ok(resp(200, r#"{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
-            }),
-            Some(cache),
-        );
-        let res = s.resolve(&ResolveTarget { file_idx: intp(0), no_add: true, ..tgt(H) }).await;
-        assert!(reached.load(Ordering::SeqCst), "requestdl was never called, so this asserts nothing");
-        let msg = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(res.is_err() && !msg.contains(token), "the token reached an error that gets logged: {res:?}");
+    let token = "supersecrettoken";
+    let cache = new_cache();
+    // Seeded under the store's OWN token: the id key is account-scoped, so seeding it under any other
+    // name leaves the account holding nothing and the request is never made.
+    cache.put(&torrent_id_key(token, H), "42", resolve_cache_ttl());
+    let reached = Arc::new(AtomicBool::new(false));
+    let r = reached.clone();
+    let s = tb(
+        token,
+        doer(move |req| {
+            if req.url().path().contains("requestdl") {
+                r.store(true, Ordering::SeqCst);
+                return Ok(resp(400, &format!("Bad Request on {}", req.url())));
+            }
+            Ok(resp(200, r#"{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
+        }),
+        Some(cache),
+    );
+    let res = s.resolve(&ResolveTarget { file_idx: intp(0), no_add: true, ..tgt(H) }).await;
+    assert!(reached.load(Ordering::SeqCst), "requestdl was never called, so this asserts nothing");
+    let msg = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(res.is_err() && !msg.contains(token), "the token reached an error that gets logged: {res:?}");
 }
 
 /// An empty needle would splice the replacement between every character, turning a short error from an
@@ -2183,38 +2253,45 @@ fn redact_token_an_empty_token_leaves_text_alone() {
 /// that fixes it is that mylist ANSWERING "no such torrent" is not the same as mylist not answering.
 #[tokio::test]
 async fn tor_box_a_deleted_pack_is_re_bought_for_a_series_too() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let gone = Arc::new(AtomicBool::new(true));
-        let adds = Arc::new(AtomicUsize::new(0));
-        let (g, a) = (gone.clone(), adds.clone());
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                a.fetch_add(1, Ordering::SeqCst);
-                g.store(false, Ordering::SeqCst); // re-bought: the account has it again
-                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+    let gone = Arc::new(AtomicBool::new(true));
+    let adds = Arc::new(AtomicUsize::new(0));
+    let (g, a) = (gone.clone(), adds.clone());
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            g.store(false, Ordering::SeqCst); // re-bought: the account has it again
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+        }
+        if req.url().path().contains("mylist") {
+            if g.load(Ordering::SeqCst) {
+                // TorBox's own words for an id it no longer holds — a 200, not an error.
+                return Ok(resp(200, r#"{"success":false,"data":null}"#));
             }
-            if req.url().path().contains("mylist") {
-                if g.load(Ordering::SeqCst) {
-                    // TorBox's own words for an id it no longer holds — a 200, not an error.
-                    return Ok(resp(200, r#"{"success":false,"data":null}"#));
-                }
-                return Ok(resp(
-                    200,
-                    r#"{"data":{"files":[{"id":0,"name":"Show.S01E01.mkv","size":900},{"id":1,"name":"Show.S01E02.mkv","size":950}]}}"#,
-                ));
-            }
-            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-        });
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl()); // a stale id from before the deletion
-        let s = tb("tok", d, Some(cache.clone()));
+            return Ok(resp(
+                200,
+                r#"{"data":{"files":[{"id":0,"name":"Show.S01E01.mkv","size":900},{"id":1,"name":"Show.S01E02.mkv","size":950}]}}"#,
+            ));
+        }
+        Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+    });
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl()); // a stale id from before the deletion
+    let s = tb("tok", d, Some(cache.clone()));
 
-        let link = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
-        assert!(matches!(&link, Ok(l) if !l.is_empty()), "a deleted pack must be re-bought, not answered unavailable forever: {link:?}");
-        let n = adds.load(Ordering::SeqCst);
-        assert_eq!(n, 1, "made {n} adds; the stale id should have been forgotten and the pack re-added");
-        assert_ne!(cache.get(&torrent_id_key("tok", H)).as_deref(), Some("42"), "the stale id survived, and every later poll would keep it alive for another six hours");
+    let link = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
+    assert!(
+        matches!(&link, Ok(l) if !l.is_empty()),
+        "a deleted pack must be re-bought, not answered unavailable forever: {link:?}"
+    );
+    let n = adds.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "made {n} adds; the stale id should have been forgotten and the pack re-added");
+    assert_ne!(
+        cache.get(&torrent_id_key("tok", H)).as_deref(),
+        Some("42"),
+        "the stale id survived, and every later poll would keep it alive for another six hours"
+    );
 }
 
 /// The two answers must stay apart in the other direction too: a mylist that does not answer is NOT
@@ -2222,31 +2299,38 @@ async fn tor_box_a_deleted_pack_is_re_bought_for_a_series_too() {
 /// and Status loses the id it needs to report the download in progress.
 #[tokio::test]
 async fn tor_box_a_blip_listing_files_does_not_re_buy_the_pack() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let adds = Arc::new(AtomicUsize::new(0));
-        let a = adds.clone();
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                a.fetch_add(1, Ordering::SeqCst);
-                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
-            }
-            if req.url().path().contains("mylist") {
-                return Ok(resp(500, "{}"));
-            }
-            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-        });
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let s = tb("tok", d, Some(cache.clone()));
-
-        for i in 0..10 {
-            let link = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
-            assert!(!matches!(&link, Ok(l) if !l.is_empty()), "poll {i} served without ever seeing the pack's file names: {link:?}");
+    let adds = Arc::new(AtomicUsize::new(0));
+    let a = adds.clone();
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
         }
-        let n = adds.load(Ordering::SeqCst);
-        assert_eq!(n, 0, "made {n} adds; a blip listing files says nothing about what the account holds");
-        assert_eq!(cache.get(&torrent_id_key("tok", H)).as_deref(), Some("42"), "the id was dropped on a blip, so Status can no longer report the download");
+        if req.url().path().contains("mylist") {
+            return Ok(resp(500, "{}"));
+        }
+        Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+    });
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let s = tb("tok", d, Some(cache.clone()));
+
+    for i in 0..10 {
+        let link = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
+        assert!(
+            !matches!(&link, Ok(l) if !l.is_empty()),
+            "poll {i} served without ever seeing the pack's file names: {link:?}"
+        );
+    }
+    let n = adds.load(Ordering::SeqCst);
+    assert_eq!(n, 0, "made {n} adds; a blip listing files says nothing about what the account holds");
+    assert_eq!(
+        cache.get(&torrent_id_key("tok", H)).as_deref(),
+        Some("42"),
+        "the id was dropped on a blip, so Status can no longer report the download"
+    );
 }
 
 /// Premiumize's error text is not merely logged: the refused branch PERSISTS it into the refusal cache,
@@ -2284,41 +2368,51 @@ async fn premiumize_the_services_words_cannot_carry_the_token() {
 /// on every poll and never re-added, wedging the series path at a permanent 503 while movies healed.
 #[tokio::test]
 async fn tor_box_an_empty_listing_is_the_account_answering() {
-        // A BARE top-level `[]` is deliberately absent: it is not the documented envelope at all, so it stays
-        // "no answer" rather than being read as a claim about what the account holds.
-        for payload in [r#"{"data":[]}"#, r#"{"success":false,"data":null}"#] {
-            let _budget = install_budget(HOUR, 50);
+    // A BARE top-level `[]` is deliberately absent: it is not the documented envelope at all, so it stays
+    // "no answer" rather than being read as a claim about what the account holds.
+    for payload in [r#"{"data":[]}"#, r#"{"success":false,"data":null}"#] {
+        let _budget = install_budget(HOUR, 50);
 
-            let gone = Arc::new(AtomicBool::new(true));
-            let adds = Arc::new(AtomicUsize::new(0));
-            let (g, a) = (gone.clone(), adds.clone());
-            let d = doer(move |req| {
-                if is_add_endpoint(&req) {
-                    a.fetch_add(1, Ordering::SeqCst);
-                    g.store(false, Ordering::SeqCst);
-                    return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+        let gone = Arc::new(AtomicBool::new(true));
+        let adds = Arc::new(AtomicUsize::new(0));
+        let (g, a) = (gone.clone(), adds.clone());
+        let d = doer(move |req| {
+            if is_add_endpoint(&req) {
+                a.fetch_add(1, Ordering::SeqCst);
+                g.store(false, Ordering::SeqCst);
+                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+            }
+            if req.url().path().contains("mylist") {
+                if g.load(Ordering::SeqCst) {
+                    return Ok(resp(200, payload));
                 }
-                if req.url().path().contains("mylist") {
-                    if g.load(Ordering::SeqCst) {
-                        return Ok(resp(200, payload));
-                    }
-                    return Ok(resp(
-                        200,
-                        r#"{"data":[{"files":[{"id":0,"name":"Show.S01E01.mkv","size":900},{"id":1,"name":"Show.S01E02.mkv","size":950}]}]}"#,
-                    ));
-                }
-                Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-            });
-            let cache = new_cache();
-            cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-            let s = tb("tok", d, Some(cache.clone()));
+                return Ok(resp(
+                    200,
+                    r#"{"data":[{"files":[{"id":0,"name":"Show.S01E01.mkv","size":900},{"id":1,"name":"Show.S01E02.mkv","size":950}]}]}"#,
+                ));
+            }
+            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+        });
+        let cache = new_cache();
+        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+        let s = tb("tok", d, Some(cache.clone()));
 
-            let link = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
-            assert!(matches!(&link, Ok(l) if !l.is_empty()), "{payload}: a pack the account no longer holds must be re-bought: {link:?}");
-            let n = adds.load(Ordering::SeqCst);
-            assert_eq!(n, 1, "{payload}: made {n} adds; the stale id should have been forgotten once and the pack re-added");
-            assert_ne!(cache.get(&torrent_id_key("tok", H)).as_deref(), Some("42"), "{payload}: the stale id survived");
-        }
+        let link = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
+        assert!(
+            matches!(&link, Ok(l) if !l.is_empty()),
+            "{payload}: a pack the account no longer holds must be re-bought: {link:?}"
+        );
+        let n = adds.load(Ordering::SeqCst);
+        assert_eq!(
+            n, 1,
+            "{payload}: made {n} adds; the stale id should have been forgotten once and the pack re-added"
+        );
+        assert_ne!(
+            cache.get(&torrent_id_key("tok", H)).as_deref(),
+            Some("42"),
+            "{payload}: the stale id survived"
+        );
+    }
 }
 
 /// A torrent createtorrent returned seconds ago, which mylist then denies, is TorBox disagreeing with
@@ -2327,35 +2421,35 @@ async fn tor_box_an_empty_listing_is_the_account_answering() {
 /// bounded by nothing but the hourly allowance.
 #[tokio::test]
 async fn tor_box_a_torrent_denied_right_after_buying_it_is_not_re_bought() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let adds = Arc::new(AtomicUsize::new(0));
-        let a = adds.clone();
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                a.fetch_add(1, Ordering::SeqCst);
-                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
-            }
-            if req.url().path().contains("mylist") {
-                return Ok(resp(200, r#"{"success":false,"data":null}"#));
-            }
-            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-        });
-        let cache = new_cache();
-        let s = tb("tok", d, Some(cache));
-
-        let target = ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) };
-        // The first poll's answer is the one the viewer acts on: a dead link, so the client moves to another
-        // release rather than sitting on a service error for one that may be fine elsewhere.
-        let first = s.resolve(&target).await;
-        assert!(is_dead_link(&first), "got {first:?}, want a dead link the client can move past");
-        // The polls behind it are what the backoff is for: they cost nothing, where before each bought the
-        // same torrent again.
-        for _ in 0..9 {
-            let _ = s.resolve(&target).await;
+    let adds = Arc::new(AtomicUsize::new(0));
+    let a = adds.clone();
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
         }
-        let n = adds.load(Ordering::SeqCst);
-        assert!(n <= 1, "made {n} adds; a store contradicting itself must not be paid once per poll");
+        if req.url().path().contains("mylist") {
+            return Ok(resp(200, r#"{"success":false,"data":null}"#));
+        }
+        Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+    });
+    let cache = new_cache();
+    let s = tb("tok", d, Some(cache));
+
+    let target = ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) };
+    // The first poll's answer is the one the viewer acts on: a dead link, so the client moves to another
+    // release rather than sitting on a service error for one that may be fine elsewhere.
+    let first = s.resolve(&target).await;
+    assert!(is_dead_link(&first), "got {first:?}, want a dead link the client can move past");
+    // The polls behind it are what the backoff is for: they cost nothing, where before each bought the
+    // same torrent again.
+    for _ in 0..9 {
+        let _ = s.resolve(&target).await;
+    }
+    let n = adds.load(Ordering::SeqCst);
+    assert!(n <= 1, "made {n} adds; a store contradicting itself must not be paid once per poll");
 }
 
 /// Real-Debrid needs the same bound TorBox's just-added path got, and for a worse loop: `gone` about a
@@ -2405,27 +2499,31 @@ async fn real_debrid_a_torrent_denied_right_after_buying_it_is_not_re_bought() {
 /// release that is simply not ready yet.
 #[tokio::test]
 async fn tor_box_the_contradiction_backoff_does_not_fire_on_an_ordinary_wait() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
-            }
-            if req.url().path().contains("mylist") {
-                // Queued: the entry exists, its files have not resolved yet.
-                return Ok(resp(200, r#"{"data":{"files":[]}}"#));
-            }
-            Ok(resp(200, r#"{"success":false}"#)) // no link yet — still downloading
-        });
-        let cache = new_cache();
-        let s = tb("tok", d, Some(cache.clone()));
-
-        let _ = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
-        if let Some(reason) = backed_off(&*cache, TorBox, "tok", H) {
-            panic!("a torrent that is merely still fetching was backed off: {reason}");
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
         }
-        // And the id is kept, so Status can report the download rather than the release reading as dead.
-        assert_eq!(cache.get(&torrent_id_key("tok", H)).as_deref(), Some("77"), "a queued fetch lost the id Status needs");
+        if req.url().path().contains("mylist") {
+            // Queued: the entry exists, its files have not resolved yet.
+            return Ok(resp(200, r#"{"data":{"files":[]}}"#));
+        }
+        Ok(resp(200, r#"{"success":false}"#)) // no link yet — still downloading
+    });
+    let cache = new_cache();
+    let s = tb("tok", d, Some(cache.clone()));
+
+    let _ = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
+    if let Some(reason) = backed_off(&*cache, TorBox, "tok", H) {
+        panic!("a torrent that is merely still fetching was backed off: {reason}");
+    }
+    // And the id is kept, so Status can report the download rather than the release reading as dead.
+    assert_eq!(
+        cache.get(&torrent_id_key("tok", H)).as_deref(),
+        Some("77"),
+        "a queued fetch lost the id Status needs"
+    );
 }
 
 /// mylist is queried by id, so an answer carrying several entries must be matched to the one asked for.
@@ -2433,43 +2531,60 @@ async fn tor_box_the_contradiction_backoff_does_not_fire_on_an_ordinary_wait() {
 /// route the name-match cannot catch, since the names it matches would be the other torrent's.
 #[tokio::test]
 async fn tor_box_list_files_matches_the_entry_to_the_id_asked_for() {
-        let body = r#"{"data":[{"id":9,"files":[{"id":0,"name":"OTHER.S09E09.mkv","size":10}]},{"id":42,"files":[{"id":7,"name":"Show.S01E02.mkv","size":900}]}]}"#;
-        let s = tb("tok", doer(move |_| Ok(resp(200, body))), None);
-        let files = s.list_files(42).await.expect("unexpected error");
-        assert!(files.len() == 1 && files[0].name == "Show.S01E02.mkv", "got {files:?} — another torrent's files were used to pick ours");
-        // And when no entry matches, that is not our torrent's file list either: refuse rather than guess.
-        let s = tb("tok", doer(move |_| Ok(resp(200, body))), None);
-        let err = s.list_files(5).await.expect_err("the answer describes other torrents");
-        assert_eq!(err, err_no_file_list(), "got {err:?}, want errNoFileList when the answer describes other torrents");
+    let body = r#"{"data":[{"id":9,"files":[{"id":0,"name":"OTHER.S09E09.mkv","size":10}]},{"id":42,"files":[{"id":7,"name":"Show.S01E02.mkv","size":900}]}]}"#;
+    let s = tb("tok", doer(move |_| Ok(resp(200, body))), None);
+    let files = s.list_files(42).await.expect("unexpected error");
+    assert!(
+        files.len() == 1 && files[0].name == "Show.S01E02.mkv",
+        "got {files:?} — another torrent's files were used to pick ours"
+    );
+    // And when no entry matches, that is not our torrent's file list either: refuse rather than guess.
+    let s = tb("tok", doer(move |_| Ok(resp(200, body))), None);
+    let err = s.list_files(5).await.expect_err("the answer describes other torrents");
+    assert_eq!(
+        err,
+        err_no_file_list(),
+        "got {err:?}, want errNoFileList when the answer describes other torrents"
+    );
 }
 
 /// Two classifications on mylist that the three-way split got wrong in opposite directions.
 #[tokio::test]
 async fn tor_box_list_files_classifies_the_remaining_shapes() {
-        // A rejected key found HERE must be able to raise the account-wide backoff. errNoFileList carries
-        // Status 0, so routing a 401 to it left the dead key undiscoverable on this endpoint.
-        let cache = new_cache();
-        let s = tb("tok", doer(|_| Ok(resp(401, "{}"))), Some(cache.clone()));
-        let err = s.list_files(42).await.expect_err("a 401 must be a refusal");
-        let u = match &err {
-            StoreError::Unavailable(u) if u.status == 401 => u.clone(),
-            other => panic!("got {other:?}, want a refusal carrying its status"),
-        };
-        record_refusal(&*cache, TorBox, "tok", H, &StoreError::Unavailable(u));
-        assert!(account_backed_off(&*cache, TorBox, "tok").is_some(), "a key TorBox rejected on mylist never reaches the account backoff");
+    // A rejected key found HERE must be able to raise the account-wide backoff. errNoFileList carries
+    // Status 0, so routing a 401 to it left the dead key undiscoverable on this endpoint.
+    let cache = new_cache();
+    let s = tb("tok", doer(|_| Ok(resp(401, "{}"))), Some(cache.clone()));
+    let err = s.list_files(42).await.expect_err("a 401 must be a refusal");
+    let u = match &err {
+        StoreError::Unavailable(u) if u.status == 401 => u.clone(),
+        other => panic!("got {other:?}, want a refusal carrying its status"),
+    };
+    record_refusal(&*cache, TorBox, "tok", H, &StoreError::Unavailable(u));
+    assert!(
+        account_backed_off(&*cache, TorBox, "tok").is_some(),
+        "a key TorBox rejected on mylist never reaches the account backoff"
+    );
 
-        // A body with no `data` key at all is not TorBox's envelope — a proxy page that happens to be valid
-        // JSON, say. Silence, not a claim about the account; read as `gone` it paid an add to re-buy a
-        // torrent nobody said was missing.
-        let s = tb("tok", doer(|_| Ok(resp(200, "{}"))), None);
-        let err = s.list_files(42).await.expect_err("a body without data is silence");
-        assert_eq!(err, err_no_file_list(), "got {err:?}, want errNoFileList for a body that is not the envelope");
-        // The two shapes that DO say it still must.
-        for payload in [r#"{"success":false,"data":null}"#, r#"{"data":null}"#] {
-            let s = tb("tok", doer(move |_| Ok(resp(200, payload))), None);
-            let err = s.list_files(42).await.expect_err("the listing says the torrent is gone");
-            assert!(is_dead_reason(&Err::<(), _>(err.clone()), ERR_TORRENT_GONE), "{payload}: got {err:?}, want errTorrentGone");
-        }
+    // A body with no `data` key at all is not TorBox's envelope — a proxy page that happens to be valid
+    // JSON, say. Silence, not a claim about the account; read as `gone` it paid an add to re-buy a
+    // torrent nobody said was missing.
+    let s = tb("tok", doer(|_| Ok(resp(200, "{}"))), None);
+    let err = s.list_files(42).await.expect_err("a body without data is silence");
+    assert_eq!(
+        err,
+        err_no_file_list(),
+        "got {err:?}, want errNoFileList for a body that is not the envelope"
+    );
+    // The two shapes that DO say it still must.
+    for payload in [r#"{"success":false,"data":null}"#, r#"{"data":null}"#] {
+        let s = tb("tok", doer(move |_| Ok(resp(200, payload))), None);
+        let err = s.list_files(42).await.expect_err("the listing says the torrent is gone");
+        assert!(
+            is_dead_reason(&Err::<(), _>(err.clone()), ERR_TORRENT_GONE),
+            "{payload}: got {err:?}, want errTorrentGone"
+        );
+    }
 }
 
 /// The same invariant on all three stores: when the service ANSWERS and creates nothing, the charge taken
@@ -2481,8 +2596,10 @@ async fn tor_box_list_files_classifies_the_remaining_shapes() {
 #[tokio::test]
 async fn real_debrid_an_answered_failure_is_not_a_charge() {
     // (name, body, status)
-    let cases: [(&str, &'static str, u16); 2] =
-        [("a rejected magnet", r#"{"error":"bad magnet","error_code":11}"#, 400), ("a 2xx with no id", r#"{"ok":true}"#, 200)];
+    let cases: [(&str, &'static str, u16); 2] = [
+        ("a rejected magnet", r#"{"error":"bad magnet","error_code":11}"#, 400),
+        ("a 2xx with no id", r#"{"ok":true}"#, 200),
+    ];
     for (name, body, status) in cases {
         let _budget = install_budget(HOUR, 50);
 
@@ -2520,14 +2637,20 @@ async fn real_debrid_an_answered_failure_is_not_a_charge() {
                     return Ok(resp(200, r#"{"download":"https://rd/ok"}"#));
                 }
                 if path.contains("/torrents/info/") {
-                    return Ok(resp(200, r#"{"files":[{"id":1,"path":"m.mkv","bytes":9,"selected":1}],"links":["l1"]}"#));
+                    return Ok(resp(
+                        200,
+                        r#"{"files":[{"id":1,"path":"m.mkv","bytes":9,"selected":1}],"links":["l1"]}"#,
+                    ));
                 }
                 Ok(resp(200, "{}"))
             }),
             Some(cache),
         );
         let other = healthy.resolve(&tgt(&repeat("b", 40))).await;
-        assert!(other.is_ok(), "{name}: a healthy release answered {other:?} — scout refused what RD would have served");
+        assert!(
+            other.is_ok(),
+            "{name}: a healthy release answered {other:?} — scout refused what RD would have served"
+        );
     }
 }
 
@@ -2554,22 +2677,25 @@ async fn real_debrid_the_add_keeps_the_services_own_words() {
 /// classification died one line after it was made.
 #[tokio::test]
 async fn tor_box_a_rejected_key_on_mylist_reaches_the_account_backoff() {
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|req| {
-                if req.url().path().contains("mylist") {
-                    return Ok(resp(401, r#"{"error":"BAD_TOKEN"}"#));
-                }
-                Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-            }),
-            Some(cache.clone()),
-        );
-        let res = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
-        let status = unavailable(&res).map(|u| u.status);
-        assert_eq!(status, Some(401), "got {res:?}, want the refusal carrying its status");
-        assert!(account_backed_off(&*cache, TorBox, "tok").is_some(), "the dead key was never recorded, so every later request asks with it again");
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|req| {
+            if req.url().path().contains("mylist") {
+                return Ok(resp(401, r#"{"error":"BAD_TOKEN"}"#));
+            }
+            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+        }),
+        Some(cache.clone()),
+    );
+    let res = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
+    let status = unavailable(&res).map(|u| u.status);
+    assert_eq!(status, Some(401), "got {res:?}, want the refusal carrying its status");
+    assert!(
+        account_backed_off(&*cache, TorBox, "tok").is_some(),
+        "the dead key was never recorded, so every later request asks with it again"
+    );
 }
 
 /// A body that could not be READ is not an answer that nothing was created. RD had already sent its
@@ -2579,54 +2705,61 @@ async fn tor_box_a_rejected_key_on_mylist_reaches_the_account_backoff() {
 /// the budget was the only bound: sixty polls created sixty torrents with the allowance untouched.
 #[tokio::test]
 async fn real_debrid_an_unreadable_answer_is_not_proof_nothing_was_created() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let created = Arc::new(AtomicUsize::new(0));
-        let c = created.clone();
-        let d = doer(move |req| {
-            if req.url().path().contains("addMagnet") {
-                c.fetch_add(1, Ordering::SeqCst);
-                // Answered 201 — the torrent exists — then the body dies mid-flight.
-                return Ok(broken_body_response(201, "unexpected EOF mid-body"));
-            }
-            Ok(resp(200, "{}"))
-        });
-        let s = rd("tok", d, Some(new_cache()));
-        for _ in 0..60 {
-            let _ = s.resolve(&tgt(H)).await;
+    let created = Arc::new(AtomicUsize::new(0));
+    let c = created.clone();
+    let d = doer(move |req| {
+        if req.url().path().contains("addMagnet") {
+            c.fetch_add(1, Ordering::SeqCst);
+            // Answered 201 — the torrent exists — then the body dies mid-flight.
+            return Ok(broken_body_response(201, "unexpected EOF mid-body"));
         }
-        let n = created.load(Ordering::SeqCst);
-        assert!(n <= 1, "created {n} torrents on the account across 60 polls");
-        // The charge stays: the outcome is unknown, and that is precisely when assuming nothing happened is
-        // the expensive assumption.
-        let left = global_add_budget().remaining(&budget_account(RealDebrid, "tok"));
-        assert_eq!(left, 49, "allowance {left} — an add whose outcome is unknown was treated as one that never happened");
+        Ok(resp(200, "{}"))
+    });
+    let s = rd("tok", d, Some(new_cache()));
+    for _ in 0..60 {
+        let _ = s.resolve(&tgt(H)).await;
+    }
+    let n = created.load(Ordering::SeqCst);
+    assert!(n <= 1, "created {n} torrents on the account across 60 polls");
+    // The charge stays: the outcome is unknown, and that is precisely when assuming nothing happened is
+    // the expensive assumption.
+    let left = global_add_budget().remaining(&budget_account(RealDebrid, "tok"));
+    assert_eq!(
+        left, 49,
+        "allowance {left} — an add whose outcome is unknown was treated as one that never happened"
+    );
 }
 
 /// The rejected-key return must not drop the torrent id it was just handed: Status needs it to report a
 /// download in progress, and without it the next poll knows of no torrent and buys another.
 #[tokio::test]
 async fn tor_box_the_rejected_key_return_keeps_the_torrent_id() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let adds = Arc::new(AtomicUsize::new(0));
-        let a = adds.clone();
-        let d = doer(move |req| {
-            if is_add_endpoint(&req) {
-                a.fetch_add(1, Ordering::SeqCst);
-                return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
-            }
-            if req.url().path().contains("mylist") {
-                return Ok(resp(403, r#"{"error":"BAD_TOKEN"}"#));
-            }
-            Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
-        });
-        let cache = new_cache();
-        let s = tb("tok", d, Some(cache.clone()));
-        let _ = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
-        assert_eq!(cache.get(&torrent_id_key("tok", H)).as_deref(), Some("77"), "the id createtorrent just handed us was dropped");
-        let n = adds.load(Ordering::SeqCst);
-        assert_eq!(n, 1, "made {n} adds");
+    let adds = Arc::new(AtomicUsize::new(0));
+    let a = adds.clone();
+    let d = doer(move |req| {
+        if is_add_endpoint(&req) {
+            a.fetch_add(1, Ordering::SeqCst);
+            return Ok(resp(200, r#"{"data":{"torrent_id":77}}"#));
+        }
+        if req.url().path().contains("mylist") {
+            return Ok(resp(403, r#"{"error":"BAD_TOKEN"}"#));
+        }
+        Ok(resp(200, r#"{"success":true,"data":"https://cdn/x"}"#))
+    });
+    let cache = new_cache();
+    let s = tb("tok", d, Some(cache.clone()));
+    let _ = s.resolve(&ResolveTarget { season: intp(1), episode: intp(2), ..tgt(H) }).await;
+    assert_eq!(
+        cache.get(&torrent_id_key("tok", H)).as_deref(),
+        Some("77"),
+        "the id createtorrent just handed us was dropped"
+    );
+    let n = adds.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "made {n} adds");
 }
 
 /// The same bound on Premiumize's answered-failure branch: refunding the charge fixed the quota but left
@@ -2668,43 +2801,43 @@ async fn premiumize_an_answered_failure_is_asked_only_once() {
 /// is exactly how it shipped.
 #[tokio::test]
 async fn stores_a_cancelled_add_body_is_not_a_refusal() {
-        // (name, service, add path, body that the store then reads)
-        let cases: [(&str, DebridService, &'static str, &'static str); 3] = [
-            ("realdebrid", RealDebrid, "addMagnet", r#"{"id":"t1"}"#),
-            ("torbox", TorBox, "createtorrent", r#"{"data":{"torrent_id":7}}"#),
-            ("premiumize", Premiumize, "directdl", r#"{"status":"success","content":[]}"#),
-        ];
-        for (name, svc, path, head) in cases {
-            let _budget = install_budget(HOUR, 50);
+    // (name, service, add path, body that the store then reads)
+    let cases: [(&str, DebridService, &'static str, &'static str); 3] = [
+        ("realdebrid", RealDebrid, "addMagnet", r#"{"id":"t1"}"#),
+        ("torbox", TorBox, "createtorrent", r#"{"data":{"torrent_id":7}}"#),
+        ("premiumize", Premiumize, "directdl", r#"{"status":"success","content":[]}"#),
+    ];
+    for (name, svc, path, head) in cases {
+        let _budget = install_budget(HOUR, 50);
 
-            let cache = new_cache();
-            let adds = Arc::new(AtomicUsize::new(0));
-            let a = adds.clone();
-            let d = doer(move |req| {
-                if req.url().path().contains(path) {
-                    a.fetch_add(1, Ordering::SeqCst);
-                    // The add was accepted; the body then dies because the viewer moved on.
-                    return Ok(cancelled_body_response(200, "context canceled"));
-                }
-                Ok(resp(200, head))
-            });
-            let store = build_for(name, d, cache.clone());
-            for _ in 0..30 {
-                let _ = store.resolve(&tgt(H)).await;
+        let cache = new_cache();
+        let adds = Arc::new(AtomicUsize::new(0));
+        let a = adds.clone();
+        let d = doer(move |req| {
+            if req.url().path().contains(path) {
+                a.fetch_add(1, Ordering::SeqCst);
+                // The add was accepted; the body then dies because the viewer moved on.
+                return Ok(cancelled_body_response(200, "context canceled"));
             }
-            // Three properties, because "not filed as a refusal" alone is a PROXY: both the TorBox and
-            // the Premiumize bug this test was written for passed that assertion while re-sending the add
-            // on every poll. What matters is that a cancelled poll cannot cost an add and cannot loop.
-            if let Some(reason) = backed_off(&*cache, svc, "tok", H) {
-                panic!("{name}: a cancelled poll was filed as {svc:?} refusing: {reason}");
-            }
-            let n = adds.load(Ordering::SeqCst);
-            assert!(n <= 1, "{name}: sent the add {n} times across 30 polls — the marker that says one is in flight was cleared before the body was read");
-            // The charge stays exactly once: the add was written to the wire, and refunding it is what
-            // removed the only bound the loop had.
-            let left = global_add_budget().remaining(&budget_account(svc, "tok"));
-            assert_eq!(left, 49, "{name}: allowance {left}, want 49");
+            Ok(resp(200, head))
+        });
+        let store = build_for(name, d, cache.clone());
+        for _ in 0..30 {
+            let _ = store.resolve(&tgt(H)).await;
         }
+        // Three properties, because "not filed as a refusal" alone is a PROXY: both the TorBox and
+        // the Premiumize bug this test was written for passed that assertion while re-sending the add
+        // on every poll. What matters is that a cancelled poll cannot cost an add and cannot loop.
+        if let Some(reason) = backed_off(&*cache, svc, "tok", H) {
+            panic!("{name}: a cancelled poll was filed as {svc:?} refusing: {reason}");
+        }
+        let n = adds.load(Ordering::SeqCst);
+        assert!(n <= 1, "{name}: sent the add {n} times across 30 polls — the marker that says one is in flight was cleared before the body was read");
+        // The charge stays exactly once: the add was written to the wire, and refunding it is what
+        // removed the only bound the loop had.
+        let left = global_add_budget().remaining(&budget_account(svc, "tok"));
+        assert_eq!(left, 49, "{name}: allowance {left}, want 49");
+    }
 }
 
 /// An add whose answer never arrived is what the in-flight marker is for. It must survive, so the next
@@ -2712,32 +2845,35 @@ async fn stores_a_cancelled_add_body_is_not_a_refusal() {
 /// buying the torrent again or blaming the store.
 #[tokio::test]
 async fn real_debrid_an_unread_answer_leaves_the_add_in_flight() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let created = Arc::new(AtomicUsize::new(0));
-        let c = created.clone();
-        let d = doer(move |req| {
-            if req.url().path().contains("addMagnet") {
-                c.fetch_add(1, Ordering::SeqCst);
-                return Ok(broken_body_response(201, "unexpected EOF mid-body"));
-            }
-            Ok(resp(200, "{}"))
-        });
-        let cache = new_cache();
-        let s = rd("tok", d, Some(cache.clone()));
-
-        let first = s.resolve(&tgt(H)).await;
-        assert!(matches!(&first, Err(StoreError::AddInFlight)), "got {first:?}, want the add reported as still in flight");
-        for _ in 0..60 {
-            let _ = s.resolve(&tgt(H)).await;
+    let created = Arc::new(AtomicUsize::new(0));
+    let c = created.clone();
+    let d = doer(move |req| {
+        if req.url().path().contains("addMagnet") {
+            c.fetch_add(1, Ordering::SeqCst);
+            return Ok(broken_body_response(201, "unexpected EOF mid-body"));
         }
-        let n = created.load(Ordering::SeqCst);
-        assert!(n <= 1, "created {n} torrents on the account across 61 polls");
-        // The charge stays: the add was written to the wire, and assuming otherwise is the expensive guess.
-        let left = global_add_budget().remaining(&budget_account(RealDebrid, "tok"));
-        assert_eq!(left, 49, "allowance {left} — an add that went out was treated as one that never happened");
-        // And it is not a refusal, so no store gets blamed for a body scout could not read.
-        assert!(backed_off(&*cache, RealDebrid, "tok", H).is_none(), "filed as RD refusing");
+        Ok(resp(200, "{}"))
+    });
+    let cache = new_cache();
+    let s = rd("tok", d, Some(cache.clone()));
+
+    let first = s.resolve(&tgt(H)).await;
+    assert!(
+        matches!(&first, Err(StoreError::AddInFlight)),
+        "got {first:?}, want the add reported as still in flight"
+    );
+    for _ in 0..60 {
+        let _ = s.resolve(&tgt(H)).await;
+    }
+    let n = created.load(Ordering::SeqCst);
+    assert!(n <= 1, "created {n} torrents on the account across 61 polls");
+    // The charge stays: the add was written to the wire, and assuming otherwise is the expensive guess.
+    let left = global_add_budget().remaining(&budget_account(RealDebrid, "tok"));
+    assert_eq!(left, 49, "allowance {left} — an add that went out was treated as one that never happened");
+    // And it is not a refusal, so no store gets blamed for a body scout could not read.
+    assert!(backed_off(&*cache, RealDebrid, "tok", H).is_none(), "filed as RD refusing");
 }
 
 /// TorBox's createtorrent detail is persisted into the refusal cache, which writes through to disk — so
@@ -2746,27 +2882,32 @@ async fn real_debrid_an_unread_answer_leaves_the_add_in_flight() {
 /// rule, which is reason enough.
 #[tokio::test]
 async fn tor_box_the_add_detail_cannot_carry_the_token() {
-        let _budget = install_budget(HOUR, 50);
+    let _budget = install_budget(HOUR, 50);
 
-        let token = "torboxsecrettoken";
-        let cache = new_cache();
-        let s = tb(
-            token,
-            doer(|req| {
-                if is_add_endpoint(&req) {
-                    let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-                    return Ok(resp(403, &format!(r#"{{"error":"rejected for {auth}"}}"#)));
-                }
-                Ok(resp(200, "{}"))
-            }),
-            Some(cache.clone()),
-        );
-        let res = s.resolve(&tgt(H)).await;
-        let msg = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(res.is_err() && !msg.contains(token), "the token reached an error that gets logged: {res:?}");
-        if let Some(reason) = backed_off(&*cache, TorBox, token, H) {
-            assert!(!reason.contains(token), "the token was persisted into the refusal cache: {reason}");
-        }
+    let token = "torboxsecrettoken";
+    let cache = new_cache();
+    let s = tb(
+        token,
+        doer(|req| {
+            if is_add_endpoint(&req) {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                return Ok(resp(403, &format!(r#"{{"error":"rejected for {auth}"}}"#)));
+            }
+            Ok(resp(200, "{}"))
+        }),
+        Some(cache.clone()),
+    );
+    let res = s.resolve(&tgt(H)).await;
+    let msg = res.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(res.is_err() && !msg.contains(token), "the token reached an error that gets logged: {res:?}");
+    if let Some(reason) = backed_off(&*cache, TorBox, token, H) {
+        assert!(!reason.contains(token), "the token was persisted into the refusal cache: {reason}");
+    }
 }
 
 /// The other side of moving the settle after the body read: an add that DID complete must still clear the
@@ -2774,46 +2915,53 @@ async fn tor_box_the_add_detail_cannot_carry_the_token() {
 /// perfectly well — 202 downloading forever, with no add ever sent again to heal it.
 #[tokio::test]
 async fn stores_a_completed_add_clears_the_in_flight_marker() {
-        for (name, svc, make) in [
-            ("realdebrid", RealDebrid, 0usize),
-            ("torbox", TorBox, 1),
-            ("premiumize", Premiumize, 2),
-        ] {
-            let _budget = install_budget(HOUR, 50);
+    for (name, svc, make) in
+        [("realdebrid", RealDebrid, 0usize), ("torbox", TorBox, 1), ("premiumize", Premiumize, 2)]
+    {
+        let _budget = install_budget(HOUR, 50);
 
-            let cache = new_cache();
-            let d = doer(move |req| {
-                let path = req.url().path();
-                Ok(match make {
-                    0 => {
-                        if path.contains("addMagnet") {
-                            resp(201, r#"{"id":"t1"}"#)
-                        } else if path.contains("unrestrict") {
-                            resp(200, r#"{"download":"https://rd/ok"}"#)
-                        } else if path.contains("/torrents/info/") {
-                            resp(200, r#"{"files":[{"id":1,"path":"m.mkv","bytes":9,"selected":1}],"links":["l1"]}"#)
-                        } else {
-                            resp(200, "{}")
-                        }
+        let cache = new_cache();
+        let d = doer(move |req| {
+            let path = req.url().path();
+            Ok(match make {
+                0 => {
+                    if path.contains("addMagnet") {
+                        resp(201, r#"{"id":"t1"}"#)
+                    } else if path.contains("unrestrict") {
+                        resp(200, r#"{"download":"https://rd/ok"}"#)
+                    } else if path.contains("/torrents/info/") {
+                        resp(
+                            200,
+                            r#"{"files":[{"id":1,"path":"m.mkv","bytes":9,"selected":1}],"links":["l1"]}"#,
+                        )
+                    } else {
+                        resp(200, "{}")
                     }
-                    1 => {
-                        if is_add_endpoint(&req) {
-                            resp(200, r#"{"data":{"torrent_id":7}}"#)
-                        } else {
-                            resp(200, r#"{"success":true,"data":"https://cdn/x"}"#)
-                        }
+                }
+                1 => {
+                    if is_add_endpoint(&req) {
+                        resp(200, r#"{"data":{"torrent_id":7}}"#)
+                    } else {
+                        resp(200, r#"{"success":true,"data":"https://cdn/x"}"#)
                     }
-                    _ => resp(200, r#"{"status":"success","content":[{"path":"m.mkv","link":"https://pm/ok"}]}"#),
-                })
-            });
-            let store = build_for(name, d, cache.clone());
-            let link = store.resolve(&tgt(H)).await;
-            assert!(matches!(&link, Ok(l) if !l.is_empty()), "{name}: setup: the release did not resolve: {link:?}");
-            assert!(add_in_flight(&*cache, svc, "tok", H).is_ok(), "{name}: the marker survived a completed add, so every later poll answers in flight");
-            // And the release still resolves on the next poll rather than reporting a phantom add.
-            let again = store.resolve(&tgt(H)).await;
-            assert!(matches!(&again, Ok(l) if !l.is_empty()), "{name}: the second poll answered {again:?}");
-        }
+                }
+                _ => resp(200, r#"{"status":"success","content":[{"path":"m.mkv","link":"https://pm/ok"}]}"#),
+            })
+        });
+        let store = build_for(name, d, cache.clone());
+        let link = store.resolve(&tgt(H)).await;
+        assert!(
+            matches!(&link, Ok(l) if !l.is_empty()),
+            "{name}: setup: the release did not resolve: {link:?}"
+        );
+        assert!(
+            add_in_flight(&*cache, svc, "tok", H).is_ok(),
+            "{name}: the marker survived a completed add, so every later poll answers in flight"
+        );
+        // And the release still resolves on the next poll rather than reporting a phantom add.
+        let again = store.resolve(&tgt(H)).await;
+        assert!(matches!(&again, Ok(l) if !l.is_empty()), "{name}: the second poll answered {again:?}");
+    }
 }
 
 /// A pack named with bare episode numbers — `[Grp] Show - 03 [1080p].mkv`, the standard anime/TV shape —
@@ -2823,28 +2971,28 @@ async fn stores_a_completed_add_clears_the_in_flight_marker() {
 /// torrent, and correct. So every episode of the pack resolved to the same file, with a 302 and no error.
 #[test]
 fn stores_a_bare_numbered_pack_uses_the_indexers_file_index() {
-        let files = vec![
-            TorrentFile { index: 0, name: "[Grp] Show - 01 [1080p].mkv".into(), size_bytes: Some(900) },
-            TorrentFile { index: 1, name: "[Grp] Show - 02 [1080p].mkv".into(), size_bytes: Some(4000) }, // the largest: the old answer
-            TorrentFile { index: 2, name: "[Grp] Show - 03 [1080p].mkv".into(), size_bytes: Some(950) },
-        ];
-        // S01E03 is at position 2, which is exactly what the indexer said.
-        let target = ResolveTarget { season: intp(1), episode: intp(3), file_idx: intp(2), ..tgt(H) };
+    let files = vec![
+        TorrentFile { index: 0, name: "[Grp] Show - 01 [1080p].mkv".into(), size_bytes: Some(900) },
+        TorrentFile { index: 1, name: "[Grp] Show - 02 [1080p].mkv".into(), size_bytes: Some(4000) }, // the largest: the old answer
+        TorrentFile { index: 2, name: "[Grp] Show - 03 [1080p].mkv".into(), size_bytes: Some(950) },
+    ];
+    // S01E03 is at position 2, which is exactly what the indexer said.
+    let target = ResolveTarget { season: intp(1), episode: intp(3), file_idx: intp(2), ..tgt(H) };
 
-        want_pick(select_file_id(&files, &target), 2, "torbox follows the indexer rather than the biggest file");
-        want_pick(idle_real_debrid().pick_file_id(&files, &target), 2, "realdebrid follows the indexer");
-        want_pick(idle_premiumize().pick_index(&files, &target), 2, "premiumize follows the indexer");
+    want_pick(select_file_id(&files, &target), 2, "torbox follows the indexer rather than the biggest file");
+    want_pick(idle_real_debrid().pick_file_id(&files, &target), 2, "realdebrid follows the indexer");
+    want_pick(idle_premiumize().pick_index(&files, &target), 2, "premiumize follows the indexer");
 
-        // With no fileIdx there is nothing better than the largest, and that fallback must survive — a
-        // feature plus a sample is the common shape and the big one is right.
-        let sampled = vec![
-            TorrentFile { index: 0, name: "Show.1080p.mkv".into(), size_bytes: Some(4000) },
-            TorrentFile { index: 1, name: "Sample/sample.mkv".into(), size_bytes: Some(2) },
-        ];
-        let blind = ResolveTarget { season: intp(1), episode: intp(3), ..tgt(H) };
-        want_pick(select_file_id(&sampled, &blind), 0, "torbox still prefers the feature to the sample");
-        want_pick(idle_real_debrid().pick_file_id(&sampled, &blind), 0, "realdebrid still prefers the feature");
-        want_pick(idle_premiumize().pick_index(&sampled, &blind), 0, "premiumize still prefers the feature");
+    // With no fileIdx there is nothing better than the largest, and that fallback must survive — a
+    // feature plus a sample is the common shape and the big one is right.
+    let sampled = vec![
+        TorrentFile { index: 0, name: "Show.1080p.mkv".into(), size_bytes: Some(4000) },
+        TorrentFile { index: 1, name: "Sample/sample.mkv".into(), size_bytes: Some(2) },
+    ];
+    let blind = ResolveTarget { season: intp(1), episode: intp(3), ..tgt(H) };
+    want_pick(select_file_id(&sampled, &blind), 0, "torbox still prefers the feature to the sample");
+    want_pick(idle_real_debrid().pick_file_id(&sampled, &blind), 0, "realdebrid still prefers the feature");
+    want_pick(idle_premiumize().pick_index(&sampled, &blind), 0, "premiumize still prefers the feature");
 }
 
 /// "The outcome is unknown" is a wait, and a wait needs a deadline. The add-attempt marker lives 90s and
@@ -2858,7 +3006,10 @@ fn stores_an_add_whose_outcome_is_never_known_gives_up() {
         let cache = new_cache();
         // The first failure starts the clock and reads as "still coming".
         let first = unknown_outcome(&*cache, svc, "tok", H, &service_went_quiet());
-        assert!(matches!(first, StoreError::AddInFlight), "{svc:?}: got {first:?}, want the add reported as still in flight");
+        assert!(
+            matches!(first, StoreError::AddInFlight),
+            "{svc:?}: got {first:?}, want the add reported as still in flight"
+        );
         // Re-asking must not restamp it: a clock every poll resets is not a deadline, it is the
         // absorbing state this exists to end. Wind it back to just inside the window, ask twenty more
         // times, and the stamp must still be the old one.
@@ -2867,15 +3018,25 @@ fn stores_an_add_whose_outcome_is_never_known_gives_up() {
         for _ in 0..20 {
             let _ = unknown_outcome(&*cache, svc, "tok", H, &service_went_quiet());
         }
-        assert_eq!(cache.get(&unknown_outcome_key(svc, "tok", H)).as_deref(), Some(aged.as_str()), "{svc:?}: the clock was restamped — twenty polls just bought another ten minutes");
+        assert_eq!(
+            cache.get(&unknown_outcome_key(svc, "tok", H)).as_deref(),
+            Some(aged.as_str()),
+            "{svc:?}: the clock was restamped — twenty polls just bought another ten minutes"
+        );
         let stale = stamp_at(SystemTime::now() - ADD_GIVE_UP - Duration::from_secs(60));
         cache.put(&unknown_outcome_key(svc, "tok", H), &stale, UNKNOWN_OUTCOME_TTL);
         let dead = unknown_outcome(&*cache, svc, "tok", H, &service_went_quiet());
-        assert!(matches!(dead, StoreError::DeadLink(_)), "{svc:?}: got {dead:?}, want a dead link so the client can fall through");
+        assert!(
+            matches!(dead, StoreError::DeadLink(_)),
+            "{svc:?}: got {dead:?}, want a dead link so the client can fall through"
+        );
         // An outcome of any kind ends the run of not knowing, so the next add starts fresh.
         settle_add_attempt(&*cache, svc, "tok", H);
         let fresh = unknown_outcome(&*cache, svc, "tok", H, &service_went_quiet());
-        assert!(matches!(fresh, StoreError::AddInFlight), "{svc:?}: got {fresh:?} — the give-up outlived the answer that resolved it");
+        assert!(
+            matches!(fresh, StoreError::AddInFlight),
+            "{svc:?}: got {fresh:?} — the give-up outlived the answer that resolved it"
+        );
     }
 }
 
@@ -2887,42 +3048,48 @@ fn stores_an_add_whose_outcome_is_never_known_gives_up() {
 /// add out for. Real-Debrid is the sharp case: it has no Status for handlePlay to rescue the answer with.
 #[tokio::test]
 async fn stores_an_unanswered_add_reads_as_coming_not_as_refusing() {
-        // (name, svc, add path, build)
-        let cases: [(&str, DebridService, &'static str); 3] = [
-            ("torbox", TorBox, "createtorrent"),
-            ("realdebrid", RealDebrid, "addMagnet"),
-            ("premiumize", Premiumize, "directdl"),
-        ];
-        for (name, svc, path) in cases {
-            let _budget = install_budget(HOUR, 50);
+    // (name, svc, add path, build)
+    let cases: [(&str, DebridService, &'static str); 3] = [
+        ("torbox", TorBox, "createtorrent"),
+        ("realdebrid", RealDebrid, "addMagnet"),
+        ("premiumize", Premiumize, "directdl"),
+    ];
+    for (name, svc, path) in cases {
+        let _budget = install_budget(HOUR, 50);
 
-            let adds = Arc::new(AtomicUsize::new(0));
-            let a = adds.clone();
-            let cache = new_cache();
-            let store = build_for(
-                name,
-                doer(move |req| {
-                    if req.url().path().contains(path) {
-                        a.fetch_add(1, Ordering::SeqCst);
-                        return Err(io::Error::other("read tcp 10.0.0.2:443: connection reset by peer").into());
-                    }
-                    Ok(resp(200, "{}"))
-                }),
-                cache.clone(),
+        let adds = Arc::new(AtomicUsize::new(0));
+        let a = adds.clone();
+        let cache = new_cache();
+        let store = build_for(
+            name,
+            doer(move |req| {
+                if req.url().path().contains(path) {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    return Err(io::Error::other("read tcp 10.0.0.2:443: connection reset by peer").into());
+                }
+                Ok(resp(200, "{}"))
+            }),
+            cache.clone(),
+        );
+        let target = tgt(H);
+        let _ = store.resolve(&target).await;
+
+        // The store said nothing, so nothing may be recorded against it.
+        assert!(
+            backed_off(&*cache, svc, "tok", H).is_none(),
+            "{name}: an unanswered add was filed as refusing"
+        );
+        // And the polls behind it read as "coming", which handlePlay answers 202, rather than 503.
+        for i in 0..5 {
+            let res = store.resolve(&target).await;
+            assert!(
+                matches!(&res, Err(StoreError::AddInFlight)),
+                "{name}: poll {i} answered {res:?}, want the add reported as still in flight"
             );
-            let target = tgt(H);
-            let _ = store.resolve(&target).await;
-
-            // The store said nothing, so nothing may be recorded against it.
-            assert!(backed_off(&*cache, svc, "tok", H).is_none(), "{name}: an unanswered add was filed as refusing");
-            // And the polls behind it read as "coming", which handlePlay answers 202, rather than 503.
-            for i in 0..5 {
-                let res = store.resolve(&target).await;
-                assert!(matches!(&res, Err(StoreError::AddInFlight)), "{name}: poll {i} answered {res:?}, want the add reported as still in flight");
-            }
-            let n = adds.load(Ordering::SeqCst);
-            assert_eq!(n, 1, "{name}: sent the add {n} times; the marker exists to stop exactly that");
         }
+        let n = adds.load(Ordering::SeqCst);
+        assert_eq!(n, 1, "{name}: sent the add {n} times; the marker exists to stop exactly that");
+    }
 }
 
 /// The account gate the other two stores have. It was redundant on Premiumize until addInFlight was moved
@@ -2952,7 +3119,10 @@ async fn premiumize_a_rejected_key_outranks_an_in_flight_marker() {
         Some(cache),
     );
     let res = s.resolve(&tgt(H)).await;
-    assert!(!matches!(&res, Err(StoreError::AddInFlight)), "a dead key was reported as a transfer on its way: {res:?}");
+    assert!(
+        !matches!(&res, Err(StoreError::AddInFlight)),
+        "a dead key was reported as a transfer on its way: {res:?}"
+    );
     assert!(unavailable(&res).is_some(), "got {res:?}, want the store reported unavailable");
 }
 
@@ -2962,55 +3132,64 @@ async fn premiumize_a_rejected_key_outranks_an_in_flight_marker() {
 /// scout_busy. That is the cycle unknownOutcomeKey exists to end; it was wired only to the body-read path.
 #[tokio::test]
 async fn stores_a_transport_failed_add_gives_up_eventually() {
-        // (name, svc, add path)
-        let cases: [(&str, DebridService, &'static str); 3] = [
-            ("torbox", TorBox, "createtorrent"),
-            ("realdebrid", RealDebrid, "addMagnet"),
-            ("premiumize", Premiumize, "directdl"),
-        ];
-        for (name, svc, path) in cases {
-            let _budget = install_budget(HOUR, 50);
+    // (name, svc, add path)
+    let cases: [(&str, DebridService, &'static str); 3] = [
+        ("torbox", TorBox, "createtorrent"),
+        ("realdebrid", RealDebrid, "addMagnet"),
+        ("premiumize", Premiumize, "directdl"),
+    ];
+    for (name, svc, path) in cases {
+        let _budget = install_budget(HOUR, 50);
 
-            let adds = Arc::new(AtomicUsize::new(0));
-            let a = adds.clone();
-            let cache = new_cache();
-            let store = build_for(
-                name,
-                doer(move |req| {
-                    if req.url().path().contains(path) {
-                        a.fetch_add(1, Ordering::SeqCst);
-                        return Err(io::Error::other("dial tcp 10.0.0.2:443: connect: connection refused").into());
-                    }
-                    Ok(resp(200, "{}"))
-                }),
-                cache.clone(),
-            );
-            let target = tgt(H);
-            let _ = store.resolve(&target).await;
+        let adds = Arc::new(AtomicUsize::new(0));
+        let a = adds.clone();
+        let cache = new_cache();
+        let store = build_for(
+            name,
+            doer(move |req| {
+                if req.url().path().contains(path) {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    return Err(io::Error::other("dial tcp 10.0.0.2:443: connect: connection refused").into());
+                }
+                Ok(resp(200, "{}"))
+            }),
+            cache.clone(),
+        );
+        let target = tgt(H);
+        let _ = store.resolve(&target).await;
 
-            // PRODUCTION must have started the clock. Writing it here instead would test the deadline
-            // against a stamp the service never makes — the proxy shape that has hidden a defect in nine
-            // of the last ten rounds.
-            let stamp = cache.get(&unknown_outcome_key(svc, "tok", H));
-            assert!(stamp.as_deref().is_some_and(|s| !s.is_empty()), "{name}: a transport-failed add left no give-up clock, so nothing bounds the retries");
-            // While it is running, the polls behind it read as "coming".
+        // PRODUCTION must have started the clock. Writing it here instead would test the deadline
+        // against a stamp the service never makes — the proxy shape that has hidden a defect in nine
+        // of the last ten rounds.
+        let stamp = cache.get(&unknown_outcome_key(svc, "tok", H));
+        assert!(
+            stamp.as_deref().is_some_and(|s| !s.is_empty()),
+            "{name}: a transport-failed add left no give-up clock, so nothing bounds the retries"
+        );
+        // While it is running, the polls behind it read as "coming".
+        let res = store.resolve(&target).await;
+        assert!(
+            matches!(&res, Err(StoreError::AddInFlight)),
+            "{name}: got {res:?}, want the add reported as still in flight"
+        );
+        // Wind the clock the service wrote past its deadline, and lapse the 90s marker with it. Every
+        // later poll must answer a dead link the client can move past, and must not buy the torrent
+        // again.
+        settle_add_attempt(&*cache, svc, "tok", H);
+        let stale = stamp_at(SystemTime::now() - ADD_GIVE_UP - Duration::from_secs(60));
+        cache.put(&unknown_outcome_key(svc, "tok", H), &stale, UNKNOWN_OUTCOME_TTL);
+
+        let before = adds.load(Ordering::SeqCst);
+        for i in 0..20 {
             let res = store.resolve(&target).await;
-            assert!(matches!(&res, Err(StoreError::AddInFlight)), "{name}: got {res:?}, want the add reported as still in flight");
-            // Wind the clock the service wrote past its deadline, and lapse the 90s marker with it. Every
-            // later poll must answer a dead link the client can move past, and must not buy the torrent
-            // again.
-            settle_add_attempt(&*cache, svc, "tok", H);
-            let stale = stamp_at(SystemTime::now() - ADD_GIVE_UP - Duration::from_secs(60));
-            cache.put(&unknown_outcome_key(svc, "tok", H), &stale, UNKNOWN_OUTCOME_TTL);
-
-            let before = adds.load(Ordering::SeqCst);
-            for i in 0..20 {
-                let res = store.resolve(&target).await;
-                assert!(is_dead_link(&res), "{name}: poll {i} answered {res:?}, want a dead link the client can move past");
-            }
-            let after = adds.load(Ordering::SeqCst);
-            assert_eq!(after, before, "{name}: sent {} more adds past the give-up deadline", after - before);
+            assert!(
+                is_dead_link(&res),
+                "{name}: poll {i} answered {res:?}, want a dead link the client can move past"
+            );
         }
+        let after = adds.load(Ordering::SeqCst);
+        assert_eq!(after, before, "{name}: sent {} more adds past the give-up deadline", after - before);
+    }
 }
 
 /// An add of ours already out outranks any refusal, whichever store said what and in whichever order.
@@ -3026,14 +3205,14 @@ async fn resolve_preferring_an_add_in_flight_outranks_a_refusal() {
             reason: "createtorrent http 429 (backing off)".into(),
         }),
     };
-    let fetching = StubStore {
-        svc: RealDebrid,
-        err: StoreError::AddInFlight,
-    };
+    let fetching = StubStore { svc: RealDebrid, err: StoreError::AddInFlight };
     for order in [vec![refusing.clone(), fetching.clone()], vec![fetching.clone(), refusing.clone()]] {
         let pool = StorePool { stores: order.into_iter().map(|s| Box::new(s) as Box<dyn Store>).collect() };
         let res = pool.resolve_preferring(&tgt(H), &[]).await;
-        assert!(matches!(&res, Err(StoreError::AddInFlight)), "store order decided the verdict: got {res:?}, want the add reported in flight");
+        assert!(
+            matches!(&res, Err(StoreError::AddInFlight)),
+            "store order decided the verdict: got {res:?}, want the add reported in flight"
+        );
     }
 }
 
@@ -3045,47 +3224,54 @@ async fn resolve_preferring_an_add_in_flight_outranks_a_refusal() {
 /// went quiet, not on a client that hung up.
 #[tokio::test]
 async fn stores_a_cancelled_add_does_not_start_the_give_up_clock() {
-        // (name, svc, add path)
-        let cases: [(&str, DebridService, &'static str); 3] = [
-            ("torbox", TorBox, "createtorrent"),
-            ("realdebrid", RealDebrid, "addMagnet"),
-            ("premiumize", Premiumize, "directdl"),
-        ];
-        for (name, svc, path) in cases {
-            let _budget = install_budget(HOUR, 50);
-            let cache = new_cache();
-            for cause in ["context canceled", "context deadline exceeded"] {
-                let store = build_for(
-                    name,
-                    doer(move |req| {
-                        if req.url().path().contains(path) {
-                            return Err(io::Error::other(format!("Post \"https://example/add\": {cause}")).into());
-                        }
-                        Ok(resp(200, "{}"))
-                    }),
-                    cache.clone(),
-                );
-                let _ = store.resolve(&tgt(H)).await;
-                if let Some(stamp) = cache.get(&unknown_outcome_key(svc, "tok", H)) {
-                    assert!(stamp.is_empty(), "{name}: {cause} started the give-up clock: the release is condemned for {:?}", ADD_GIVE_UP);
-                }
-                settle_add_attempt(&*cache, svc, "tok", H);
-            }
-            // A service that genuinely went quiet still starts it — the guard must be about the CAUSE,
-            // not about switching the deadline off.
+    // (name, svc, add path)
+    let cases: [(&str, DebridService, &'static str); 3] = [
+        ("torbox", TorBox, "createtorrent"),
+        ("realdebrid", RealDebrid, "addMagnet"),
+        ("premiumize", Premiumize, "directdl"),
+    ];
+    for (name, svc, path) in cases {
+        let _budget = install_budget(HOUR, 50);
+        let cache = new_cache();
+        for cause in ["context canceled", "context deadline exceeded"] {
             let store = build_for(
                 name,
                 doer(move |req| {
                     if req.url().path().contains(path) {
-                        return Err(io::Error::other("read tcp 10.0.0.2:443: connection reset by peer").into());
+                        return Err(io::Error::other(format!("Post \"https://example/add\": {cause}")).into());
                     }
                     Ok(resp(200, "{}"))
                 }),
                 cache.clone(),
             );
             let _ = store.resolve(&tgt(H)).await;
-            assert!(cache.get(&unknown_outcome_key(svc, "tok", H)).is_some_and(|s| !s.is_empty()), "{name}: a service that never answered left no give-up clock");
+            if let Some(stamp) = cache.get(&unknown_outcome_key(svc, "tok", H)) {
+                assert!(
+                    stamp.is_empty(),
+                    "{name}: {cause} started the give-up clock: the release is condemned for {:?}",
+                    ADD_GIVE_UP
+                );
+            }
+            settle_add_attempt(&*cache, svc, "tok", H);
         }
+        // A service that genuinely went quiet still starts it — the guard must be about the CAUSE,
+        // not about switching the deadline off.
+        let store = build_for(
+            name,
+            doer(move |req| {
+                if req.url().path().contains(path) {
+                    return Err(io::Error::other("read tcp 10.0.0.2:443: connection reset by peer").into());
+                }
+                Ok(resp(200, "{}"))
+            }),
+            cache.clone(),
+        );
+        let _ = store.resolve(&tgt(H)).await;
+        assert!(
+            cache.get(&unknown_outcome_key(svc, "tok", H)).is_some_and(|s| !s.is_empty()),
+            "{name}: a service that never answered left no give-up clock"
+        );
+    }
 }
 
 /// errServiceWentQuiet stands for the cause these tests mean: the service stopped answering, as opposed
@@ -3096,47 +3282,54 @@ async fn stores_a_cancelled_add_does_not_start_the_give_up_clock() {
 /// release condemned by the same viewer action.
 #[tokio::test]
 async fn stores_a_cancelled_body_read_does_not_start_the_give_up_clock() {
-        // (name, svc, add path)
-        let cases: [(&str, DebridService, &'static str); 3] = [
-            ("torbox", TorBox, "createtorrent"),
-            ("realdebrid", RealDebrid, "addMagnet"),
-            ("premiumize", Premiumize, "directdl"),
-        ];
-        for (name, svc, path) in cases {
-            let _budget = install_budget(HOUR, 50);
-            let cache = new_cache();
-            // The add is ACCEPTED — 201 on RD, 200 elsewhere — and the body then dies because the viewer
-            // moved on. The torrent very likely exists, which is exactly why condemning it is wrong.
-            let store = build_for(
-                name,
-                doer(move |req| {
-                    if req.url().path().contains(path) {
-                        return Ok(cancelled_body_response(201, "context canceled"));
-                    }
-                    Ok(resp(200, "{}"))
-                }),
-                cache.clone(),
+    // (name, svc, add path)
+    let cases: [(&str, DebridService, &'static str); 3] = [
+        ("torbox", TorBox, "createtorrent"),
+        ("realdebrid", RealDebrid, "addMagnet"),
+        ("premiumize", Premiumize, "directdl"),
+    ];
+    for (name, svc, path) in cases {
+        let _budget = install_budget(HOUR, 50);
+        let cache = new_cache();
+        // The add is ACCEPTED — 201 on RD, 200 elsewhere — and the body then dies because the viewer
+        // moved on. The torrent very likely exists, which is exactly why condemning it is wrong.
+        let store = build_for(
+            name,
+            doer(move |req| {
+                if req.url().path().contains(path) {
+                    return Ok(cancelled_body_response(201, "context canceled"));
+                }
+                Ok(resp(200, "{}"))
+            }),
+            cache.clone(),
+        );
+        let _ = store.resolve(&tgt(H)).await;
+        if let Some(stamp) = cache.get(&unknown_outcome_key(svc, "tok", H)) {
+            assert!(
+                stamp.is_empty(),
+                "{name}: a back-out mid-body started the give-up clock: the release is condemned for {:?}",
+                ADD_GIVE_UP
             );
-            let _ = store.resolve(&tgt(H)).await;
-            if let Some(stamp) = cache.get(&unknown_outcome_key(svc, "tok", H)) {
-                assert!(stamp.is_empty(), "{name}: a back-out mid-body started the give-up clock: the release is condemned for {:?}", ADD_GIVE_UP);
-            }
-
-            // A body that dies for the SERVICE's own reasons still starts it.
-            settle_add_attempt(&*cache, svc, "tok", H);
-            let store = build_for(
-                name,
-                doer(move |req| {
-                    if req.url().path().contains(path) {
-                        return Ok(broken_body_response(201, "unexpected EOF mid-body"));
-                    }
-                    Ok(resp(200, "{}"))
-                }),
-                cache.clone(),
-            );
-            let _ = store.resolve(&tgt(H)).await;
-            assert!(cache.get(&unknown_outcome_key(svc, "tok", H)).is_some_and(|s| !s.is_empty()), "{name}: a truncated answer left no give-up clock, so nothing bounds the retries");
         }
+
+        // A body that dies for the SERVICE's own reasons still starts it.
+        settle_add_attempt(&*cache, svc, "tok", H);
+        let store = build_for(
+            name,
+            doer(move |req| {
+                if req.url().path().contains(path) {
+                    return Ok(broken_body_response(201, "unexpected EOF mid-body"));
+                }
+                Ok(resp(200, "{}"))
+            }),
+            cache.clone(),
+        );
+        let _ = store.resolve(&tgt(H)).await;
+        assert!(
+            cache.get(&unknown_outcome_key(svc, "tok", H)).is_some_and(|s| !s.is_empty()),
+            "{name}: a truncated answer left no give-up clock, so nothing bounds the retries"
+        );
+    }
 }
 
 /// TorBox reports plenty of errors as HTTP 200 with no torrent id, and a proxy page served as 200 lands
@@ -3145,35 +3338,38 @@ async fn stores_a_cancelled_body_read_does_not_start_the_give_up_clock() {
 /// needed. RD already refunded the same shape.
 #[tokio::test]
 async fn add_budget_an_empty_two_hundred_is_not_an_add() {
-        // (name, svc, add path, body, build)
-        let cases: [(&str, DebridService, &'static str, &'static str); 2] = [
-            ("torbox", TorBox, "createtorrent", r#"{"success":false}"#),
-            ("realdebrid", RealDebrid, "addMagnet", r#"{"ok":true}"#),
-        ];
-        for (name, svc, path, body) in cases {
-            let _budget = install_budget(HOUR, 50);
+    // (name, svc, add path, body, build)
+    let cases: [(&str, DebridService, &'static str, &'static str); 2] = [
+        ("torbox", TorBox, "createtorrent", r#"{"success":false}"#),
+        ("realdebrid", RealDebrid, "addMagnet", r#"{"ok":true}"#),
+    ];
+    for (name, svc, path, body) in cases {
+        let _budget = install_budget(HOUR, 50);
 
-            let adds = Arc::new(AtomicUsize::new(0));
-            // Sixty DISTINCT releases: the client falling through candidates, not a poll loop.
-            for i in 0..60 {
-                let a = adds.clone();
-                let store = build_for(
-                    name,
-                    doer(move |req| {
-                        if req.url().path().contains(path) {
-                            a.fetch_add(1, Ordering::SeqCst);
-                            return Ok(resp(200, body));
-                        }
-                        Ok(resp(200, "{}"))
-                    }),
-                    new_cache(),
-                );
-                let _ = store.resolve(&tgt(&format!("{:0>40x}", i))).await;
-            }
-            let left = global_add_budget().remaining(&budget_account(svc, "tok"));
-            let n = adds.load(Ordering::SeqCst);
-            assert_eq!(left, 50, "{name}: allowance {left} after {n} empty answers — one bad title walks the hour");
+        let adds = Arc::new(AtomicUsize::new(0));
+        // Sixty DISTINCT releases: the client falling through candidates, not a poll loop.
+        for i in 0..60 {
+            let a = adds.clone();
+            let store = build_for(
+                name,
+                doer(move |req| {
+                    if req.url().path().contains(path) {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        return Ok(resp(200, body));
+                    }
+                    Ok(resp(200, "{}"))
+                }),
+                new_cache(),
+            );
+            let _ = store.resolve(&tgt(&format!("{:0>40x}", i))).await;
         }
+        let left = global_add_budget().remaining(&budget_account(svc, "tok"));
+        let n = adds.load(Ordering::SeqCst);
+        assert_eq!(
+            left, 50,
+            "{name}: allowance {left} after {n} empty answers — one bad title walks the hour"
+        );
+    }
 }
 
 /// Refund what the ANSWER says was not created, and nothing more. `success:false` and an unparseable body
@@ -3182,31 +3378,31 @@ async fn add_budget_an_empty_two_hundred_is_not_an_add() {
 /// refunding there would manufacture allowance against a real add.
 #[tokio::test]
 async fn add_budget_tor_box_refunds_only_what_the_answer_denies() {
-        // (name, body, remaining out of 50)
-        let cases: [(&str, &'static str, i64); 5] = [
-            ("success:false", r#"{"success":false}"#, 50),
-            ("an html proxy page", "<html>502 Bad Gateway</html>", 50),
-            ("an id under a name we do not know", r#"{"data":{"queued_id":91}}"#, 49),
-            ("a string id", r#"{"data":{"torrent_id":"7"}}"#, 49),
-            ("a one-element array", r#"{"data":[{"torrent_id":7}]}"#, 49),
-        ];
-        for (name, body, want) in cases {
-            let _budget = install_budget(HOUR, 50);
+    // (name, body, remaining out of 50)
+    let cases: [(&str, &'static str, i64); 5] = [
+        ("success:false", r#"{"success":false}"#, 50),
+        ("an html proxy page", "<html>502 Bad Gateway</html>", 50),
+        ("an id under a name we do not know", r#"{"data":{"queued_id":91}}"#, 49),
+        ("a string id", r#"{"data":{"torrent_id":"7"}}"#, 49),
+        ("a one-element array", r#"{"data":[{"torrent_id":7}]}"#, 49),
+    ];
+    for (name, body, want) in cases {
+        let _budget = install_budget(HOUR, 50);
 
-            let s = tb(
-                "tok",
-                doer(move |req| {
-                    if is_add_endpoint(&req) {
-                        return Ok(resp(200, body));
-                    }
-                    Ok(resp(200, "{}"))
-                }),
-                Some(new_cache()),
-            );
-            let _ = s.resolve(&tgt(H)).await;
-            let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
-            assert_eq!(left, want, "{name}: remaining = {left}, want {want}");
-        }
+        let s = tb(
+            "tok",
+            doer(move |req| {
+                if is_add_endpoint(&req) {
+                    return Ok(resp(200, body));
+                }
+                Ok(resp(200, "{}"))
+            }),
+            Some(new_cache()),
+        );
+        let _ = s.resolve(&tgt(H)).await;
+        let left = global_add_budget().remaining(&budget_account(TorBox, "tok"));
+        assert_eq!(left, want, "{name}: remaining = {left}, want {want}");
+    }
 }
 
 /// A miss is only worth remembering when the account list was READ and the hash was not in it. A timeout
@@ -3214,29 +3410,39 @@ async fn add_budget_tor_box_refunds_only_what_the_answer_denies() {
 /// rediscover a queued torrent — for fifteen seconds, on /play as well as the probe route.
 #[tokio::test]
 async fn tor_box_a_timed_out_listing_is_not_a_miss() {
-        let cache = new_cache();
-        let failing = tb("tok", doer(|_| Err(io::Error::other("deadline has elapsed").into())), Some(cache.clone()));
-        assert!(failing.status(&tgt(H)).await.is_none(), "a timed-out listing cannot report a status");
-        assert!(cache.get(&torrent_miss_key("tok", H)).is_none(), "a timeout was remembered as the account not holding the torrent");
+    let cache = new_cache();
+    let failing =
+        tb("tok", doer(|_| Err(io::Error::other("deadline has elapsed").into())), Some(cache.clone()));
+    assert!(failing.status(&tgt(H)).await.is_none(), "a timed-out listing cannot report a status");
+    assert!(
+        cache.get(&torrent_miss_key("tok", H)).is_none(),
+        "a timeout was remembered as the account not holding the torrent"
+    );
 
-        // The list recovers, and the very next poll must be allowed to ask again.
-        let healthy = tb(
-            "tok",
-            doer(|req| {
-                if req.url().query().unwrap_or("").contains("id=") {
-                    return Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#));
-                }
-                Ok(resp(200, &format!(r#"{{"data":[{{"id":77,"hash":"{H}"}}]}}"#)))
-            }),
-            Some(cache.clone()),
-        );
-        assert!(healthy.status(&tgt(H)).await.is_some(), "the torrent was rediscoverable, but the miss marker suppressed the lookup");
+    // The list recovers, and the very next poll must be allowed to ask again.
+    let healthy = tb(
+        "tok",
+        doer(|req| {
+            if req.url().query().unwrap_or("").contains("id=") {
+                return Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#));
+            }
+            Ok(resp(200, &format!(r#"{{"data":[{{"id":77,"hash":"{H}"}}]}}"#)))
+        }),
+        Some(cache.clone()),
+    );
+    assert!(
+        healthy.status(&tgt(H)).await.is_some(),
+        "the torrent was rediscoverable, but the miss marker suppressed the lookup"
+    );
 
-        // An authoritative miss — the list was read and the hash is not in it — IS still remembered.
-        let other = new_cache();
-        let absent = tb("tok", doer(|_| Ok(resp(200, r#"{"data":[]}"#))), Some(other.clone()));
-        let _ = absent.status(&tgt(H)).await;
-        assert!(other.get(&torrent_miss_key("tok", H)).is_some(), "an answered miss must still be remembered, or every poll re-fetches the whole list");
+    // An authoritative miss — the list was read and the hash is not in it — IS still remembered.
+    let other = new_cache();
+    let absent = tb("tok", doer(|_| Ok(resp(200, r#"{"data":[]}"#))), Some(other.clone()));
+    let _ = absent.status(&tgt(H)).await;
+    assert!(
+        other.get(&torrent_miss_key("tok", H)).is_some(),
+        "an answered miss must still be remembered, or every poll re-fetches the whole list"
+    );
 }
 
 /// mylist is asked BY id, but it can answer with the whole account list — which is why the array fallback
@@ -3247,52 +3453,62 @@ async fn tor_box_a_timed_out_listing_is_not_a_miss() {
 /// another torrent's percentage, ETA and rate.
 #[tokio::test]
 async fn tor_box_status_reports_on_the_torrent_it_asked_about() {
-        const OURS: i64 = 100;
-        let finished_other = r#"{"id":42,"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
-        let busy_other = r#"{"id":42,"progress":0.43,"download_finished":false,"eta":900,"download_speed":1500000}"#;
-        let ours_busy = r#"{"id":100,"progress":0.02,"download_finished":false,"eta":60,"download_speed":10}"#;
+    const OURS: i64 = 100;
+    let finished_other = r#"{"id":42,"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
+    let busy_other =
+        r#"{"id":42,"progress":0.43,"download_finished":false,"eta":900,"download_speed":1500000}"#;
+    let ours_busy = r#"{"id":100,"progress":0.02,"download_finished":false,"eta":60,"download_speed":10}"#;
 
-        let cases = [
-            ("ours behind a finished torrent", format!("{finished_other},{ours_busy}")),
-            ("ours behind a busy torrent", format!("{busy_other},{ours_busy}")),
-            ("ours last of several", format!("{finished_other},{busy_other},{ours_busy}")),
-        ];
-        for (name, entries) in cases {
-            let cache = new_cache();
-            cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-            let body = format!(r#"{{"data":[{entries}]}}"#);
-            let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
-            let got = s.status(&tgt(H)).await.expect("our torrent is in the list and downloading; this must report on it");
-            assert!(got.progress == 0.02 && got.bytes_per_second == Some(10), "{name}: reported {got:?} — that is another torrent's progress");
-        }
-
-        // A list that does not mention our torrent says nothing about it, and must not borrow an answer.
+    let cases = [
+        ("ours behind a finished torrent", format!("{finished_other},{ours_busy}")),
+        ("ours behind a busy torrent", format!("{busy_other},{ours_busy}")),
+        ("ours last of several", format!("{finished_other},{busy_other},{ours_busy}")),
+    ];
+    for (name, entries) in cases {
         let cache = new_cache();
         cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-        let body = format!(r#"{{"data":[{busy_other}]}}"#);
+        let body = format!(r#"{{"data":[{entries}]}}"#);
         let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
-        assert!(s.status(&tgt(H)).await.is_none(), "reported a status for a torrent the answer never mentions");
-
-        // The ordinary single-entry answer to a by-id query need not repeat the id, and still counts.
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|_| Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false,"eta":30}}"#))),
-            Some(cache),
+        let got = s
+            .status(&tgt(H))
+            .await
+            .expect("our torrent is in the list and downloading; this must report on it");
+        assert!(
+            got.progress == 0.02 && got.bytes_per_second == Some(10),
+            "{name}: reported {got:?} — that is another torrent's progress"
         );
-        let got = s.status(&tgt(H)).await;
-        assert!(matches!(&got, Some(g) if g.progress == 0.25), "an unlabelled single entry is still ours: {got:?}");
+    }
 
-        // But an object naming a DIFFERENT torrent is not.
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|_| Ok(resp(200, r#"{"data":{"id":42,"progress":0.9,"download_finished":false}}"#))),
-            Some(cache),
-        );
-        assert!(s.status(&tgt(H)).await.is_none(), "reported a status from an entry that names torrent 42");
+    // A list that does not mention our torrent says nothing about it, and must not borrow an answer.
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+    let body = format!(r#"{{"data":[{busy_other}]}}"#);
+    let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
+    assert!(s.status(&tgt(H)).await.is_none(), "reported a status for a torrent the answer never mentions");
+
+    // The ordinary single-entry answer to a by-id query need not repeat the id, and still counts.
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|_| Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false,"eta":30}}"#))),
+        Some(cache),
+    );
+    let got = s.status(&tgt(H)).await;
+    assert!(
+        matches!(&got, Some(g) if g.progress == 0.25),
+        "an unlabelled single entry is still ours: {got:?}"
+    );
+
+    // But an object naming a DIFFERENT torrent is not.
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|_| Ok(resp(200, r#"{"data":{"id":42,"progress":0.9,"download_finished":false}}"#))),
+        Some(cache),
+    );
+    assert!(s.status(&tgt(H)).await.is_none(), "reported a status from an entry that names torrent 42");
 }
 
 /// A 200 with no `data` key is TorBox's envelope missing, not the account saying it holds nothing —
@@ -3300,17 +3516,20 @@ async fn tor_box_status_reports_on_the_torrent_it_asked_about() {
 /// the only lookup able to rediscover a queued torrent.
 #[tokio::test]
 async fn tor_box_an_envelope_without_data_is_not_a_miss() {
-        for body in [r#"{}"#, r#"{"success":false}"#, r#"{"success":false,"data":null}"#] {
-            let cache = new_cache();
-            let s = tb("tok", doer(move |_| Ok(resp(200, body))), Some(cache.clone()));
-            let _ = s.status(&tgt(H)).await;
-            assert!(cache.get(&torrent_miss_key("tok", H)).is_none(), "{body} was remembered as the account not holding the torrent");
-        }
-        // A real, readable list that lacks the hash still is one.
+    for body in [r#"{}"#, r#"{"success":false}"#, r#"{"success":false,"data":null}"#] {
         let cache = new_cache();
-        let s = tb("tok", doer(|_| Ok(resp(200, r#"{"success":true,"data":[]}"#))), Some(cache.clone()));
+        let s = tb("tok", doer(move |_| Ok(resp(200, body))), Some(cache.clone()));
         let _ = s.status(&tgt(H)).await;
-        assert!(cache.get(&torrent_miss_key("tok", H)).is_some(), "an answered miss must still be remembered");
+        assert!(
+            cache.get(&torrent_miss_key("tok", H)).is_none(),
+            "{body} was remembered as the account not holding the torrent"
+        );
+    }
+    // A real, readable list that lacks the hash still is one.
+    let cache = new_cache();
+    let s = tb("tok", doer(|_| Ok(resp(200, r#"{"success":true,"data":[]}"#))), Some(cache.clone()));
+    let _ = s.status(&tgt(H)).await;
+    assert!(cache.get(&torrent_miss_key("tok", H)).is_some(), "an answered miss must still be remembered");
 }
 
 /// A refusal is a fact about the account, not the release — and the last calls of RD's chain classified
@@ -3375,9 +3594,15 @@ async fn real_debrid_every_call_in_the_chain_classifies_a_refusal() {
             Some(cache.clone()),
         );
         let res = s.resolve(&tgt(H)).await;
-        assert!(unavailable(&res).is_some(), "unrestrict {code} answered {res:?} — a throttle is not a dead release");
+        assert!(
+            unavailable(&res).is_some(),
+            "unrestrict {code} answered {res:?} — a throttle is not a dead release"
+        );
         // And being classified is what gets it remembered, so the next poll costs one call rather than four.
-        assert!(backed_off(&*cache, RealDebrid, "tok", H).is_some(), "unrestrict {code} left no backoff, so nothing slows the retries");
+        assert!(
+            backed_off(&*cache, RealDebrid, "tok", H).is_some(),
+            "unrestrict {code} left no backoff, so nothing slows the retries"
+        );
     }
 }
 
@@ -3410,27 +3635,34 @@ async fn premiumize_the_status_error_message_cannot_carry_the_token() {
 /// still handed back its files.
 #[tokio::test]
 async fn tor_box_list_files_matches_the_id_at_any_length() {
-        let foreign = r#"{"id":42,"files":[{"id":7,"name":"Wanted.S01E01.mkv","size":10}]}"#;
-        let ours = r#"{"id":100,"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}"#;
-        // (name, payload, want error)
-        let cases: [(&str, String, bool); 6] = [
-            ("a lone foreign entry, object form", format!(r#"{{"data":{foreign}}}"#), true),
-            ("a lone foreign entry, array form", format!(r#"{{"data":[{foreign}]}}"#), true),
-            ("ours, object form", format!(r#"{{"data":{ours}}}"#), false),
-            ("ours, array form", format!(r#"{{"data":[{ours}]}}"#), false),
-            ("ours behind a foreign entry", format!(r#"{{"data":[{foreign},{ours}]}}"#), false),
-            // An entry with no id at all is still taken at its word.
-            ("an unlabelled entry", r#"{"data":{"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}}"#.to_string(), false),
-        ];
-        for (name, payload, want_err) in cases {
-            let s = tb("tok", doer(move |_| Ok(resp(200, &payload))), None);
-            let res = s.list_files(100).await;
-            if want_err {
-                assert!(res.is_err(), "{name}: accepted another torrent's file list: {res:?}");
-                continue;
-            }
-            assert!(matches!(&res, Ok(f) if f.len() == 1 && f[0].name == "Show.S01E01.mkv"), "{name}: got {res:?}");
+    let foreign = r#"{"id":42,"files":[{"id":7,"name":"Wanted.S01E01.mkv","size":10}]}"#;
+    let ours = r#"{"id":100,"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}"#;
+    // (name, payload, want error)
+    let cases: [(&str, String, bool); 6] = [
+        ("a lone foreign entry, object form", format!(r#"{{"data":{foreign}}}"#), true),
+        ("a lone foreign entry, array form", format!(r#"{{"data":[{foreign}]}}"#), true),
+        ("ours, object form", format!(r#"{{"data":{ours}}}"#), false),
+        ("ours, array form", format!(r#"{{"data":[{ours}]}}"#), false),
+        ("ours behind a foreign entry", format!(r#"{{"data":[{foreign},{ours}]}}"#), false),
+        // An entry with no id at all is still taken at its word.
+        (
+            "an unlabelled entry",
+            r#"{"data":{"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}}"#.to_string(),
+            false,
+        ),
+    ];
+    for (name, payload, want_err) in cases {
+        let s = tb("tok", doer(move |_| Ok(resp(200, &payload))), None);
+        let res = s.list_files(100).await;
+        if want_err {
+            assert!(res.is_err(), "{name}: accepted another torrent's file list: {res:?}");
+            continue;
         }
+        assert!(
+            matches!(&res, Ok(f) if f.len() == 1 && f[0].name == "Show.S01E01.mkv"),
+            "{name}: got {res:?}"
+        );
+    }
 }
 
 /// An exact id wins; an unlabelled entry is only a fallback. Taking the first of either meant an id-less
@@ -3438,22 +3670,25 @@ async fn tor_box_list_files_matches_the_id_at_any_length() {
 /// — worse than the blind arr[0] it replaced, because it looks like a check.
 #[tokio::test]
 async fn tor_box_list_files_an_exact_id_beats_an_unlabelled_entry() {
-        let ours = r#"{"id":100,"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}"#;
-        let unlabelled = r#"{"files":[{"id":7,"name":"OTHER.mkv","size":10}]}"#;
-        let zero_id = r#"{"id":0,"files":[{"id":7,"name":"OTHER.mkv","size":10}]}"#;
-        // (name, payload, want file name)
-        let cases: [(&str, String, &str); 4] = [
-            ("unlabelled first", format!(r#"{{"data":[{unlabelled},{ours}]}}"#), "Show.S01E01.mkv"),
-            ("id 0 first", format!(r#"{{"data":[{zero_id},{ours}]}}"#), "Show.S01E01.mkv"),
-            ("ours first", format!(r#"{{"data":[{ours},{unlabelled}]}}"#), "Show.S01E01.mkv"),
-            // With no exact match anywhere, an unlabelled entry is still better than nothing.
-            ("only unlabelled", format!(r#"{{"data":[{unlabelled}]}}"#), "OTHER.mkv"),
-        ];
-        for (name, payload, want) in cases {
-            let s = tb("tok", doer(move |_| Ok(resp(200, &payload))), None);
-            let res = s.list_files(100).await;
-            assert!(matches!(&res, Ok(f) if f.len() == 1 && f[0].name == want), "{name}: got {res:?} — want {want}");
-        }
+    let ours = r#"{"id":100,"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}"#;
+    let unlabelled = r#"{"files":[{"id":7,"name":"OTHER.mkv","size":10}]}"#;
+    let zero_id = r#"{"id":0,"files":[{"id":7,"name":"OTHER.mkv","size":10}]}"#;
+    // (name, payload, want file name)
+    let cases: [(&str, String, &str); 4] = [
+        ("unlabelled first", format!(r#"{{"data":[{unlabelled},{ours}]}}"#), "Show.S01E01.mkv"),
+        ("id 0 first", format!(r#"{{"data":[{zero_id},{ours}]}}"#), "Show.S01E01.mkv"),
+        ("ours first", format!(r#"{{"data":[{ours},{unlabelled}]}}"#), "Show.S01E01.mkv"),
+        // With no exact match anywhere, an unlabelled entry is still better than nothing.
+        ("only unlabelled", format!(r#"{{"data":[{unlabelled}]}}"#), "OTHER.mkv"),
+    ];
+    for (name, payload, want) in cases {
+        let s = tb("tok", doer(move |_| Ok(resp(200, &payload))), None);
+        let res = s.list_files(100).await;
+        assert!(
+            matches!(&res, Ok(f) if f.len() == 1 && f[0].name == want),
+            "{name}: got {res:?} — want {want}"
+        );
+    }
 }
 
 /// A 403 from unrestrict is RD refusing a FILE, not the account: realDebridBlocked exists because RD
@@ -3503,81 +3738,11 @@ async fn real_debrid_a_forbidden_link_is_not_a_forbidden_account() {
 /// records no refusal either, so it could not even set the key it skipped") without fixing it.
 #[tokio::test]
 async fn tor_box_the_warm_path_remembers_its_refusal() {
-        // (name, requestdl status, want account-wide)
-        let cases: [(&str, u16, bool); 2] = [("a throttle", 429, false), ("a rejected key", 401, true)];
-        for (name, status, want_account) in cases {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let c = calls.clone();
-            let cache = new_cache();
-            cache.put(
-                &resolve_key("tok", H),
-                r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#,
-                resolve_cache_ttl(),
-            );
-            let s = tb(
-                "tok",
-                doer(move |req| {
-                    if req.url().path().contains("requestdl") {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        return Ok(resp(status, "{}"));
-                    }
-                    Ok(resp(200, "{}"))
-                }),
-                Some(cache.clone()),
-            );
-            let target = ResolveTarget { file_idx: intp(0), ..tgt(H) };
-            for _ in 0..10 {
-                let _ = s.resolve(&target).await;
-            }
-            assert!(backed_off(&*cache, TorBox, "tok", H).is_some(), "{name}: the refusal was not remembered, so every poll re-asks");
-            let n = calls.load(Ordering::SeqCst);
-            assert!(n <= 1, "{name}: asked {n} times across ten polls");
-            let got = account_backed_off(&*cache, TorBox, "tok").is_some();
-            assert_eq!(got, want_account, "{name}: account backoff = {got}, want {want_account}");
-        }
-}
-
-/// listFiles and Status read the same mylist payload and must agree about whose entry it is. Status was
-/// left on first-of-either, and it is the reader that decides "downloading" against "dead": a finished
-/// stranger at the head of the array made a live download report nothing, which /play answers 404
-/// dead_link — the client blacklists a release that is downloading right now.
-#[tokio::test]
-async fn tor_box_status_an_exact_id_beats_an_unlabelled_entry() {
-        const OURS: i64 = 42;
-        let unlabelled_finished = r#"{"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
-        let stranger_busy = r#"{"id":9,"progress":0.11,"download_finished":false,"eta":9999,"download_speed":5}"#;
-        let ours_busy = r#"{"id":42,"progress":0.5,"download_finished":false,"eta":600,"download_speed":900000}"#;
-        let cases = [
-            ("an unlabelled finished entry first", format!("{unlabelled_finished},{ours_busy}")),
-            ("a stranger downloading first", format!("{stranger_busy},{ours_busy}")),
-            ("both ahead of ours", format!("{unlabelled_finished},{stranger_busy},{ours_busy}")),
-        ];
-        for (name, entries) in cases {
-            let cache = new_cache();
-            cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-            let body = format!(r#"{{"data":[{entries}]}}"#);
-            let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
-            let got = s.status(&tgt(H)).await.expect("our torrent is in the list and downloading; this must report on it");
-            assert!(got.progress == 0.5, "{name}: reported {got:?} — that is another torrent's progress");
-        }
-
-        // With no exact match anywhere, an id-less entry is still the best available answer.
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|_| Ok(resp(200, r#"{"data":[{"progress":0.25,"download_finished":false}]}"#))),
-            Some(cache),
-        );
-        let got = s.status(&tgt(H)).await;
-        assert!(matches!(&got, Some(g) if g.progress == 0.25), "an unlabelled lone entry is still ours: {got:?}");
-}
-
-/// A read-only caller is exempt from the gate that READS the per-release backoff, so it must not WRITE
-/// one either: the probe re-stamped a refusal it would never consult, which kept /play gated for exactly
-/// as long as the probe kept polling.
-#[tokio::test]
-async fn tor_box_a_read_only_resolve_writes_no_backoff() {
+    // (name, requestdl status, want account-wide)
+    let cases: [(&str, u16, bool); 2] = [("a throttle", 429, false), ("a rejected key", 401, true)];
+    for (name, status, want_account) in cases {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
         let cache = new_cache();
         cache.put(
             &resolve_key("tok", H),
@@ -3586,22 +3751,104 @@ async fn tor_box_a_read_only_resolve_writes_no_backoff() {
         );
         let s = tb(
             "tok",
-            doer(|req| {
+            doer(move |req| {
                 if req.url().path().contains("requestdl") {
-                    return Ok(resp(429, "{}"));
+                    c.fetch_add(1, Ordering::SeqCst);
+                    return Ok(resp(status, "{}"));
                 }
                 Ok(resp(200, "{}"))
             }),
             Some(cache.clone()),
         );
-        let probe = ResolveTarget { file_idx: intp(0), no_add: true, ..tgt(H) };
-        for _ in 0..5 {
-            let _ = s.resolve(&probe).await;
+        let target = ResolveTarget { file_idx: intp(0), ..tgt(H) };
+        for _ in 0..10 {
+            let _ = s.resolve(&target).await;
         }
-        assert!(backed_off(&*cache, TorBox, "tok", H).is_none(), "a read-only resolve wrote the backoff that gates /play");
-        // And a real play still records it, so the poll loop is bounded where it matters.
-        let _ = s.resolve(&ResolveTarget { file_idx: intp(0), ..tgt(H) }).await;
-        assert!(backed_off(&*cache, TorBox, "tok", H).is_some(), "a queueing resolve must still remember the refusal");
+        assert!(
+            backed_off(&*cache, TorBox, "tok", H).is_some(),
+            "{name}: the refusal was not remembered, so every poll re-asks"
+        );
+        let n = calls.load(Ordering::SeqCst);
+        assert!(n <= 1, "{name}: asked {n} times across ten polls");
+        let got = account_backed_off(&*cache, TorBox, "tok").is_some();
+        assert_eq!(got, want_account, "{name}: account backoff = {got}, want {want_account}");
+    }
+}
+
+/// listFiles and Status read the same mylist payload and must agree about whose entry it is. Status was
+/// left on first-of-either, and it is the reader that decides "downloading" against "dead": a finished
+/// stranger at the head of the array made a live download report nothing, which /play answers 404
+/// dead_link — the client blacklists a release that is downloading right now.
+#[tokio::test]
+async fn tor_box_status_an_exact_id_beats_an_unlabelled_entry() {
+    const OURS: i64 = 42;
+    let unlabelled_finished = r#"{"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
+    let stranger_busy = r#"{"id":9,"progress":0.11,"download_finished":false,"eta":9999,"download_speed":5}"#;
+    let ours_busy = r#"{"id":42,"progress":0.5,"download_finished":false,"eta":600,"download_speed":900000}"#;
+    let cases = [
+        ("an unlabelled finished entry first", format!("{unlabelled_finished},{ours_busy}")),
+        ("a stranger downloading first", format!("{stranger_busy},{ours_busy}")),
+        ("both ahead of ours", format!("{unlabelled_finished},{stranger_busy},{ours_busy}")),
+    ];
+    for (name, entries) in cases {
+        let cache = new_cache();
+        cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+        let body = format!(r#"{{"data":[{entries}]}}"#);
+        let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
+        let got = s
+            .status(&tgt(H))
+            .await
+            .expect("our torrent is in the list and downloading; this must report on it");
+        assert!(got.progress == 0.5, "{name}: reported {got:?} — that is another torrent's progress");
+    }
+
+    // With no exact match anywhere, an id-less entry is still the best available answer.
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|_| Ok(resp(200, r#"{"data":[{"progress":0.25,"download_finished":false}]}"#))),
+        Some(cache),
+    );
+    let got = s.status(&tgt(H)).await;
+    assert!(matches!(&got, Some(g) if g.progress == 0.25), "an unlabelled lone entry is still ours: {got:?}");
+}
+
+/// A read-only caller is exempt from the gate that READS the per-release backoff, so it must not WRITE
+/// one either: the probe re-stamped a refusal it would never consult, which kept /play gated for exactly
+/// as long as the probe kept polling.
+#[tokio::test]
+async fn tor_box_a_read_only_resolve_writes_no_backoff() {
+    let cache = new_cache();
+    cache.put(
+        &resolve_key("tok", H),
+        r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#,
+        resolve_cache_ttl(),
+    );
+    let s = tb(
+        "tok",
+        doer(|req| {
+            if req.url().path().contains("requestdl") {
+                return Ok(resp(429, "{}"));
+            }
+            Ok(resp(200, "{}"))
+        }),
+        Some(cache.clone()),
+    );
+    let probe = ResolveTarget { file_idx: intp(0), no_add: true, ..tgt(H) };
+    for _ in 0..5 {
+        let _ = s.resolve(&probe).await;
+    }
+    assert!(
+        backed_off(&*cache, TorBox, "tok", H).is_none(),
+        "a read-only resolve wrote the backoff that gates /play"
+    );
+    // And a real play still records it, so the poll loop is bounded where it matters.
+    let _ = s.resolve(&ResolveTarget { file_idx: intp(0), ..tgt(H) }).await;
+    assert!(
+        backed_off(&*cache, TorBox, "tok", H).is_some(),
+        "a queueing resolve must still remember the refusal"
+    );
 }
 
 /// recordRefusal feeds two memories and a read-only caller stands differently to each. The per-release
@@ -3611,72 +3858,78 @@ async fn tor_box_a_read_only_resolve_writes_no_backoff() {
 /// unable to set the very key it then reads, so it re-asked a rejected endpoint once per poll.
 #[tokio::test]
 async fn tor_box_a_read_only_resolve_writes_only_the_account_refusal() {
-        // Both paths that record: the warm resolve entry, and the held torrent id.
-        for path in ["warm", "held"] {
-            // (name, status, want per-release, want account)
-            let cases: [(&str, u16, bool, bool); 2] = [
-                ("a throttle", 429, false, false),
-                // A rejected key writes both, because recordRefusal writes the per-release key alongside the
-                // account one. That is harmless where it would not be for a throttle: the account gate blocks
-                // every release on this token anyway, so the narrower key gates nothing that was not already
-                // gated. What matters is that a THROTTLE — an add-path fact — writes neither.
-                ("a rejected key", 401, true, true),
-            ];
-            for (name, status, want_per_release, want_account) in cases {
-                let calls = Arc::new(AtomicUsize::new(0));
-                let c = calls.clone();
-                let cache = new_cache();
-                if path == "warm" {
-                    cache.put(
-                        &resolve_key("tok", H),
-                        r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#,
-                        resolve_cache_ttl(),
-                    );
-                } else {
-                    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-                }
-                let s = tb(
-                    "tok",
-                    doer(move |req| {
-                        if req.url().path().contains("requestdl") {
-                            c.fetch_add(1, Ordering::SeqCst);
-                            return Ok(resp(status, "{}"));
-                        }
-                        Ok(resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
-                    }),
-                    Some(cache.clone()),
+    // Both paths that record: the warm resolve entry, and the held torrent id.
+    for path in ["warm", "held"] {
+        // (name, status, want per-release, want account)
+        let cases: [(&str, u16, bool, bool); 2] = [
+            ("a throttle", 429, false, false),
+            // A rejected key writes both, because recordRefusal writes the per-release key alongside the
+            // account one. That is harmless where it would not be for a throttle: the account gate blocks
+            // every release on this token anyway, so the narrower key gates nothing that was not already
+            // gated. What matters is that a THROTTLE — an add-path fact — writes neither.
+            ("a rejected key", 401, true, true),
+        ];
+        for (name, status, want_per_release, want_account) in cases {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = calls.clone();
+            let cache = new_cache();
+            if path == "warm" {
+                cache.put(
+                    &resolve_key("tok", H),
+                    r#"{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}"#,
+                    resolve_cache_ttl(),
                 );
-                let probe = ResolveTarget { file_idx: intp(0), no_add: true, ..tgt(H) };
-                for _ in 0..5 {
-                    let _ = s.resolve(&probe).await;
-                }
-                let per_release = backed_off(&*cache, TorBox, "tok", H).is_some();
-                assert_eq!(per_release, want_per_release, "{path}/{name}: per-release backoff = {per_release} — a probe must not gate /play");
-                let account = account_backed_off(&*cache, TorBox, "tok").is_some();
-                assert_eq!(account, want_account, "{path}/{name}: account backoff = {account}");
-                // A dead key must stop the probe re-asking; a throttle is an add-path fact and does not.
-                let n = calls.load(Ordering::SeqCst);
-                if want_account {
-                    assert!(n <= 1, "{path}/{name}: asked a rejected endpoint {n} times across five polls");
-                }
+            } else {
+                cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+            }
+            let s = tb(
+                "tok",
+                doer(move |req| {
+                    if req.url().path().contains("requestdl") {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        return Ok(resp(status, "{}"));
+                    }
+                    Ok(resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
+                }),
+                Some(cache.clone()),
+            );
+            let probe = ResolveTarget { file_idx: intp(0), no_add: true, ..tgt(H) };
+            for _ in 0..5 {
+                let _ = s.resolve(&probe).await;
+            }
+            let per_release = backed_off(&*cache, TorBox, "tok", H).is_some();
+            assert_eq!(
+                per_release, want_per_release,
+                "{path}/{name}: per-release backoff = {per_release} — a probe must not gate /play"
+            );
+            let account = account_backed_off(&*cache, TorBox, "tok").is_some();
+            assert_eq!(account, want_account, "{path}/{name}: account backoff = {account}");
+            // A dead key must stop the probe re-asking; a throttle is an add-path fact and does not.
+            let n = calls.load(Ordering::SeqCst);
+            if want_account {
+                assert!(n <= 1, "{path}/{name}: asked a rejected endpoint {n} times across five polls");
             }
         }
+    }
 
-        // And a queueing resolve still writes the per-release key, which is where the bound is wanted.
-        let cache = new_cache();
-        cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
-        let s = tb(
-            "tok",
-            doer(|req| {
-                if req.url().path().contains("requestdl") {
-                    return Ok(resp(429, "{}"));
-                }
-                Ok(resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
-            }),
-            Some(cache.clone()),
-        );
-        let _ = s.resolve(&ResolveTarget { file_idx: intp(0), ..tgt(H) }).await;
-        assert!(backed_off(&*cache, TorBox, "tok", H).is_some(), "a queueing resolve must still remember the refusal");
+    // And a queueing resolve still writes the per-release key, which is where the bound is wanted.
+    let cache = new_cache();
+    cache.put(&torrent_id_key("tok", H), "42", resolve_cache_ttl());
+    let s = tb(
+        "tok",
+        doer(|req| {
+            if req.url().path().contains("requestdl") {
+                return Ok(resp(429, "{}"));
+            }
+            Ok(resp(200, r#"{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}"#))
+        }),
+        Some(cache.clone()),
+    );
+    let _ = s.resolve(&ResolveTarget { file_idx: intp(0), ..tgt(H) }).await;
+    assert!(
+        backed_off(&*cache, TorBox, "tok", H).is_some(),
+        "a queueing resolve must still remember the refusal"
+    );
 }
 
 /// The account listing is the WHOLE account, and it was pulled once per infohash because the only memo
@@ -3684,47 +3937,53 @@ async fn tor_box_a_read_only_resolve_writes_only_the_account_refusal() {
 /// requests. The question "what does this account hold?" has one answer at a time.
 #[tokio::test]
 async fn tor_box_the_account_listing_is_fetched_once_per_account() {
-        // A realistic account: 300 torrents, one of which is the one being asked about.
-        let mut entries: Vec<String> = (0..300)
-            .map(|i| format!(r#"{{"id":{i},"hash":"{}"}}"#, repeat(&format!("{:x}", i % 16), 40)))
-            .collect();
-        entries.push(format!(r#"{{"id":999,"hash":"{H}"}}"#));
-        let payload = format!(r#"{{"success":true,"data":[{}]}}"#, entries.join(","));
+    // A realistic account: 300 torrents, one of which is the one being asked about.
+    let mut entries: Vec<String> = (0..300)
+        .map(|i| format!(r#"{{"id":{i},"hash":"{}"}}"#, repeat(&format!("{:x}", i % 16), 40)))
+        .collect();
+    entries.push(format!(r#"{{"id":999,"hash":"{H}"}}"#));
+    let payload = format!(r#"{{"success":true,"data":[{}]}}"#, entries.join(","));
 
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let bytes_out = Arc::new(AtomicUsize::new(0));
-        let cache = new_cache();
-        let make = |f: Arc<AtomicUsize>, b: Arc<AtomicUsize>| {
-            let payload = payload.clone();
-            tb(
-                "tok",
-                doer(move |req| {
-                    if req.url().path().contains("mylist") && !req.url().query().unwrap_or("").contains("id=") {
-                        f.fetch_add(1, Ordering::SeqCst);
-                        b.fetch_add(payload.len(), Ordering::SeqCst);
-                        return Ok(resp(200, &payload));
-                    }
-                    Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#))
-                }),
-                Some(cache.clone()),
-            )
-        };
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let bytes_out = Arc::new(AtomicUsize::new(0));
+    let cache = new_cache();
+    let make = |f: Arc<AtomicUsize>, b: Arc<AtomicUsize>| {
+        let payload = payload.clone();
+        tb(
+            "tok",
+            doer(move |req| {
+                if req.url().path().contains("mylist") && !req.url().query().unwrap_or("").contains("id=") {
+                    f.fetch_add(1, Ordering::SeqCst);
+                    b.fetch_add(payload.len(), Ordering::SeqCst);
+                    return Ok(resp(200, &payload));
+                }
+                Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#))
+            }),
+            Some(cache.clone()),
+        )
+    };
 
-        // Eight different releases, the poster-grid shape. Only one is in the account.
-        let mut hashes = vec![H.to_string()];
-        for i in 0..7 {
-            hashes.push(repeat(&format!("{i:x}"), 40));
-        }
-        for h in &hashes {
-            let _ = make(fetches.clone(), bytes_out.clone()).status(&tgt(h)).await;
-        }
-        let n = fetches.load(Ordering::SeqCst);
-        let b = bytes_out.load(Ordering::SeqCst);
-        assert_eq!(n, 1, "fetched the account listing {n} times for {} releases ({b} bytes)", hashes.len());
-        // And the answer is still right for both a hash it holds and one it does not.
-        assert!(make(fetches.clone(), bytes_out.clone()).status(&tgt(H)).await.is_some(), "a held, downloading torrent must still be found through the memo");
-        let absent = "dead".repeat(10); // 40 chars, and not one of the generated single-digit hashes
-        assert!(make(fetches.clone(), bytes_out.clone()).status(&tgt(&absent)).await.is_none(), "a hash the account does not hold must not be found");
+    // Eight different releases, the poster-grid shape. Only one is in the account.
+    let mut hashes = vec![H.to_string()];
+    for i in 0..7 {
+        hashes.push(repeat(&format!("{i:x}"), 40));
+    }
+    for h in &hashes {
+        let _ = make(fetches.clone(), bytes_out.clone()).status(&tgt(h)).await;
+    }
+    let n = fetches.load(Ordering::SeqCst);
+    let b = bytes_out.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "fetched the account listing {n} times for {} releases ({b} bytes)", hashes.len());
+    // And the answer is still right for both a hash it holds and one it does not.
+    assert!(
+        make(fetches.clone(), bytes_out.clone()).status(&tgt(H)).await.is_some(),
+        "a held, downloading torrent must still be found through the memo"
+    );
+    let absent = "dead".repeat(10); // 40 chars, and not one of the generated single-digit hashes
+    assert!(
+        make(fetches.clone(), bytes_out.clone()).status(&tgt(&absent)).await.is_none(),
+        "a hash the account does not hold must not be found"
+    );
 }
 
 /// The same hash is asked about three times within seconds — by /stream, by ?probe=1, and by /play on a
@@ -3733,42 +3992,74 @@ async fn tor_box_the_account_listing_is_fetched_once_per_account() {
 /// so a negative is never memoised.
 #[tokio::test]
 async fn cache_check_remembers_held_but_never_not_held() {
-        // (name, svc, body for a held / not-held answer, build)
-        let cases: [(&str, DebridService, fn(bool) -> &'static str); 2] = [
-            ("torbox", TorBox, |held| if held { r#"{"data":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"name":"x"}}}"# } else { r#"{"data":{}}"# }),
-            ("premiumize", Premiumize, |held| if held { r#"{"status":"success","response":[true]}"# } else { r#"{"status":"success","response":[false]}"# }),
-        ];
-        for (name, svc, body_for) in cases {
-            // A release the account HOLDS: asked once, answered three times.
-            let calls = Arc::new(AtomicUsize::new(0));
-            let c = calls.clone();
-            let cache = new_cache();
-            let s = build_for(name, doer(move |_| { c.fetch_add(1, Ordering::SeqCst); Ok(resp(200, body_for(true))) }), cache.clone());
-            for i in 0..3 {
-                let got = s.cache_check(&[H.to_string()]).await;
-                assert!(matches!(&got, Ok(m) if m.get(H) == Some(&true)), "{name}: check {i}: {got:?}");
+    // (name, svc, body for a held / not-held answer, build)
+    let cases: [(&str, DebridService, fn(bool) -> &'static str); 2] = [
+        ("torbox", TorBox, |held| {
+            if held {
+                r#"{"data":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"name":"x"}}}"#
+            } else {
+                r#"{"data":{}}"#
             }
-            let n = calls.load(Ordering::SeqCst);
-            assert_eq!(n, 1, "{name}: asked {n} times about a release the account holds");
-
-            // A release it does NOT hold: asked every time, because the answer is what changes when the
-            // download lands.
-            let calls = Arc::new(AtomicUsize::new(0));
-            let c = calls.clone();
-            let held = Arc::new(AtomicBool::new(false));
-            let h = held.clone();
-            let cache = new_cache();
-            let s = build_for(name, doer(move |_| { c.fetch_add(1, Ordering::SeqCst); Ok(resp(200, body_for(h.load(Ordering::SeqCst)))) }), cache.clone());
-            for i in 0..3 {
-                let got = s.cache_check(&[H.to_string()]).await;
-                assert!(!matches!(&got, Ok(m) if m.get(H) == Some(&true)), "{name}: check {i} claimed a release that is still downloading");
+        }),
+        ("premiumize", Premiumize, |held| {
+            if held {
+                r#"{"status":"success","response":[true]}"#
+            } else {
+                r#"{"status":"success","response":[false]}"#
             }
-            let n = calls.load(Ordering::SeqCst);
-            assert_eq!(n, 3, "{name}: asked {n} times about a downloading release — the poll must see it land");
-            // It lands, and the very next check must notice.
-            held.store(true, Ordering::SeqCst);
+        }),
+    ];
+    for (name, svc, body_for) in cases {
+        // A release the account HOLDS: asked once, answered three times.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let cache = new_cache();
+        let s = build_for(
+            name,
+            doer(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(resp(200, body_for(true)))
+            }),
+            cache.clone(),
+        );
+        for i in 0..3 {
             let got = s.cache_check(&[H.to_string()]).await;
-            assert!(matches!(&got, Ok(m) if m.get(H) == Some(&true)), "{name}: the download finished and the next check did not notice");
-            let _ = svc;
+            assert!(matches!(&got, Ok(m) if m.get(H) == Some(&true)), "{name}: check {i}: {got:?}");
         }
+        let n = calls.load(Ordering::SeqCst);
+        assert_eq!(n, 1, "{name}: asked {n} times about a release the account holds");
+
+        // A release it does NOT hold: asked every time, because the answer is what changes when the
+        // download lands.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let held = Arc::new(AtomicBool::new(false));
+        let h = held.clone();
+        let cache = new_cache();
+        let s = build_for(
+            name,
+            doer(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(resp(200, body_for(h.load(Ordering::SeqCst))))
+            }),
+            cache.clone(),
+        );
+        for i in 0..3 {
+            let got = s.cache_check(&[H.to_string()]).await;
+            assert!(
+                !matches!(&got, Ok(m) if m.get(H) == Some(&true)),
+                "{name}: check {i} claimed a release that is still downloading"
+            );
+        }
+        let n = calls.load(Ordering::SeqCst);
+        assert_eq!(n, 3, "{name}: asked {n} times about a downloading release — the poll must see it land");
+        // It lands, and the very next check must notice.
+        held.store(true, Ordering::SeqCst);
+        let got = s.cache_check(&[H.to_string()]).await;
+        assert!(
+            matches!(&got, Ok(m) if m.get(H) == Some(&true)),
+            "{name}: the download finished and the next check did not notice"
+        );
+        let _ = svc;
+    }
 }

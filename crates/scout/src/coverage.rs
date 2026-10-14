@@ -265,7 +265,12 @@ fn parse_rfc3339(s: &str) -> Option<Option<SystemTime>> {
         let part = s.get(from..from + len)?;
         part.bytes().all(|c| c.is_ascii_digit()).then(|| part.parse().ok()).flatten()
     };
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b't') || b[13] != b':' || b[16] != b':'
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !(b[10] == b'T' || b[10] == b't')
+        || b[13] != b':'
+        || b[16] != b':'
     {
         return None;
     }

@@ -346,7 +346,12 @@ fn vectors(kind: &str) -> Vec<Vector> {
                 Some(n) => "A".repeat(n.parse().unwrap()),
                 None => f[3].to_owned(),
             };
-            Vector { kind: f[1], name: f[2], value, expect: serde_json::from_str(f[4]).expect("expected is JSON") }
+            Vector {
+                kind: f[1],
+                name: f[2],
+                value,
+                expect: serde_json::from_str(f[4]).expect("expected is JSON"),
+            }
         })
         .filter(|v| v.kind == kind)
         .collect();

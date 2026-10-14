@@ -41,7 +41,12 @@ fn compiled_insts(_pat: &str) -> i64 {
 
 #[test]
 fn decode_config() {
-    let c = crate::config::decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#));
+    let c = crate::config::decode_config(
+        None,
+        &blob(
+            r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}"#,
+        ),
+    );
     assert!(
         matches!(&c, Some(c) if c.debrid.len() == 1 && c.debrid[0].service == DebridService::TorBox && c.debrid[0].token == "tb-secret" && c.cached_only),
         "valid config: {c:?}"
@@ -55,7 +60,10 @@ fn decode_config() {
     ] {
         assert!(crate::config::decode_config(None, &blob(bad)).is_none(), "expected reject: {bad}");
     }
-    assert!(crate::config::decode_config(None, "!!!not-base64!!!").is_none(), "garbage blob should be rejected");
+    assert!(
+        crate::config::decode_config(None, "!!!not-base64!!!").is_none(),
+        "garbage blob should be rejected"
+    );
 
     // clamp + drop unknown; #12: minSeeders:-5 becomes nil (no filter), not 0.
     let c = crate::config::decode_config(
@@ -112,7 +120,11 @@ fn decode_config() {
         ) else {
             panic!("config carrying {bad:?} was rejected outright");
         };
-        assert!(c.filters.exclude_regex.is_empty(), "counted repetition survived validation: {:?}", c.filters.exclude_regex);
+        assert!(
+            c.filters.exclude_regex.is_empty(),
+            "counted repetition survived validation: {:?}",
+            c.filters.exclude_regex
+        );
     }
     // The patterns people actually write are untouched — including a genuinely escaped brace, a unicode
     // class (whose braces carry no digits), and a brace inside a character class.
@@ -130,25 +142,43 @@ fn decode_config() {
 
     // preferResolution is whitelisted like every other resolution field. An unknown value becomes "no
     // preference" rather than a preference nothing can satisfy — which would sink every release equally.
-    let pref = crate::config::decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"filters":{"preferResolution":"1080p"}}"#))
-        .unwrap_or_default();
+    let pref = crate::config::decode_config(
+        None,
+        &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"filters":{"preferResolution":"1080p"}}"#),
+    )
+    .unwrap_or_default();
     assert_eq!(pref.filters.prefer_resolution, "1080p", "preferResolution");
-    let bogus = crate::config::decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"filters":{"preferResolution":"8k"}}"#))
-        .unwrap_or_default();
-    assert!(bogus.filters.prefer_resolution.is_empty(), "an unknown preferResolution was carried: {:?}", bogus.filters.prefer_resolution);
+    let bogus = crate::config::decode_config(
+        None,
+        &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"filters":{"preferResolution":"8k"}}"#),
+    )
+    .unwrap_or_default();
+    assert!(
+        bogus.filters.prefer_resolution.is_empty(),
+        "an unknown preferResolution was carried: {:?}",
+        bogus.filters.prefer_resolution
+    );
 
     // A live host that needs a config PATH is not disabled. comet 403s the bare path and answers on a
     // config path, which `configPathIndexers` already handles — disabling it stripped it before
     // makeScrapers could mint one, leaving the install with a single real source.
-    let with_comet = crate::config::decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","comet"]}"#))
-        .unwrap_or_default();
-    assert!(with_comet.indexers.len() == 2, "comet needs a config path, not a headstone: {:?}", with_comet.indexers);
+    let with_comet = crate::config::decode_config(
+        None,
+        &blob(r#"{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","comet"]}"#),
+    )
+    .unwrap_or_default();
+    assert!(
+        with_comet.indexers.len() == 2,
+        "comet needs a config path, not a headstone: {:?}",
+        with_comet.indexers
+    );
 
     // defaults. A config carrying only the account defers everything else to the server, which is what
     // /configure builds by default — so these ARE the shipped defaults, not incidental fallbacks.
     // cachedOnly is deliberately off: inheriting "hide anything not already fetched" can leave a title
     // showing one scrap of a release, or nothing, while good ones sit a download away.
-    let c = crate::config::decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}]}"#)).unwrap_or_default();
+    let c = crate::config::decode_config(None, &blob(r#"{"debrid":[{"service":"torbox","token":"t"}]}"#))
+        .unwrap_or_default();
     // The default indexer set is the working one, not every one this server knows how to talk to.
     assert!(
         c.filters.exclude_cam
@@ -209,7 +239,10 @@ fn parse_stream_id() {
         overlong.len(),
         MAX_STREAM_ID_LEN
     );
-    assert!(crate::id::parse_stream_id("series", &format!("{overlong}.json")).is_none(), "an otherwise-valid id past the length cap was accepted");
+    assert!(
+        crate::id::parse_stream_id("series", &format!("{overlong}.json")).is_none(),
+        "an otherwise-valid id past the length cap was accepted"
+    );
     // …and the same shape just under the cap still parses, so the cap is not simply refusing everything.
     let short_enough = format!("tt1234567:{}1:1", "0".repeat(8));
     let s = crate::id::parse_stream_id("series", &format!("{short_enough}.json"));
@@ -223,7 +256,10 @@ fn parse_stream_id() {
 fn play_token() {
     let movie = PlayTarget { info_hash: "a".repeat(40), ..Default::default() };
     let got = decode_play_token(&encode_play_token(&movie));
-    assert!(matches!(&got, Some(g) if g.info_hash == movie.info_hash && g.file_idx.is_none()), "movie round-trip: {got:?}");
+    assert!(
+        matches!(&got, Some(g) if g.info_hash == movie.info_hash && g.file_idx.is_none()),
+        "movie round-trip: {got:?}"
+    );
     let series = PlayTarget {
         info_hash: "b".repeat(40),
         file_idx: Some(3),
@@ -236,7 +272,10 @@ fn play_token() {
         matches!(&got, Some(g) if g.info_hash == series.info_hash && g.file_idx == Some(3) && g.season == Some(1) && g.episode == Some(2)),
         "series round-trip: {got:?}"
     );
-    let got = decode_play_token(&encode_play_token(&PlayTarget { info_hash: "C".repeat(40), ..Default::default() }));
+    let got = decode_play_token(&encode_play_token(&PlayTarget {
+        info_hash: "C".repeat(40),
+        ..Default::default()
+    }));
     assert!(matches!(&got, Some(g) if g.info_hash == "c".repeat(40)), "infohash should be lowercased");
     assert!(decode_play_token("!!!").is_none(), "garbage token should be rejected");
     assert!(decode_play_token(&blob(r#"{"h":"short"}"#)).is_none(), "short hash should be rejected");
@@ -244,59 +283,68 @@ fn play_token() {
 
 #[test]
 fn pick_episode_file() {
-        use crate::season::{pick_episode_file, TorrentFile};
-        let files = vec![
-            TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
-            TorrentFile { index: 1, name: "Show.S01E02.1080p.mkv".into(), size_bytes: Some(900) },
-            TorrentFile { index: 2, name: "Show.S01E02.sample.mkv".into(), size_bytes: Some(5) },
-            TorrentFile { index: 3, name: "readme.txt".into(), size_bytes: Some(1) },
-        ];
-        // SxxExx pick (largest on ties)
-        let got = pick_episode_file(&files, 1, 2);
-        assert!(matches!(got, Ok(Some(1))), "SxxExx pick (largest on ties): got {got:?} want 1");
-        let got = pick_episode_file(&[TorrentFile { index: 7, name: "Show 1x03.mp4".into(), size_bytes: None }], 1, 3);
-        assert!(matches!(got, Ok(Some(7))), "1x03: got {got:?}");
-        let got = pick_episode_file(&[TorrentFile { index: 8, name: "Show.104.mp4".into(), size_bytes: None }], 1, 4);
-        assert!(matches!(got, Ok(Some(8))), "104: got {got:?}");
-        // Neither name is episode-labelled and there is more than one candidate, so this function has NO
-        // opinion — the largest-video fallback moved out to the callers, where it comes after the indexer's
-        // fileIdx instead of pre-empting it. Answering here made a guess beat a fact: a non-nil result makes
-        // every caller return before FileIdx is read, so a bare-numbered pack ("[Grp] Show - 03") served the
-        // same file for every episode of it.
-        let multi = [
-            TorrentFile { index: 4, name: "a.mkv".into(), size_bytes: Some(10) },
-            TorrentFile { index: 5, name: "b.mkv".into(), size_bytes: Some(20) },
-        ];
-        let got = pick_episode_file(&multi, 9, 9);
-        assert!(matches!(got, Ok(None)), "no-match on a multi-file pool → no opinion: got {got:?}");
-        // One candidate is different: there the largest really is the only thing it could be.
-        let got = pick_episode_file(&[TorrentFile { index: 4, name: "a.mkv".into(), size_bytes: Some(10) }], 9, 9);
-        assert!(matches!(got, Ok(Some(4))), "a lone unlabelled video is still the answer: got {got:?} want 4");
-        let got = pick_episode_file(&[], 1, 1);
-        assert!(matches!(got, Ok(None)), "no files → nil: got {got:?}");
+    use crate::season::{pick_episode_file, TorrentFile};
+    let files = vec![
+        TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+        TorrentFile { index: 1, name: "Show.S01E02.1080p.mkv".into(), size_bytes: Some(900) },
+        TorrentFile { index: 2, name: "Show.S01E02.sample.mkv".into(), size_bytes: Some(5) },
+        TorrentFile { index: 3, name: "readme.txt".into(), size_bytes: Some(1) },
+    ];
+    // SxxExx pick (largest on ties)
+    let got = pick_episode_file(&files, 1, 2);
+    assert!(matches!(got, Ok(Some(1))), "SxxExx pick (largest on ties): got {got:?} want 1");
+    let got =
+        pick_episode_file(&[TorrentFile { index: 7, name: "Show 1x03.mp4".into(), size_bytes: None }], 1, 3);
+    assert!(matches!(got, Ok(Some(7))), "1x03: got {got:?}");
+    let got =
+        pick_episode_file(&[TorrentFile { index: 8, name: "Show.104.mp4".into(), size_bytes: None }], 1, 4);
+    assert!(matches!(got, Ok(Some(8))), "104: got {got:?}");
+    // Neither name is episode-labelled and there is more than one candidate, so this function has NO
+    // opinion — the largest-video fallback moved out to the callers, where it comes after the indexer's
+    // fileIdx instead of pre-empting it. Answering here made a guess beat a fact: a non-nil result makes
+    // every caller return before FileIdx is read, so a bare-numbered pack ("[Grp] Show - 03") served the
+    // same file for every episode of it.
+    let multi = [
+        TorrentFile { index: 4, name: "a.mkv".into(), size_bytes: Some(10) },
+        TorrentFile { index: 5, name: "b.mkv".into(), size_bytes: Some(20) },
+    ];
+    let got = pick_episode_file(&multi, 9, 9);
+    assert!(matches!(got, Ok(None)), "no-match on a multi-file pool → no opinion: got {got:?}");
+    // One candidate is different: there the largest really is the only thing it could be.
+    let got =
+        pick_episode_file(&[TorrentFile { index: 4, name: "a.mkv".into(), size_bytes: Some(10) }], 9, 9);
+    assert!(matches!(got, Ok(Some(4))), "a lone unlabelled video is still the answer: got {got:?} want 4");
+    let got = pick_episode_file(&[], 1, 1);
+    assert!(matches!(got, Ok(None)), "no files → nil: got {got:?}");
 }
 
 #[test]
 fn select_file_id_torbox() {
-        use crate::season::TorrentFile;
-        use crate::stores::torbox::select_file_id;
-        use crate::stores::ResolveTarget;
-        // TorBox file ids (Index) are NOT positions in Torrentio's list, so a series episode must be
-        // name-matched, never resolved via the passed-through fileIdx (FOLLOWUP #13).
-        let pack = vec![
-            TorrentFile { index: 50, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
-            TorrentFile { index: 55, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
-        ];
-        let got = select_file_id(&pack, &ResolveTarget { season: Some(1), episode: Some(2), file_idx: Some(99), ..Default::default() });
-        assert!(matches!(got, Ok(Some(55))), "episode name-match wins over fileIdx: got {got:?} want 55 (TorBox id)");
-        // fileIdx-only → POSITION in the list mapped to TorBox's file id (files[1].Index == 55).
-        let got = select_file_id(&pack, &ResolveTarget { file_idx: Some(1), ..Default::default() });
-        assert!(matches!(got, Ok(Some(55))), "fileIdx position → TorBox id: got {got:?} want 55");
-        // fileIdx-only with no file list (single-file fast path / list failure) → raw passthrough.
-        let got = select_file_id(&[], &ResolveTarget { file_idx: Some(7), ..Default::default() });
-        assert!(matches!(got, Ok(Some(7))), "fileIdx passthrough when no list: got {got:?} want 7");
-        let got = select_file_id(&pack, &ResolveTarget::default());
-        assert!(matches!(got, Ok(None)), "no selector → nil, got {got:?}");
+    use crate::season::TorrentFile;
+    use crate::stores::torbox::select_file_id;
+    use crate::stores::ResolveTarget;
+    // TorBox file ids (Index) are NOT positions in Torrentio's list, so a series episode must be
+    // name-matched, never resolved via the passed-through fileIdx (FOLLOWUP #13).
+    let pack = vec![
+        TorrentFile { index: 50, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+        TorrentFile { index: 55, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
+    ];
+    let got = select_file_id(
+        &pack,
+        &ResolveTarget { season: Some(1), episode: Some(2), file_idx: Some(99), ..Default::default() },
+    );
+    assert!(
+        matches!(got, Ok(Some(55))),
+        "episode name-match wins over fileIdx: got {got:?} want 55 (TorBox id)"
+    );
+    // fileIdx-only → POSITION in the list mapped to TorBox's file id (files[1].Index == 55).
+    let got = select_file_id(&pack, &ResolveTarget { file_idx: Some(1), ..Default::default() });
+    assert!(matches!(got, Ok(Some(55))), "fileIdx position → TorBox id: got {got:?} want 55");
+    // fileIdx-only with no file list (single-file fast path / list failure) → raw passthrough.
+    let got = select_file_id(&[], &ResolveTarget { file_idx: Some(7), ..Default::default() });
+    assert!(matches!(got, Ok(Some(7))), "fileIdx passthrough when no list: got {got:?} want 7");
+    let got = select_file_id(&pack, &ResolveTarget::default());
+    assert!(matches!(got, Ok(None)), "no selector → nil, got {got:?}");
 }
 
 #[test]
@@ -323,33 +371,41 @@ fn pick_file_id_prefers_episode_match() {
 
 #[test]
 fn clean_label_and_size() {
-        use crate::label::{clean_label, size_label};
-        use crate::rank::RawStream;
-        const GIB: i64 = 1 << 30;
-        const MIB: i64 = 1 << 20;
-        let s = RawStream { title: "Movie 2160p WEB-DL HDR Atmos".into(), size_bytes: Some(18 * GIB), ..Default::default() };
-        assert_eq!(clean_label(&s), "4K • WEB-DL • HDR • Atmos • 18 GB", "cleanLabel");
-        let sz = 3.4 * GIB as f64;
-        assert_eq!(size_label(sz as i64), "3.4 GB", "sizeLabel small");
-        assert_eq!(size_label(700 * MIB), "700 MB", "sizeLabel mb");
-        assert_eq!(clean_label(&RawStream { title: "mysterious".into(), ..Default::default() }), "Stream", "cleanLabel empty");
+    use crate::label::{clean_label, size_label};
+    use crate::rank::RawStream;
+    const GIB: i64 = 1 << 30;
+    const MIB: i64 = 1 << 20;
+    let s = RawStream {
+        title: "Movie 2160p WEB-DL HDR Atmos".into(),
+        size_bytes: Some(18 * GIB),
+        ..Default::default()
+    };
+    assert_eq!(clean_label(&s), "4K • WEB-DL • HDR • Atmos • 18 GB", "cleanLabel");
+    let sz = 3.4 * GIB as f64;
+    assert_eq!(size_label(sz as i64), "3.4 GB", "sizeLabel small");
+    assert_eq!(size_label(700 * MIB), "700 MB", "sizeLabel mb");
+    assert_eq!(
+        clean_label(&RawStream { title: "mysterious".into(), ..Default::default() }),
+        "Stream",
+        "cleanLabel empty"
+    );
 }
 
 // Fauda S1E3: the picker must say what this stream actually is (1.1 GB) and name the pack only as
 // context, never the other way round.
 #[test]
 fn clean_label_pack_size_is_context_not_the_headline() {
-        use crate::label::clean_label;
-        use crate::rank::RawStream;
-        const GIB: i64 = 1 << 30;
-        let s = RawStream {
-            title: "Fauda.S01E03.1080p.WEB-DL".into(),
-            size_bytes: Some(1_136_580_921),
-            pack_size_bytes: Some(68 * GIB),
-            ..Default::default()
-        };
-        let want = "1080p • WEB-DL • 1.1 GB · from a 68 GB pack";
-        assert_eq!(clean_label(&s), want, "cleanLabel");
+    use crate::label::clean_label;
+    use crate::rank::RawStream;
+    const GIB: i64 = 1 << 30;
+    let s = RawStream {
+        title: "Fauda.S01E03.1080p.WEB-DL".into(),
+        size_bytes: Some(1_136_580_921),
+        pack_size_bytes: Some(68 * GIB),
+        ..Default::default()
+    };
+    let want = "1080p • WEB-DL • 1.1 GB · from a 68 GB pack";
+    assert_eq!(clean_label(&s), want, "cleanLabel");
 }
 
 // A never-opened pack (unresolvedSeasonPack left SizeBytes nil): the label must name the number as a
@@ -358,99 +414,122 @@ fn clean_label_pack_size_is_context_not_the_headline() {
 // trusted episode number for that context to sit beside.
 #[test]
 fn clean_label_unknown_episode_size_names_the_pack_in_the_headline() {
-        use crate::label::clean_label;
-        use crate::rank::RawStream;
-        const GIB: i64 = 1 << 30;
-        let s = RawStream { title: "Fauda.S01.COMPLETE.1080p.WEB-DL".into(), pack_size_bytes: Some(68 * GIB), ..Default::default() };
-        assert_eq!(clean_label(&s), "1080p • WEB-DL • 68 GB pack", "cleanLabel");
+    use crate::label::clean_label;
+    use crate::rank::RawStream;
+    const GIB: i64 = 1 << 30;
+    let s = RawStream {
+        title: "Fauda.S01.COMPLETE.1080p.WEB-DL".into(),
+        pack_size_bytes: Some(68 * GIB),
+        ..Default::default()
+    };
+    assert_eq!(clean_label(&s), "1080p • WEB-DL • 68 GB pack", "cleanLabel");
 }
 
 // Needs `streamAttributes` and `StreamAttributes` from attributes.go (work package 5). The body is ported and
 // compiled out until it lands.
 #[test]
 fn stream_attributes() {
-        use crate::attributes::stream_attributes;
-        use crate::rank::RawStream;
-        const GIB: i64 = 1 << 30;
-        let a = stream_attributes(RawStream {
-            title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos".into(),
-            size_bytes: Some(40 * GIB),
-            seeders: Some(12),
-            cached: true,
-            cache_known: true,
-            ..Default::default()
-        });
+    use crate::attributes::stream_attributes;
+    use crate::rank::RawStream;
+    const GIB: i64 = 1 << 30;
+    let a = stream_attributes(RawStream {
+        title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos".into(),
+        size_bytes: Some(40 * GIB),
+        seeders: Some(12),
+        cached: true,
+        cache_known: true,
+        ..Default::default()
+    });
+    assert!(
+        a.resolution.as_deref() == Some("2160p")
+            && a.source.as_deref() == Some("remux")
+            && a.codec.as_deref() == Some("hevc")
+            && a.hdr
+            && a.dolby_vision
+            && a.audio.as_deref() == Some("Atmos")
+            && a.hdr_format.as_deref() == Some("HDR")
+            && !a.three_d
+            && a.cached == Some(true)
+            && a.seeders == Some(12),
+        "rich attrs: {a:?}"
+    );
+
+    // Cachedness is reported only when it was observed. A failed cache check leaves `Cached` at its zero
+    // value, and sending that as `false` is a claim nobody made — the client reads a definite "must
+    // download" and queues a fetch for a release the debrid may already hold.
+    let unknown = stream_attributes(RawStream {
+        title: "Movie.1080p.WEB-DL".into(),
+        cached: false,
+        cache_known: false,
+        ..Default::default()
+    });
+    assert!(unknown.cached.is_none(), "unchecked cachedness must be omitted, got {:?}", unknown.cached);
+    let held = stream_attributes(RawStream {
+        title: "Movie.1080p.WEB-DL".into(),
+        cached: false,
+        cache_known: true,
+        ..Default::default()
+    });
+    assert_eq!(held.cached, Some(false), "an observed 'not held' must be reported as false");
+
+    // HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
+    let hdr_cases = [
+        ("Movie 2160p WEB-DL DDP5.1 DV HDR10+ HEVC", "HDR10+"), // HDR10+ beats a bare hdr10 token
+        ("Movie 2160p WEB-DL HLG HEVC", "HLG"),
+        ("Movie 2160p WEB-DL HDR10 HEVC", "HDR10"),
+        ("Movie 2160p WEB-DL HDR HEVC", "HDR"),
+        ("Movie 1080p BluRay x264", ""),
+    ];
+    for (title, want) in hdr_cases {
+        let got = stream_attributes(RawStream { title: title.into(), ..Default::default() })
+            .hdr_format
+            .unwrap_or_default();
+        assert_eq!(got, want, "hdrFormat({title:?})");
+    }
+
+    // Source-truth audio: normalized codec family + channel layout + atmos flag (so the client can
+    // compute what Den actually delivers). DDP5 1 (space) still resolves to 5.1.
+    let audio_cases = [
+        ("Movie 2160p WEB-DL DDP5.1 Atmos HEVC", "eac3", "5.1", true),
+        ("Movie 2160p REMUX TrueHD.Atmos.7.1 HEVC", "truehd", "7.1", true),
+        ("Movie 1080p BluRay DTS-HD.MA.5.1 x264", "dtshdma", "5.1", false),
+        ("Movie 2160p UHD BluRay DTS-X 7.1 HEVC", "dtsx", "7.1", false),
+        ("Movie 2160p WEB-DL DDP5 1 HEVC", "eac3", "5.1", false),
+        ("Movie 1080p BluRay AC3 2.0 x264", "ac3", "2.0", false),
+    ];
+    for (title, codec, channels, atmos) in audio_cases {
+        let g = stream_attributes(RawStream { title: title.into(), ..Default::default() });
+        let got_codec = g.audio_codec.unwrap_or_default();
+        let got_chans = g.audio_channels.unwrap_or_default();
         assert!(
-            a.resolution.as_deref() == Some("2160p")
-                && a.source.as_deref() == Some("remux")
-                && a.codec.as_deref() == Some("hevc")
-                && a.hdr
-                && a.dolby_vision
-                && a.audio.as_deref() == Some("Atmos")
-                && a.hdr_format.as_deref() == Some("HDR")
-                && !a.three_d
-                && a.cached == Some(true)
-                && a.seeders == Some(12),
-            "rich attrs: {a:?}"
+            got_codec == codec && got_chans == channels && g.atmos == atmos,
+            "audio({title:?})= {{{got_codec} {got_chans} {}}} want {{{codec} {channels} {atmos}}}",
+            g.atmos
         );
-
-        // Cachedness is reported only when it was observed. A failed cache check leaves `Cached` at its zero
-        // value, and sending that as `false` is a claim nobody made — the client reads a definite "must
-        // download" and queues a fetch for a release the debrid may already hold.
-        let unknown = stream_attributes(RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: false, ..Default::default() });
-        assert!(unknown.cached.is_none(), "unchecked cachedness must be omitted, got {:?}", unknown.cached);
-        let held = stream_attributes(RawStream { title: "Movie.1080p.WEB-DL".into(), cached: false, cache_known: true, ..Default::default() });
-        assert_eq!(held.cached, Some(false), "an observed 'not held' must be reported as false");
-
-        // HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
-        let hdr_cases = [
-            ("Movie 2160p WEB-DL DDP5.1 DV HDR10+ HEVC", "HDR10+"), // HDR10+ beats a bare hdr10 token
-            ("Movie 2160p WEB-DL HLG HEVC", "HLG"),
-            ("Movie 2160p WEB-DL HDR10 HEVC", "HDR10"),
-            ("Movie 2160p WEB-DL HDR HEVC", "HDR"),
-            ("Movie 1080p BluRay x264", ""),
-        ];
-        for (title, want) in hdr_cases {
-            let got = stream_attributes(RawStream { title: title.into(), ..Default::default() }).hdr_format.unwrap_or_default();
-            assert_eq!(got, want, "hdrFormat({title:?})");
-        }
-
-        // Source-truth audio: normalized codec family + channel layout + atmos flag (so the client can
-        // compute what Den actually delivers). DDP5 1 (space) still resolves to 5.1.
-        let audio_cases = [
-            ("Movie 2160p WEB-DL DDP5.1 Atmos HEVC", "eac3", "5.1", true),
-            ("Movie 2160p REMUX TrueHD.Atmos.7.1 HEVC", "truehd", "7.1", true),
-            ("Movie 1080p BluRay DTS-HD.MA.5.1 x264", "dtshdma", "5.1", false),
-            ("Movie 2160p UHD BluRay DTS-X 7.1 HEVC", "dtsx", "7.1", false),
-            ("Movie 2160p WEB-DL DDP5 1 HEVC", "eac3", "5.1", false),
-            ("Movie 1080p BluRay AC3 2.0 x264", "ac3", "2.0", false),
-        ];
-        for (title, codec, channels, atmos) in audio_cases {
-            let g = stream_attributes(RawStream { title: title.into(), ..Default::default() });
-            let got_codec = g.audio_codec.unwrap_or_default();
-            let got_chans = g.audio_channels.unwrap_or_default();
-            assert!(
-                got_codec == codec && got_chans == channels && g.atmos == atmos,
-                "audio({title:?})= {{{got_codec} {got_chans} {}}} want {{{codec} {channels} {atmos}}}",
-                g.atmos
-            );
-        }
-        assert!(stream_attributes(RawStream { title: "Movie 2160p WEB-DL KORSUB HEVC".into(), ..Default::default() }).hardcoded_subs, "KORSUB → hardcodedSubs");
-        let sources = [
-            ("X 1080p WEB-DL", "webdl"),
-            ("X 1080p WEBRip", "webrip"),
-            ("X 1080p BluRay", "bluray"),
-            ("X 720p HDTV", "hdtv"),
-            ("X DVDRip", "dvdrip"),
-            ("X 2024 HDCAM", "cam"),
-        ];
-        for (title, want) in sources {
-            let s = stream_attributes(RawStream { title: title.into(), ..Default::default() }).source;
-            assert_eq!(s.as_deref(), Some(want), "source({title:?})");
-        }
-        assert!(stream_attributes(RawStream { title: "X mystery".into(), ..Default::default() }).source.is_none(), "no source → nil");
-        let a = stream_attributes(RawStream { title: "Movie 2160p WEB-DL HDR10".into(), ..Default::default() });
-        assert!(a.hdr && !a.dolby_vision, "HDR10 without DV");
+    }
+    assert!(
+        stream_attributes(RawStream { title: "Movie 2160p WEB-DL KORSUB HEVC".into(), ..Default::default() })
+            .hardcoded_subs,
+        "KORSUB → hardcodedSubs"
+    );
+    let sources = [
+        ("X 1080p WEB-DL", "webdl"),
+        ("X 1080p WEBRip", "webrip"),
+        ("X 1080p BluRay", "bluray"),
+        ("X 720p HDTV", "hdtv"),
+        ("X DVDRip", "dvdrip"),
+        ("X 2024 HDCAM", "cam"),
+    ];
+    for (title, want) in sources {
+        let s = stream_attributes(RawStream { title: title.into(), ..Default::default() }).source;
+        assert_eq!(s.as_deref(), Some(want), "source({title:?})");
+    }
+    assert!(
+        stream_attributes(RawStream { title: "X mystery".into(), ..Default::default() }).source.is_none(),
+        "no source → nil"
+    );
+    let a = stream_attributes(RawStream { title: "Movie 2160p WEB-DL HDR10".into(), ..Default::default() });
+    assert!(a.hdr && !a.dolby_vision, "HDR10 without DV");
 }
 
 #[test]
@@ -497,11 +576,21 @@ fn decode_config_bounds_what_one_request_can_retain() {
         "a".repeat(64),
         "p".repeat(MAX_CONFIG_BLOB)
     ));
-    assert!(oversized.len() > MAX_CONFIG_BLOB, "the oversized fixture is only {} bytes — it cannot exercise the {} cap", oversized.len(), MAX_CONFIG_BLOB);
-    assert!(crate::config::decode_config(None, &oversized).is_none(), "a well-formed oversized config segment was accepted");
+    assert!(
+        oversized.len() > MAX_CONFIG_BLOB,
+        "the oversized fixture is only {} bytes — it cannot exercise the {} cap",
+        oversized.len(),
+        MAX_CONFIG_BLOB
+    );
+    assert!(
+        crate::config::decode_config(None, &oversized).is_none(),
+        "a well-formed oversized config segment was accepted"
+    );
     // …and it really would have decoded, so the refusal above is the cap and not a parse failure.
     if crate::config::decode_config(None, &oversized[..MAX_CONFIG_BLOB / 2 / 4 * 4]).is_none() {
-        eprintln!("(the truncated half does not decode either, which is fine — the check above is the point)");
+        eprintln!(
+            "(the truncated half does not decode either, which is fine — the check above is the point)"
+        );
     }
 
     // The margin that matters is against the largest LEGITIMATE config the field caps admit, not against
@@ -569,8 +658,18 @@ fn decode_config_bounds_what_one_request_can_retain() {
     let Some(cfg) = cfg else {
         panic!("the padded config was refused outright");
     };
-    assert!(cfg.debrid.len() <= MAX_DEBRID_ACCOUNTS, "kept {} debrid accounts, want at most {}", cfg.debrid.len(), MAX_DEBRID_ACCOUNTS);
-    assert_eq!(cfg.filters.resolutions.len(), 1, "kept {} resolutions for one repeated value, want 1", cfg.filters.resolutions.len());
+    assert!(
+        cfg.debrid.len() <= MAX_DEBRID_ACCOUNTS,
+        "kept {} debrid accounts, want at most {}",
+        cfg.debrid.len(),
+        MAX_DEBRID_ACCOUNTS
+    );
+    assert_eq!(
+        cfg.filters.resolutions.len(),
+        1,
+        "kept {} resolutions for one repeated value, want 1",
+        cfg.filters.resolutions.len()
+    );
 }
 
 // The account cap is a ceiling, not a target: a config naming several services keeps all of them.

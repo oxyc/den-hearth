@@ -150,9 +150,8 @@ pub(crate) fn scoped(key: &str) -> String {
 /// closure that panics re-raises on a bare goroutine nothing can recover, so each of these jobs recovers its own,
 /// counts it, and abandons the work.
 pub(crate) struct DetachedFlight<T> {
-    calls: std::sync::Mutex<
-        std::collections::BTreeMap<String, tokio::sync::watch::Receiver<Option<Option<T>>>>,
-    >,
+    calls:
+        std::sync::Mutex<std::collections::BTreeMap<String, tokio::sync::watch::Receiver<Option<Option<T>>>>>,
     /// What the work is, for the log line a panic writes. Always a literal, so it is a fixed vocabulary for the
     /// limiter's key.
     what: &'static str,
@@ -205,7 +204,11 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     crate::loglimit::log_limited(
                                         &format!("panic:{}", self.what),
-                                        &format!("{} panicked, abandoning it: {}", self.what, panic_text(e.into_panic())),
+                                        &format!(
+                                            "{} panicked, abandoning it: {}",
+                                            self.what,
+                                            panic_text(e.into_panic())
+                                        ),
                                     );
                                 }
                                 None
@@ -263,7 +266,12 @@ pub(crate) fn go_url_parse(raw: &str) -> Option<GoUrl> {
 
 fn go_url_parse_main(raw: &str) -> Option<GoUrl> {
     if raw == "*" {
-        return Some(GoUrl { scheme: String::new(), host: String::new(), path: b"*".to_vec(), opaque: false });
+        return Some(GoUrl {
+            scheme: String::new(),
+            host: String::new(),
+            path: b"*".to_vec(),
+            opaque: false,
+        });
     }
     // getScheme: letters, then letters, digits, `+`, `-` and `.`, closed by `:`. A `:` first is an error; any other
     // character first means there is no scheme.
@@ -305,7 +313,8 @@ fn go_url_parse_main(raw: &str) -> Option<GoUrl> {
     }
     let (host, path) = if (!scheme.is_empty() || !rest.starts_with("///")) && rest.starts_with("//") {
         let authority_and_path = &rest[2..];
-        let (authority, path) = authority_and_path.split_at(authority_and_path.find('/').unwrap_or(authority_and_path.len()));
+        let (authority, path) =
+            authority_and_path.split_at(authority_and_path.find('/').unwrap_or(authority_and_path.len()));
         (go_parse_authority(authority)?, path)
     } else {
         (String::new(), rest)
@@ -322,9 +331,7 @@ fn go_parse_authority(authority: &str) -> Option<String> {
     };
     let host = go_parse_host(host)?;
     if let Some(userinfo) = userinfo {
-        let valid = userinfo
-            .chars()
-            .all(|c| c.is_alphanumeric() || "-._:~!$&'()*+,;=%@".contains(c));
+        let valid = userinfo.chars().all(|c| c.is_alphanumeric() || "-._:~!$&'()*+,;=%@".contains(c));
         if !valid {
             return None; // net/url: invalid userinfo
         }

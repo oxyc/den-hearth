@@ -95,7 +95,10 @@ async fn cancel_never_leaks_the_token() {
     };
     // The token really was in the body — otherwise this test would pass for the wrong reason.
     let msg = format!("{err:?}");
-    assert!(msg.contains("proxy_error"), "precondition failed: the refusal detail did not reach the error: {msg}");
+    assert!(
+        msg.contains("proxy_error"),
+        "precondition failed: the refusal detail did not reach the error: {msg}"
+    );
     assert!(!msg.contains(LEAK_TOKEN), "the token leaked into the cancel error: {msg}");
 }
 
@@ -113,7 +116,10 @@ fn transport_kind() {
          context deadline exceeded (Client.Timeout exceeded)"
     )
     .into();
-    assert!(!transport_kind(Some(timeout.as_ref())).contains(LEAK_TOKEN), "url.Error leaked its query string");
+    assert!(
+        !transport_kind(Some(timeout.as_ref())).contains(LEAK_TOKEN),
+        "url.Error leaked its query string"
+    );
     let cancelled: DoError =
         format!("error sending request for url (https://x?token={LEAK_TOKEN}): operation cancelled").into();
     let got = transport_kind(Some(cancelled.as_ref()));

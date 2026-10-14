@@ -153,7 +153,12 @@ pub(crate) fn known_cached(
 
 /// Go `rememberCached` (stores.go:561) records the positives from an answer. Negatives are deliberately not
 /// recorded.
-pub(crate) fn remember_cached(cache: &dyn Cache, svc: DebridService, token: &str, result: &HashMap<String, bool>) {
+pub(crate) fn remember_cached(
+    cache: &dyn Cache,
+    svc: DebridService,
+    token: &str,
+    result: &HashMap<String, bool>,
+) {
     for (h, held) in result {
         if *held {
             cache.put_class(&cached_key(svc, token, h), "1", CACHED_TTL, CacheClass::Volatile);
@@ -243,7 +248,11 @@ fn without_url(message: &str) -> String {
     match end {
         Some(i) => {
             let rest = after[i + 1..].trim_start_matches(": ");
-            if rest.is_empty() { message[..start].to_owned() } else { rest.to_owned() }
+            if rest.is_empty() {
+                message[..start].to_owned()
+            } else {
+                rest.to_owned()
+            }
         }
         // An unterminated clause cannot be told from the URL itself, so nothing after the lead-in is kept.
         None => message[..start].to_owned(),
@@ -417,7 +426,12 @@ pub(crate) fn add_in_flight(
 /// poll — backedOff is consulted first there — so errAddInFlight became unreachable and the client was
 /// told its debrid was refusing, for a release scout had an add out for. Premiumize was right by
 /// accident: it happens to ask addInFlight before backedOff.
-pub(crate) fn add_outcome_unknown(cache: &dyn Cache, svc: DebridService, token: &str, info_hash: &str) -> bool {
+pub(crate) fn add_outcome_unknown(
+    cache: &dyn Cache,
+    svc: DebridService,
+    token: &str,
+    info_hash: &str,
+) -> bool {
     live(cache, &add_attempt_key(svc, token, info_hash)).is_some()
 }
 
@@ -579,7 +593,12 @@ pub(crate) fn refusal_reason(err: &StoreError) -> String {
 }
 
 /// Go `backedOff` (stores.go:1481): this account was turned away a moment ago, for this hash or outright.
-pub(crate) fn backed_off(cache: &dyn Cache, svc: DebridService, token: &str, info_hash: &str) -> Option<String> {
+pub(crate) fn backed_off(
+    cache: &dyn Cache,
+    svc: DebridService,
+    token: &str,
+    info_hash: &str,
+) -> Option<String> {
     if let Some(reason) = cache.get(&account_refused_key(svc, token)) {
         return Some(reason);
     }
@@ -637,14 +656,24 @@ pub(crate) fn record_refusal(
         return;
     }
     if refusal_is_about_the_account(err) {
-        cache.put_class(&account_refused_key(svc, token), &refusal_reason(err), REFUSAL_BACKOFF, CacheClass::Volatile);
+        cache.put_class(
+            &account_refused_key(svc, token),
+            &refusal_reason(err),
+            REFUSAL_BACKOFF,
+            CacheClass::Volatile,
+        );
         log_limited(
             &format!("account-refused:{}", svc.as_str()),
             &format!("{} refused the account itself ({}) — check the key", svc.as_str(), refusal_reason(err)),
         );
         return;
     }
-    cache.put_class(&refused_key(svc, token, info_hash), &refusal_reason(err), REFUSAL_BACKOFF, CacheClass::Volatile);
+    cache.put_class(
+        &refused_key(svc, token, info_hash),
+        &refusal_reason(err),
+        REFUSAL_BACKOFF,
+        CacheClass::Volatile,
+    );
 }
 
 impl StorePool {
@@ -655,9 +684,7 @@ impl StorePool {
     /// calls the endpoint that refuses. Without it a throttled account reads as "nothing is queued", which
     /// the client cannot distinguish from a release nobody can deliver — and it condemns a healthy one.
     pub fn recent_refusal(&self, info_hash: &str) -> Option<(DebridService, String)> {
-        self.stores
-            .iter()
-            .find_map(|st| st.recent_refusal(info_hash).map(|reason| (st.service(), reason)))
+        self.stores.iter().find_map(|st| st.recent_refusal(info_hash).map(|reason| (st.service(), reason)))
     }
 
     /// Go `StorePool.AccountRefusal` (stores.go:1170) reports a rejected key, which outranks an add of ours
@@ -755,7 +782,12 @@ impl StorePool {
 /// That is the defect this reporter was added to fix, pointing the other way, and it defeats what
 /// addGiveUp is for — "past this the release is reported dead so the client can fall through" — on the
 /// one URL the client polls to decide whether to keep waiting.
-pub(crate) fn add_still_believable(cache: &dyn Cache, svc: DebridService, token: &str, info_hash: &str) -> bool {
+pub(crate) fn add_still_believable(
+    cache: &dyn Cache,
+    svc: DebridService,
+    token: &str,
+    info_hash: &str,
+) -> bool {
     if unknown_too_long(cache, svc, token, info_hash) {
         return false;
     }

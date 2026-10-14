@@ -6,15 +6,21 @@ use std::time::Duration;
 use crate::cache::{Cache, MemoryCache};
 use crate::config::Indexer;
 use crate::coverage::{
-    classify_scrape as classify, decide_answer_kind as decide_kind, AnswerEnvelope, ANSWER_EMPTY, ANSWER_LIVE, ANSWER_PARTIAL, ANSWER_UNKNOWN,
-    OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_QUARANTINED, OUTCOME_REFUSED, OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE,
+    classify_scrape as classify, decide_answer_kind as decide_kind, AnswerEnvelope, ANSWER_EMPTY,
+    ANSWER_LIVE, ANSWER_PARTIAL, ANSWER_UNKNOWN, OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED,
+    OUTCOME_QUARANTINED, OUTCOME_REFUSED, OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE,
 };
 use crate::handler::new_handler;
 use crate::indexerconfig::UnaskableScraper;
 use crate::rank::RawStream;
-use crate::scrape::{keep_answer, scrape_covered as cover, DeadlineExceeded, DoError, HttpStatusError, ScrapeQuery, Scraper, StremioScraper, UnaskableError};
+use crate::scrape::{
+    keep_answer, scrape_covered as cover, DeadlineExceeded, DoError, HttpStatusError, ScrapeQuery, Scraper,
+    StremioScraper, UnaskableError,
+};
 use crate::sources::ERR_NOT_PUBLIC;
-use crate::tests::handler::{blob, body_str, fake_scraper, get, test_deps, test_seeds, valid_blob, FakeFuture};
+use crate::tests::handler::{
+    blob, body_str, fake_scraper, get, test_deps, test_seeds, valid_blob, FakeFuture,
+};
 use crate::tests::mock::MockDoer;
 
 /// Go `envelopeOf`: splits a stream-list body into its `streams` array and its `den` envelope.
@@ -65,7 +71,9 @@ fn classify_scrape() {
     let asked = || fake_scraper("torrentio", || Box::pin(async { Ok(Vec::new()) }) as FakeFuture);
     let err = |text: &str| -> Option<DoError> { Some(Box::new(std::io::Error::other(text.to_owned()))) };
     let deadline = |prefix: &'static str| -> Option<DoError> { Some(Box::new(WrappedDeadline(prefix))) };
-    let http = |code: u16| -> Option<DoError> { Some(Box::new(HttpStatusError { name: "torrentio".to_owned(), code })) };
+    let http = |code: u16| -> Option<DoError> {
+        Some(Box::new(HttpStatusError { name: "torrentio".to_owned(), code }))
+    };
     let unaskable = |transient: bool| -> Option<DoError> {
         Some(Box::new(UnaskableError { indexer: "mediafusion".to_owned(), transient }))
     };
@@ -94,29 +102,69 @@ fn classify_scrape() {
 async fn scrape_covered() {
     let found = || -> Arc<dyn Scraper> {
         Arc::from(fake_scraper("torrentio", || {
-            Box::pin(async { Ok(vec![RawStream { info_hash: "a".repeat(40), title: "Movie 1080p".to_owned(), ..Default::default() }]) })
-                as FakeFuture
+            Box::pin(async {
+                Ok(vec![RawStream {
+                    info_hash: "a".repeat(40),
+                    title: "Movie 1080p".to_owned(),
+                    ..Default::default()
+                }])
+            }) as FakeFuture
         }))
     };
-    let none = || -> Arc<dyn Scraper> { Arc::from(fake_scraper("comet", || Box::pin(async { Ok(Vec::new()) }) as FakeFuture)) };
+    let none = || -> Arc<dyn Scraper> {
+        Arc::from(fake_scraper("comet", || Box::pin(async { Ok(Vec::new()) }) as FakeFuture))
+    };
     // Go's `<-ctx.Done()`: never answers, so only the scrape's own budget ends it.
     let hang = || -> Arc<dyn Scraper> {
         Arc::from(fake_scraper("mediafusion", || {
             Box::pin(std::future::pending::<Result<Vec<RawStream>, DoError>>()) as FakeFuture
         }))
     };
-    let unconfigured = || -> Arc<dyn Scraper> { Arc::new(UnaskableScraper { indexer: Indexer("mediafusion".to_owned()), transient: false }) };
+    let unconfigured = || -> Arc<dyn Scraper> {
+        Arc::new(UnaskableScraper { indexer: Indexer("mediafusion".to_owned()), transient: false })
+    };
 
     let cases: Vec<(&str, Vec<Arc<dyn Scraper>>, bool, Vec<&str>, &str)> = vec![
-        ("all answered, none found", vec![none(), unconfigured()], true, vec![OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED], ANSWER_EMPTY),
-        ("one timed out, none found", vec![none(), hang()], false, vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT], ANSWER_UNKNOWN),
-        ("one timed out, releases found", vec![found(), hang()], false, vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT], ANSWER_PARTIAL),
-        ("all answered, releases found", vec![found(), none()], true, vec![OUTCOME_ANSWERED, OUTCOME_ANSWERED], ANSWER_LIVE),
+        (
+            "all answered, none found",
+            vec![none(), unconfigured()],
+            true,
+            vec![OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED],
+            ANSWER_EMPTY,
+        ),
+        (
+            "one timed out, none found",
+            vec![none(), hang()],
+            false,
+            vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT],
+            ANSWER_UNKNOWN,
+        ),
+        (
+            "one timed out, releases found",
+            vec![found(), hang()],
+            false,
+            vec![OUTCOME_ANSWERED, OUTCOME_TIMEOUT],
+            ANSWER_PARTIAL,
+        ),
+        (
+            "all answered, releases found",
+            vec![found(), none()],
+            true,
+            vec![OUTCOME_ANSWERED, OUTCOME_ANSWERED],
+            ANSWER_LIVE,
+        ),
     ];
     for (name, scrapers, complete, outcomes, kind) in cases {
-        let res = cover(&scrapers, &ScrapeQuery::default(), Duration::from_millis(30), None, Duration::ZERO).await;
+        let res =
+            cover(&scrapers, &ScrapeQuery::default(), Duration::from_millis(30), None, Duration::ZERO).await;
         assert_eq!(res.complete, complete, "{name}: complete = {}, want {complete}", res.complete);
-        assert_eq!(res.sources.len(), scrapers.len(), "{name}: {} sources in coverage, want every one of {}", res.sources.len(), scrapers.len());
+        assert_eq!(
+            res.sources.len(),
+            scrapers.len(),
+            "{name}: {} sources in coverage, want every one of {}",
+            res.sources.len(),
+            scrapers.len()
+        );
         for (i, want) in outcomes.iter().enumerate() {
             let s = &res.sources[i];
             assert!(
@@ -144,14 +192,20 @@ async fn scrape_covered_reused_answer_is_marked() {
     let sc = StremioScraper {
         indexer: Indexer("torrentio".to_owned()),
         base_url: "https://torrentio.example".to_owned(),
-        client: Arc::new(MockDoer(|_| -> Result<reqwest::Response, DoError> { panic!("a reused answer must not ask the indexer") })),
+        client: Arc::new(MockDoer(|_| -> Result<reqwest::Response, DoError> {
+            panic!("a reused answer must not ask the indexer")
+        })),
     };
     let q = ScrapeQuery { kind: "movie".to_owned(), imdb: "tt1".to_owned(), ..Default::default() };
     keep_answer(Some(&*cache), Duration::from_secs(60), &sc, &q, &test_seeds());
     let scrapers: Vec<Arc<dyn Scraper>> = vec![Arc::new(sc)];
     let res = cover(&scrapers, &q, Duration::from_secs(1), Some(cache), Duration::from_secs(60)).await;
     let s = &res.sources[0];
-    assert!(s.outcome == OUTCOME_ANSWERED && s.cached && s.items == 3 && res.complete, "reused answer: {s:?}, complete {}", res.complete);
+    assert!(
+        s.outcome == OUTCOME_ANSWERED && s.cached && s.items == 3 && res.complete,
+        "reused answer: {s:?}, complete {}",
+        res.complete
+    );
 }
 
 /// Go `TestStream_envelopeReportsCoverage`: the body carries the envelope, the header and the envelope agree, and
@@ -165,14 +219,49 @@ async fn stream_envelope_reports_coverage() {
         fake_scraper("torrentio", || Box::pin(async { Ok(test_seeds()) }) as FakeFuture)
     }
     fn times_out() -> Box<dyn crate::scrape::Scraper> {
-        fake_scraper("comet", || Box::pin(std::future::pending::<Result<Vec<crate::rank::RawStream>, crate::scrape::DoError>>()) as FakeFuture)
+        fake_scraper("comet", || {
+            Box::pin(std::future::pending::<Result<Vec<crate::rank::RawStream>, crate::scrape::DoError>>())
+                as FakeFuture
+        })
     }
     type Make = fn() -> Vec<Box<dyn crate::scrape::Scraper>>;
     let cases: [(&str, Make, &str, &str, bool, Vec<&str>, bool); 4] = [
-        ("all answered, none found", || vec![answers_empty()], ANSWER_EMPTY, "", true, vec!["answered"], false),
-        ("one timed out, none found", || vec![answers_empty(), times_out()], ANSWER_UNKNOWN, "indexers", false, vec!["answered", "timeout"], false),
-        ("one timed out, releases found", || vec![answers_seeds(), times_out()], ANSWER_PARTIAL, "", false, vec!["answered", "timeout"], true),
-        ("all answered, releases found", || vec![answers_seeds()], ANSWER_LIVE, "", true, vec!["answered"], true),
+        (
+            "all answered, none found",
+            || vec![answers_empty()],
+            ANSWER_EMPTY,
+            "",
+            true,
+            vec!["answered"],
+            false,
+        ),
+        (
+            "one timed out, none found",
+            || vec![answers_empty(), times_out()],
+            ANSWER_UNKNOWN,
+            "indexers",
+            false,
+            vec!["answered", "timeout"],
+            false,
+        ),
+        (
+            "one timed out, releases found",
+            || vec![answers_seeds(), times_out()],
+            ANSWER_PARTIAL,
+            "",
+            false,
+            vec!["answered", "timeout"],
+            true,
+        ),
+        (
+            "all answered, releases found",
+            || vec![answers_seeds()],
+            ANSWER_LIVE,
+            "",
+            true,
+            vec!["answered"],
+            true,
+        ),
     ];
     for (name, make, kind, degraded, complete, outcomes, streams) in cases {
         let h = new_handler(test_deps(move |d| {
@@ -181,11 +270,21 @@ async fn stream_envelope_reports_coverage() {
         }));
         let rr = get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await;
         let (list, env) = envelope_of(&body_str(&rr));
-        assert!(env.v == 1 && env.answer_kind == kind && env.coverage.complete == complete, "{name}: envelope = {env:?}");
+        assert!(
+            env.v == 1 && env.answer_kind == kind && env.coverage.complete == complete,
+            "{name}: envelope = {env:?}"
+        );
         let header = crate::tests::handler::hdr(&rr, "x-den-degraded");
-        assert!(header == degraded && env.degraded == header, "{name}: X-Den-Degraded {header:?}, envelope {:?}", env.degraded);
+        assert!(
+            header == degraded && env.degraded == header,
+            "{name}: X-Den-Degraded {header:?}, envelope {:?}",
+            env.degraded
+        );
         // A cached (non-degraded) list says when it expires; an uncached (degraded) one does not.
-        assert!(env.generated_at.is_some() && degraded.is_empty() != env.expires_at.is_none(), "{name}: generatedAt/expiresAt");
+        assert!(
+            env.generated_at.is_some() && degraded.is_empty() != env.expires_at.is_none(),
+            "{name}: generatedAt/expiresAt"
+        );
         assert_eq!(env.coverage.sources.len(), outcomes.len(), "{name}: coverage sources");
         for (i, want) in outcomes.iter().enumerate() {
             assert_eq!(env.coverage.sources[i].outcome, *want, "{name}: source {i} outcome");
@@ -199,11 +298,19 @@ async fn stream_envelope_reports_coverage() {
 /// listed, not dropped, and does not hold the list back from being complete.
 #[tokio::test]
 async fn stream_quarantined_indexer_appears_in_coverage() {
-    let cfg = blob(r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio","torz"]}"#);
+    let cfg =
+        blob(r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio","torz"]}"#);
     let h = new_handler(test_deps(|_| {}));
     let rr = get(&h, &format!("/{cfg}/stream/movie/tt1234567.json"), &[]).await;
     let (_, env) = envelope_of(&body_str(&rr));
-    assert!(env.coverage.complete && env.answer_kind == ANSWER_LIVE, "envelope = {env:?}, want live and complete");
+    assert!(
+        env.coverage.complete && env.answer_kind == ANSWER_LIVE,
+        "envelope = {env:?}, want live and complete"
+    );
     let torz = env.coverage.sources.iter().find(|s| s.id == "torz");
-    assert!(torz.is_some_and(|s| s.outcome == OUTCOME_QUARANTINED), "torz in coverage: {:?}", env.coverage.sources);
+    assert!(
+        torz.is_some_and(|s| s.outcome == OUTCOME_QUARANTINED),
+        "torz in coverage: {:?}",
+        env.coverage.sources
+    );
 }

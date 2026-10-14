@@ -25,22 +25,52 @@ const GIB: i64 = 1 << 30;
 #[test]
 fn decision_line_identity_gating() {
     set_log_identity(true);
-    let on = decision_line("rank", "served", "picked from 3 candidates", "torrentio", Duration::from_millis(12), "req-1", "imdb=tt1 type=movie");
-    for want in ["event=rank", "outcome=served", "reason=picked from 3 candidates", "upstream=torrentio", "dur_ms=12", "rid=req-1", "imdb=tt1 type=movie"] {
+    let on = decision_line(
+        "rank",
+        "served",
+        "picked from 3 candidates",
+        "torrentio",
+        Duration::from_millis(12),
+        "req-1",
+        "imdb=tt1 type=movie",
+    );
+    for want in [
+        "event=rank",
+        "outcome=served",
+        "reason=picked from 3 candidates",
+        "upstream=torrentio",
+        "dur_ms=12",
+        "rid=req-1",
+        "imdb=tt1 type=movie",
+    ] {
         assert!(on.contains(want), "LOG_IDENTITY=on: line lacks {want:?}: {on}");
     }
 
     set_log_identity(false);
-    let off = decision_line("rank", "served", "picked from 3 candidates", "torrentio", Duration::from_millis(12), "req-1", "imdb=tt1 type=movie");
+    let off = decision_line(
+        "rank",
+        "served",
+        "picked from 3 candidates",
+        "torrentio",
+        Duration::from_millis(12),
+        "req-1",
+        "imdb=tt1 type=movie",
+    );
     for want in ["event=rank", "outcome=served", "upstream=torrentio", "dur_ms=12", "rid=req-1"] {
         assert!(off.contains(want), "LOG_IDENTITY=off: line lost a non-identity field {want:?}: {off}");
     }
-    assert!(!off.contains("imdb=") && !off.contains("type=movie"), "LOG_IDENTITY=off: identity survived: {off}");
+    assert!(
+        !off.contains("imdb=") && !off.contains("type=movie"),
+        "LOG_IDENTITY=off: identity survived: {off}"
+    );
     set_log_identity(true);
 
     // upstream and rid are each omitted on their own when absent — neither forces the other's presence.
     let bare = decision_line("probe", "skipped", "not queued", "", Duration::ZERO, "", "");
-    assert!(!bare.contains("upstream=") && !bare.contains("rid="), "an absent upstream/rid should not print at all: {bare}");
+    assert!(
+        !bare.contains("upstream=") && !bare.contains("rid="),
+        "an absent upstream/rid should not print at all: {bare}"
+    );
 }
 
 #[test]
@@ -68,14 +98,23 @@ fn format_pick_labels_a_release() {
         ..Default::default()
     };
     let got = format_pick(&s);
-    for want in [r#""Movie.2024.2160p.BluRay.REMUX""#, &format!("hash={}", "a".repeat(12)), "size_gb=42.0", "cached"] {
+    for want in
+        [r#""Movie.2024.2160p.BluRay.REMUX""#, &format!("hash={}", "a".repeat(12)), "size_gb=42.0", "cached"]
+    {
         assert!(got.contains(want), "formatPick missing {want:?}: {got}");
     }
     assert!(!got.contains("uncached"), "a cached release must not also read uncached: {got}");
     // A release name longer than the cap is cut, never left to grow the log line without bound.
-    let long = RawStream { title: "x".repeat(MAX_LOGGED_TITLE + 50), info_hash: "b".repeat(40), ..Default::default() };
+    let long = RawStream {
+        title: "x".repeat(MAX_LOGGED_TITLE + 50),
+        info_hash: "b".repeat(40),
+        ..Default::default()
+    };
     let got = format_pick(&long);
-    assert!(!got.contains(&"x".repeat(MAX_LOGGED_TITLE + 1)), "formatPick did not truncate a long title: {got}");
+    assert!(
+        !got.contains(&"x".repeat(MAX_LOGGED_TITLE + 1)),
+        "formatPick did not truncate a long title: {got}"
+    );
 }
 
 /// Go `lastLineContaining`: the last line of a captured log containing `needle`, for asserting on one decision line
@@ -97,15 +136,26 @@ async fn rank_decision_line() {
     let h = new_handler(test_deps(|_| {}));
 
     forget_logged("rank-decision");
-    get(&h, &format!("/{}/stream/movie/tt9000001.json", valid_blob()), &[("X-Request-Id", "req-rank-1")]).await;
+    get(&h, &format!("/{}/stream/movie/tt9000001.json", valid_blob()), &[("X-Request-Id", "req-rank-1")])
+        .await;
     let got = out.text();
-    for want in ["event=rank", "outcome=served", "rid=req-rank-1", "imdb=tt9000001", "type=movie", "top_drops=cam:1", "picked=", "runnerup1="] {
+    for want in [
+        "event=rank",
+        "outcome=served",
+        "rid=req-rank-1",
+        "imdb=tt9000001",
+        "type=movie",
+        "top_drops=cam:1",
+        "picked=",
+        "runnerup1=",
+    ] {
         assert!(got.contains(want), "rank decision line missing {want:?}:\n{got}");
     }
 
     set_log_identity(false);
     forget_logged("rank-decision");
-    get(&h, &format!("/{}/stream/movie/tt9000002.json", valid_blob()), &[("X-Request-Id", "req-rank-2")]).await;
+    get(&h, &format!("/{}/stream/movie/tt9000002.json", valid_blob()), &[("X-Request-Id", "req-rank-2")])
+        .await;
     let line2 = last_line_containing(&out.text(), "req-rank-2");
     assert!(line2.contains("rid=req-rank-2"), "rid must survive LOG_IDENTITY=off: {line2}");
     for leak in ["imdb=", "picked=", "top_drops="] {
@@ -126,12 +176,32 @@ async fn scrape_decision_line() {
         base_url: "https://torz.example/SECRET-PATH".into(),
         client: Arc::new(MockDoer(|_r: reqwest::Request| Ok(resp(502, "{}")))),
     };
-    let _ = bad.scrape_once("", &ScrapeQuery { kind: "movie".into(), imdb: "tt1234567".into(), rid: "req-scrape-1".into(), ..Default::default() }).await;
+    let _ = bad
+        .scrape_once(
+            "",
+            &ScrapeQuery {
+                kind: "movie".into(),
+                imdb: "tt1234567".into(),
+                rid: "req-scrape-1".into(),
+                ..Default::default()
+            },
+        )
+        .await;
     let got = out.text();
-    for want in ["event=scrape", "upstream=torz", "rid=req-scrape-1", "imdb=tt1234567", "type=movie", "reason=http 502"] {
+    for want in [
+        "event=scrape",
+        "upstream=torz",
+        "rid=req-scrape-1",
+        "imdb=tt1234567",
+        "type=movie",
+        "reason=http 502",
+    ] {
         assert!(got.contains(want), "scrape decision line missing {want:?}:\n{got}");
     }
-    assert!(!got.contains("SECRET-PATH") && !got.contains("torz.example"), "the indexer base URL leaked into the log:\n{got}");
+    assert!(
+        !got.contains("SECRET-PATH") && !got.contains("torz.example"),
+        "the indexer base URL leaked into the log:\n{got}"
+    );
 
     // A transport failure never logs the error itself — Go's http.Client wraps a *url.Error carrying the
     // full request URL, which for a debrid-backed indexer carries the account token in its query string.
@@ -141,10 +211,26 @@ async fn scrape_decision_line() {
         base_url: "https://torz.example/SECRET-PATH".into(),
         client: Arc::new(FailingDoer { last_url: std::sync::Mutex::new(String::new()) }),
     };
-    let _ = unreachable.scrape_once("", &ScrapeQuery { kind: "movie".into(), imdb: "tt7654321".into(), rid: "req-scrape-2".into(), ..Default::default() }).await;
+    let _ = unreachable
+        .scrape_once(
+            "",
+            &ScrapeQuery {
+                kind: "movie".into(),
+                imdb: "tt7654321".into(),
+                rid: "req-scrape-2".into(),
+                ..Default::default()
+            },
+        )
+        .await;
     let got = out.text();
-    assert!(got.contains("rid=req-scrape-2") && got.contains("event=scrape"), "transport-failure decision line missing its shape:\n{got}");
-    assert!(!got.contains("SECRET-PATH") && !got.contains(LEAK_TOKEN), "the transport error (or its URL) leaked into the log:\n{got}");
+    assert!(
+        got.contains("rid=req-scrape-2") && got.contains("event=scrape"),
+        "transport-failure decision line missing its shape:\n{got}"
+    );
+    assert!(
+        !got.contains("SECRET-PATH") && !got.contains(LEAK_TOKEN),
+        "the transport error (or its URL) leaked into the log:\n{got}"
+    );
 }
 
 // A play/probe/cancel decision line never carries the debrid token, even when the store's own error
@@ -162,7 +248,9 @@ async fn cancel_decision_line_never_leaks_the_token() {
                 resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false}}"#)
             }
             "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
-            "controltorrent" => resp(503, r#"{"error":"proxy_error","detail":"upstream rejected Bearer tb-secret"}"#),
+            "controltorrent" => {
+                resp(503, r#"{"error":"proxy_error","detail":"upstream rejected Bearer tb-secret"}"#)
+            }
             _ => resp(404, "{}"),
         },
         Some(Box::new(move |cache| {
@@ -179,6 +267,9 @@ async fn cancel_decision_line_never_leaks_the_token() {
     );
     // The precondition: the refusal detail really did reach the error, so redaction — not the fixture's
     // silence — is what the assertion below is proving.
-    assert!(got.contains("proxy_error"), "precondition failed: the refusal detail never reached the line:\n{got}");
+    assert!(
+        got.contains("proxy_error"),
+        "precondition failed: the refusal detail never reached the line:\n{got}"
+    );
     assert!(!got.contains("tb-secret"), "the debrid token leaked into the cancel decision line:\n{got}");
 }

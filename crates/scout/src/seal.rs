@@ -135,7 +135,9 @@ fn key_from_b64(s: &str) -> Result<SealKeypair, String> {
 pub fn decode_key_b64(s: &str) -> Result<Vec<u8>, String> {
     use base64::alphabet::{STANDARD, URL_SAFE};
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-    let config = |mode| GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(mode);
+    let config = |mode| {
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(mode)
+    };
     let engines = [
         GeneralPurpose::new(&STANDARD, config(DecodePaddingMode::RequireCanonical)),
         GeneralPurpose::new(&STANDARD, config(DecodePaddingMode::RequireNone)),

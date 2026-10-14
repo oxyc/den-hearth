@@ -141,7 +141,8 @@ async fn availability_checks_behind_the_reply() {
 #[tokio::test]
 async fn availability_default_costs_no_debrid_cache_check() {
     let checks = Arc::new(AtomicI32::new(0));
-    let config = blob(r#"{"debrid":[{"service":"torbox","token":"tb"}],"indexers":["torrentio"],"cachedOnly":false}"#);
+    let config =
+        blob(r#"{"debrid":[{"service":"torbox","token":"tb"}],"indexers":["torrentio"],"cachedOnly":false}"#);
     let c = checks.clone();
     let h = new_handler(test_deps(move |d| {
         d.make_scrapers = counting_scraper(Arc::new(AtomicI32::new(0)), test_seeds(), None);
@@ -156,21 +157,37 @@ async fn availability_cached_only_filters_before_its_first_cache_check() {
     let checks = Arc::new(AtomicI32::new(0));
     let held = "f".repeat(40);
     let mut streams: Vec<RawStream> = (0..120)
-        .map(|i| RawStream { info_hash: format!("{:040x}", i + 1), title: "CAM release".to_owned(), ..RawStream::default() })
+        .map(|i| RawStream {
+            info_hash: format!("{:040x}", i + 1),
+            title: "CAM release".to_owned(),
+            ..RawStream::default()
+        })
         .collect();
-    streams.push(RawStream { info_hash: held.clone(), title: "Movie.2026.1080p.WEB-DL".to_owned(), ..RawStream::default() });
+    streams.push(RawStream {
+        info_hash: held.clone(),
+        title: "Movie.2026.1080p.WEB-DL".to_owned(),
+        ..RawStream::default()
+    });
     let (tx, rx) = mpsc::channel();
     let (c, held2) = (checks.clone(), held.clone());
     let h = new_handler(test_deps(move |d| {
         d.make_scrapers = counting_scraper(Arc::new(AtomicI32::new(0)), streams.clone(), None);
         d.make_stores = Arc::new(move |_| {
-            vec![Box::new(AvailabilityTruthStore { checks: c.clone(), seen: tx.clone(), held: held2.clone() })]
+            vec![Box::new(AvailabilityTruthStore {
+                checks: c.clone(),
+                seen: tx.clone(),
+                held: held2.clone(),
+            })]
         });
     }));
     wait_for_verdict(&h, &valid_blob(), "tt1234567", "available").await;
     assert_eq!(checks.load(Ordering::SeqCst), 1, "cache checks, want one batch ending at the first positive");
     let hashes = rx.recv().expect("one batch was sent");
-    assert!(hashes.len() == 1 && hashes[0] == held, "cache check saw {} hashes ({hashes:?}), want only the one release surviving filters", hashes.len());
+    assert!(
+        hashes.len() == 1 && hashes[0] == held,
+        "cache check saw {} hashes ({hashes:?}), want only the one release surviving filters",
+        hashes.len()
+    );
 }
 
 /// Every indexer answering with nothing is a verdict. A failed scrape is not: it stays unknown, and holds off the
@@ -182,7 +199,8 @@ async fn availability_empty_is_unavailable_but_a_failure_is_unknown() {
     wait_for_verdict(&empty, &valid_blob(), "tt1234567", "unavailable").await;
 
     let scrapes = Arc::new(AtomicI32::new(0));
-    let deps = test_deps(|d| d.make_scrapers = counting_scraper(scrapes.clone(), Vec::new(), Some("indexer down")));
+    let deps =
+        test_deps(|d| d.make_scrapers = counting_scraper(scrapes.clone(), Vec::new(), Some("indexer down")));
     let cache = deps.cache.clone();
     let failing = new_handler(deps);
     let config = crate::config::decode_config(None, &valid_blob()).expect("the valid config decodes");
@@ -193,7 +211,11 @@ async fn availability_empty_is_unavailable_but_a_failure_is_unknown() {
         assert!(Instant::now() < deadline, "the failed check left no marker");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(availability_of(&failing, &valid_blob(), "tt1234567").await, "unknown", "after a failed check");
+    assert_eq!(
+        availability_of(&failing, &valid_blob(), "tt1234567").await,
+        "unknown",
+        "after a failed check"
+    );
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(scrapes.load(Ordering::SeqCst), 1, "a failed check must hold off the next");
 }
@@ -202,8 +224,13 @@ async fn availability_empty_is_unavailable_but_a_failure_is_unknown() {
 #[tokio::test]
 async fn availability_a_stream_list_records_the_verdict() {
     let scrapes = Arc::new(AtomicI32::new(0));
-    let h = new_handler(test_deps(|d| d.make_scrapers = counting_scraper(scrapes.clone(), test_seeds(), None)));
-    assert_eq!(get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(), 200, "stream");
+    let h =
+        new_handler(test_deps(|d| d.make_scrapers = counting_scraper(scrapes.clone(), test_seeds(), None)));
+    assert_eq!(
+        get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(),
+        200,
+        "stream"
+    );
     assert_eq!(availability_of(&h, &valid_blob(), "tt1234567").await, "available", "after the stream list");
     assert_eq!(scrapes.load(Ordering::SeqCst), 1, "scrapes");
 }
@@ -227,14 +254,22 @@ async fn availability_partial_filtered_list_stays_unknown() {
                             Ok(test_seeds()[2..].to_vec()) // only the CAM survives this indexer
                         })
                     }),
-                    fake_scraper("comet", || Box::pin(async { Err(Box::new(std::io::Error::other("temporary outage")) as DoError) })),
+                    fake_scraper("comet", || {
+                        Box::pin(async {
+                            Err(Box::new(std::io::Error::other("temporary outage")) as DoError)
+                        })
+                    }),
                 ]
             });
         });
         let cache = deps.cache.clone();
         let h = new_handler(deps);
         if from_stream {
-            assert_eq!(get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(), 200, "stream");
+            assert_eq!(
+                get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(),
+                200,
+                "stream"
+            );
         } else {
             availability_of(&h, &valid_blob(), "tt1234567").await;
         }
@@ -250,7 +285,11 @@ async fn availability_partial_filtered_list_stays_unknown() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(availability_of(&h, &valid_blob(), "tt1234567").await, "unknown", "stream={from_stream}");
-        assert_eq!(scrapes.load(Ordering::SeqCst), 1, "unknown should retain the retry backoff (stream={from_stream})");
+        assert_eq!(
+            scrapes.load(Ordering::SeqCst),
+            1,
+            "unknown should retain the retry backoff (stream={from_stream})"
+        );
     }
 }
 
@@ -259,14 +298,23 @@ async fn availability_partial_filtered_list_stays_unknown() {
 #[tokio::test]
 async fn availability_the_scoped_config() {
     let kr = crate::tests::handler::ticket_keyring();
-    let cfg = r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"cachedOnly":true"#;
+    let cfg =
+        r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"cachedOnly":true"#;
     let full = sealed_config(&kr, &format!("{cfg}}}"));
     let scoped = sealed_config(&kr, &format!(r#"{cfg},"scope":"availability"}}"#));
     let kr_arc = Arc::new(crate::tests::handler::ticket_keyring());
     let h = new_handler(test_deps(move |d| d.seal_keyring = Some(kr_arc)));
 
-    assert_eq!(get(&h, &format!("/{full}/stream/movie/tt1234567.json"), &[]).await.status(), 200, "full stream");
-    assert_eq!(availability_of(&h, &scoped, "tt1234567").await, "available", "the scoped config should read the full config's verdict");
+    assert_eq!(
+        get(&h, &format!("/{full}/stream/movie/tt1234567.json"), &[]).await.status(),
+        200,
+        "full stream"
+    );
+    assert_eq!(
+        availability_of(&h, &scoped, "tt1234567").await,
+        "available",
+        "the scoped config should read the full config's verdict"
+    );
     assert_eq!(get(&h, &format!("/{scoped}/manifest.json"), &[]).await.status(), 200, "scoped manifest");
     let token = crate::play::encode_play_token(&crate::play::PlayTarget {
         info_hash: "a".repeat(40),
@@ -281,9 +329,17 @@ async fn availability_the_scoped_config() {
         assert_eq!(get(&h, &path, &[]).await.status(), 403, "{}", path.replace(&scoped, "<scoped>"));
     }
     let plaintext = blob(&format!(r#"{cfg},"scope":"availability"}}"#));
-    assert_eq!(post_json(&h, &format!("/{plaintext}/availability"), r#"{"ids":[]}"#).await.status(), 400, "a plaintext scoped config");
+    assert_eq!(
+        post_json(&h, &format!("/{plaintext}/availability"), r#"{"ids":[]}"#).await.status(),
+        400,
+        "a plaintext scoped config"
+    );
     let unknown_scope = sealed_config(&kr, &format!(r#"{cfg},"scope":"everything"}}"#));
-    assert_eq!(post_json(&h, &format!("/{unknown_scope}/availability"), r#"{"ids":[]}"#).await.status(), 400, "an unknown scope");
+    assert_eq!(
+        post_json(&h, &format!("/{unknown_scope}/availability"), r#"{"ids":[]}"#).await.status(),
+        400,
+        "an unknown scope"
+    );
 }
 
 #[tokio::test]
@@ -291,7 +347,11 @@ async fn availability_refuses_what_is_not_a_page_of_movie_ids() {
     let h = new_handler(test_deps(|_| {}));
     let path = format!("/{}/availability", valid_blob());
     let r = get(&h, &path, &[]).await;
-    assert!(r.status() == 405 && crate::tests::handler::hdr(&r, "allow") == "POST", "GET: {} allow", r.status());
+    assert!(
+        r.status() == 405 && crate::tests::handler::hdr(&r, "allow") == "POST",
+        "GET: {} allow",
+        r.status()
+    );
     let ids: Vec<String> = (0..=MAX_AVAILABILITY_IDS).map(|i| format!(r#""tt{}""#, i + 1)).collect();
     for (name, body) in [
         ("not json", "ids".to_owned()),

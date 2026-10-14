@@ -20,19 +20,19 @@ use crate::scrape::{DoError, Doer};
 use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
-use crate::stores::refusal::{resolve_key, torrent_id_key};
-use crate::stores::{dead_link, DeadLinkError, StoreError, StoreStatus, ERR_CHECK_FAILED};
 use crate::stores::refusal::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
+use crate::stores::refusal::{resolve_key, torrent_id_key};
 use crate::stores::torbox::{
     decode_listing, ListingFault, TorBoxStore, TruncationDetector, CACHE_BATCH, MAX_LISTING_ENTRIES,
     MAX_TORBOX_OUTBOUND, TORBOX_API,
 };
-use crate::util::key_hash;
+use crate::stores::{dead_link, DeadLinkError, StoreError, StoreStatus, ERR_CHECK_FAILED};
 use crate::stores::{
-    rd_fetch_state, torbox_fetch_state, ResolveTarget, Store, StatusAnswer, FETCH_DOWNLOADING, FETCH_FAILED,
+    rd_fetch_state, torbox_fetch_state, ResolveTarget, StatusAnswer, Store, FETCH_DOWNLOADING, FETCH_FAILED,
     FETCH_FETCHING, FETCH_QUEUED, FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
 };
 use crate::tests::mock::{resp, MockDoer};
+use crate::util::key_hash;
 
 const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -77,7 +77,12 @@ fn target_file(hash: &str, file_idx: i64) -> ResolveTarget {
 }
 
 fn target_episode(hash: &str, season: i64, episode: i64) -> ResolveTarget {
-    ResolveTarget { info_hash: hash.to_owned(), season: Some(season), episode: Some(episode), ..Default::default() }
+    ResolveTarget {
+        info_hash: hash.to_owned(),
+        season: Some(season),
+        episode: Some(episode),
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -263,7 +268,10 @@ async fn torbox_binge_cache_and_no_poison() {
         }
         if p.contains("requestdl") {
             dl.fetch_add(1, Ordering::SeqCst);
-            return Ok(resp(200, &format!(r#"{{"success":true,"data":"https://cdn/{}"}}"#, query(&req, "file_id"))));
+            return Ok(resp(
+                200,
+                &format!(r#"{{"success":true,"data":"https://cdn/{}"}}"#, query(&req, "file_id")),
+            ));
         }
         Ok(resp(404, "{}"))
     });
@@ -271,7 +279,8 @@ async fn torbox_binge_cache_and_no_poison() {
     let ep1 = s.resolve(&target_episode(H, 1, 1)).await.unwrap_or_default();
     let ep2 = s.resolve(&target_episode(H, 1, 2)).await.unwrap_or_default();
     assert!(ep1 == "https://cdn/0" && ep2 == "https://cdn/1", "binge picks: ep1={ep1:?} ep2={ep2:?}");
-    let (c, l, dl) = (creates.load(Ordering::SeqCst), lists.load(Ordering::SeqCst), dls.load(Ordering::SeqCst));
+    let (c, l, dl) =
+        (creates.load(Ordering::SeqCst), lists.load(Ordering::SeqCst), dls.load(Ordering::SeqCst));
     assert!(c == 1 && l == 1 && dl == 2, "binge cache: creates={c} lists={l} dls={dl} (want 1,1,2)");
 
     // A pack whose list never succeeded re-lists on the next episode instead of mis-serving from an
@@ -344,7 +353,10 @@ async fn torbox_a_pack_entry_with_no_file_list_is_not_served_to_an_episode() {
             ));
         }
         if p.contains("requestdl") {
-            return Ok(resp(200, &format!(r#"{{"success":true,"data":"https://cdn/{}"}}"#, query(&req, "file_id"))));
+            return Ok(resp(
+                200,
+                &format!(r#"{{"success":true,"data":"https://cdn/{}"}}"#, query(&req, "file_id")),
+            ));
         }
         Ok(resp(404, "{}"))
     });
@@ -408,7 +420,10 @@ async fn torbox_a_failed_list_does_not_poison_a_warm_pack_entry() {
             if !dlo.load(Ordering::SeqCst) {
                 return Ok(resp(200, r#"{"success":false}"#)); // a dead link, NOT a store outage
             }
-            return Ok(resp(200, &format!(r#"{{"success":true,"data":"https://cdn/{}"}}"#, query(&req, "file_id"))));
+            return Ok(resp(
+                200,
+                &format!(r#"{{"success":true,"data":"https://cdn/{}"}}"#, query(&req, "file_id")),
+            ));
         }
         Ok(resp(404, "{}"))
     });
@@ -422,13 +437,20 @@ async fn torbox_a_failed_list_does_not_poison_a_warm_pack_entry() {
     // entry must survive that.
     list_ok.store(false, Ordering::SeqCst);
     dl_ok.store(false, Ordering::SeqCst);
-    assert!(s.resolve(&target_episode(H, 1, 2)).await.is_err(), "a blipped list with no usable file list should refuse rather than guess an episode");
+    assert!(
+        s.resolve(&target_episode(H, 1, 2)).await.is_err(),
+        "a blipped list with no usable file list should refuse rather than guess an episode"
+    );
 
     // The proof: a later episode still resolves from the warm entry, without re-listing.
     list_ok.store(true, Ordering::SeqCst);
     dl_ok.store(true, Ordering::SeqCst);
     let link = s.resolve(&target_episode(H, 1, 3)).await;
-    assert_eq!(link.as_deref(), Ok("https://cdn/2"), "after the blip: want the pack entry to still pick S01E03");
+    assert_eq!(
+        link.as_deref(),
+        Ok("https://cdn/2"),
+        "after the blip: want the pack entry to still pick S01E03"
+    );
     let n = lists.load(Ordering::SeqCst);
     assert_eq!(n, 2, "mylist called {n} times, want 2 (the warm list and the blip) — the blip overwrote the good entry with an empty file list, so the pack had to be listed again");
     let c = creates.load(Ordering::SeqCst);
@@ -532,7 +554,10 @@ fn fetch_account_listing_streams_and_detects_truncation() {
     // miss marker and suppresses the only lookup that rediscovers a queued torrent. The duplicate-key
     // fixtures below contain `data:null` too, but decide on the repeat, so they pin nothing here.
     let (_, ok, fault) = decode_listing(r#"{"success":true,"data":null}"#.as_bytes());
-    assert!(!ok && fault == ListingFault::BadEnvelope, "a null data reported ok={ok} fault={fault:?} — null is not the account saying it holds nothing");
+    assert!(
+        !ok && fault == ListingFault::BadEnvelope,
+        "a null data reported ok={ok} fault={fault:?} — null is not the account saying it holds nothing"
+    );
     // A REPEATED data key is unreadable, whichever order it comes in. Every rule for picking one of them
     // is unsafe in one direction — a trailing null erases a list that was read, and an empty first array
     // beats a populated second one into an authoritative "holds nothing" that costs a duplicate add —
@@ -572,8 +597,18 @@ async fn fetch_account_listing_large_account_is_not_truncated() {
         i += 1;
     }
     body.push_str("]}");
-    assert!(body.len() > MAX_STORE_BYTES, "fixture is {} bytes, not past the {} ordinary cap", body.len(), MAX_STORE_BYTES);
-    assert!(body.len() < MAX_LISTING_BYTES, "fixture is {} bytes, past even the {} listing cap", body.len(), MAX_LISTING_BYTES);
+    assert!(
+        body.len() > MAX_STORE_BYTES,
+        "fixture is {} bytes, not past the {} ordinary cap",
+        body.len(),
+        MAX_STORE_BYTES
+    );
+    assert!(
+        body.len() < MAX_LISTING_BYTES,
+        "fixture is {} bytes, past even the {} listing cap",
+        body.len(),
+        MAX_LISTING_BYTES
+    );
 
     let s = tb("t", TORBOX_API, None, mock(move |_| Ok(resp(200, &body))));
     let (ids, ok, _) = s.fetch_account_listing().await;
@@ -606,7 +641,12 @@ async fn account_listing_singleflight_respects_each_callers_budget() {
     let new_store = |token: String| {
         let gate = gate.clone();
         let arrival_tx = arrival_tx.clone();
-        tb(&token, TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), Arc::new(GatedDoer { gate, arrival_tx }))
+        tb(
+            &token,
+            TORBOX_API,
+            Some(Arc::new(MemoryCache::new(1 << 20))),
+            Arc::new(GatedDoer { gate, arrival_tx }),
+        )
     };
 
     // The leader: a long budget, and it goes away before the fetch completes.
@@ -622,10 +662,7 @@ async fn account_listing_singleflight_respects_each_callers_budget() {
     // A follower on the same account with a SHORT budget must not wait for the leader.
     let follower = new_store(token.clone());
     let answered = tokio::time::timeout(Duration::from_millis(50), follower.account_listing()).await;
-    assert!(
-        !matches!(answered, Ok((_, true))),
-        "a follower that ran out of time reported an answer"
-    );
+    assert!(!matches!(answered, Ok((_, true))), "a follower that ran out of time reported an answer");
 
     // A joiner with a long budget attaches to the SAME in-flight fetch — asserted, not assumed, by the
     // fetch count. An earlier version of this simply called accountListing after cancelling the leader,
@@ -726,10 +763,8 @@ async fn torbox_status_answer_takes_its_doubt_from_the_lookup_it_already_did() {
             }),
         );
         for i in 0..2 {
-            let (_, answer) = s
-                .status_answer(&target_hash(H))
-                .await
-                .expect("the TorBox store answers three-valued");
+            let (_, answer) =
+                s.status_answer(&target_hash(H)).await.expect("the TorBox store answers three-valued");
             assert_eq!(answer, tc.want_answer, "{}: poll {i} answered {answer:?}", tc.name);
         }
         let n = fetches.load(Ordering::SeqCst);
@@ -746,7 +781,8 @@ async fn torbox_outbound_concurrency_is_bounded_without_inventing_misses() {
     let active = Arc::new(AtomicI32::new(0));
     let peak = Arc::new(AtomicI32::new(0));
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
-    let client: Arc<dyn Doer> = Arc::new(CountingGatedDoer { active: active.clone(), peak: peak.clone(), gate: gate_rx });
+    let client: Arc<dyn Doer> =
+        Arc::new(CountingGatedDoer { active: active.clone(), peak: peak.clone(), gate: gate_rx });
     let store = Arc::new(tb("bounded-outbound", TORBOX_API, None, client));
     let extra = 20;
     let mut tasks = Vec::new();
@@ -763,7 +799,9 @@ async fn torbox_outbound_concurrency_is_bounded_without_inventing_misses() {
     // Reach enough overlap to prove this burst is being held back, then verify the hard ceiling itself and
     // that every waiter eventually gets a real answer.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while active.load(Ordering::SeqCst) < (MAX_TORBOX_OUTBOUND / 2) as i32 && std::time::Instant::now() < deadline {
+    while active.load(Ordering::SeqCst) < (MAX_TORBOX_OUTBOUND / 2) as i32
+        && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -825,16 +863,24 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
 
     let fetches = Arc::new(AtomicUsize::new(0));
     let f = fetches.clone();
-    let oversized = tb("t", TORBOX_API, Some(Arc::new(MemoryCache::new(4 << 20))), mock(move |_| {
-        f.fetch_add(1, Ordering::SeqCst);
-        Ok(resp(200, &body))
-    }));
+    let oversized = tb(
+        "t",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(4 << 20))),
+        mock(move |_| {
+            f.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, &body))
+        }),
+    );
     for _ in 0..3 {
         let (ids, ok) = oversized.account_listing().await;
         assert!(!ok && ids.is_empty(), "a truncated listing must not read as an answer");
     }
     let n = fetches.load(Ordering::SeqCst);
-    assert_eq!(n, 1, "pulled the oversized listing {n} times for three attempts — it is not being remembered");
+    assert_eq!(
+        n, 1,
+        "pulled the oversized listing {n} times for three attempts — it is not being remembered"
+    );
 
     // The ENTRY cap takes the same road, and had to be given it separately: it trips before the body is
     // drained, so the byte counter never reaches the cap, truncated() stays false, and the oversize memo
@@ -856,16 +902,24 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
     );
     let entry_fetches = Arc::new(AtomicUsize::new(0));
     let ef = entry_fetches.clone();
-    let too_many = tb("t3", TORBOX_API, Some(Arc::new(MemoryCache::new(4 << 20))), mock(move |_| {
-        ef.fetch_add(1, Ordering::SeqCst);
-        Ok(resp(200, &compact))
-    }));
+    let too_many = tb(
+        "t3",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(4 << 20))),
+        mock(move |_| {
+            ef.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, &compact))
+        }),
+    );
     for _ in 0..3 {
         let (ids, ok) = too_many.account_listing().await;
         assert!(!ok && ids.is_empty(), "a listing past the entry cap must not read as an answer");
     }
     let n = entry_fetches.load(Ordering::SeqCst);
-    assert_eq!(n, 1, "pulled the over-entry-count listing {n} times for three attempts — it is not being remembered");
+    assert_eq!(
+        n, 1,
+        "pulled the over-entry-count listing {n} times for three attempts — it is not being remembered"
+    );
 
     // An UNUSABLE listing takes the same road, for the same reason: an upstream that renamed `hash` will
     // rename it again on the next poll, so re-pulling is guaranteed waste. It shipped once as
@@ -874,10 +928,15 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
     let unusable_fetches = Arc::new(AtomicUsize::new(0));
     let uf = unusable_fetches.clone();
     let unusable_body = format!(r#"{{"success":true,"data":[{{"id":1,"infohash":"{}"}}]}}"#, "a".repeat(40));
-    let unusable = tb("t4", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(move |_| {
-        uf.fetch_add(1, Ordering::SeqCst);
-        Ok(resp(200, &unusable_body))
-    }));
+    let unusable = tb(
+        "t4",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(1 << 20))),
+        mock(move |_| {
+            uf.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, &unusable_body))
+        }),
+    );
     for _ in 0..3 {
         let (ids, ok) = unusable.account_listing().await;
         assert!(!ok && ids.is_empty(), "a listing with no usable entry must not read as an answer");
@@ -913,10 +972,15 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
     ] {
         let fetches = Arc::new(AtomicUsize::new(0));
         let f = fetches.clone();
-        let s = tb(&format!("envelope-{name}"), TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(move |_| {
-            f.fetch_add(1, Ordering::SeqCst);
-            Ok(resp(200, &body))
-        }));
+        let s = tb(
+            &format!("envelope-{name}"),
+            TORBOX_API,
+            Some(Arc::new(MemoryCache::new(1 << 20))),
+            mock(move |_| {
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(resp(200, &body))
+            }),
+        );
         for _ in 0..3 {
             let (ids, ok) = s.account_listing().await;
             assert!(!ok && ids.is_empty(), "{name}: must not read as an answer");
@@ -952,10 +1016,15 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
     ] {
         let n = Arc::new(AtomicUsize::new(0));
         let c = n.clone();
-        let s = tb(&format!("cut-{name}"), TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(move |_| {
-            c.fetch_add(1, Ordering::SeqCst);
-            Ok(resp(200, body))
-        }));
+        let s = tb(
+            &format!("cut-{name}"),
+            TORBOX_API,
+            Some(Arc::new(MemoryCache::new(1 << 20))),
+            mock(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(resp(200, body))
+            }),
+        );
         for _ in 0..3 {
             let (ids, ok) = s.account_listing().await;
             assert!(!ok && ids.is_empty(), "{name}: a truncated listing must not read as an answer");
@@ -972,10 +1041,15 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
     // blip. That one character is the whole difference, which is what makes this worth pinning.
     let cut_fetches = Arc::new(AtomicUsize::new(0));
     let cf = cut_fetches.clone();
-    let cut = tb("cut", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(move |_| {
-        cf.fetch_add(1, Ordering::SeqCst);
-        Ok(resp(200, r#"{"success":false"#))
-    }));
+    let cut = tb(
+        "cut",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(1 << 20))),
+        mock(move |_| {
+            cf.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, r#"{"success":false"#))
+        }),
+    );
     for _ in 0..3 {
         let (ids, ok) = cut.account_listing().await;
         assert!(!ok && ids.is_empty(), "a truncated listing must not read as an answer");
@@ -987,10 +1061,15 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
     // being rediscoverable, which this package has a separate test for.
     let transient_fetches = Arc::new(AtomicUsize::new(0));
     let tf = transient_fetches.clone();
-    let flaky = tb("t2", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(move |_| {
-        tf.fetch_add(1, Ordering::SeqCst);
-        Ok(resp(503, "down"))
-    }));
+    let flaky = tb(
+        "t2",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(1 << 20))),
+        mock(move |_| {
+            tf.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(503, "down"))
+        }),
+    );
     for _ in 0..3 {
         let _ = flaky.account_listing().await;
     }
@@ -1009,10 +1088,13 @@ async fn account_listing_remembers_oversized_but_retries_transient() {
 #[test]
 fn truncation_detector_a_body_of_exactly_the_cap_is_whole() {
     const LIMIT: usize = 1 << 10;
-    for (name, size, want) in [("one short", LIMIT - 1, false), ("exactly the cap", LIMIT, false), ("one over", LIMIT + 1, true)] {
+    for (name, size, want) in
+        [("one short", LIMIT - 1, false), ("exactly the cap", LIMIT, false), ("one over", LIMIT + 1, true)]
+    {
         // Constructed exactly as fetchAccountListing does it.
         let body = "x".repeat(size);
-        let mut td = TruncationDetector { r: std::io::Read::take(body.as_bytes(), (LIMIT + 1) as u64), limit: LIMIT };
+        let mut td =
+            TruncationDetector { r: std::io::Read::take(body.as_bytes(), (LIMIT + 1) as u64), limit: LIMIT };
         let n = std::io::copy(&mut td, &mut std::io::sink()).expect("read");
         assert_eq!(
             td.truncated(),
@@ -1047,7 +1129,9 @@ fn decode_listing_entries_do_not_inherit_from_the_entry_before() {
 #[test]
 fn skip_value_accepts_depth_just_under_the_bound() {
     let hash = "a".repeat(40);
-    for (name, depth, want_ok) in [("under the bound", 63, true), ("exactly at the bound", 64, true), ("past the bound", 65, false)] {
+    for (name, depth, want_ok) in
+        [("under the bound", 63, true), ("exactly at the bound", 64, true), ("past the bound", 65, false)]
+    {
         // The nested field precedes `data` so the refusal, when it comes, is the depth bound rather
         // than anything downstream; a body that decodes must still yield the entry after it.
         let body = format!(
@@ -1058,10 +1142,18 @@ fn skip_value_accepts_depth_just_under_the_bound() {
         let (ids, ok, fault) = decode_listing(body.as_bytes());
         assert_eq!(ok, want_ok, "{name}: depth {depth}: ok={ok} fault={fault:?}, want ok={want_ok}");
         if !want_ok {
-            assert_eq!(fault, ListingFault::BadEnvelope, "{name}: depth {depth}: fault={fault:?}, want BadEnvelope");
+            assert_eq!(
+                fault,
+                ListingFault::BadEnvelope,
+                "{name}: depth {depth}: fault={fault:?}, want BadEnvelope"
+            );
             continue;
         }
-        assert_eq!(id_of(&ids, &hash), 1, "{name}: depth {depth} decoded, but the entry after the nested field was lost: {ids:?}");
+        assert_eq!(
+            id_of(&ids, &hash),
+            1,
+            "{name}: depth {depth} decoded, but the entry after the nested field was lost: {ids:?}"
+        );
     }
 }
 
@@ -1100,7 +1192,6 @@ fn decode_listing_bounds_entry_count() {
 // The tests below are ignored until the package that owns what they reach lands. Each keeps its full Go
 // body in a compiled-out item, so the port is reviewable now and only needs moving up when enabled.
 
-
 /// Go `fakeStore`: a Store answering from fixed values, for the pool tests.
 #[derive(Clone)]
 struct FakeStore {
@@ -1115,7 +1206,14 @@ struct FakeStore {
 
 impl FakeStore {
     fn new(svc: DebridService) -> FakeStore {
-        FakeStore { svc, check: HashMap::new(), check_err: None, resolve: None, status: None, status_blocks: false }
+        FakeStore {
+            svc,
+            check: HashMap::new(),
+            check_err: None,
+            resolve: None,
+            status: None,
+            status_blocks: false,
+        }
     }
 
     fn check(mut self, answers: &[(&str, bool)]) -> FakeStore {
@@ -1212,9 +1310,14 @@ impl Store for AnsweringStore {
 #[tokio::test]
 async fn real_debrid() {
     // RD cacheCheck is all-false with no error, even on a store with no token.
-    let m = RealDebridStore { token: String::new(), api: REAL_DEBRID_API.into(), cache: None, client: mock(|_| Ok(resp(200, ""))) }
-        .cache_check(&[H.to_owned()])
-        .await;
+    let m = RealDebridStore {
+        token: String::new(),
+        api: REAL_DEBRID_API.into(),
+        cache: None,
+        client: mock(|_| Ok(resp(200, ""))),
+    }
+    .cache_check(&[H.to_owned()])
+    .await;
     assert!(m.is_ok_and(|m| !held(&m, H)), "RD cacheCheck should be all-false, no error");
 
     let infocalls = Arc::new(AtomicUsize::new(0));
@@ -1229,7 +1332,10 @@ async fn real_debrid() {
             if n == 1 {
                 return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":[]}"#));
             }
-            return Ok(resp(200, r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}"#));
+            return Ok(resp(
+                200,
+                r#"{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}"#,
+            ));
         }
         if p.contains("selectFiles") {
             return Ok(resp(204, ""));
@@ -1252,7 +1358,10 @@ async fn real_debrid() {
         Ok(resp(200, r#"{"files":[{"id":1,"path":"Movie.WEB-DL.x264.mkv","bytes":999}],"links":[]}"#))
     });
     assert!(
-        RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), cache: None, client: db }.resolve(&target_hash(H)).await.is_err(),
+        RealDebridStore { token: "t".into(), api: REAL_DEBRID_API.into(), cache: None, client: db }
+            .resolve(&target_hash(H))
+            .await
+            .is_err(),
         "RD-blocked filename should error"
     );
 }
@@ -1292,7 +1401,11 @@ async fn store_pool_prefers_the_three_valued_answer() {
         };
         let (status, ok, unknown) = pool.status(&target_hash(H), None).await;
         assert!(ok == want_ok && unknown == want_unknown, "{name}: pool answered ok={ok} unknown={unknown}");
-        assert_eq!(asked.load(Ordering::SeqCst), 1, "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback"
+        );
         if want_ok {
             assert_eq!(status.progress, 0.5, "{name}: the status itself was dropped");
         }
@@ -1302,22 +1415,29 @@ async fn store_pool_prefers_the_three_valued_answer() {
 #[tokio::test]
 async fn store_pool() {
     // buildStores orders TorBox first regardless of config order.
-    let cfg = Config { debrid: vec![
-        DebridAccount { service: DebridService::Premiumize, token: "p".into() },
-        DebridAccount { service: DebridService::TorBox, token: "t".into() },
-        DebridAccount { service: DebridService::RealDebrid, token: "r".into() },
-    ], ..Default::default() };
+    let cfg = Config {
+        debrid: vec![
+            DebridAccount { service: DebridService::Premiumize, token: "p".into() },
+            DebridAccount { service: DebridService::TorBox, token: "t".into() },
+            DebridAccount { service: DebridService::RealDebrid, token: "r".into() },
+        ],
+        ..Default::default()
+    };
     let stores = build_stores(&cfg, mock(|_| Ok(resp(404, ""))), None);
     assert!(
-        stores.len() == 3 && stores[0].service() == DebridService::TorBox && stores[2].service() == DebridService::Premiumize,
+        stores.len() == 3
+            && stores[0].service() == DebridService::TorBox
+            && stores[2].service() == DebridService::Premiumize,
         "store order"
     );
 
     let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let pool = StorePool { stores: vec![
-        Box::new(FakeStore::new(DebridService::TorBox).check(&[(H, true), (other, false)])),
-        Box::new(FakeStore::new(DebridService::Premiumize).check(&[(H, false), (other, true)])),
-    ] };
+    let pool = StorePool {
+        stores: vec![
+            Box::new(FakeStore::new(DebridService::TorBox).check(&[(H, true), (other, false)])),
+            Box::new(FakeStore::new(DebridService::Premiumize).check(&[(H, false), (other, true)])),
+        ],
+    };
     let (m, truth_ok) = pool.cache_check(&[H.to_owned(), other.to_owned()]).await;
     assert!(m.cached(H) && m.cached(other), "pool union: {:?} / {:?}", m.held_by(H), m.held_by(other));
     assert!(truth_ok, "pool truthOK should be true when a cache-truth store succeeded");
@@ -1331,17 +1451,21 @@ async fn store_pool() {
     let (_, ok) = down.cache_check(&[H.to_owned()]).await;
     assert!(!ok, "truthOK should be false when every cache-truth store failed");
     // RD succeeding is not cache truth → truthOK false
-    let rd = StorePool { stores: vec![Box::new(FakeStore::new(DebridService::RealDebrid).check(&[(H, false)]))] };
+    let rd =
+        StorePool { stores: vec![Box::new(FakeStore::new(DebridService::RealDebrid).check(&[(H, false)]))] };
     let (_, ok) = rd.cache_check(&[H.to_owned()]).await;
     assert!(!ok, "RD success is not cache truth");
 
     let dead = || Err(StoreError::DeadLink(DeadLinkError { reason: "x".into() }));
-    let dead_only = StorePool { stores: vec![Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead()))] };
+    let dead_only =
+        StorePool { stores: vec![Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead()))] };
     assert!(dead_only.resolve(&target_hash(H)).await.is_err(), "all-fail should error");
-    let fallthr = StorePool { stores: vec![
-        Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead())),
-        Box::new(FakeStore::new(DebridService::TorBox).resolve_with(Ok("https://ok".into()))),
-    ] };
+    let fallthr = StorePool {
+        stores: vec![
+            Box::new(FakeStore::new(DebridService::TorBox).resolve_with(dead())),
+            Box::new(FakeStore::new(DebridService::TorBox).resolve_with(Ok("https://ok".into()))),
+        ],
+    };
     assert_eq!(fallthr.resolve(&target_hash(H)).await.as_deref(), Ok("https://ok"), "fallthrough");
 }
 
@@ -1349,19 +1473,33 @@ async fn store_pool() {
 fn has_cache_truth_reads_the_configured_services() {
     let rd = DebridAccount { service: DebridService::RealDebrid, token: "r".into() };
     let tb = DebridAccount { service: DebridService::TorBox, token: "t".into() };
-    assert!(!has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }), "RD-only should have no cache truth");
-    assert!(has_cache_truth(&Config { debrid: vec![rd, tb], ..Default::default() }), "torbox present → cache truth");
+    assert!(
+        !has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }),
+        "RD-only should have no cache truth"
+    );
+    assert!(
+        has_cache_truth(&Config { debrid: vec![rd, tb], ..Default::default() }),
+        "torbox present → cache truth"
+    );
 }
-
 
 #[test]
 fn has_cache_truth_and_rd_only() {
     let rd = DebridAccount { service: DebridService::RealDebrid, token: "r".into() };
     let tb = DebridAccount { service: DebridService::TorBox, token: "t".into() };
-    assert!(!has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }), "RD-only should have no cache truth");
-    assert!(has_cache_truth(&Config { debrid: vec![rd.clone(), tb.clone()], ..Default::default() }), "torbox present → cache truth");
+    assert!(
+        !has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }),
+        "RD-only should have no cache truth"
+    );
+    assert!(
+        has_cache_truth(&Config { debrid: vec![rd.clone(), tb.clone()], ..Default::default() }),
+        "torbox present → cache truth"
+    );
     assert!(rd_only(&Config { debrid: vec![rd.clone()], ..Default::default() }), "rd-only");
-    assert!(!rd_only(&Config { debrid: vec![rd, tb], ..Default::default() }), "not rd-only when torbox present");
+    assert!(
+        !rd_only(&Config { debrid: vec![rd, tb], ..Default::default() }),
+        "not rd-only when torbox present"
+    );
 }
 
 #[tokio::test]
@@ -1394,7 +1532,10 @@ async fn torbox_account_state_is_isolated_by_api_and_token() {
         r#"{"torrentId":11,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":123}]}"#,
         Duration::from_secs(3600),
     );
-    assert!(b.known_file_size(&target_hash(H)).is_none(), "endpoint B accepted endpoint A's resolve/file fact");
+    assert!(
+        b.known_file_size(&target_hash(H)).is_none(),
+        "endpoint B accepted endpoint A's resolve/file fact"
+    );
 
     // A positive cache check is scoped the same way.
     cache.put(&cached_key(DebridService::TorBox, &a.account_identity(), H), "1", CACHED_TTL);
@@ -1413,9 +1554,24 @@ async fn torbox_account_state_is_isolated_by_api_and_token() {
 async fn torbox_status() {
     // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
     for (name, body, want_ok, want_prog) in [
-        ("downloading", r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#, true, 0.42),
-        ("array payload", r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#, true, 0.1),
-        ("finished but unresolvable", r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#, false, 0.0),
+        (
+            "downloading",
+            r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#,
+            true,
+            0.42,
+        ),
+        (
+            "array payload",
+            r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#,
+            true,
+            0.1,
+        ),
+        (
+            "finished but unresolvable",
+            r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#,
+            false,
+            0.0,
+        ),
         ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
         ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
         ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
@@ -1430,7 +1586,12 @@ async fn torbox_status() {
         }
     }
     // No torrent id remembered, and the account doesn't hold it either → nothing to report.
-    let empty = tb("t", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 16))), mock(|_| Ok(resp(200, r#"{"data":[]}"#))));
+    let empty = tb(
+        "t",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(1 << 16))),
+        mock(|_| Ok(resp(200, r#"{"data":[]}"#))),
+    );
     assert!(empty.status(&target_hash(H)).await.is_none(), "an unknown infohash must not report a download");
 }
 
@@ -1445,8 +1606,20 @@ async fn torbox_status_carries_state_and_swarm() {
             Some(0),
             Some(0),
         ),
-        ("failed", r#"{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}"#, FETCH_FAILED, None, None),
-        ("metadata", r#"{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}"#, FETCH_FETCHING, Some(4), None),
+        (
+            "failed",
+            r#"{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}"#,
+            FETCH_FAILED,
+            None,
+            None,
+        ),
+        (
+            "metadata",
+            r#"{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}"#,
+            FETCH_FETCHING,
+            Some(4),
+            None,
+        ),
         ("no state named", r#"{"data":{"progress":0.4,"download_finished":false}}"#, "", None, None),
     ] {
         let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
@@ -1454,7 +1627,10 @@ async fn torbox_status_carries_state_and_swarm() {
         let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
         let got = s.status(&target_hash(H)).await.expect("a download TorBox reports on must be a wait");
         assert_eq!(got.state, want_state, "{name}: state");
-        assert!(same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers), "{name}: seeds/peers");
+        assert!(
+            same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers),
+            "{name}: seeds/peers"
+        );
     }
 }
 
@@ -1472,16 +1648,26 @@ async fn torbox_status_rediscovers_lost_torrent_id() {
     // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
     let target = H.to_uppercase();
     let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
-    let s = tb("t", TORBOX_API, Some(cache.clone()), mock(move |req| {
-        if req.url().query().unwrap_or("").contains("id=") {
-            return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
-        }
-        lc.fetch_add(1, Ordering::SeqCst);
-        Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
-    }));
-    let got = s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
+    let s = tb(
+        "t",
+        TORBOX_API,
+        Some(cache.clone()),
+        mock(move |req| {
+            if req.url().query().unwrap_or("").contains("id=") {
+                return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
+            }
+            lc.fetch_add(1, Ordering::SeqCst);
+            Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
+        }),
+    );
+    let got =
+        s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
     assert_eq!(got.progress, 0.25, "progress");
-    assert_eq!(cache.get(&torrent_id_key("t", &target)).as_deref(), Some("7"), "the rediscovered id must be remembered");
+    assert_eq!(
+        cache.get(&torrent_id_key("t", &target)).as_deref(),
+        Some("7"),
+        "the rediscovered id must be remembered"
+    );
     // Second call must reuse the cache rather than list the whole account again.
     assert!(s.status(&target_hash(&target)).await.is_some(), "second status");
     assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
@@ -1492,19 +1678,31 @@ async fn torbox_remembers_torrent_id_for_queued_episode() {
     // The series path: Resolve refuses to cache an entry whose file list is empty, and a just-queued torrent
     // has no files yet. The id must survive that anyway.
     let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-    let s = tb("t", TORBOX_API, Some(cache.clone()), mock(|req| {
-        let p = req.url().path().to_owned();
-        if p.contains("createtorrent") {
-            return Ok(resp(200, r#"{"data":{"torrent_id":7}}"#));
-        }
-        if p.contains("mylist") {
-            return Ok(resp(200, r#"{"success":true,"data":{"files":[]}}"#)); // queued: no files yet
-        }
-        Ok(resp(200, r#"{"success":false}"#)) // link not ready
-    }));
+    let s = tb(
+        "t",
+        TORBOX_API,
+        Some(cache.clone()),
+        mock(|req| {
+            let p = req.url().path().to_owned();
+            if p.contains("createtorrent") {
+                return Ok(resp(200, r#"{"data":{"torrent_id":7}}"#));
+            }
+            if p.contains("mylist") {
+                return Ok(resp(200, r#"{"success":true,"data":{"files":[]}}"#));
+                // queued: no files yet
+            }
+            Ok(resp(200, r#"{"success":false}"#)) // link not ready
+        }),
+    );
     let target = target_episode(H, 1, 3);
-    assert!(s.resolve(&target).await.is_err(), "expected the link request to fail while the torrent is still queued");
-    assert!(cache.get(&torrent_id_key("t", H)).is_some(), "the torrent id must be remembered so Status can report the download");
+    assert!(
+        s.resolve(&target).await.is_err(),
+        "expected the link request to fail while the torrent is still queued"
+    );
+    assert!(
+        cache.get(&torrent_id_key("t", H)).is_some(),
+        "the torrent id must be remembered so Status can report the download"
+    );
 }
 
 /// Go's status test doer: every call takes 20 ms, counts itself and reports a download at half way.
@@ -1581,8 +1779,16 @@ fn queued_body_carries_state_and_swarm() {
     let decode = |status: StoreStatus| -> serde_json::Value {
         serde_json::from_slice(&write_queued_body(&status).body).expect("decode")
     };
-    let stalled = decode(StoreStatus { state: FETCH_STALLED.into(), seeds: Some(0), peers: Some(2), ..Default::default() });
-    assert!(stalled["state"] == "stalled" && stalled["seeds"] == 0 && stalled["peers"] == 2, "stalled body: {stalled}");
+    let stalled = decode(StoreStatus {
+        state: FETCH_STALLED.into(),
+        seeds: Some(0),
+        peers: Some(2),
+        ..Default::default()
+    });
+    assert!(
+        stalled["state"] == "stalled" && stalled["seeds"] == 0 && stalled["peers"] == 2,
+        "stalled body: {stalled}"
+    );
     let plain = decode(StoreStatus { progress: 0.5, ..Default::default() });
     assert_eq!(plain["state"], "downloading", "a store naming no state must still answer downloading");
     assert!(plain.get("seeds").is_none(), "unknown seeds must be omitted, not zero: {plain}");
@@ -1602,7 +1808,11 @@ async fn store_pool_status_reports_when_a_store_could_not_answer() {
     let (_, ok, unknown) = pool.status(&target_hash(H), Some(deadline)).await;
     assert!(!ok, "a wedged store reported a download");
     assert!(unknown, "a store that ran out of time was reported as a definitive 'not downloading'");
-    assert!(start.elapsed() < Duration::from_millis(80), "the first store consumed the whole budget ({:?}) — the slices are not being applied", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_millis(80),
+        "the first store consumed the whole budget ({:?}) — the slices are not being applied",
+        start.elapsed()
+    );
 
     // Every store answering promptly → a real answer, not indeterminate.
     let clean = StorePool { stores: vec![Box::new(silent.clone()), Box::new(silent)] };
@@ -1619,7 +1829,9 @@ async fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() 
     let uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, uncertain_asks.clone());
     let definite = AnsweringStore::new(DebridService::RealDebrid, StatusAnswer::No, definite_asks.clone());
 
-    let pool = StorePool { stores: vec![Box::new(definite.clone()), Box::new(uncertain), Box::new(definite.clone())] };
+    let pool = StorePool {
+        stores: vec![Box::new(definite.clone()), Box::new(uncertain), Box::new(definite.clone())],
+    };
     let (_, ok, unknown) = pool.status_detail(&target_hash(H), None).await;
     assert!(!ok, "nothing was downloading");
     assert_eq!(unknown.len(), 1, "reported {} stores as unable to answer, want 1", unknown.len());
@@ -1628,8 +1840,17 @@ async fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() 
     // The retry, as handlePlay performs it: only the named store is asked again.
     let before = definite_asks.load(Ordering::SeqCst);
     let _ = crate::stores::pool::status_detail_among(&unknown, &target_hash(H), None).await;
-    assert_eq!(definite_asks.load(Ordering::SeqCst), before, "the retry asked a store that had already answered definitively");
-    assert_eq!(uncertain_asks.load(Ordering::SeqCst), 2, "the store that could not answer was asked {} times, want 2", uncertain_asks.load(Ordering::SeqCst));
+    assert_eq!(
+        definite_asks.load(Ordering::SeqCst),
+        before,
+        "the retry asked a store that had already answered definitively"
+    );
+    assert_eq!(
+        uncertain_asks.load(Ordering::SeqCst),
+        2,
+        "the store that could not answer was asked {} times, want 2",
+        uncertain_asks.load(Ordering::SeqCst)
+    );
 }
 
 #[tokio::test]
@@ -1638,8 +1859,10 @@ async fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
     // never reached: three stores — answered, uncertain, never reached — and the caller hangs up (here: the clock
     // passes the deadline while the second store is being asked, which a blocking sleep makes certain).
     let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-    let answered = AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No, Arc::new(AtomicUsize::new(0)));
-    let mut uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, Arc::new(AtomicUsize::new(0)));
+    let answered =
+        AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No, Arc::new(AtomicUsize::new(0)));
+    let mut uncertain =
+        AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, Arc::new(AtomicUsize::new(0)));
     uncertain.on_ask = Some(Arc::new(|| std::thread::sleep(Duration::from_millis(60))));
     let unreached = FakeStore::new(DebridService::RealDebrid);
 
@@ -1654,20 +1877,30 @@ async fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
 async fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
     // A panic inside the listing fetch is abandoned, not fatal.
     let before = crate::metrics::background_panic();
-    let s = tb("panics", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(|_| panic!("a parser went off the end")));
+    let s = tb(
+        "panics",
+        TORBOX_API,
+        Some(Arc::new(MemoryCache::new(1 << 20))),
+        mock(|_| panic!("a parser went off the end")),
+    );
     let s = Arc::new(s);
     let mut tasks = Vec::new();
     for _ in 0..2 {
         let s = s.clone();
         tasks.push(tokio::spawn(async move {
-            let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing()).await.expect("a caller never returned from a panicking fetch");
+            let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing())
+                .await
+                .expect("a caller never returned from a panicking fetch");
             ok || !ids.is_empty()
         }));
     }
     for t in tasks {
         assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
     }
-    assert!(crate::metrics::background_panic() > before, "the panic was not counted — an operator has nothing to alert on");
+    assert!(
+        crate::metrics::background_panic() > before,
+        "the panic was not counted — an operator has nothing to alert on"
+    );
 }
 
 #[test]
@@ -1679,13 +1912,17 @@ fn listing_memo_is_bounded_by_torrents_and_drops_expired_entries() {
         // The memo is bounded by torrents held, not by accounts, and an expired entry stops being resident.
         let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
         let per = MAX_LISTING_MEMO_ENTRIES / 10;
-        let ids = |n: usize| -> HashMap<String, i64> { (0..n).map(|i| (format!("{i:040x}"), i as i64)).collect() };
+        let ids =
+            |n: usize| -> HashMap<String, i64> { (0..n).map(|i| (format!("{i:040x}"), i as i64)).collect() };
         for i in 0..15 {
             put_cached_listing(&*cache, &format!("acct-{i}"), ids(per));
         }
         let (total, accounts) = listing_memo_totals();
         assert!(total <= MAX_LISTING_MEMO_ENTRIES, "the memo holds {total} torrents across {accounts} accounts, ceiling is {MAX_LISTING_MEMO_ENTRIES}");
-        assert!(total >= MAX_LISTING_MEMO_ENTRIES - per, "the memo holds only {total} torrents — the flood never reached the ceiling");
+        assert!(
+            total >= MAX_LISTING_MEMO_ENTRIES - per,
+            "the memo holds only {total} torrents — the flood never reached the ceiling"
+        );
 
         // REFRESHING an account evicts nobody.
         reset_listing_memo();
@@ -1694,11 +1931,19 @@ fn listing_memo_is_bounded_by_torrents_and_drops_expired_entries() {
         put_cached_listing(&*cache, "b", ids(half));
         for i in 0..3 {
             put_cached_listing(&*cache, "a", ids(half));
-            assert!(listing_memo_has(&*cache, "b"), "refresh {i} of account a evicted account b, which still fits");
+            assert!(
+                listing_memo_has(&*cache, "b"),
+                "refresh {i} of account a evicted account b, which still fits"
+            );
         }
 
         // An expired entry is dropped on LOOKUP, not left for the next account's put.
-        set_listing_memo_stale(&*cache, "stale", ids(3), Instant::now() - LISTING_TTL - Duration::from_secs(1));
+        set_listing_memo_stale(
+            &*cache,
+            "stale",
+            ids(3),
+            Instant::now() - LISTING_TTL - Duration::from_secs(1),
+        );
         assert!(cached_listing(&*cache, "stale").is_none(), "an expired listing was served");
         assert_eq!(listing_memo_len(), 0, "the expired entry is still resident");
     }
@@ -1738,10 +1983,15 @@ fn account_listing_memo_hits_share_one_parsed_map() {
         body.push_str("]}");
         let fetches = Arc::new(AtomicUsize::new(0));
         let f = fetches.clone();
-        let s = tb("memo", TORBOX_API, Some(Arc::new(MemoryCache::new(1 << 20))), mock(move |_| {
-            f.fetch_add(1, Ordering::SeqCst);
-            Ok(resp(200, &body))
-        }));
+        let s = tb(
+            "memo",
+            TORBOX_API,
+            Some(Arc::new(MemoryCache::new(1 << 20))),
+            mock(move |_| {
+                f.fetch_add(1, Ordering::SeqCst);
+                Ok(resp(200, &body))
+            }),
+        );
         let (first, ok) = s.account_listing().await;
         assert!(ok && first.len() == ENTRIES, "first read: ok={ok} entries={}", first.len());
         let before = allocated_bytes();
@@ -1755,9 +2005,16 @@ fn account_listing_memo_hits_share_one_parsed_map() {
         assert_eq!(fetches.load(Ordering::SeqCst), 1, "fetched the listing more than once for nine reads");
         for (i, ids) in got.iter().enumerate() {
             assert_eq!(ids.len(), first.len(), "memo hit {i} returned a different count");
-            assert!(same_map(ids, &first), "memo hit {i} returned a private copy of the listing, not the shared map");
+            assert!(
+                same_map(ids, &first),
+                "memo hit {i} returned a private copy of the listing, not the shared map"
+            );
         }
-        assert!(allocated <= 64 << 10, "{} memo hits allocated {allocated} bytes — the listing is being re-parsed per caller", got.len());
+        assert!(
+            allocated <= 64 << 10,
+            "{} memo hits allocated {allocated} bytes — the listing is being re-parsed per caller",
+            got.len()
+        );
     }
     todo!("pending: stores_test.go:1600 TestAccountListing_memoHitsShareOneParsedMap")
 }
@@ -1773,8 +2030,15 @@ fn skip_value_refuses_runaway_nesting() {
         let before = allocated_bytes();
         let (_, ok, fault) = decode_listing(deep.as_bytes());
         let allocated = allocated_bytes() - before;
-        assert!(!ok && fault == ListingFault::BadEnvelope, "runaway nesting: ok={ok} fault={fault:?}, want false and BadEnvelope");
-        assert!(allocated <= deep.len() as u64, "walking {} bytes of nesting allocated {allocated} bytes", deep.len());
+        assert!(
+            !ok && fault == ListingFault::BadEnvelope,
+            "runaway nesting: ok={ok} fault={fault:?}, want false and BadEnvelope"
+        );
+        assert!(
+            allocated <= deep.len() as u64,
+            "walking {} bytes of nesting allocated {allocated} bytes",
+            deep.len()
+        );
     }
     todo!("pending: stores_test.go:1941 TestSkipValue_refusesRunawayNesting")
 }
@@ -1834,7 +2098,10 @@ fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
         // Hashes nothing could ask about are dropped before retention; a body of them still reads as
         // "could not read this", never "the account holds nothing".
         let good = "a".repeat(40);
-        let giant = format!(r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}},{{"id":2,"hash":"{good}"}}]}}"#, "A".repeat(8 << 20));
+        let giant = format!(
+            r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}},{{"id":2,"hash":"{good}"}}]}}"#,
+            "A".repeat(8 << 20)
+        );
         let (ids, ok, _) = decode_listing(giant.as_bytes());
         assert!(ok, "one unusable entry must not make the whole listing unreadable");
         assert_eq!(ids.get(&good).copied(), Some(2), "the usable entry was lost");
@@ -1849,11 +2116,19 @@ fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
         }
         junk.push_str("]}");
         let (_, ok, fault) = decode_listing(junk.as_bytes());
-        assert!(!ok && fault == ListingFault::TooManyEntries, "a listing of more than {MAX_LISTING_ENTRIES} unusable hashes: ok={ok} fault={fault:?}");
+        assert!(
+            !ok && fault == ListingFault::TooManyEntries,
+            "a listing of more than {MAX_LISTING_ENTRIES} unusable hashes: ok={ok} fault={fault:?}"
+        );
 
-        let renamed = format!(r#"{{"success":true,"data":[{{"id":1,"infohash":"{good}"}},{{"id":2,"infohash":"x"}}]}}"#);
+        let renamed = format!(
+            r#"{{"success":true,"data":[{{"id":1,"infohash":"{good}"}},{{"id":2,"infohash":"x"}}]}}"#
+        );
         let (_, ok, fault) = decode_listing(renamed.as_bytes());
-        assert!(!ok && fault == ListingFault::NoUsableEntries, "a listing whose entries all filtered out: ok={ok} fault={fault:?}");
+        assert!(
+            !ok && fault == ListingFault::NoUsableEntries,
+            "a listing whose entries all filtered out: ok={ok} fault={fault:?}"
+        );
         let (ids, ok, _) = decode_listing(br#"{"success":true,"data":[]}"#);
         assert!(ok && ids.is_empty(), "a genuinely empty account must stay an ANSWER");
 
@@ -1861,25 +2136,40 @@ fn decode_listing_drops_unusable_hashes_without_inventing_an_empty_account() {
         assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds");
         for n in [32usize, 40] {
             assert!(hash_norm_matches(&"b".repeat(n)), "hashNorm rejects a {n}-char hash the listing keeps");
-            let (got, ok, _) = decode_listing(format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{}"}}]}}"#, "b".repeat(n)).as_bytes());
-            assert!(ok && got.get(&"b".repeat(n)).copied() == Some(9), "a {n}-char hash that /play accepts was dropped");
+            let (got, ok, _) = decode_listing(
+                format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{}"}}]}}"#, "b".repeat(n)).as_bytes(),
+            );
+            assert!(
+                ok && got.get(&"b".repeat(n)).copied() == Some(9),
+                "a {n}-char hash that /play accepts was dropped"
+            );
         }
         for n in [31usize, 33, 39, 41, 64] {
-            assert!(!hash_norm_matches(&"b".repeat(n)), "hashNorm accepts a {n}-char hash the listing filter drops");
+            assert!(
+                !hash_norm_matches(&"b".repeat(n)),
+                "hashNorm accepts a {n}-char hash the listing filter drops"
+            );
         }
 
         // The cheap pre-guard stops ToLower copying a giant value.
         let huge = format!(r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}}]}}"#, "A".repeat(24 << 20));
         let before = allocated_bytes();
         let _ = decode_listing(huge.as_bytes());
-        assert!(allocated_bytes() - before <= 4 * huge.len() as u64, "a listing with a huge hash allocated more than 4x its body");
+        assert!(
+            allocated_bytes() - before <= 4 * huge.len() as u64,
+            "a listing with a huge hash allocated more than 4x its body"
+        );
 
         // The length that decides is the LOWERED one: 32 upper-case Kelvin signs lower into a valid hash.
         let kelvin = "K".repeat(32);
         let lowered = kelvin.to_lowercase();
         assert!(info_hash_re_matches(&lowered), "the fixture does not lower into an askable hash");
-        let (got, ok, _) = decode_listing(format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{kelvin}"}}]}}"#).as_bytes());
-        assert!(ok && got.get(&lowered).copied() == Some(7), "a hash judged on its raw byte length was dropped though it lowers into range");
+        let (got, ok, _) =
+            decode_listing(format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{kelvin}"}}]}}"#).as_bytes());
+        assert!(
+            ok && got.get(&lowered).copied() == Some(7),
+            "a hash judged on its raw byte length was dropped though it lowers into range"
+        );
     }
     todo!("pending: stores_test.go:2107 TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount")
 }
@@ -1893,7 +2183,10 @@ fn skip_value_refuses_runaway_nesting_functional_half() {
 
     let deep = format!(r#"{{"success":true,"x":{}"#, "[".repeat(1 << 20));
     let (_, ok, fault) = decode_listing(deep.as_bytes());
-    assert!(!ok && fault == ListingFault::BadEnvelope, "runaway nesting: ok={ok} fault={fault:?}, want false and BadEnvelope");
+    assert!(
+        !ok && fault == ListingFault::BadEnvelope,
+        "runaway nesting: ok={ok} fault={fault:?}, want false and BadEnvelope"
+    );
 }
 
 #[test]
@@ -1923,7 +2216,10 @@ fn decode_listing_does_not_retain_the_body_functional_half() {
     }
     in_data.push_str("]}");
 
-    for (name, body) in [("bulk in a skipped top-level field", skipped.as_str()), ("bulk inside the data array", in_data.as_str())] {
+    for (name, body) in [
+        ("bulk in a skipped top-level field", skipped.as_str()),
+        ("bulk inside the data array", in_data.as_str()),
+    ] {
         let (ids, ok, _) = decode_listing(body.as_bytes());
         assert!(ok, "{name}: the fixture did not decode");
         assert!(!ids.is_empty(), "{name}: no entries");
@@ -1939,7 +2235,10 @@ fn decode_listing_drops_unusable_hashes_functional_half() {
     // Hashes nothing could ask about are dropped before retention; a body of them still reads as
     // "could not read this", never "the account holds nothing".
     let good = "a".repeat(40);
-    let giant = format!(r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}},{{"id":2,"hash":"{good}"}}]}}"#, "A".repeat(8 << 20));
+    let giant = format!(
+        r#"{{"success":true,"data":[{{"id":1,"hash":"{}"}},{{"id":2,"hash":"{good}"}}]}}"#,
+        "A".repeat(8 << 20)
+    );
     let (ids, ok, _) = decode_listing(giant.as_bytes());
     assert!(ok, "one unusable entry must not make the whole listing unreadable");
     assert_eq!(ids.get(&good).copied(), Some(2), "the usable entry was lost");
@@ -1954,29 +2253,51 @@ fn decode_listing_drops_unusable_hashes_functional_half() {
     }
     junk.push_str("]}");
     let (_, ok, fault) = decode_listing(junk.as_bytes());
-    assert!(!ok && fault == ListingFault::TooManyEntries, "a listing of more than {MAX_LISTING_ENTRIES} unusable hashes: ok={ok} fault={fault:?}");
+    assert!(
+        !ok && fault == ListingFault::TooManyEntries,
+        "a listing of more than {MAX_LISTING_ENTRIES} unusable hashes: ok={ok} fault={fault:?}"
+    );
 
-    let renamed = format!(r#"{{"success":true,"data":[{{"id":1,"infohash":"{good}"}},{{"id":2,"infohash":"x"}}]}}"#);
+    let renamed =
+        format!(r#"{{"success":true,"data":[{{"id":1,"infohash":"{good}"}},{{"id":2,"infohash":"x"}}]}}"#);
     let (_, ok, fault) = decode_listing(renamed.as_bytes());
-    assert!(!ok && fault == ListingFault::NoUsableEntries, "a listing whose entries all filtered out: ok={ok} fault={fault:?}");
+    assert!(
+        !ok && fault == ListingFault::NoUsableEntries,
+        "a listing whose entries all filtered out: ok={ok} fault={fault:?}"
+    );
     let (ids, ok, _) = decode_listing(&br#"{"success":true,"data":[]}"#[..]);
     assert!(ok && ids.is_empty(), "a genuinely empty account must stay an ANSWER");
 
     // The filter keeps 32 (base32) and 40 (hex) character hashes, and nothing else.
     assert!(MIN_INFO_HASH_LEN == 32 && MAX_INFO_HASH_LEN == 40, "infohash bounds");
     for n in [32usize, 40] {
-        assert!(normalize_hash(&"b".repeat(n)).is_some(), "hashNorm rejects a {n}-char hash the listing keeps");
-        let (got, ok, _) = decode_listing(format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{}"}}]}}"#, "b".repeat(n)).as_bytes());
-        assert!(ok && got.get(&"b".repeat(n)).copied() == Some(9), "a {n}-char hash that /play accepts was dropped");
+        assert!(
+            normalize_hash(&"b".repeat(n)).is_some(),
+            "hashNorm rejects a {n}-char hash the listing keeps"
+        );
+        let (got, ok, _) = decode_listing(
+            format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{}"}}]}}"#, "b".repeat(n)).as_bytes(),
+        );
+        assert!(
+            ok && got.get(&"b".repeat(n)).copied() == Some(9),
+            "a {n}-char hash that /play accepts was dropped"
+        );
     }
     for n in [31usize, 33, 39, 41, 64] {
-        assert!(normalize_hash(&"b".repeat(n)).is_none(), "hashNorm accepts a {n}-char hash the listing filter drops");
+        assert!(
+            normalize_hash(&"b".repeat(n)).is_none(),
+            "hashNorm accepts a {n}-char hash the listing filter drops"
+        );
     }
 
     // The length that decides is the LOWERED one: 32 upper-case Kelvin signs lower into a valid hash.
     let kelvin = "\u{212A}".repeat(32);
     let lowered = kelvin.to_lowercase();
     assert!(is_info_hash(&lowered), "the fixture does not lower into an askable hash");
-    let (got, ok, _) = decode_listing(format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{kelvin}"}}]}}"#).as_bytes());
-    assert!(ok && got.get(&lowered).copied() == Some(7), "a hash judged on its raw byte length was dropped though it lowers into range");
+    let (got, ok, _) =
+        decode_listing(format!(r#"{{"success":true,"data":[{{"id":7,"hash":"{kelvin}"}}]}}"#).as_bytes());
+    assert!(
+        ok && got.get(&lowered).copied() == Some(7),
+        "a hash judged on its raw byte length was dropped though it lowers into range"
+    );
 }

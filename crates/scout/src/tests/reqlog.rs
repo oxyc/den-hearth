@@ -61,7 +61,11 @@ fn log_requests_setting() {
     for (v, want) in [("", false), ("0", false), ("1", true), ("true", true), ("yes", true)] {
         let s = settings_from_env(|k| if k == "LOG_REQUESTS" { v.to_owned() } else { String::new() });
         let d = build_deps(&s, reqwest::Client::new(), std::sync::Arc::new(MemoryCache::new(1 << 10)));
-        assert!(s.log_requests == want && d.log_requests == want, "LOG_REQUESTS={v:?}: got {}, want {want}", s.log_requests);
+        assert!(
+            s.log_requests == want && d.log_requests == want,
+            "LOG_REQUESTS={v:?}: got {}, want {want}",
+            s.log_requests
+        );
     }
 }
 

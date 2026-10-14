@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::scrape::{DoError, Doer};
-use crate::upstreampause::{exhausted_for, pause_on_refusal, retry_after, MAX_REFUSAL_PAUSE, MAX_RETRY_AFTER, REFUSAL_PAUSE};
+use crate::upstreampause::{
+    exhausted_for, pause_on_refusal, retry_after, MAX_REFUSAL_PAUSE, MAX_RETRY_AFTER, REFUSAL_PAUSE,
+};
 
 type Answer = Box<dyn Fn(&reqwest::Request) -> reqwest::Response + Send + Sync>;
 
@@ -54,7 +56,8 @@ impl Doer for Arc<CountingDoer> {
 
 /// Go `answering`: a response of `status` carrying `headers`.
 fn answering(status: u16, headers: &[(&str, &str)]) -> Answer {
-    let headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let headers: Vec<(String, String)> =
+        headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     Box::new(move |_req: &reqwest::Request| {
         let mut b = http::Response::builder().status(status);
         for (k, v) in &headers {
@@ -100,11 +103,17 @@ async fn pause_on_refusal_waits_out_a_retry_after_for_every_request() {
     let mut rt = pause_on_refusal(Arc::clone(&next));
     rt.now = clock_fn(&clock);
 
-    assert_eq!(get(&rt, "https://torrentio.example/stream/movie/tt1.json", None).await.status(), 429, "first answer");
+    assert_eq!(
+        get(&rt, "https://torrentio.example/stream/movie/tt1.json", None).await.status(),
+        429,
+        "first answer"
+    );
     let paused = get(&rt, "https://torrentio.example/stream/movie/tt2.json", None).await;
     assert_eq!(next.calls(), 1, "asked the upstream {} times inside its Retry-After", next.calls());
     assert!(
-        paused.status() == 429 && paused.headers()["retry-after"] == "120" && paused.headers()["x-scout-paused"] == "1",
+        paused.status() == 429
+            && paused.headers()["retry-after"] == "120"
+            && paused.headers()["x-scout-paused"] == "1",
         "paused answer = {} {:?}",
         paused.status(),
         paused.headers()
@@ -115,7 +124,12 @@ async fn pause_on_refusal_waits_out_a_retry_after_for_every_request() {
     *clock.lock().unwrap() += Duration::from_secs(121);
     next.set_answer(answering(200, &[]));
     let resp = get(&rt, "https://torrentio.example/stream/movie/tt3.json", None).await;
-    assert!(resp.status() == 200 && next.calls() == 3, "after the pause: {}, {} calls", resp.status(), next.calls());
+    assert!(
+        resp.status() == 200 && next.calls() == 3,
+        "after the pause: {}, {} calls",
+        resp.status(),
+        next.calls()
+    );
     assert_eq!(rt.left("torrentio.example"), Duration::ZERO, "an answer did not end the pause");
 }
 
@@ -141,7 +155,10 @@ async fn pause_on_refusal_doubles_without_retry_after_and_leaves_a_bare_503_alon
     let first = rt.refused("h", Duration::ZERO, false);
     let second = rt.refused("h", Duration::ZERO, false);
     assert!(
-        first >= REFUSAL_PAUSE && first <= REFUSAL_PAUSE * 5 / 4 && second >= 2 * REFUSAL_PAUSE && second <= 2 * REFUSAL_PAUSE * 5 / 4,
+        first >= REFUSAL_PAUSE
+            && first <= REFUSAL_PAUSE * 5 / 4
+            && second >= 2 * REFUSAL_PAUSE
+            && second <= 2 * REFUSAL_PAUSE * 5 / 4,
         "pauses {first:?} then {second:?}"
     );
     for _ in 0..20 {
@@ -171,7 +188,10 @@ fn retry_after_reads_seconds_and_dates_and_caps_them() {
         assert_eq!(got, want, "Retry-After {value:?}");
     }
     for value in ["", "soon", "-5"] {
-        assert!(retry_after(&headers(&[("retry-after", value)]), now).is_none(), "Retry-After {value:?} read as a wait");
+        assert!(
+            retry_after(&headers(&[("retry-after", value)]), now).is_none(),
+            "Retry-After {value:?} read as a wait"
+        );
     }
 }
 
@@ -179,7 +199,8 @@ fn retry_after_reads_seconds_and_dates_and_caps_them() {
 #[tokio::test]
 async fn pause_on_refusal_waits_out_an_allowance_an_answer_says_is_spent() {
     let now = sept_14_noon();
-    let legacy_reset = (now + Duration::from_secs(90)).duration_since(UNIX_EPOCH).expect("epoch").as_secs().to_string();
+    let legacy_reset =
+        (now + Duration::from_secs(90)).duration_since(UNIX_EPOCH).expect("epoch").as_secs().to_string();
     let spent: [(&str, HeaderMap); 3] = [
         ("draft", headers(&[("ratelimit", r#""hourly";r=0;t=90"#)])),
         ("older", headers(&[("ratelimit-remaining", "0"), ("ratelimit-reset", "90")])),
@@ -196,11 +217,19 @@ async fn pause_on_refusal_waits_out_an_allowance_an_answer_says_is_spent() {
         assert!(!exhausted_for(&header, now).1, "{name} read as spent");
     }
 
-    let next = Arc::new(CountingDoer::new(answering(200, &[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "60")])));
+    let next = Arc::new(CountingDoer::new(answering(
+        200,
+        &[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "60")],
+    )));
     let rt = pause_on_refusal(Arc::clone(&next));
     get(&rt, "https://api.torbox.example/v1/api/user/me", None).await;
     let resp = get(&rt, "https://api.torbox.example/v1/api/user/me", None).await;
-    assert!(resp.status() == 429 && next.calls() == 1, "asked a spent upstream again: {} {} calls", resp.status(), next.calls());
+    assert!(
+        resp.status() == 429 && next.calls() == 1,
+        "asked a spent upstream again: {} {} calls",
+        resp.status(),
+        next.calls()
+    );
 }
 
 // The add budget frees a slot when its oldest charge drains. Package 3 (addbudget.rs) owns the budget.
@@ -211,8 +240,16 @@ fn add_budget_frees_in_when_its_oldest_charge_drains() {
     let clock = Arc::new(Mutex::new(sept_14_noon()));
     b.now = clock_fn(&clock);
     b.take("acct", false);
-    assert_eq!(b.frees_in("acct", false), Duration::ZERO, "an account with allowance left must not be told to wait");
+    assert_eq!(
+        b.frees_in("acct", false),
+        Duration::ZERO,
+        "an account with allowance left must not be told to wait"
+    );
     *clock.lock().unwrap() += Duration::from_secs(600);
     b.take("acct", false);
-    assert_eq!(b.frees_in("acct", false), Duration::from_secs(50 * 60), "freesIn: want the first charge's 50 minutes left");
+    assert_eq!(
+        b.frees_in("acct", false),
+        Duration::from_secs(50 * 60),
+        "freesIn: want the first charge's 50 minutes left"
+    );
 }

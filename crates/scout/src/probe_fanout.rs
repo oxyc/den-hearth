@@ -8,14 +8,14 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::attributes::stream_attributes;
 use crate::cache::Cache;
 use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::id::StreamId;
+use crate::metrics::metrics;
 use crate::probe::Probe;
 use crate::rank::{detect_resolution_lower, junk_class_of, quality_score_lower, RawStream, PREFERENCE_SINK};
-use crate::attributes::stream_attributes;
-use crate::metrics::metrics;
 use crate::stores::{CacheTruth, ResolveTarget};
 use crate::util::go_to_lower;
 
@@ -41,7 +41,11 @@ pub(crate) const PACK_SIZE_RATIO: f64 = 1.3;
 
 /// Go `(*handler).hydrateProbeFacts`: attaches the track details already known for these releases. Only the CACHE is
 /// consulted on the request path — a map lookup, no network.
-pub(crate) fn hydrate_probe_facts(cache: Option<&dyn Cache>, streams: &mut [RawStream], sid: Option<&StreamId>) {
+pub(crate) fn hydrate_probe_facts(
+    cache: Option<&dyn Cache>,
+    streams: &mut [RawStream],
+    sid: Option<&StreamId>,
+) {
     let Some(cache) = cache else { return };
     for s in streams.iter_mut() {
         if s.info_hash.is_empty() {
@@ -67,7 +71,9 @@ pub(crate) fn hydrate_probe_facts(cache: Option<&dyn Cache>, streams: &mut [RawS
 /// confused with.
 pub(crate) fn apply_probed_size(s: &mut RawStream, sid: Option<&StreamId>) {
     let Some(probed) = s.probe.as_ref().map(|p| p.size_bytes).filter(|&n| n > 0) else { return };
-    if sid.is_some_and(|sid| sid.has_ep) && s.size_bytes.is_some_and(|n| n as f64 >= probed as f64 * PACK_SIZE_RATIO) {
+    if sid.is_some_and(|sid| sid.has_ep)
+        && s.size_bytes.is_some_and(|n| n as f64 >= probed as f64 * PACK_SIZE_RATIO)
+    {
         s.pack_size_bytes = s.size_bytes;
     }
     s.size_bytes = Some(probed);

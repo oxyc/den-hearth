@@ -211,7 +211,9 @@ impl TicketKeys {
         let mut debrid = Vec::with_capacity(w.d.len());
         for (service, token) in &w.d {
             match DebridService::parse(service) {
-                Some(service) if !token.is_empty() => debrid.push(DebridAccount { service, token: token.clone() }),
+                Some(service) if !token.is_empty() => {
+                    debrid.push(DebridAccount { service, token: token.clone() })
+                }
                 _ => return Err(TicketError::Bad),
             }
         }

@@ -5,9 +5,10 @@
 
 use crate::attributes::{detect_audio_codec, stream_attributes};
 use crate::probe::{
-    avc_bit_depth, bit_depth_from_config, hevc_bit_depth, parse_matroska_tracks, Probe, ID_BLOCK_ADDITION_MAPPING,
-    ID_BLOCK_ADD_ID_EXTRA_DATA, ID_BLOCK_ADD_ID_TYPE, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_LANGUAGE, ID_SEGMENT, ID_TRACKS,
-    ID_TRACK_ENTRY, ID_TRACK_TYPE, TRACK_TYPE_AUDIO, TRACK_TYPE_VIDEO,
+    avc_bit_depth, bit_depth_from_config, hevc_bit_depth, parse_matroska_tracks, Probe,
+    ID_BLOCK_ADDITION_MAPPING, ID_BLOCK_ADD_ID_EXTRA_DATA, ID_BLOCK_ADD_ID_TYPE, ID_CODEC_ID,
+    ID_CODEC_PRIVATE, ID_LANGUAGE, ID_SEGMENT, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_TYPE, TRACK_TYPE_AUDIO,
+    TRACK_TYPE_VIDEO,
 };
 use crate::probe_mp4::parse_mp4;
 use crate::rank::RawStream;
@@ -94,7 +95,12 @@ fn stream_attributes_follow_the_probe() {
         (
             "High 10 in MP4, named plain x264",
             "Movie 1080p x264 AAC",
-            Probe { container: "mp4".into(), video_codec: "h264".into(), bit_depth: 10, ..Default::default() },
+            Probe {
+                container: "mp4".into(),
+                video_codec: "h264".into(),
+                bit_depth: 10,
+                ..Default::default()
+            },
         ),
         (
             "8-bit probe beats an HDR title's 10",
@@ -104,17 +110,35 @@ fn stream_attributes_follow_the_probe() {
         (
             "DV profile 5 in Matroska",
             "Movie 2160p AAC",
-            Probe { container: "matroska".into(), video_codec: "hevc".into(), dolby_vision: true, dv_profile: 5, ..Default::default() },
+            Probe {
+                container: "matroska".into(),
+                video_codec: "hevc".into(),
+                dolby_vision: true,
+                dv_profile: 5,
+                ..Default::default()
+            },
         ),
         (
             "DV profile 8, title says only DV",
             "Movie 2160p DV AAC",
-            Probe { container: "mp4".into(), video_codec: "hevc".into(), dolby_vision: true, dv_profile: 8, ..Default::default() },
+            Probe {
+                container: "mp4".into(),
+                video_codec: "hevc".into(),
+                dolby_vision: true,
+                dv_profile: 8,
+                ..Default::default()
+            },
         ),
         (
             "DV profile 7 in MP4",
             "Movie 2160p AAC",
-            Probe { container: "mp4".into(), video_codec: "hevc".into(), dolby_vision: true, dv_profile: 7, ..Default::default() },
+            Probe {
+                container: "mp4".into(),
+                video_codec: "hevc".into(),
+                dolby_vision: true,
+                dv_profile: 7,
+                ..Default::default()
+            },
         ),
         (
             "VP9 in Matroska",
@@ -123,16 +147,28 @@ fn stream_attributes_follow_the_probe() {
         ),
     ];
     for (name, title, p) in cases {
-        let a = stream_attributes(RawStream { title: title.into(), probe: Some(p.clone()), ..Default::default() });
+        let a = stream_attributes(RawStream {
+            title: title.into(),
+            probe: Some(p.clone()),
+            ..Default::default()
+        });
         let codec = a.codec.as_deref().unwrap_or("");
         if !p.video_codec.is_empty() {
             assert_eq!(codec, p.video_codec, "{name}: codec = {codec:?}, the probe said {:?}", p.video_codec);
         }
         if p.bit_depth != 0 {
-            assert_eq!(a.bit_depth, p.bit_depth as i64, "{name}: bitDepth = {}, the probe said {}", a.bit_depth, p.bit_depth);
+            assert_eq!(
+                a.bit_depth, p.bit_depth as i64,
+                "{name}: bitDepth = {}, the probe said {}",
+                a.bit_depth, p.bit_depth
+            );
         }
         if p.dv_profile != 0 {
-            assert_eq!(a.dv_profile, p.dv_profile as i64, "{name}: dvProfile = {}, the probe said {}", a.dv_profile, p.dv_profile);
+            assert_eq!(
+                a.dv_profile, p.dv_profile as i64,
+                "{name}: dvProfile = {}, the probe said {}",
+                a.dv_profile, p.dv_profile
+            );
         }
     }
 }
@@ -140,8 +176,11 @@ fn stream_attributes_follow_the_probe() {
 // Unknown depth and profile are omitted from the wire rather than sent as 0.
 #[test]
 fn stream_attributes_wire_shape() {
-    let body = serde_json::to_value(stream_attributes(RawStream { title: "Movie 1080p".into(), ..Default::default() }))
-        .expect("json");
+    let body = serde_json::to_value(stream_attributes(RawStream {
+        title: "Movie 1080p".into(),
+        ..Default::default()
+    }))
+    .expect("json");
     assert!(body.get("bitDepth").is_none(), "an unknown bit depth must be omitted, not sent as 0");
     assert!(body.get("dvProfile").is_none(), "an unknown DV profile must be omitted, not sent as 0");
 }
@@ -186,7 +225,12 @@ fn parse_head_bit_depth_from_real_files() {
             p.video_codec,
             p.bit_depth
         );
-        assert!(!p.dolby_vision && p.dv_profile == 0, "no Dolby Vision in this file: dv={} profile={}", p.dolby_vision, p.dv_profile);
+        assert!(
+            !p.dolby_vision && p.dv_profile == 0,
+            "no Dolby Vision in this file: dv={} profile={}",
+            p.dolby_vision,
+            p.dv_profile
+        );
     }
 }
 
@@ -244,7 +288,12 @@ fn parse_mp4_video_config_boxes() {
     );
 
     // High 10 avcC
-    let (p, _) = parse_mp4(&mp4_file(&[trak("vide", "und", 0, &[video_entry("avc1", &[mp4box("avcC", &avc_c(110))])])]));
+    let (p, _) = parse_mp4(&mp4_file(&[trak(
+        "vide",
+        "und",
+        0,
+        &[video_entry("avc1", &[mp4box("avcC", &avc_c(110))])],
+    )]));
     assert_eq!(p.bit_depth, 10, "bitDepth = {}, want 10 from profile_idc 110", p.bit_depth);
 
     // dvwC
@@ -255,7 +304,12 @@ fn parse_mp4_video_config_boxes() {
         // profile 20
         &[video_entry("hvc1", &[mp4box("dvwC", &[1, 0, 20 << 1, 0])])],
     )]));
-    assert!(p.dolby_vision && p.dv_profile == 20, "dv={} profile={}, want the dvwC record read", p.dolby_vision, p.dv_profile);
+    assert!(
+        p.dolby_vision && p.dv_profile == 20,
+        "dv={} profile={}, want the dvwC record read",
+        p.dolby_vision,
+        p.dv_profile
+    );
 }
 
 #[test]
@@ -265,9 +319,15 @@ fn avc_and_hevc_bit_depth() {
         let got = avc_bit_depth(&avc_c(profile));
         assert_eq!(got, want, "avcBitDepth(profile {profile}) = {got}, want {want}");
     }
-    assert!(avc_bit_depth(&[1]) == 0 && hevc_bit_depth(&[0u8; 17]) == 0, "a truncated record must read as unknown");
+    assert!(
+        avc_bit_depth(&[1]) == 0 && hevc_bit_depth(&[0u8; 17]) == 0,
+        "a truncated record must read as unknown"
+    );
     assert!(hevc_bit_depth(&hvc_c(8)) == 8 && hevc_bit_depth(&hvc_c(10)) == 10, "hvcC bit depth mis-read");
-    assert!(bit_depth_from_config("av1", &hvc_c(10)) == 0, "a codec with no parser here must read as unknown");
+    assert!(
+        bit_depth_from_config("av1", &hvc_c(10)) == 0,
+        "a codec with no parser here must read as unknown"
+    );
 }
 
 // ebml assembles one element: its id's own bytes, an 8-byte size, then the body.
@@ -313,7 +373,10 @@ fn parse_matroska_dolby_vision_block_addition_mapping() {
             "dvvC with a profile 8.1 record",
             Some(ebml(
                 ID_BLOCK_ADDITION_MAPPING,
-                &[ebml(ID_BLOCK_ADD_ID_TYPE, &[b"dvvC".to_vec()]), ebml(ID_BLOCK_ADD_ID_EXTRA_DATA, &[DOVI_P81.to_vec()])],
+                &[
+                    ebml(ID_BLOCK_ADD_ID_TYPE, &[b"dvvC".to_vec()]),
+                    ebml(ID_BLOCK_ADD_ID_EXTRA_DATA, &[DOVI_P81.to_vec()]),
+                ],
             )),
             true,
             8,
@@ -322,7 +385,10 @@ fn parse_matroska_dolby_vision_block_addition_mapping() {
             "dvcC with a profile 7 record",
             Some(ebml(
                 ID_BLOCK_ADDITION_MAPPING,
-                &[ebml(ID_BLOCK_ADD_ID_TYPE, &[b"dvcC".to_vec()]), ebml(ID_BLOCK_ADD_ID_EXTRA_DATA, &[DOVI_P7.to_vec()])],
+                &[
+                    ebml(ID_BLOCK_ADD_ID_TYPE, &[b"dvcC".to_vec()]),
+                    ebml(ID_BLOCK_ADD_ID_EXTRA_DATA, &[DOVI_P7.to_vec()]),
+                ],
             )),
             true,
             7,
@@ -338,7 +404,10 @@ fn parse_matroska_dolby_vision_block_addition_mapping() {
             "a mapping that isn't Dolby Vision",
             Some(ebml(
                 ID_BLOCK_ADDITION_MAPPING,
-                &[ebml(ID_BLOCK_ADD_ID_TYPE, &[b"itut".to_vec()]), ebml(ID_BLOCK_ADD_ID_EXTRA_DATA, &[DOVI_P81.to_vec()])],
+                &[
+                    ebml(ID_BLOCK_ADD_ID_TYPE, &[b"itut".to_vec()]),
+                    ebml(ID_BLOCK_ADD_ID_EXTRA_DATA, &[DOVI_P81.to_vec()]),
+                ],
             )),
             false,
             0,

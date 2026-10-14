@@ -95,11 +95,7 @@ impl CacheState {
 impl MemoryCache {
     /// Go `NewMemoryCache`.
     pub fn new(max_bytes: usize) -> MemoryCache {
-        MemoryCache {
-            max_bytes,
-            now: Box::new(SystemTime::now),
-            state: Mutex::new(CacheState::default()),
-        }
+        MemoryCache { max_bytes, now: Box::new(SystemTime::now), state: Mutex::new(CacheState::default()) }
     }
 
     /// A poisoned lock still holds consistent state (every edit finishes before a panic can), so it is taken.
@@ -127,7 +123,8 @@ impl Cache for MemoryCache {
         let now = (self.now)();
         // Go's `Add` does not panic on an absurd TTL; neither may this. A TTL past what the clock can hold
         // never expires in any lifetime of this process.
-        let expires = now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 60 * 60));
+        let expires =
+            now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 60 * 60));
         let size = key.len() + value.len();
         let mut guard = self.lock();
         let st = &mut *guard;

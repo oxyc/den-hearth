@@ -58,7 +58,8 @@ pub(crate) fn version_from(get: impl Fn(&str) -> String) -> String {
 
 /// Go `buildManifest`: the manifest for a config (`None` = unconfigured).
 pub(crate) fn build_manifest(config: Option<&Config>) -> ManifestJson {
-    let mut description = "Self-hosted stream aggregator for Den — configure to add your debrid token.".to_owned();
+    let mut description =
+        "Self-hosted stream aggregator for Den — configure to add your debrid token.".to_owned();
     let mut install_id = String::new();
     if let Some(config) = config {
         install_id = config.iid.clone();

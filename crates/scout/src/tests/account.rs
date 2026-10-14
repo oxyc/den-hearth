@@ -66,7 +66,10 @@ async fn account_known_plan() {
     let rr = get(&h, &format!("/{}/account", valid_blob()), &[]).await;
     assert_eq!(rr.status(), 200, "account");
     let out = decode_account_body(rr.body());
-    assert!(out.len() == 1 && out[0]["service"] == "torbox" && out[0]["plan"] == "pro", "account body = {out:?}");
+    assert!(
+        out.len() == 1 && out[0]["service"] == "torbox" && out[0]["plan"] == "pro",
+        "account body = {out:?}"
+    );
     // "active" counts the active, unfinished entries only.
     assert_eq!(out[0]["slots"]["active"], 1, "slots = {:?}, want active=1", out[0]["slots"]);
     assert_eq!(out[0]["queued"], 2, "queued = {:?}, want 2", out[0]["queued"]);
@@ -238,7 +241,10 @@ mod store {
             _ => resp(404, "{}"),
         });
         let sum = s.account_summary().await.expect("summary");
-        assert_eq!(sum.cooldown_until.map(|t| t.to_rfc3339()).as_deref(), Some("2027-01-02T03:04:05.5+02:00"));
+        assert_eq!(
+            sum.cooldown_until.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2027-01-02T03:04:05.5+02:00")
+        );
         assert!(sum.premium_expires_at.is_none(), "an unparseable time is unknown, not a failure");
     }
 }

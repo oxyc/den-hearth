@@ -125,7 +125,10 @@ impl Matcher {
 /// match" — so a long enough title would silently stop being judged. The pattern backtracks a bounded amount per
 /// start position, so lifting the ceiling costs time linear in the title.
 fn look(pattern: &str) -> Matcher {
-    let re = LookRegexBuilder::new(pattern).backtrack_limit(usize::MAX).build().expect("static lookaround pattern");
+    let re = LookRegexBuilder::new(pattern)
+        .backtrack_limit(usize::MAX)
+        .build()
+        .expect("static lookaround pattern");
     Matcher::Look(re)
 }
 
@@ -464,13 +467,16 @@ pub(crate) fn title_tokens(s: &str) -> HashSet<String> {
 /// mode, where a match is a whole codepoint as in RE2. RE2's `\s` is ASCII-only (`[\t\n\f\r ]`) and `\S` is its
 /// complement, where the regex crate's Unicode `\s` also takes NBSP and the like, so both are spelled out.
 static RELEASE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([\t\n\f\r ]*(\[[^\]]*\]|\([^)]*\)|www\.[^\t\n\f\r ]+[\t\n\f\r ]*-))+").expect("static pattern")
+    Regex::new(r"^([\t\n\f\r ]*(\[[^\]]*\]|\([^)]*\)|www\.[^\t\n\f\r ]+[\t\n\f\r ]*-))+")
+        .expect("static pattern")
 });
 
 /// Go `showEndRe`: where a release's show name ends (an SxxEyy or 1x02 label, an anime " - 01", or an
 /// E01/EP01 tag).
 static SHOW_END_RE: LazyLock<Regex> = LazyLock::new(|| {
-    re2(r"(?i)(\bs\d{1,2}[ ._-]*e\d{1,4}|\b\d{1,2}x\d{2,3}\b|[\t\n\f\r ]-[\t\n\f\r ]\d{1,4}\b|\bep?\d{1,4}\b)")
+    re2(
+        r"(?i)(\bs\d{1,2}[ ._-]*e\d{1,4}|\b\d{1,2}x\d{2,3}\b|[\t\n\f\r ]-[\t\n\f\r ]\d{1,4}\b|\bep?\d{1,4}\b)",
+    )
 });
 
 /// Go `showNoise`: words a release puts between the show and the episode that name neither.
@@ -653,8 +659,11 @@ pub(crate) fn rank_streams_debug(
 ) -> Vec<RawStream> {
     // Malformed or incompatible regex: nil, and the filter is ignored. Unicode mode, since a user pattern
     // may use `.` and RE2 matches whole codepoints there.
-    let exclude_re =
-        if f.exclude_regex.is_empty() { None } else { Regex::new(&format!("(?i){}", re2_user_pattern(&f.exclude_regex))).ok() };
+    let exclude_re = if f.exclude_regex.is_empty() {
+        None
+    } else {
+        Regex::new(&format!("(?i){}", re2_user_pattern(&f.exclude_regex))).ok()
+    };
     let allowed: HashSet<&str> = f.resolutions.iter().map(String::as_str).collect();
 
     struct Scored {

@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::label::clean_label_lower;
 use crate::probe::Probe;
-use crate::util::go_to_lower;
 use crate::rank::{
     detect_resolution_lower, junk_class_of, re2, RawStream, RE_3D, RE_AC3, RE_ATMOS, RE_AV1, RE_BLURAY,
     RE_BR_RIP, RE_DTS, RE_DTSHD_MA, RE_DTSX, RE_DVD_RIP, RE_EAC3, RE_HDR10P, RE_HDTV, RE_KORSUB_HC, RE_REMUX,
     RE_TRUEHD, RE_WEB, RE_WEB_DL, RE_WEB_RIP,
 };
+use crate::util::go_to_lower;
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0

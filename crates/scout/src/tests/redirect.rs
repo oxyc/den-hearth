@@ -44,7 +44,8 @@ async fn spawn_server(respond: impl Fn(&str, &str) -> Reply + Send + Sync + 'sta
                 let method = parts.next().unwrap_or("").to_owned();
                 let path = parts.next().unwrap_or("").to_owned();
                 let (status, location, body) = respond(&method, &path);
-                let mut out = format!("HTTP/1.1 {status} x\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
+                let mut out =
+                    format!("HTTP/1.1 {status} x\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
                 if let Some(loc) = location {
                     out.push_str(&format!("location: {loc}\r\n"));
                 }
@@ -99,9 +100,14 @@ async fn an_add_is_not_replayed_to_the_redirect_target() {
         // the add itself.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::custom(|a| {
-                let method = if matches!(a.status().as_u16(), 301..=303) { Method::GET } else { Method::POST };
+                let method =
+                    if matches!(a.status().as_u16(), 301..=303) { Method::GET } else { Method::POST };
                 let via = a.previous().iter().map(|u| (Method::POST, u.clone())).collect::<Vec<_>>();
-                if refuse_redirect_replay(&method, a.url(), &via) { a.stop() } else { a.follow() }
+                if refuse_redirect_replay(&method, a.url(), &via) {
+                    a.stop()
+                } else {
+                    a.follow()
+                }
             }))
             .build()
             .expect("a client");
@@ -128,11 +134,19 @@ fn credential_query_stays_on_the_debrid_host() {
 
     let requestdl = url("https://api.torbox.app/v1/api/torrents/requestdl?token=secret&torrent_id=1");
     assert!(
-        refuse_redirect_replay(&get, &url("https://elsewhere.example/x?token=secret"), &[(get.clone(), requestdl.clone())]),
+        refuse_redirect_replay(
+            &get,
+            &url("https://elsewhere.example/x?token=secret"),
+            &[(get.clone(), requestdl.clone())]
+        ),
         "a redirect from the TorBox API to another host was followed — the token goes with it"
     );
     assert!(
-        !refuse_redirect_replay(&get, &url("https://api.torbox.app/v1/api/other"), &[(get.clone(), requestdl)]),
+        !refuse_redirect_replay(
+            &get,
+            &url("https://api.torbox.app/v1/api/other"),
+            &[(get.clone(), requestdl)]
+        ),
         "a same-host redirect was refused"
     );
 
@@ -169,7 +183,8 @@ async fn reads_still_follow_redirects() {
         let m = method.clone();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                let via: Vec<(Method, Url)> = attempt.previous().iter().map(|u| (m.clone(), u.clone())).collect();
+                let via: Vec<(Method, Url)> =
+                    attempt.previous().iter().map(|u| (m.clone(), u.clone())).collect();
                 if refuse_redirect_replay(&m, attempt.url(), &via) {
                     attempt.stop()
                 } else {
@@ -178,7 +193,8 @@ async fn reads_still_follow_redirects() {
             }))
             .build()
             .expect("a client");
-        let resp = client.request(method.clone(), format!("{base}/start")).send().await.expect("the request sends");
+        let resp =
+            client.request(method.clone(), format!("{base}/start")).send().await.expect("the request sends");
 
         assert!(
             resp.status() == 200 && served.load(Ordering::SeqCst) == 1,

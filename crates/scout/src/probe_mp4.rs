@@ -3,8 +3,8 @@
 use std::borrow::Cow;
 
 use crate::probe::{
-    append_unique, bit_depth_from_config, channel_count, channel_layout, clean_lang, dovi_profile, hdr_from_transfer,
-    round_rate, video_shape, Probe,
+    append_unique, bit_depth_from_config, channel_count, channel_layout, clean_lang, dovi_profile,
+    hdr_from_transfer, round_rate, video_shape, Probe,
 };
 use crate::probe_avi::codec_from_four_cc;
 
@@ -124,7 +124,9 @@ fn sample_codec(mdia: &[u8]) -> &'static str {
     if stsd.len() < 16 {
         return "";
     }
-    codec_from_four_cc(String::from_utf8_lossy(&stsd[12..16]).trim_end_matches(|c: char| c == '\0' || c == ' '))
+    codec_from_four_cc(
+        String::from_utf8_lossy(&stsd[12..16]).trim_end_matches(|c: char| c == '\0' || c == ' '),
+    )
 }
 
 /// Go `findBox`: the payload of the first child box with this type.
@@ -235,7 +237,8 @@ fn mp4_video_config(mdia: &[u8], p: &mut Probe) {
             "colr" => {
                 // An nclx colour box: its type, then colour primaries, transfer characteristics and matrix, 16 bits each.
                 if first && b.body.len() >= 8 && &b.body[..4] == b"nclx" {
-                    p.hdr_format = hdr_from_transfer(i64::from(u16::from_be_bytes([b.body[6], b.body[7]]))).to_string();
+                    p.hdr_format =
+                        hdr_from_transfer(i64::from(u16::from_be_bytes([b.body[6], b.body[7]]))).to_string();
                 }
             }
             "dvcC" | "dvvC" | "dvwC" => {

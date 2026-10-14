@@ -72,7 +72,10 @@ impl TieredCache {
         let mut off = dir.as_os_str().is_empty();
         if !off {
             if let Err(e) = fs::create_dir_all(dir) {
-                emit(&format!("cache dir {} not writable ({e}) — persistence disabled, memory still serving", dir.display()));
+                emit(&format!(
+                    "cache dir {} not writable ({e}) — persistence disabled, memory still serving",
+                    dir.display()
+                ));
                 off = true;
             }
         }
@@ -128,7 +131,9 @@ impl TieredCache {
     /// Go `disable`: turns the disk tier off for the process lifetime after a failure, and logs why.
     pub(crate) fn disable(&self, op: &str, err: &dyn Display) {
         self.lock().off = true;
-        self.once.call_once(|| emit(&format!("cache {op} failed ({err}) — persistence disabled, memory still serving")));
+        self.once.call_once(|| {
+            emit(&format!("cache {op} failed ({err}) — persistence disabled, memory still serving"))
+        });
     }
 
     fn lock(&self) -> MutexGuard<'_, DiskState> {
@@ -344,11 +349,8 @@ fn entry_expired(path: &Path, now: i64) -> bool {
 /// half-written entry read after a crash is never served. The error names the step that failed, for `disable`.
 fn write_entry(dir: &Path, dest: &Path, body: &str) -> Result<(), (&'static str, io::Error)> {
     let tmp = dir.join(temp_name());
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| ("create temp", e))?;
+    let mut file =
+        OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| ("create temp", e))?;
     let written = file.write_all(body.as_bytes()).map_err(|e| ("write", e));
     drop(file);
     let result = written.and_then(|()| fs::rename(&tmp, dest).map_err(|e| ("rename", e)));

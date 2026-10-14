@@ -10,7 +10,10 @@ use crate::config::{DebridService, ALL_INDEXERS};
 use crate::diskcache::{write_file, TieredCache};
 use crate::handler::{join_cached, new_handler, split_cached, NO_STORE};
 use crate::manifest::manifest_version;
-use crate::metrics::{cache_persistent_gauge, new_metric_set, METRIC_TORBOX_AVOIDED, METRIC_TORBOX_ENDPOINTS, METRIC_TORBOX_OUTCOMES};
+use crate::metrics::{
+    cache_persistent_gauge, new_metric_set, METRIC_TORBOX_AVOIDED, METRIC_TORBOX_ENDPOINTS,
+    METRIC_TORBOX_OUTCOMES,
+};
 use crate::tests::handler::{body_str, get, test_deps, valid_blob, RecordingCache};
 
 const METRICS_TOKEN: &str = "metrics-shared-secret";
@@ -20,7 +23,11 @@ fn metrics_auth() -> [(&'static str, String); 1] {
 }
 
 /// handler_test.go's `do(h, path, headers)` with owned header values.
-async fn get_with(h: &crate::handler::Handler, path: &str, headers: &[(&str, String)]) -> http::Response<Vec<u8>> {
+async fn get_with(
+    h: &crate::handler::Handler,
+    path: &str,
+    headers: &[(&str, String)],
+) -> http::Response<Vec<u8>> {
     let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
     get(h, path, &borrowed).await
 }
@@ -34,10 +41,7 @@ fn sample_value(body: &str, series: &str) -> i64 {
         .lines()
         .find(|l| l.starts_with(&prefix))
         .unwrap_or_else(|| panic!("no series {series:?} in:\n{body}"));
-    line[prefix.len()..]
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("unparseable sample {line:?}"))
+    line[prefix.len()..].trim().parse().unwrap_or_else(|_| panic!("unparseable sample {line:?}"))
 }
 
 // The counters say when this install is being watched and which indexers it uses, so the route is gated
@@ -128,7 +132,8 @@ async fn metrics_reports_what_was_previously_log_only() {
 // visible — how often viewers are being served a list while it is rebuilt behind them.
 #[tokio::test]
 async fn metrics_counts_stale_hits() {
-    let cache = Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
+    let cache =
+        Arc::new(RecordingCache { inner: Arc::new(MemoryCache::new(1 << 20)), last: Default::default() });
     let h = new_handler(test_deps(|d| {
         d.cache = cache.clone();
         d.metrics_token = METRICS_TOKEN.to_owned();
@@ -142,7 +147,9 @@ async fn metrics_counts_stale_hits() {
     let key = cache.last_key();
     let held = cache.get(&key).expect("nothing cached");
     let (complete, _, etag, body) = split_cached(&held);
-    let backdated = (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH).expect("epoch").as_secs() as i64;
+    let backdated =
+        (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH).expect("epoch").as_secs()
+            as i64;
     cache.put(&key, &join_cached(complete, backdated, etag, body), Duration::from_secs(60));
     get(&h, &path, &[]).await;
 

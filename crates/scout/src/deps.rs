@@ -84,8 +84,11 @@ pub fn startup_summary(s: &Settings, persistent: bool) -> String {
         .copied()
         .filter(|id| s.indexer_urls.get(&Indexer((*id).to_owned())).is_some_and(|u| !u.is_empty()))
         .collect();
-    let disabled: Vec<&str> =
-        ALL_INDEXERS.iter().copied().filter(|id| DISABLED_INDEXERS.iter().any(|(name, _)| name == id)).collect();
+    let disabled: Vec<&str> = ALL_INDEXERS
+        .iter()
+        .copied()
+        .filter(|id| DISABLED_INDEXERS.iter().any(|(name, _)| name == id))
+        .collect();
     // The fleet's one startup shape: `den-<addon> <version> listening on :<port> — <shared k=v> <own k=v>`.
     format!(
         "den-scout {} listening on :{} — metrics={} log_requests={} log_identity={} sealed={} revoked={} epoch={} \
@@ -134,12 +137,16 @@ pub fn settings_from_env(get: impl Fn(&str) -> String) -> Settings {
         public_url: get("PUBLIC_BASE_URL"),
         indexer_urls: urls,
         cache_bytes: int_env(&get("MEMORY_CACHE_BYTES"), 48 << 20), // 48 MiB
-        cache_dir: or_default(get("CACHE_DIR"), &std::env::temp_dir().join("den-scout-cache").to_string_lossy()),
+        cache_dir: or_default(
+            get("CACHE_DIR"),
+            &std::env::temp_dir().join("den-scout-cache").to_string_lossy(),
+        ),
         cinemeta_url: or_default(get("CINEMETA_URL"), CINEMETA_BASE),
         config_key: get("CONFIG_KEY"),
         config_keys_prev: get("CONFIG_KEYS_PREV"),
         metrics_token: get("METRICS_TOKEN"),
-        mint_indexer_configs: get("MINT_INDEXER_CONFIGS").eq_ignore_ascii_case("true") || get("MINT_INDEXER_CONFIGS") == "1",
+        mint_indexer_configs: get("MINT_INDEXER_CONFIGS").eq_ignore_ascii_case("true")
+            || get("MINT_INDEXER_CONFIGS") == "1",
         log_requests: flag("LOG_REQUESTS"),
         log_identity: bool_env_or(&get("LOG_IDENTITY"), true),
         revoked_installs: parse_revoked_installs(&get("REVOKED_INSTALLS")),
@@ -185,7 +192,9 @@ pub(crate) fn parse_revoked_installs(v: &str) -> Vec<String> {
             continue;
         }
         if !valid_install_id(s) {
-            emit(&format!("skipping a malformed REVOKED_INSTALLS entry (want a {INSTALL_ID_LEN}-character install id)"));
+            emit(&format!(
+                "skipping a malformed REVOKED_INSTALLS entry (want a {INSTALL_ID_LEN}-character install id)"
+            ));
             continue;
         }
         out.push(s.to_owned());
@@ -277,7 +286,9 @@ pub fn refuse_redirect_replay(
         return true;
     }
     if let Some((_, first)) = via.first() {
-        if first.host_str().is_some_and(|h| CREDENTIAL_QUERY_HOSTS.contains(&h)) && url.host_str() != first.host_str() {
+        if first.host_str().is_some_and(|h| CREDENTIAL_QUERY_HOSTS.contains(&h))
+            && url.host_str() != first.host_str()
+        {
             return true;
         }
     }
@@ -371,7 +382,9 @@ pub fn build_deps(settings: &Settings, client: reqwest::Client, cache: Arc<dyn C
         scrape_timeout: settings.scrape_timeout,
         list_ttl: settings.list_ttl,
         public_url: settings.public_url.clone(),
-        make_scrapers: Arc::new(move |c| make_scrapers(c, scraper_doer.clone(), source_doer.clone(), &indexer_urls)),
+        make_scrapers: Arc::new(move |c| {
+            make_scrapers(c, scraper_doer.clone(), source_doer.clone(), &indexer_urls)
+        }),
         make_stores: Arc::new(move |c| build_stores(c, store_doer.clone(), Some(store_cache.clone()))),
         seal_keyring: build_keyring(&settings.config_key, &settings.config_keys_prev).map(Arc::new),
         metrics_token: settings.metrics_token.clone(),

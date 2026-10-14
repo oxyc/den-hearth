@@ -79,7 +79,9 @@ impl Store for NamedStore {
             }));
         }
         if self.link.is_empty() {
-            return Err(StoreError::DeadLink(DeadLinkError { reason: format!("{} has nothing", self.svc.as_str()) }));
+            return Err(StoreError::DeadLink(DeadLinkError {
+                reason: format!("{} has nothing", self.svc.as_str()),
+            }));
         }
         Ok(self.link.clone())
     }
@@ -131,7 +133,10 @@ async fn cache_truth_separates_unknown_from_not_cached() {
         truth.known(H),
         truth.cached(H)
     );
-    assert!(!truth.known(&other), "a hash the store never reported on must read as unknown, not as not-cached");
+    assert!(
+        !truth.known(&other),
+        "a hash the store never reported on must read as unknown, not as not-cached"
+    );
 }
 
 // The probe path must never reach a store that would ADD the release.
@@ -342,7 +347,10 @@ async fn cache_truth_what_counts_as_known() {
     ]);
     let (survivor, survivor_ok) = down.cache_check(&[H.to_string()]).await;
     assert!(survivor_ok, "one store still answered");
-    assert!(!survivor.known(H), "the down store may be the one holding it; the survivor's no cannot settle that");
+    assert!(
+        !survivor.known(H),
+        "the down store may be the one holding it; the survivor's no cannot settle that"
+    );
     assert!(
         !survivor.complete(),
         "a store that answered nothing must make the answer incomplete, or the outage is invisible"

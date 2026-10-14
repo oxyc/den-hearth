@@ -7,8 +7,8 @@ use tokio::time::{timeout_at, Instant};
 use crate::loglimit::log_limited;
 use crate::scrape::Doer;
 use crate::season::TorrentFile;
-use crate::stores::refusal::transport_kind;
 use crate::stores::realdebrid::rd_torrent_key;
+use crate::stores::refusal::transport_kind;
 use crate::stores::{short_hash, ResolveTarget};
 use crate::util::go_url_parse;
 
@@ -57,7 +57,12 @@ pub enum LinkVerdict {
 /// release, consulted only when `want_size` is unknown, and only as a floor: a served total under half of it is
 /// `WrongFile`. Half, because a collection's film is legitimately smaller than the pack an indexer may
 /// report, while the failure this exists for is a sample or an .nfo — kilobytes against gigabytes.
-pub async fn check_link(doer: &dyn Doer, link: &str, want_size: i64, release_size: i64) -> (LinkVerdict, String) {
+pub async fn check_link(
+    doer: &dyn Doer,
+    link: &str,
+    want_size: i64,
+    release_size: i64,
+) -> (LinkVerdict, String) {
     let deadline = Instant::now() + LINK_CHECK_TIMEOUT;
     // Go's `http.NewRequest` refuses only what `url.Parse` refuses; that is "not a usable URL". The WHATWG parser
     // behind `reqwest::Url` disagrees both ways (it takes a control byte and a bad escape, and refuses a relative
@@ -121,7 +126,10 @@ fn judge(resp: &reqwest::Response, want_size: i64, release_size: i64) -> (LinkVe
     } else if release_size > 0 {
         if let Some(total) = content_range_total(header("content-range")) {
             if total * 2 < release_size {
-                return (LinkVerdict::WrongFile, format!("serves {total} bytes of a {release_size}-byte release"));
+                return (
+                    LinkVerdict::WrongFile,
+                    format!("serves {total} bytes of a {release_size}-byte release"),
+                );
             }
         }
     }
@@ -162,11 +170,17 @@ pub async fn verify_link(
         ),
         LinkVerdict::WrongFile => log_limited(
             "play-link-wrong-file",
-            &format!("play {}: the minted link names another file in the release ({reason})", short_hash(&rt.info_hash)),
+            &format!(
+                "play {}: the minted link names another file in the release ({reason})",
+                short_hash(&rt.info_hash)
+            ),
         ),
         LinkVerdict::Unverified => log_limited(
             "play-link-unverified",
-            &format!("play {}: could not check the minted link ({reason}), serving it anyway", short_hash(&rt.info_hash)),
+            &format!(
+                "play {}: could not check the minted link ({reason}), serving it anyway",
+                short_hash(&rt.info_hash)
+            ),
         ),
         LinkVerdict::Playable => {}
     }

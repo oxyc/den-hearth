@@ -222,7 +222,10 @@ pub(crate) fn log_rank_decision(
     } else {
         ("served", format!("picked from {candidates} candidates"))
     };
-    log_limited("rank-decision", &decision_line("rank", outcome, &reason, "", dur, rid, &rank_identity(sid, ranked, dbg)));
+    log_limited(
+        "rank-decision",
+        &decision_line("rank", outcome, &reason, "", dur, rid, &rank_identity(sid, ranked, dbg)),
+    );
 }
 
 /// Go `rankRunnerUps`: "the chosen first release and the next 2-3 runner-ups".

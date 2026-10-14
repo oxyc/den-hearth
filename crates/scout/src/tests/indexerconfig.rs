@@ -11,11 +11,11 @@ use async_trait::async_trait;
 
 use crate::config::{Config, DebridAccount, DebridService, Indexer};
 use crate::indexerconfig::{
-    indexer_base_with_config, prune_minted_locked, primary_debrid, MintedConfig, UnaskableScraper, MAX_MINTED_ENTRIES,
-    MINTED, MINTED_TTL,
+    indexer_base_with_config, primary_debrid, prune_minted_locked, MintedConfig, UnaskableScraper,
+    MAX_MINTED_ENTRIES, MINTED, MINTED_TTL,
 };
 use crate::rank::RawStream;
-use crate::scrape::{scrape_all, DoError, Doer, Scraper, ScrapeQuery, DEFAULT_INDEXER_URLS};
+use crate::scrape::{scrape_all, DoError, Doer, ScrapeQuery, Scraper, DEFAULT_INDEXER_URLS};
 
 use super::mock::resp;
 
@@ -26,7 +26,11 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 fn default_url(indexer: &str) -> &'static str {
-    DEFAULT_INDEXER_URLS.iter().find(|(name, _)| *name == indexer).map(|(_, url)| *url).expect("known indexer")
+    DEFAULT_INDEXER_URLS
+        .iter()
+        .find(|(name, _)| *name == indexer)
+        .map(|(_, url)| *url)
+        .expect("known indexer")
 }
 
 fn reset_minted() {
@@ -97,19 +101,21 @@ impl Doer for StubDoer {
 // opt-in, so the shape is worth pinning.
 #[test]
 fn mint_comet_url_carries_the_account() {
-        use crate::indexerconfig::mint_comet_url;
-        use base64::Engine as _;
-        let got = mint_comet_url(&torbox("tb-token"));
-        let prefix = format!("{}/", default_url("comet"));
-        assert!(got.starts_with(&prefix), "not a comet URL: {got}");
-        let raw = base64::engine::general_purpose::STANDARD.decode(&got[prefix.len()..]).expect("config segment is base64");
-        let cfg: serde_json::Value = serde_json::from_slice(&raw).expect("config segment is JSON");
-        assert!(
-            cfg["debridService"] == "torbox" && cfg["debridApiKey"] == "tb-token",
-            "account not carried: {} / {}",
-            cfg["debridService"],
-            cfg["debridApiKey"]
-        );
+    use crate::indexerconfig::mint_comet_url;
+    use base64::Engine as _;
+    let got = mint_comet_url(&torbox("tb-token"));
+    let prefix = format!("{}/", default_url("comet"));
+    assert!(got.starts_with(&prefix), "not a comet URL: {got}");
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&got[prefix.len()..])
+        .expect("config segment is base64");
+    let cfg: serde_json::Value = serde_json::from_slice(&raw).expect("config segment is JSON");
+    assert!(
+        cfg["debridService"] == "torbox" && cfg["debridApiKey"] == "tb-token",
+        "account not carried: {} / {}",
+        cfg["debridService"],
+        cfg["debridApiKey"]
+    );
 }
 
 // MediaFusion encrypts server-side, so a mint is a round trip that can fail — and a failure must not
@@ -145,7 +151,10 @@ async fn indexer_base_with_config_caches_per_account() {
 
     let (first, _) = indexer_base_with_config(&Indexer("mediafusion".into()), &cfg, Some(&d)).await;
     let (second, _) = indexer_base_with_config(&Indexer("mediafusion".into()), &cfg, Some(&d)).await;
-    assert!(!first.is_empty() && first == second, "expected a stable minted URL, got {first:?} then {second:?}");
+    assert!(
+        !first.is_empty() && first == second,
+        "expected a stable minted URL, got {first:?} then {second:?}"
+    );
     assert_eq!(d.reqs(), 1, "minted more than once");
 
     // A different account must not reuse the first account's config — that would search one person's
@@ -162,8 +171,12 @@ async fn indexer_base_with_config_edges() {
     let _guard = serial();
     reset_minted();
     let d = StubDoer::ok(r#"{"encrypted_str":"E","status":"success"}"#);
-    let (got, transient) = indexer_base_with_config(&Indexer("mediafusion".into()), &Config::default(), Some(&d)).await;
-    assert!(got.is_empty() && !transient, "no account should mint nothing, and permanently so: {got:?} transient={transient}");
+    let (got, transient) =
+        indexer_base_with_config(&Indexer("mediafusion".into()), &Config::default(), Some(&d)).await;
+    assert!(
+        got.is_empty() && !transient,
+        "no account should mint nothing, and permanently so: {got:?} transient={transient}"
+    );
     assert!(primary_debrid(None).is_none(), "a nil config has no account");
     let cfg = cfg_with("t");
     let (got, _) = indexer_base_with_config(&Indexer("comet".into()), &cfg, Some(&d)).await;
@@ -187,12 +200,17 @@ async fn indexer_base_with_config_separates_outage_from_misconfiguration() {
 
     reset_minted();
     let unreachable = StubDoer::failing("dial tcp: i/o timeout");
-    let (got, transient) = indexer_base_with_config(&Indexer("mediafusion".into()), &cfg, Some(&unreachable)).await;
-    assert!(got.is_empty() && transient, "an unreachable indexer is a transient failure: {got:?} transient={transient}");
+    let (got, transient) =
+        indexer_base_with_config(&Indexer("mediafusion".into()), &cfg, Some(&unreachable)).await;
+    assert!(
+        got.is_empty() && transient,
+        "an unreachable indexer is a transient failure: {got:?} transient={transient}"
+    );
 
     // The classification must survive the failure cache, or the two minutes it is replayed for
     // reintroduce the same confusion.
-    let (_, cached) = indexer_base_with_config(&Indexer("mediafusion".into()), &cfg, Some(&unreachable)).await;
+    let (_, cached) =
+        indexer_base_with_config(&Indexer("mediafusion".into()), &cfg, Some(&unreachable)).await;
     assert!(cached, "the cached failure forgot that it was transient");
     assert_eq!(unreachable.reqs(), 1, "the failure was re-POSTed instead of being cached");
 }
@@ -309,7 +327,10 @@ fn minted_cache_is_bounded_by_count() {
     for i in 0..MAX_MINTED_ENTRIES * 3 {
         // Staggered so "least recently used first" is a defined order.
         let stamp = idle_base - Duration::from_secs(i as u64);
-        m.insert(format!("comet:{i}"), MintedConfig { url: "https://comet.example/x".into(), at: now, used: stamp });
+        m.insert(
+            format!("comet:{i}"),
+            MintedConfig { url: "https://comet.example/x".into(), at: now, used: stamp },
+        );
     }
     prune_minted_locked(&mut m);
     let got = m.len();
@@ -357,21 +378,36 @@ fn minted_cache_keeps_the_entries_actually_in_use() {
     for k in legit {
         m.insert(
             k.to_owned(),
-            MintedConfig { url: "https://real.example/x".into(), at: now - Duration::from_secs(3600), used: now },
+            MintedConfig {
+                url: "https://real.example/x".into(),
+                at: now - Duration::from_secs(3600),
+                used: now,
+            },
         );
     }
     // Freshly minted entries that nobody has come back for.
     for i in 0..MAX_MINTED_ENTRIES * 2 {
         let stamp = now - Duration::from_secs(i as u64 + 1);
-        m.insert(format!("comet:flood{i}"), MintedConfig { url: "https://flood.example/x".into(), at: stamp, used: stamp });
+        m.insert(
+            format!("comet:flood{i}"),
+            MintedConfig { url: "https://flood.example/x".into(), at: stamp, used: stamp },
+        );
     }
     prune_minted_locked(&mut m);
     let survived = legit.iter().filter(|k| m.contains_key(**k)).count();
     let total = m.len();
     *MINTED.lock().expect("lock") = saved;
 
-    assert_eq!(survived, legit.len(), "{survived} of {} in-use entries survived — eviction is not ordered by last use", legit.len());
-    assert!(total < MAX_MINTED_ENTRIES, "ceiling not enforced: total={total}, want under {MAX_MINTED_ENTRIES}");
+    assert_eq!(
+        survived,
+        legit.len(),
+        "{survived} of {} in-use entries survived — eviction is not ordered by last use",
+        legit.len()
+    );
+    assert!(
+        total < MAX_MINTED_ENTRIES,
+        "ceiling not enforced: total={total}, want under {MAX_MINTED_ENTRIES}"
+    );
 }
 
 // An entry idle past the protect window is evictable again, so a genuinely disused config cannot pin a
@@ -385,13 +421,19 @@ fn minted_cache_reclaims_idle_entries() {
     let mut m = HashMap::new();
     for i in 0..MAX_MINTED_ENTRIES + 10 {
         let stamp = now - Duration::from_secs(i as u64);
-        m.insert(format!("comet:idle{i}"), MintedConfig { url: "https://x.example/x".into(), at: now, used: stamp });
+        m.insert(
+            format!("comet:idle{i}"),
+            MintedConfig { url: "https://x.example/x".into(), at: now, used: stamp },
+        );
     }
     prune_minted_locked(&mut m);
     let total = m.len();
     *MINTED.lock().expect("lock") = saved;
 
-    assert!(total < MAX_MINTED_ENTRIES, "idle entries were not reclaimed: total={total}, want under {MAX_MINTED_ENTRIES}");
+    assert!(
+        total < MAX_MINTED_ENTRIES,
+        "idle entries were not reclaimed: total={total}, want under {MAX_MINTED_ENTRIES}"
+    );
 }
 
 // The ceiling holds through the REAL caller, not just through prune_minted_locked.
@@ -417,7 +459,12 @@ async fn indexer_base_with_config_map_stays_bounded_under_a_flood() {
     for (name, indexer, doer, want_url) in cases {
         reset_minted();
         for i in 0..MAX_MINTED_ENTRIES * 4 {
-            let (got, _) = indexer_base_with_config(&Indexer(indexer.into()), &cfg_with(&format!("invented-{i}")), Some(&doer)).await;
+            let (got, _) = indexer_base_with_config(
+                &Indexer(indexer.into()),
+                &cfg_with(&format!("invented-{i}")),
+                Some(&doer),
+            )
+            .await;
             assert_eq!(!got.is_empty(), want_url, "{name}: mint {i} returned {got:?}");
         }
         let total = with_minted(|m| m.len());
@@ -457,7 +504,11 @@ async fn flight_shares_concurrent_calls_and_does_not_keep_an_error() {
         })
         .collect();
     for c in callers {
-        assert_eq!(c.await.expect("caller"), Err("boom".to_owned()), "a caller did not get the shared result");
+        assert_eq!(
+            c.await.expect("caller"),
+            Err("boom".to_owned()),
+            "a caller did not get the shared result"
+        );
     }
     assert_eq!(runs.load(Ordering::SeqCst), 1, "concurrent callers ran the call more than once");
     assert_eq!(flight.in_flight(), 0, "a finished flight was kept");
@@ -493,7 +544,10 @@ async fn flight_survives_a_caller_that_goes_away() {
     };
     tokio::time::sleep(Duration::from_millis(20)).await;
     leader.abort();
-    let got = tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("the waiter was stranded").expect("waiter");
+    let got = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the waiter was stranded")
+        .expect("waiter");
     assert_eq!(got, 2, "the waiter should run its own call once the leader is gone");
     assert_eq!(flight.in_flight(), 0, "a finished flight was kept");
 

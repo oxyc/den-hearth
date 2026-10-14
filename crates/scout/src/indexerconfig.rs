@@ -36,7 +36,9 @@ use tokio::sync::OnceCell;
 use crate::config::{Config, DebridAccount, DebridService, Indexer};
 use crate::loglimit::log_limited;
 use crate::rank::RawStream;
-use crate::scrape::{DoError, Doer, Scraper, ScrapeQuery, UnaskableError, DEFAULT_INDEXER_URLS, SCRAPE_USER_AGENT};
+use crate::scrape::{
+    DoError, Doer, ScrapeQuery, Scraper, UnaskableError, DEFAULT_INDEXER_URLS, SCRAPE_USER_AGENT,
+};
 use crate::util::key_hash;
 
 /// Go `mintedTTL`: how long a minted config is reused. Long enough that minting is rare, short enough that a
@@ -170,7 +172,8 @@ impl<T> Drop for Forget<'_, T> {
     fn drop(&mut self) {
         let mut calls = lock(self.calls);
         // The map holds one reference and this guard's caller another: any more is a waiter still to be served.
-        if Arc::strong_count(self.cell) <= 2 && calls.get(self.key).is_some_and(|c| Arc::ptr_eq(c, self.cell)) {
+        if Arc::strong_count(self.cell) <= 2 && calls.get(self.key).is_some_and(|c| Arc::ptr_eq(c, self.cell))
+        {
             calls.remove(self.key);
         }
     }
@@ -208,7 +211,9 @@ pub(crate) fn prune_minted_locked(minted: &mut HashMap<String, MintedConfig>) {
     // while holding the mint mutex. Once a minute is enough to notice.
     log_limited(
         "minted-config-ceiling",
-        &format!("minted-config cache is at its {MAX_MINTED_ENTRIES}-entry ceiling; evicting least-recently-used"),
+        &format!(
+            "minted-config cache is at its {MAX_MINTED_ENTRIES}-entry ceiling; evicting least-recently-used"
+        ),
     );
 }
 
@@ -226,11 +231,8 @@ fn default_indexer_url(id: &str) -> &'static str {
 /// Go `mintCometURL`: the Comet config built locally from the account, carrying its debrid token. Comet's
 /// config is base64 of a plain JSON object; no round trip to the service is needed.
 pub(crate) fn mint_comet_url(account: &DebridAccount) -> String {
-    let service = if account.service == DebridService::RealDebrid {
-        "realdebrid"
-    } else {
-        account.service.as_str()
-    };
+    let service =
+        if account.service == DebridService::RealDebrid { "realdebrid" } else { account.service.as_str() };
     let body = serde_json::json!({
         "maxResultsPerResolution": 0,
         "maxSize": 0,
@@ -277,13 +279,17 @@ pub(crate) async fn mint_media_fusion_url(account: &DebridAccount, client: Optio
         let resp = match client.do_request(req).await {
             Ok(resp) => resp,
             Err(err) => {
-                log_limited("mint-mediafusion-unreachable", &format!("could not mint a mediafusion config: {err}"));
+                log_limited(
+                    "mint-mediafusion-unreachable",
+                    &format!("could not mint a mediafusion config: {err}"),
+                );
                 return String::new();
             }
         };
         let Some(raw) = read_capped(resp, 64 << 10).await else { return String::new() };
         // Go decodes the first JSON value in the body, and ignores whatever follows it.
-        let Some(Ok(out)) = serde_json::Deserializer::from_slice(&raw).into_iter::<MediaFusionMint>().next() else {
+        let Some(Ok(out)) = serde_json::Deserializer::from_slice(&raw).into_iter::<MediaFusionMint>().next()
+        else {
             return String::new();
         };
         // Its own words when it refuses — "invalid user data: Invalid max_size" is the difference between a

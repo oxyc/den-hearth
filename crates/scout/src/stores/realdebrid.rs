@@ -18,15 +18,14 @@ use crate::season::{
     ambiguous_episode_guess, largest_episode_candidate, largest_playable, pick_episode_file, TorrentFile,
 };
 use crate::stores::refusal::{
-    account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, backed_off,
+    account_backed_off, add_in_flight, add_outcome_unknown, add_still_believable, as_unavailable, backed_off,
     cache_or_none, is_cancellation, is_torrent_gone, note_add_attempt, note_unknown_outcome, record_refusal,
-    record_refusal_for, scout_budget_spent, settle_add_attempt, store_error_from_do,
-    unknown_outcome, as_unavailable,
+    record_refusal_for, scout_budget_spent, settle_add_attempt, store_error_from_do, unknown_outcome,
 };
 use crate::stores::{
-    build_request, decode_first, dead_link, encode_form, magnet_for, null_default, rd_fetch_state, read_limited,
-    redact_token, store_error_text, store_refused_us, unavailable, ResolveTarget, Store, StoreError, StoreStatus,
-    ERR_TORRENT_GONE, ERR_WOULD_ADD, MAX_STORE_BYTES, RESOLVE_CACHE_TTL,
+    build_request, dead_link, decode_first, encode_form, magnet_for, null_default, rd_fetch_state,
+    read_limited, redact_token, store_error_text, store_refused_us, unavailable, ResolveTarget, Store,
+    StoreError, StoreStatus, ERR_TORRENT_GONE, ERR_WOULD_ADD, MAX_STORE_BYTES, RESOLVE_CACHE_TTL,
 };
 use crate::util::{key_hash, Shape, LEAF};
 
@@ -73,12 +72,8 @@ pub(crate) struct RdInfo {
 static RD_FILE_SHAPE: Shape =
     Shape::Object(&[("id", &LEAF), ("path", &LEAF), ("bytes", &LEAF), ("selected", &LEAF)]);
 static RD_FILES_SHAPE: Shape = Shape::Array(&RD_FILE_SHAPE);
-static RD_INFO_SHAPE: Shape = Shape::Object(&[
-    ("files", &RD_FILES_SHAPE),
-    ("links", &LEAF),
-    ("status", &LEAF),
-    ("progress", &LEAF),
-]);
+static RD_INFO_SHAPE: Shape =
+    Shape::Object(&[("files", &RD_FILES_SHAPE), ("links", &LEAF), ("status", &LEAF), ("progress", &LEAF)]);
 
 #[derive(Default, Deserialize)]
 struct RdAdded {
@@ -213,7 +208,11 @@ impl RealDebridStore {
     /// Go `realDebridStore.pickFileID` (stores.go:4269): the file id to unrestrict. Name match first, then
     /// the caller's position mapped to RD's own id, then the largest video; a refusal when the pack names
     /// episodes and not the one asked for.
-    pub(crate) fn pick_file_id(&self, files: &[TorrentFile], t: &ResolveTarget) -> Result<Option<i64>, StoreError> {
+    pub(crate) fn pick_file_id(
+        &self,
+        files: &[TorrentFile],
+        t: &ResolveTarget,
+    ) -> Result<Option<i64>, StoreError> {
         if files.is_empty() {
             return Ok(None);
         }
@@ -288,7 +287,8 @@ impl RealDebridStore {
         if status != 200 {
             return Err(dead_link(format!("realdebrid info http {status}")));
         }
-        let raw = read_limited(&mut resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid bad info"))?;
+        let raw =
+            read_limited(&mut resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid bad info"))?;
         decode_first::<RdInfo>(&raw, &RD_INFO_SHAPE).ok_or_else(|| dead_link("realdebrid bad info"))
     }
 
@@ -303,11 +303,17 @@ impl RealDebridStore {
             // it through here escalated one unplayable file into a sixty-second account-wide outage that
             // took unrelated releases down with it.
             if status != 403 && store_refused_us(status) {
-                return Err(unavailable(DebridService::RealDebrid, format!("unrestrict http {status}"), status));
+                return Err(unavailable(
+                    DebridService::RealDebrid,
+                    format!("unrestrict http {status}"),
+                    status,
+                ));
             }
             return Err(dead_link(format!("realdebrid unrestrict http {status}")));
         }
-        let raw = read_limited(&mut resp, MAX_STORE_BYTES).await.map_err(|_| dead_link("realdebrid no download"))?;
+        let raw = read_limited(&mut resp, MAX_STORE_BYTES)
+            .await
+            .map_err(|_| dead_link("realdebrid no download"))?;
         match decode_first::<RdUnrestricted>(&raw, &RD_UNRESTRICTED_SHAPE) {
             Some(body) if !body.download.is_empty() => Ok(body.download),
             _ => Err(dead_link("realdebrid no download")),
@@ -323,7 +329,14 @@ impl RealDebridStore {
         // whole chain again to reach the same throttled endpoint.
         if let Err(err) = &got {
             if as_unavailable(err).is_some() {
-                record_refusal_for(self.cache(), DebridService::RealDebrid, &self.token, &t.info_hash, err, t.no_add);
+                record_refusal_for(
+                    self.cache(),
+                    DebridService::RealDebrid,
+                    &self.token,
+                    &t.info_hash,
+                    err,
+                    t.no_add,
+                );
             }
         }
         got
@@ -396,9 +409,8 @@ impl RealDebridStore {
             }
         }
 
-        let sel = self
-            .post(&format!("/torrents/selectFiles/{id}"), &[("files", &file_id.to_string())])
-            .await?;
+        let sel =
+            self.post(&format!("/torrents/selectFiles/{id}"), &[("files", &file_id.to_string())]).await?;
         let sel_status = sel.status().as_u16();
         drop(sel);
         if !(200..300).contains(&sel_status) {
@@ -522,31 +534,32 @@ impl Store for RealDebridStore {
         // future before it reaches the charge instead of arriving at it.
         spend_add(svc, &self.token, &t.info_hash, t.prefetch)?;
         note_add_attempt(cache, svc, &self.token, &t.info_hash);
-        let mut add_resp = match self.post("/torrents/addMagnet", &[("magnet", &magnet_for(&t.info_hash))]).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                // See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
-                // case, having no Status for handlePlay to rescue the answer with.
-                if add_outcome_unknown(cache, svc, &self.token, &t.info_hash) {
-                    // Not on a cancellation. /play runs on the client's context and a focus change is enough,
-                    // so a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every
-                    // resolve of that release answered a dead link for the rest of unknownOutcomeTTL, with no
-                    // upstream call able to clear it — RD and Premiumize have no Status to rediscover the
-                    // torrent with. A deadline belongs on a service that never answered, not on a client that
-                    // hung up. This is the same guard recordRefusal applies one branch over, for the same
-                    // reason.
-                    // Nor when the add itself already judged the outcome: it returns errAddInFlight from the
-                    // body-read branch, which is not recognisably a cancellation out here, so stamping again
-                    // undid the guard one layer down.
-                    if !is_cancellation(&err) && !matches!(err, StoreError::AddInFlight) {
-                        note_unknown_outcome(cache, svc, &self.token, &t.info_hash);
+        let mut add_resp =
+            match self.post("/torrents/addMagnet", &[("magnet", &magnet_for(&t.info_hash))]).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    // See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
+                    // case, having no Status for handlePlay to rescue the answer with.
+                    if add_outcome_unknown(cache, svc, &self.token, &t.info_hash) {
+                        // Not on a cancellation. /play runs on the client's context and a focus change is enough,
+                        // so a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every
+                        // resolve of that release answered a dead link for the rest of unknownOutcomeTTL, with no
+                        // upstream call able to clear it — RD and Premiumize have no Status to rediscover the
+                        // torrent with. A deadline belongs on a service that never answered, not on a client that
+                        // hung up. This is the same guard recordRefusal applies one branch over, for the same
+                        // reason.
+                        // Nor when the add itself already judged the outcome: it returns errAddInFlight from the
+                        // body-read branch, which is not recognisably a cancellation out here, so stamping again
+                        // undid the guard one layer down.
+                        if !is_cancellation(&err) && !matches!(err, StoreError::AddInFlight) {
+                            note_unknown_outcome(cache, svc, &self.token, &t.info_hash);
+                        }
+                    } else {
+                        record_refusal(cache, svc, &self.token, &t.info_hash, &err);
                     }
-                } else {
-                    record_refusal(cache, svc, &self.token, &t.info_hash, &err);
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
         let add_status = add_resp.status().as_u16();
         // Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
         // decoding straight off the reader left nothing for readStoreError further down.

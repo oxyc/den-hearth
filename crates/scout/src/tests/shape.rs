@@ -1,10 +1,12 @@
 //! Go: `internal/scout/shape_test.go` (212 lines). Work package 5.
 
 use crate::attributes::stream_attributes;
-use crate::client::{NEVER_PLAYS_COST, AUDIO_CONVERTED_COST, VIDEO_CONVERTED_COST};
-use crate::probe::{parse_head, parse_matroska_tracks, Probe, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_COLOUR, ID_DEFAULT_DURATION,
-    ID_LANGUAGE, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_SEGMENT, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_TYPE, ID_TRANSFER_CHARACTERISTICS,
-    ID_VIDEO, TRACK_TYPE_AUDIO, TRACK_TYPE_VIDEO};
+use crate::client::{AUDIO_CONVERTED_COST, NEVER_PLAYS_COST, VIDEO_CONVERTED_COST};
+use crate::probe::{
+    parse_head, parse_matroska_tracks, Probe, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_COLOUR, ID_DEFAULT_DURATION,
+    ID_LANGUAGE, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_SEGMENT, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_TYPE,
+    ID_TRANSFER_CHARACTERISTICS, ID_VIDEO, TRACK_TYPE_AUDIO, TRACK_TYPE_VIDEO,
+};
 use crate::probe_mp4::parse_mp4;
 use crate::rank::RawStream;
 
@@ -30,10 +32,7 @@ fn timed_video_trak(timescale: u32, samples: u32, delta: u32, entry: &[u8]) -> V
     stts[8..12].copy_from_slice(&samples.to_be_bytes());
     stts[12..16].copy_from_slice(&delta.to_be_bytes());
     let stbl = mp4box("stbl", &concat(&[stsd(&[entry.to_vec()]), mp4box("stts", &stts)]));
-    let mdia = mp4box(
-        "mdia",
-        &concat(&[hdlr("vide"), mp4box("mdhd", &mdhd_body), mp4box("minf", &stbl)]),
-    );
+    let mdia = mp4box("mdia", &concat(&[hdlr("vide"), mp4box("mdhd", &mdhd_body), mp4box("minf", &stbl)]));
     mp4box("trak", &mdia)
 }
 
@@ -79,7 +78,12 @@ fn parse_mp4_video_shape() {
                 24000,
                 240,
                 1001,
-                &sized_video_entry("hvc1", 3840, 1608, &[mp4box("hvcC", &hvc_c_shape(2, true, 153)), nclx(16)]),
+                &sized_video_entry(
+                    "hvc1",
+                    3840,
+                    1608,
+                    &[mp4box("hvcC", &hvc_c_shape(2, true, 153)), nclx(16)],
+                ),
             ),
             Probe {
                 video_codec: "hevc".into(),
@@ -96,7 +100,12 @@ fn parse_mp4_video_shape() {
         ),
         (
             "H.264 High L4.1, 25 fps",
-            timed_video_trak(25, 100, 1, &sized_video_entry("avc1", 1920, 1080, &[mp4box("avcC", &[1, 100, 0, 41])])),
+            timed_video_trak(
+                25,
+                100,
+                1,
+                &sized_video_entry("avc1", 1920, 1080, &[mp4box("avcC", &[1, 100, 0, 41])]),
+            ),
             Probe {
                 video_codec: "h264".into(),
                 video_profile: 100,
@@ -186,7 +195,8 @@ fn parse_matroska_video_shape() {
 #[test]
 fn parse_head_video_shape_from_real_files() {
     // (file, width, height, fps)
-    let cases: [(&str, i32, i32, f64); 3] = [("hevc10.mp4", 64, 64, 5.0), ("hi10p.mkv", 64, 64, 5.0), ("sample.mp4", 320, 240, 15.0)];
+    let cases: [(&str, i32, i32, f64); 3] =
+        [("hevc10.mp4", 64, 64, 5.0), ("hi10p.mkv", 64, 64, 5.0), ("sample.mp4", 320, 240, 15.0)];
     for (file, width, height, fps) in cases {
         let p = parse_head(&testdata(file)).expect("parse");
         assert!(
@@ -218,7 +228,12 @@ fn guess_dv_profile() {
     }
     let probed = stream_attributes(RawStream {
         title: "Film.2021.2160p.WEB-DL.DV.HEVC".into(),
-        probe: Some(Probe { video_codec: "hevc".into(), dolby_vision: true, dv_profile: 8, ..Default::default() }),
+        probe: Some(Probe {
+            video_codec: "hevc".into(),
+            dolby_vision: true,
+            dv_profile: 8,
+            ..Default::default()
+        }),
         ..Default::default()
     });
     assert!(
@@ -269,13 +284,27 @@ fn client_playable_cost_from_the_probe() {
         (
             "H.264 over the browser's level can't play",
             "Film.1080p.AAC.mkv",
-            Probe { container: "matroska".into(), video_codec: "h264".into(), bit_depth: 8, video_level: 52, width: 1920, ..Default::default() },
+            Probe {
+                container: "matroska".into(),
+                video_codec: "h264".into(),
+                bit_depth: 8,
+                video_level: 52,
+                width: 1920,
+                ..Default::default()
+            },
             NEVER_PLAYS_COST,
         ),
         (
             "H.264 within it plays as it is",
             "Film.1080p.AAC.mkv",
-            Probe { container: "matroska".into(), video_codec: "h264".into(), bit_depth: 8, video_level: 41, width: 1920, ..Default::default() },
+            Probe {
+                container: "matroska".into(),
+                video_codec: "h264".into(),
+                bit_depth: 8,
+                video_level: 41,
+                width: 1920,
+                ..Default::default()
+            },
             0,
         ),
         (
@@ -295,13 +324,26 @@ fn client_playable_cost_from_the_probe() {
         (
             "VP9 profile 0 to a browser that takes none can't play",
             "Film.1080p.AAC.mkv",
-            Probe { container: "matroska".into(), video_codec: "vp9".into(), bit_depth: 8, width: 1920, ..Default::default() },
+            Probe {
+                container: "matroska".into(),
+                video_codec: "vp9".into(),
+                bit_depth: 8,
+                width: 1920,
+                ..Default::default()
+            },
             NEVER_PLAYS_COST,
         ),
         (
             "FLAC to a browser without it is converted",
             "Film.1080p.x264.FLAC.mkv",
-            Probe { container: "matroska".into(), video_codec: "h264".into(), bit_depth: 8, video_level: 41, width: 1920, ..Default::default() },
+            Probe {
+                container: "matroska".into(),
+                video_codec: "h264".into(),
+                bit_depth: 8,
+                video_level: 41,
+                width: 1920,
+                ..Default::default()
+            },
             AUDIO_CONVERTED_COST,
         ),
     ];
@@ -333,7 +375,13 @@ fn client_playable_cost_from_the_probe() {
     });
     let (s, a) = probed(
         "Film.1080p.FLAC.mkv",
-        Probe { container: "matroska".into(), video_codec: "vp9".into(), bit_depth: 8, width: 1920, ..Default::default() },
+        Probe {
+            container: "matroska".into(),
+            video_codec: "vp9".into(),
+            bit_depth: 8,
+            width: 1920,
+            ..Default::default()
+        },
     );
     let got = copies.cost(s, a);
     assert_eq!(got, 0, "VP9 with FLAC to a browser that plays both: cost {got}");

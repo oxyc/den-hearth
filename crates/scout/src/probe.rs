@@ -199,7 +199,11 @@ pub(crate) fn parse_matroska_tracks(head: &[u8]) -> Result<Probe, &'static str> 
         }
         pos = next;
     }
-    if out.audio.is_empty() && out.subtitles.is_empty() && out.untagged_audio == 0 && out.untagged_subtitles == 0 {
+    if out.audio.is_empty()
+        && out.subtitles.is_empty()
+        && out.untagged_audio == 0
+        && out.untagged_subtitles == 0
+    {
         return Err(ERR_NO_TRACKS);
     }
     Ok(out)
@@ -343,13 +347,62 @@ fn go_lossy_utf8(mut b: &[u8]) -> String {
 /// Go `iso639`: ISO 639-2 (bibliographic AND terminological — muxers emit both) to 639-1, for the languages
 /// that actually turn up on releases. Unlisted codes pass through unchanged.
 const ISO_639_2: &[(&str, &str)] = &[
-    ("eng", "en"), ("swe", "sv"), ("nor", "no"), ("nob", "no"), ("dan", "da"), ("fin", "fi"), ("isl", "is"), ("ice", "is"),
-    ("ger", "de"), ("deu", "de"), ("fre", "fr"), ("fra", "fr"), ("spa", "es"), ("ita", "it"), ("por", "pt"), ("dut", "nl"),
-    ("nld", "nl"), ("pol", "pl"), ("rus", "ru"), ("ukr", "uk"), ("cze", "cs"), ("ces", "cs"), ("slo", "sk"), ("slk", "sk"),
-    ("hun", "hu"), ("rum", "ro"), ("ron", "ro"), ("gre", "el"), ("ell", "el"), ("tur", "tr"), ("ara", "ar"), ("heb", "he"),
-    ("hin", "hi"), ("jpn", "ja"), ("kor", "ko"), ("chi", "zh"), ("zho", "zh"), ("cmn", "zh"), ("yue", "zh"), ("tha", "th"),
-    ("vie", "vi"), ("ind", "id"), ("may", "ms"), ("msa", "ms"), ("fil", "fil"), ("hrv", "hr"), ("srp", "sr"), ("bul", "bg"),
-    ("est", "et"), ("lav", "lv"), ("lit", "lt"), ("cat", "ca"), ("baq", "eu"), ("glg", "gl"), ("per", "fa"), ("fas", "fa"),
+    ("eng", "en"),
+    ("swe", "sv"),
+    ("nor", "no"),
+    ("nob", "no"),
+    ("dan", "da"),
+    ("fin", "fi"),
+    ("isl", "is"),
+    ("ice", "is"),
+    ("ger", "de"),
+    ("deu", "de"),
+    ("fre", "fr"),
+    ("fra", "fr"),
+    ("spa", "es"),
+    ("ita", "it"),
+    ("por", "pt"),
+    ("dut", "nl"),
+    ("nld", "nl"),
+    ("pol", "pl"),
+    ("rus", "ru"),
+    ("ukr", "uk"),
+    ("cze", "cs"),
+    ("ces", "cs"),
+    ("slo", "sk"),
+    ("slk", "sk"),
+    ("hun", "hu"),
+    ("rum", "ro"),
+    ("ron", "ro"),
+    ("gre", "el"),
+    ("ell", "el"),
+    ("tur", "tr"),
+    ("ara", "ar"),
+    ("heb", "he"),
+    ("hin", "hi"),
+    ("jpn", "ja"),
+    ("kor", "ko"),
+    ("chi", "zh"),
+    ("zho", "zh"),
+    ("cmn", "zh"),
+    ("yue", "zh"),
+    ("tha", "th"),
+    ("vie", "vi"),
+    ("ind", "id"),
+    ("may", "ms"),
+    ("msa", "ms"),
+    ("fil", "fil"),
+    ("hrv", "hr"),
+    ("srp", "sr"),
+    ("bul", "bg"),
+    ("est", "et"),
+    ("lav", "lv"),
+    ("lit", "lt"),
+    ("cat", "ca"),
+    ("baq", "eu"),
+    ("glg", "gl"),
+    ("per", "fa"),
+    ("fas", "fa"),
 ];
 
 /// Go `appendUnique`: adds `v` unless the list already holds it.
@@ -555,7 +608,9 @@ pub(crate) fn bit_depth_from_config(codec: &str, record: &[u8]) -> i64 {
 pub(crate) fn video_shape(codec: &str, record: &[u8]) -> (i32, i32, bool) {
     match codec {
         "h264" if record.len() >= 4 => (i32::from(record[1]), i32::from(record[3]), false),
-        "hevc" if record.len() >= 13 => (i32::from(record[1] & 0x1F), i32::from(record[12]), record[1] & 0x20 != 0),
+        "hevc" if record.len() >= 13 => {
+            (i32::from(record[1] & 0x1F), i32::from(record[12]), record[1] & 0x20 != 0)
+        }
         "av1" if record.len() >= 3 && record[0] == 0x81 => {
             (i32::from(record[1] >> 5), i32::from(record[1] & 0x1F), record[2] & 0x80 != 0)
         }

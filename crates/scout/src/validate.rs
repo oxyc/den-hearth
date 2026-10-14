@@ -47,7 +47,12 @@ pub const MAX_VALIDATE_BODY: usize = 4 << 10;
 /// down is worse than telling them nothing. The Go function reads the package-level `validateLimiter`; the port
 /// takes it as `limiter` so a test can pass its own without a global swap. The caller bounds the whole check with
 /// `VALIDATE_BUDGET` (`tokio::time::timeout`), since a dropped future is the cancellation.
-pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: DebridService, token: &str) -> ValidateResult {
+pub async fn validate_debrid_token(
+    doer: &dyn Doer,
+    limiter: &HostLimiter,
+    svc: DebridService,
+    token: &str,
+) -> ValidateResult {
     let Some(req) = validate_request(svc, token) else {
         return ValidateResult { reason: "validation unavailable".to_owned(), ..Default::default() };
     };
@@ -74,7 +79,12 @@ pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: 
         // The indexer scrapers log the service name and never the URL, because MediaFusion's carries an
         // encrypted config. Same rule here for a different reason: the URL would be fine, the token would not,
         // and the two travel together.
-        Err(_) => return ValidateResult { reason: format!("could not reach {}", svc.as_str()), ..Default::default() },
+        Err(_) => {
+            return ValidateResult {
+                reason: format!("could not reach {}", svc.as_str()),
+                ..Default::default()
+            }
+        }
     };
 
     let status = resp.status();
@@ -82,7 +92,10 @@ pub async fn validate_debrid_token(doer: &dyn Doer, limiter: &HostLimiter, svc: 
         return rejected();
     }
     if status != StatusCode::OK {
-        return ValidateResult { reason: format!("{} answered {}", svc.as_str(), status.as_u16()), ..Default::default() };
+        return ValidateResult {
+            reason: format!("{} answered {}", svc.as_str(), status.as_u16()),
+            ..Default::default()
+        };
     }
     // Premiumize answers 200 for a bad key and puts the verdict in the body, so the status alone is not the
     // answer for every service.
@@ -119,7 +132,8 @@ fn validate_request(svc: DebridService, token: &str) -> Option<reqwest::Request>
         // Premiumize authenticates in the query string, so it sends no bearer header.
         // Go `url.QueryEscape`, not the form encoder's: it keeps `~` and escapes `*`, which the form encoder does not.
         DebridService::Premiumize => {
-            reqwest::Url::parse(&format!("{PREMIUMIZE_API}/account/info?apikey={}", go_query_escape(token))).ok()?
+            reqwest::Url::parse(&format!("{PREMIUMIZE_API}/account/info?apikey={}", go_query_escape(token)))
+                .ok()?
         }
     };
     let mut req = reqwest::Request::new(reqwest::Method::GET, url);

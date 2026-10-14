@@ -33,7 +33,10 @@ pub(crate) fn held_torbox_play(
         cache: Some(cache.clone()),
         api: TORBOX_API.to_owned(),
         client: Arc::new(MockDoer(move |req: reqwest::Request| {
-            recorder.lock().expect("the lock").push(req.url().path().rsplit('/').next().unwrap_or("").to_owned());
+            recorder
+                .lock()
+                .expect("the lock")
+                .push(req.url().path().rsplit('/').next().unwrap_or("").to_owned());
             Ok(reply(&req))
         })),
     });
@@ -61,7 +64,11 @@ async fn play_a_held_release_skips_the_status_read() {
     let hash = "a".repeat(40);
     for (name, target, want) in [
         // Was mylist (status) + requestdl.
-        ("movie", PlayTarget { info_hash: hash.clone(), file_idx: Some(0), ..Default::default() }, vec!["requestdl"]),
+        (
+            "movie",
+            PlayTarget { info_hash: hash.clone(), file_idx: Some(0), ..Default::default() },
+            vec!["requestdl"],
+        ),
         // Was mylist (status) + mylist (file list) + requestdl.
         (
             "episode",
@@ -110,14 +117,20 @@ async fn play_a_held_resolve_that_fails_falls_back_to_the_old_sequence() {
                     resp(200, r#"{"success":true,"data":"https://cdn.torbox/second.mkv"}"#)
                 }
             }
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"progress":1,"download_finished":true}}"#),
+            "mylist" => {
+                resp(200, r#"{"success":true,"data":{"id":42,"progress":1,"download_finished":true}}"#)
+            }
             _ => resp(404, "{}"),
         },
         |_| {},
     );
     let rr = get(
         &h,
-        &format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })),
+        &format!(
+            "/{}/play/{}",
+            valid_blob(),
+            encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })
+        ),
         &[],
     )
     .await;
@@ -158,13 +171,20 @@ async fn play_the_held_step_never_adds_even_for_a_stale_id() {
     );
     get(
         &h,
-        &format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })),
+        &format!(
+            "/{}/play/{}",
+            valid_blob(),
+            encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })
+        ),
         &[],
     )
     .await;
 
     let calls = calls.lock().expect("the lock").clone();
-    assert!(calls.first().is_some_and(|c| c == "requestdl"), "upstream calls = {calls:?}, want the read-only resolve first");
+    assert!(
+        calls.first().is_some_and(|c| c == "requestdl"),
+        "upstream calls = {calls:?}, want the read-only resolve first"
+    );
     for c in &calls {
         if c == "mylist" {
             break;
@@ -182,17 +202,26 @@ async fn play_a_download_in_progress_is_polled_with_the_status_read_alone() {
         &hash,
         |r| match endpoint(r) {
             "requestdl" => resp(200, r#"{"success":false}"#),
-            "mylist" => resp(200, r#"{"success":true,"data":{"id":42,"progress":0.5,"download_finished":false}}"#),
+            "mylist" => {
+                resp(200, r#"{"success":true,"data":{"id":42,"progress":0.5,"download_finished":false}}"#)
+            }
             _ => resp(404, "{}"),
         },
         |_| {},
     );
-    let play_path = format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() }));
+    let play_path = format!(
+        "/{}/play/{}",
+        valid_blob(),
+        encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })
+    );
 
     let rr = get(&h, &play_path, &[]).await;
     assert_eq!(rr.status(), 202, "first poll: {}, want 202", rr.status());
     let got = calls.lock().expect("the lock").clone();
-    assert!(same_calls(&got, &["requestdl", "mylist"]), "first poll calls = {got:?}, want [requestdl, mylist]");
+    assert!(
+        same_calls(&got, &["requestdl", "mylist"]),
+        "first poll calls = {got:?}, want [requestdl, mylist]"
+    );
     calls.lock().expect("the lock").clear();
     let rr = get(&h, &play_path, &[]).await;
     assert_eq!(rr.status(), 202, "second poll: {}, want 202", rr.status());

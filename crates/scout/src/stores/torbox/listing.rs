@@ -246,7 +246,10 @@ impl<R: Read> Reader<R> {
             }
             let (run, len) = {
                 let chunk = &self.buf[self.pos..self.end];
-                (chunk.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(chunk.len()), chunk.len())
+                (
+                    chunk.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20).unwrap_or(chunk.len()),
+                    chunk.len(),
+                )
             };
             if !over {
                 if out.len() + run > cap {

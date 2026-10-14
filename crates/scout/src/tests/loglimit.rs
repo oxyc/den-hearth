@@ -74,7 +74,8 @@ fn startup_summary() {
         ("METRICS_TOKEN", "metrics-secret"),
         ("CACHE_DIR", "/cache"),
     ];
-    let lookup = |k: &str| env.iter().find(|(name, _)| *name == k).map(|(_, v)| (*v).to_owned()).unwrap_or_default();
+    let lookup =
+        |k: &str| env.iter().find(|(name, _)| *name == k).map(|(_, v)| (*v).to_owned()).unwrap_or_default();
     let s = settings_from_env(lookup);
     let line = startup_line(&s, true);
     let first = format!("den-scout {} listening on :8080 — ", manifest_version());

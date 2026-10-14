@@ -47,7 +47,8 @@ fn settings_from_env() {
             && s.scrape_timeout == Duration::from_secs(5)
             && s.list_ttl == Duration::from_secs(60)
             && s.public_url == "https://scout.example"
-            && s.indexer_urls.get(&indexer("mediafusion")).map(String::as_str) == Some("https://mf.self/CONFIG")
+            && s.indexer_urls.get(&indexer("mediafusion")).map(String::as_str)
+                == Some("https://mf.self/CONFIG")
             && s.cache_bytes == 1 << 20,
         "from env: {s:?}"
     );
@@ -131,8 +132,15 @@ async fn build_deps() {
     // authoritative only when every indexer answered" would quietly become "…every indexer we still
     // bother asking", which is how one 200-empty becomes a confident "this release does not exist".
     let sc = (built.make_scrapers)(&cfg);
-    assert!(sc.len() == 2 && sc[0].id() == indexer("torrentio") && sc[1].id() == indexer("comet"), "makeScrapers: {} scrapers", sc.len());
-    let err = sc[1].scrape(&ScrapeQuery::default()).await.expect_err("an unaskable indexer must fail, so it counts as a source that did not answer");
+    assert!(
+        sc.len() == 2 && sc[0].id() == indexer("torrentio") && sc[1].id() == indexer("comet"),
+        "makeScrapers: {} scrapers",
+        sc.len()
+    );
+    let err = sc[1]
+        .scrape(&ScrapeQuery::default())
+        .await
+        .expect_err("an unaskable indexer must fail, so it counts as a source that did not answer");
     // Go asserts `sc[1].(unaskableScraper)`; here the scraper's failure says what it is.
     let Some(un) = err.downcast_ref::<UnaskableError>() else {
         panic!("comet should be unaskable without a config URL, got {err}");
@@ -150,10 +158,21 @@ async fn build_deps() {
          suppresses the operator's log line and reports healthy empty lists as a degraded scrape"
     );
     // Given the URL, it is asked.
-    let with_comet_settings = deps::settings_from_env(|k| if k == "COMET_URL" { "https://comet.example/CONFIG".to_owned() } else { String::new() });
-    let with_comet = deps::build_deps(&with_comet_settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
+    let with_comet_settings = deps::settings_from_env(|k| {
+        if k == "COMET_URL" {
+            "https://comet.example/CONFIG".to_owned()
+        } else {
+            String::new()
+        }
+    });
+    let with_comet =
+        deps::build_deps(&with_comet_settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
     let sc = (with_comet.make_scrapers)(&cfg);
-    assert!(sc.len() == 2 && sc[1].id() == indexer("comet"), "makeScrapers with comet URL: {} scrapers", sc.len());
+    assert!(
+        sc.len() == 2 && sc[1].id() == indexer("comet"),
+        "makeScrapers with comet URL: {} scrapers",
+        sc.len()
+    );
     let st = (built.make_stores)(&cfg);
     assert!(st.len() == 1 && st[0].service() == DebridService::TorBox, "makeStores: {} stores", st.len());
 }

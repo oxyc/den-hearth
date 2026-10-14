@@ -9,7 +9,12 @@ use crate::label::MIB;
 use crate::rank::{self as prod, RankFilters, RawStream, GIB};
 
 pub(crate) fn rs(title: &str, mutate: impl FnOnce(&mut RawStream)) -> RawStream {
-    let mut s = RawStream { info_hash: "h".into(), title: title.into(), source: "torrentio".into(), ..Default::default() };
+    let mut s = RawStream {
+        info_hash: "h".into(),
+        title: title.into(),
+        source: "torrentio".into(),
+        ..Default::default()
+    };
     mutate(&mut s);
     s
 }
@@ -68,19 +73,23 @@ fn quality_score() {
     assert!(!(remux <= webdl || webdl <= hdtv), "expected remux({remux}) > webdl({webdl}) > hdtv({hdtv})");
 
     assert!(
-        prod::quality_score(rs("Movie 2160p WEB-DL AV1", |_| {})) < prod::quality_score(rs("Movie 2160p WEB-DL", |_| {})),
+        prod::quality_score(rs("Movie 2160p WEB-DL AV1", |_| {}))
+            < prod::quality_score(rs("Movie 2160p WEB-DL", |_| {})),
         "av1 at 4k should be penalized"
     );
     assert!(
-        prod::quality_score(rs("Movie 1080p BluRay 3D HSBS", |_| {})) < prod::quality_score(rs("Movie 1080p BluRay", |_| {})),
+        prod::quality_score(rs("Movie 1080p BluRay 3D HSBS", |_| {}))
+            < prod::quality_score(rs("Movie 1080p BluRay", |_| {})),
         "3d should be penalized"
     );
     assert!(
-        prod::quality_score(rs("Movie 2160p WEB-DL DoVi", |_| {})) > prod::quality_score(rs("Movie 2160p WEB-DL", |_| {})),
+        prod::quality_score(rs("Movie 2160p WEB-DL DoVi", |_| {}))
+            > prod::quality_score(rs("Movie 2160p WEB-DL", |_| {})),
         "DoVi should be rewarded"
     );
     assert!(
-        prod::quality_score(rs("Movie 2160p REMUX Atmos", |_| {})) > prod::quality_score(rs("Movie 2160p REMUX", |_| {})),
+        prod::quality_score(rs("Movie 2160p REMUX Atmos", |_| {}))
+            > prod::quality_score(rs("Movie 2160p REMUX", |_| {})),
         "Atmos should be rewarded"
     );
     // Ranked by what Den DELIVERS: DD+ (stream-copy) over the same title in TrueHD/DTS (bridged to 5.1),
@@ -204,17 +213,30 @@ fn rank_streams() {
             s.cached = true;
             s.cache_known = true;
         }),
-        rs("B 1080p WEB-DL", |s| s.cache_known = true),  // known: not cached
+        rs("B 1080p WEB-DL", |s| s.cache_known = true), // known: not cached
         rs("C 1080p WEB-DL", |s| s.cache_known = false), // its batch failed
     ];
-    let kept_unchecked =
-        prod::rank_streams(&unchecked, RankFilters { cached_only: true, result_cap: 5, ..Default::default() });
-    assert_eq!(kept_unchecked.len(), 2, "cachedOnly dropped a release nobody could check: {:?}", titles(&kept_unchecked));
+    let kept_unchecked = prod::rank_streams(
+        &unchecked,
+        RankFilters { cached_only: true, result_cap: 5, ..Default::default() },
+    );
+    assert_eq!(
+        kept_unchecked.len(),
+        2,
+        "cachedOnly dropped a release nobody could check: {:?}",
+        titles(&kept_unchecked)
+    );
 
     // hdrOnly keeps only HDR/DV.
     let hdr = prod::rank_streams(
         &[rs("A 2160p WEB HDR", |s| s.cached = true), rs("B 2160p WEB", |s| s.cached = true)],
-        RankFilters { exclude_cam: true, cached_only: true, hdr_only: true, result_cap: 5, ..Default::default() },
+        RankFilters {
+            exclude_cam: true,
+            cached_only: true,
+            hdr_only: true,
+            result_cap: 5,
+            ..Default::default()
+        },
     );
     assert!(hdr.len() == 1 && hdr[0].title == "A 2160p WEB HDR", "hdrOnly: got {:?}", titles(&hdr));
 
@@ -304,14 +326,31 @@ fn rank_streams() {
             s.size_bytes = Some(episode);
             s.pack_size_bytes = Some(pack);
         })],
-        RankFilters { exclude_cam: true, cached_only: true, result_cap: 5, max_size_gb: intp(20), ..Default::default() },
+        RankFilters {
+            exclude_cam: true,
+            cached_only: true,
+            result_cap: 5,
+            max_size_gb: intp(20),
+            ..Default::default()
+        },
     );
-    assert_eq!(by_size.len(), 1, "maxSizeGB judged a probed episode by its pack's weight: got {:?}", titles(&by_size));
+    assert_eq!(
+        by_size.len(),
+        1,
+        "maxSizeGB judged a probed episode by its pack's weight: got {:?}",
+        titles(&by_size)
+    );
 
     // malformed excludeRegex is ignored, not fatal.
     let ok = prod::rank_streams(
         &[rs("A 1080p WEB-DL", |s| s.cached = true)],
-        RankFilters { exclude_cam: true, cached_only: true, result_cap: 5, exclude_regex: "(".into(), ..Default::default() },
+        RankFilters {
+            exclude_cam: true,
+            cached_only: true,
+            result_cap: 5,
+            exclude_regex: "(".into(),
+            ..Default::default()
+        },
     );
     assert_eq!(ok.len(), 1, "bad excludeRegex should be ignored, got {}", ok.len());
 }
@@ -376,7 +415,11 @@ fn cap_seeds_keeps_the_best_not_the_first() {
 fn cap_seeds_leaves_a_small_list_alone() {
     let streams = [
         RawStream { info_hash: "a".into(), title: "Some.Film.2024.CAM.mkv".into(), ..Default::default() },
-        RawStream { info_hash: "b".into(), title: "Some.Film.2024.2160p.REMUX.mkv".into(), ..Default::default() },
+        RawStream {
+            info_hash: "b".into(),
+            title: "Some.Film.2024.2160p.REMUX.mkv".into(),
+            ..Default::default()
+        },
     ];
     let kept = prod::cap_seeds(&streams, 10);
     assert!(
@@ -487,8 +530,7 @@ fn rank_streams_preference_keeps_untagged_resolution_neutral() {
     );
     assert_eq!(got.len(), 2, "kept {} of 2", got.len());
     assert_eq!(
-        got[0].title,
-        untagged.title,
+        got[0].title, untagged.title,
         "an untagged release was sunk alongside the non-preferred ones: {:?} first",
         got[0].title
     );
@@ -512,7 +554,10 @@ fn rank_streams_preference_never_lifts_junk() {
 #[test]
 fn re2_patterns_read_ascii_classes() {
     // `19\d\d` is RE2's yearToken: Arabic-Indic digits are not digits to it.
-    assert!(prod::release_years("Movie 19\u{669}\u{669} 1080p").is_empty(), "a non-ASCII digit was read as a year");
+    assert!(
+        prod::release_years("Movie 19\u{669}\u{669} 1080p").is_empty(),
+        "a non-ASCII digit was read as a year"
+    );
     // RE2's `\s` is [\t\n\f\r ]: a vertical tab does not end `.ts` as a container extension, so the TS tag stands.
     assert_eq!(prod::junk_class("Show.S01E01.ts\u{b}"), "telesync", "a vertical tab was read as whitespace");
     assert_eq!(prod::junk_class("Show.S01E01.ts\n"), "", "a newline ends a container extension");
@@ -560,7 +605,10 @@ fn net_patterns_read_as_regexp2_does() {
     use crate::season::{bare_episode_patterns, matches_episode, names_episode};
 
     // .NET's `$` also matches before a final newline.
-    assert!(matches_episode("Show - 05\n", &bare_episode_patterns(5)), "`$` did not match before a final newline");
+    assert!(
+        matches_episode("Show - 05\n", &bare_episode_patterns(5)),
+        "`$` did not match before a final newline"
+    );
     assert!(!matches_episode("Show - 05\n\n", &bare_episode_patterns(5)), "`$` matched before two newlines");
     // `\b` is .NET's `\w`: a non-spacing mark (Mn) is a word character, a spacing mark (Mc) and a letter number
     // (Nl) are not, though the regex crate's `\w` takes both.
@@ -578,7 +626,11 @@ fn lookaround_patterns_answer_for_a_title_of_any_length() {
     use crate::season::{episode_patterns, matches_episode, names_episode, unresolved_season_pack};
 
     let pad = "a ".repeat(1 << 20);
-    assert_eq!(prod::junk_class(&format!("{pad} upscaled")), "upscaled", "a long title escaped the upscaled check");
+    assert_eq!(
+        prod::junk_class(&format!("{pad} upscaled")),
+        "upscaled",
+        "a long title escaped the upscaled check"
+    );
     let pad = "a ".repeat(1 << 17);
     assert!(names_episode(&format!("{pad} S01E02"), 1, 2), "a long name stopped naming its episode");
     assert!(matches_episode(&format!("{pad} S01E02"), &episode_patterns(1, 2)));

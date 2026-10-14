@@ -129,11 +129,9 @@ impl HostLimiter {
         }
         let b = {
             let mut buckets = locked(&self.buckets);
-            Arc::clone(
-                buckets
-                    .entry(key.to_owned())
-                    .or_insert_with(|| Arc::new(Mutex::new(Bucket { tokens: self.burst as f64, last: Instant::now() }))),
-            )
+            Arc::clone(buckets.entry(key.to_owned()).or_insert_with(|| {
+                Arc::new(Mutex::new(Bucket { tokens: self.burst as f64, last: Instant::now() }))
+            }))
         };
         let ok = locked(&b).try_take(self.every, self.burst);
         ok

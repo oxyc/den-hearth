@@ -30,7 +30,9 @@ pub(crate) struct TallyStore {
 
 impl TallyStore {
     pub(crate) fn calls(&self) -> i32 {
-        self.resolves.load(Ordering::SeqCst) + self.statuses.load(Ordering::SeqCst) + self.checks.load(Ordering::SeqCst)
+        self.resolves.load(Ordering::SeqCst)
+            + self.statuses.load(Ordering::SeqCst)
+            + self.checks.load(Ordering::SeqCst)
     }
 }
 
@@ -105,14 +107,25 @@ fn link_memo_mark_checked_keeps_the_mint_time() {
 // read-only target must land on the same entry /play reads.
 #[test]
 fn link_memo_key_scopes_by_account_and_file() {
-    let a = Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "one".to_owned() }], ..Default::default() };
-    let b = Config { debrid: vec![DebridAccount { service: DebridService::TorBox, token: "two".to_owned() }], ..Default::default() };
+    let a = Config {
+        debrid: vec![DebridAccount { service: DebridService::TorBox, token: "one".to_owned() }],
+        ..Default::default()
+    };
+    let b = Config {
+        debrid: vec![DebridAccount { service: DebridService::TorBox, token: "two".to_owned() }],
+        ..Default::default()
+    };
     let hash = "a".repeat(40);
     let movie = ResolveTarget { info_hash: hash.clone(), file_idx: Some(0), ..Default::default() };
     assert!(link_memo_key(&a, &movie) != link_memo_key(&b, &movie), "two accounts share a memo key");
     let read_only = ResolveTarget { no_add: true, ..movie.clone() };
-    assert_eq!(link_memo_key(&a, &movie), link_memo_key(&a, &read_only), "the probe's NoAdd target keys differently from /play's");
-    let ep1 = ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
+    assert_eq!(
+        link_memo_key(&a, &movie),
+        link_memo_key(&a, &read_only),
+        "the probe's NoAdd target keys differently from /play's"
+    );
+    let ep1 =
+        ResolveTarget { info_hash: hash.clone(), season: Some(1), episode: Some(1), ..Default::default() };
     let ep2 = ResolveTarget { info_hash: hash, season: Some(1), episode: Some(2), ..Default::default() };
     assert!(link_memo_key(&a, &ep1) != link_memo_key(&a, &ep2), "two episodes of one pack share a memo key");
 }
@@ -170,7 +183,13 @@ async fn play_fresh_bypasses_and_replaces_the_memo() {
     let path = play_path();
 
     let rr = get(&h, &path, &[]).await;
-    assert_eq!(hdr(&rr, "location"), "https://cdn.example/minted-1.mkv", "first play: {} {:?}", rr.status(), hdr(&rr, "location"));
+    assert_eq!(
+        hdr(&rr, "location"),
+        "https://cdn.example/minted-1.mkv",
+        "first play: {} {:?}",
+        rr.status(),
+        hdr(&rr, "location")
+    );
     let rr = get(&h, &format!("{path}?fresh=1"), &[]).await;
     assert_eq!(
         hdr(&rr, "location"),
@@ -180,7 +199,12 @@ async fn play_fresh_bypasses_and_replaces_the_memo() {
         hdr(&rr, "location")
     );
     let rr = get(&h, &path, &[]).await;
-    assert_eq!(hdr(&rr, "location"), "https://cdn.example/minted-2.mkv", "the fresh link did not replace the memo: {:?}", hdr(&rr, "location"));
+    assert_eq!(
+        hdr(&rr, "location"),
+        "https://cdn.example/minted-2.mkv",
+        "the fresh link did not replace the memo: {:?}",
+        hdr(&rr, "location")
+    );
     let got = store.resolves.load(Ordering::SeqCst);
     assert_eq!(got, 2, "resolves = {got}, want 2");
 }
@@ -197,7 +221,12 @@ async fn play_fresh_drops_the_old_link_even_when_the_resolve_fails() {
     let rr = get(&h, &format!("{path}?fresh=1"), &[]).await;
     assert_eq!(rr.status(), 404, "fresh play: {}, want 404", rr.status());
     let rr = get(&h, &path, &[]).await;
-    assert_ne!(rr.status(), 302, "the link the client reported as unopenable was served again: {:?}", hdr(&rr, "location"));
+    assert_ne!(
+        rr.status(),
+        302,
+        "the link the client reported as unopenable was served again: {:?}",
+        hdr(&rr, "location")
+    );
 }
 
 // A failure is never remembered: the next play asks again.
@@ -219,7 +248,10 @@ async fn play_a_failed_resolve_is_not_memoised() {
 // same file again.
 #[tokio::test]
 async fn probe_behind_fills_the_link_memo_for_play() {
-    let cdn = loopback_file(std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tracks.mkv")).expect("testdata fixture")).await;
+    let cdn = loopback_file(
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/tracks.mkv")).expect("testdata fixture"),
+    )
+    .await;
     let link = format!("{cdn}/tracks.mkv");
     let store = tally({
         let link = link.clone();
@@ -236,7 +268,11 @@ async fn probe_behind_fills_the_link_memo_for_play() {
     let probe_target = ResolveTarget { no_add: true, ..target.clone() };
     h.probe_behind(
         &config,
-        vec![ProbeJob { key: format!("probe:v1:{hash}:0"), holders: vec![DebridService::TorBox], target: probe_target }],
+        vec![ProbeJob {
+            key: format!("probe:v1:{hash}:0"),
+            holders: vec![DebridService::TorBox],
+            target: probe_target,
+        }],
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -248,11 +284,20 @@ async fn probe_behind_fills_the_link_memo_for_play() {
     let before = store.calls();
     let rr = get(
         &h,
-        &format!("/{}/play/{}", valid_blob(), encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })),
+        &format!(
+            "/{}/play/{}",
+            valid_blob(),
+            encode_play_token(&PlayTarget { info_hash: hash, file_idx: Some(0), ..Default::default() })
+        ),
         &[],
     )
     .await;
-    assert!(rr.status() == 302 && hdr(&rr, "location") == link, "play: {} {:?}, want 302 to the probe's link", rr.status(), hdr(&rr, "location"));
+    assert!(
+        rr.status() == 302 && hdr(&rr, "location") == link,
+        "play: {} {:?}, want 302 to the probe's link",
+        rr.status(),
+        hdr(&rr, "location")
+    );
     let got = store.calls() - before;
     assert_eq!(got, 0, "play re-asked the store {got} times for a link the probe had just minted");
 }

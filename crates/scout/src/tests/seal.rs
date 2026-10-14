@@ -102,7 +102,10 @@ fn decode_config_sealed() {
     // With a keyring, plaintext is refused: every issued install is sealed, and /config-key is public, so a
     // plaintext config is one anyone could have minted. Without one it is the only form, and decodes.
     let plain = blob(r#"{"debrid":[{"service":"torbox","token":"t"}]}"#);
-    assert!(decode_config(Some(&kr), &plain).is_none(), "a plaintext config must be refused while sealing is on");
+    assert!(
+        decode_config(Some(&kr), &plain).is_none(),
+        "a plaintext config must be refused while sealing is on"
+    );
     assert!(decode_config(None, &plain).is_some(), "a plaintext config must decode with sealing off");
 }
 

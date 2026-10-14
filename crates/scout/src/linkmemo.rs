@@ -88,7 +88,8 @@ impl LinkMemo {
     /// least recently used past `LINK_MEMO_MAX_ENTRIES`.
     pub fn put(&self, key: &str, link: &str, checked: bool, now: SystemTime) {
         let mut inner = self.lock();
-        let entry = MemoLink { key: key.to_owned(), link: link.to_owned(), checked, expires: now + LINK_MEMO_TTL };
+        let entry =
+            MemoLink { key: key.to_owned(), link: link.to_owned(), checked, expires: now + LINK_MEMO_TTL };
         if inner.items.contains_key(key) {
             inner.items.insert(key.to_owned(), entry);
             inner.touch(key);

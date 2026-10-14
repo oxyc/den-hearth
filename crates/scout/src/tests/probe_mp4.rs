@@ -93,7 +93,11 @@ fn parse_mp4_reads_tracks_languages_and_codec() {
     assert_eq!(p.video_codec, "hevc", "videoCodec = {:?}, want hevc", p.video_codec);
     // mdhd stores ISO 639-2 ("eng"); the probe normalises to 639-1 so one vocabulary reaches Den,
     // whatever the container spoke.
-    assert!(p.audio.len() == 2 && p.audio[0] == "en" && p.audio[1] == "sv", "audio = {:?}, want [en sv]", p.audio);
+    assert!(
+        p.audio.len() == 2 && p.audio[0] == "en" && p.audio[1] == "sv",
+        "audio = {:?}, want [en sv]",
+        p.audio
+    );
     assert!(p.subtitles.len() == 1 && p.subtitles[0] == "fi", "subtitles = {:?}, want [fi]", p.subtitles);
     // The channel count comes from the FIRST audio track's sample entry.
     assert_eq!(p.audio_channels, "5.1", "audioChannels = {:?}, want 5.1", p.audio_channels);
@@ -113,7 +117,11 @@ fn parse_mp4_untagged_tracks_are_counted_not_named() {
     let (p, ok) = parse_mp4(&head);
     assert!(ok, "parse");
     assert!(p.audio.is_empty(), "audio = {:?}, want none named", p.audio);
-    assert_eq!(p.untagged_audio, 2, "untaggedAudio = {}, want 2 (empty and 'und' both count)", p.untagged_audio);
+    assert_eq!(
+        p.untagged_audio, 2,
+        "untaggedAudio = {}, want 2 (empty and 'und' both count)",
+        p.untagged_audio
+    );
     assert_eq!(p.untagged_subtitles, 1, "untaggedSubtitles = {}, want 1", p.untagged_subtitles);
 }
 
@@ -137,7 +145,11 @@ fn parse_mp4_dolby_vision_config_box() {
             0,
             &[video_entry("hvc1", &[mp4box(box_type, &[0u8; 4])])],
         )]));
-        assert!(ok && got.dolby_vision, "{box_type} present → Dolby Vision (ok={ok}, dv={})", got.dolby_vision);
+        assert!(
+            ok && got.dolby_vision,
+            "{box_type} present → Dolby Vision (ok={ok}, dv={})",
+            got.dolby_vision
+        );
     }
 }
 
@@ -185,7 +197,10 @@ fn boxes_size_handling() {
         buf[4..8].copy_from_slice(b"last");
         buf.extend_from_slice(&[1, 2, 3, 4]);
         let got = boxes(&buf);
-        assert!(got.len() == 1 && got[0].body.len() == 4, "size-0 box must extend to the buffer end: {got:?}");
+        assert!(
+            got.len() == 1 && got[0].body.len() == 4,
+            "size-0 box must extend to the buffer end: {got:?}"
+        );
     }
 
     // truncated and impossible sizes stop the walk
@@ -235,16 +250,24 @@ fn four_cc_and_channel_mapping() {
         assert_eq!(got, want, "codecFromFourCC({cc:?}) = {got:?}, want {want:?}");
     }
 
-    let layouts = [(0, ""), (1, "1.0"), (2, "2.0"), (5, "2.0"), (6, "5.1"), (7, "5.1"), (8, "7.1"), (12, "7.1")];
+    let layouts =
+        [(0, ""), (1, "1.0"), (2, "2.0"), (5, "2.0"), (6, "5.1"), (7, "5.1"), (8, "7.1"), (12, "7.1")];
     for (n, want) in layouts {
         let got = channel_layout(n);
         assert_eq!(got, want, "channelLayout({n}) = {got:?}, want {want:?}");
     }
     // channelCount is the inverse, used to rank one layout against another; unknown text is 0, not a guess.
     for layout in ["7.1", "5.1", "2.0", "1.0"] {
-        assert_eq!(channel_count(layout), channel_count_round_trip(layout), "channelCount({layout:?}) disagrees with its layout");
+        assert_eq!(
+            channel_count(layout),
+            channel_count_round_trip(layout),
+            "channelCount({layout:?}) disagrees with its layout"
+        );
     }
-    assert!(channel_count("atmos") == 0 && channel_count("") == 0, "an unrecognised layout counts as 0 channels, never a guess");
+    assert!(
+        channel_count("atmos") == 0 && channel_count("") == 0,
+        "an unrecognised layout counts as 0 channels, never a guess"
+    );
 }
 
 // The smallest channel count that produces this layout — channelLayout(channelCount(x)) must be x.
@@ -313,12 +336,20 @@ fn parse_mp4_richest_audio_track_wins() {
         trak("soun", "eng", 0, &[audio_entry("mp4a", 8)]),
     ]);
     let (p, ok) = parse_mp4(&five_then_seven);
-    assert!(ok && p.audio_channels == "7.1", "5.1 listed first won over 7.1: {:?} (ok={ok})", p.audio_channels);
+    assert!(
+        ok && p.audio_channels == "7.1",
+        "5.1 listed first won over 7.1: {:?} (ok={ok})",
+        p.audio_channels
+    );
     // And a poorer later track must not overwrite a richer earlier one.
     let seven_then_stereo = mp4_file(&[
         trak("soun", "eng", 0, &[audio_entry("mp4a", 8)]),
         trak("soun", "eng", 0, &[audio_entry("mp4a", 2)]),
     ]);
     let (p, ok) = parse_mp4(&seven_then_stereo);
-    assert!(ok && p.audio_channels == "7.1", "a stereo track overwrote 7.1: {:?} (ok={ok})", p.audio_channels);
+    assert!(
+        ok && p.audio_channels == "7.1",
+        "a stereo track overwrote 7.1: {:?} (ok={ok})",
+        p.audio_channels
+    );
 }
