@@ -120,6 +120,17 @@ fn segments_longest_shared(bencher: Bencher) {
     bencher.bench(|| remux::longest_shared(black_box(&a), black_box(&b), 15.0));
 }
 
+/// The probe on the fixtures of `testdata/`, with the head a session reads (256 KiB): an MP4 whose `moov` is read
+/// whole, and Matroska files whose Cues and Tags are fetched through the SeekHead.
+#[divan::bench(args = ["h264.mp4", "moov-at-end.mp4", "hevc.mkv", "hdr10.mkv", "subs.mkv"])]
+fn probe_file(bencher: Bencher, name: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+    let file = std::fs::read(path).expect("testdata");
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("a runtime");
+    assert!(rt.block_on(remux::probe_file(&file, 256 * 1024)), "{name} did not probe");
+    bencher.bench(|| rt.block_on(remux::probe_file(black_box(&file), 256 * 1024)));
+}
+
 #[divan::bench]
 fn auth_url_sig(bencher: Bencher) {
     let key = [7u8; 32];

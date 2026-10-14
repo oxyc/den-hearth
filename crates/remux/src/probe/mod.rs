@@ -10,6 +10,8 @@
 //! needed are small, and ffprobe would be another binary parsing untrusted bytes before we have
 //! decided to trust the file at all.
 
+#[cfg(test)]
+mod golden;
 pub mod mkv;
 pub mod mp4;
 
@@ -779,7 +781,7 @@ pub enum Source<'a> {
         client: &'a reqwest::Client,
         url: &'a str,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench"))]
     Mem(&'a [u8]),
 }
 
@@ -787,7 +789,7 @@ impl Source<'_> {
     /// `len` bytes from `start`, or fewer at the end of the file.
     pub async fn read(&self, start: u64, len: u64) -> Result<Vec<u8>, ProbeError> {
         match self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "bench"))]
             Source::Mem(b) => {
                 let s = start.min(b.len() as u64) as usize;
                 let e = start.saturating_add(len).min(b.len() as u64) as usize;
