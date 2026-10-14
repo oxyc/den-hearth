@@ -3338,7 +3338,7 @@ impl Inner {
                 .or_else(|| req.uri().authority().map(|a| a.as_str()))
                 .unwrap_or("");
         }
-        format!("{proto}://{host}")
+        format!("{proto}://{host}{}", self.deps.mount)
     }
 
     /// remuxAuthorized reports whether the request carries den-remux's service key (X-Den-Remux-Key), compared
@@ -3367,7 +3367,11 @@ impl Inner {
     /// A warm stream-list hit opens nothing (handleStream), so for a few minutes after a revocation the install
     /// can still read a list it had cached. Every play URL in that list is refused.
     pub(crate) fn open_config(&self, blob: &str) -> Option<Config> {
-        let config = crate::config::decode_config(self.deps.seal_keyring.as_deref(), blob)?;
+        let config = crate::config::decode_config_slice(
+            self.deps.seal_keyring.as_deref(),
+            blob,
+            self.deps.config_slice,
+        )?;
         self.admit_install(&config).then_some(config)
     }
 

@@ -37,6 +37,12 @@ use hyper::{Request, Response, StatusCode};
 pub use crate::config::Config;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+pub use crate::userconfig::is_valid as is_valid_config;
+
+/// The unconfigured manifest, for the combined Den addon's manifest to take Subtitles' resource from.
+pub fn unconfigured_manifest() -> serde_json::Value {
+    addon::manifest(None)
+}
 
 /// Lock `m`, recovering the data if a panic poisoned it. Every map behind these locks is left
 /// consistent between statements, and a `Drop` that unwrapped a poisoned lock would panic while
@@ -121,7 +127,10 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
         // collapses to a 304. A HEAD answer never has a body (the router builds one regardless of method).
         hyper::Method::GET | hyper::Method::HEAD => {
-            httputil::apply_conditional(&parts.method, &parts.headers, route(&state, &parts).await)
+            // Set by hearth on a request it routed under `/den`; no client can put one here.
+            let den = parts.extensions.get::<Arc<den_seal::Addon>>().cloned();
+            let resp = route(&state, den.as_deref(), &parts).await;
+            httputil::apply_conditional(&parts.method, &parts.headers, resp)
         }
         // Every route is a read. Routing on the path alone let a POST reach the same handlers — and a
         // subtitle or translate route spends a metered download or an LLM bill.
@@ -156,7 +165,13 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     resp
 }
 
-async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
+/// `den` is the combined Den addon's terms when hearth routed the request under `/den`: the config segment is
+/// that addon's, and the links answered with point back under it (`AppState::decode_config`, `addon::self_base`).
+async fn route(
+    state: &Arc<AppState>,
+    den: Option<&den_seal::Addon>,
+    parts: &hyper::http::request::Parts,
+) -> Response<Body> {
     let path = parts.uri.path();
 
     match path {
@@ -207,14 +222,13 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
     let config = segs.first().copied().unwrap_or("");
     let resource = segs.get(1).copied().unwrap_or("");
 
-    if state.config_key_invalid
-        && matches!(resource, "manifest.json" | "subtitles" | "subtitle" | "translate")
+    if state.key_invalid(den) && matches!(resource, "manifest.json" | "subtitles" | "subtitle" | "translate")
     {
         return config_key_invalid_response();
     }
 
     match resource {
-        "manifest.json" => match state.decode_config(config) {
+        "manifest.json" => match state.decode_config(den, config) {
             // The ETag is over the body, and the body names the install, so one install's cached
             // copy never answers another's If-None-Match.
             Some(cfg) => httputil::json(StatusCode::OK, &addon::manifest(Some(&cfg)), INSTALL_CACHE),
@@ -233,7 +247,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             };
             let id = strip_json(id_seg).unwrap_or(id_seg);
             let extra = strip_json(extra).unwrap_or(extra);
-            addon::handle_subtitles(state, &parts.headers, config, id, extra).await
+            addon::handle_subtitles(state, den, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
             // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>]
@@ -261,6 +275,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     let dub_flagged = query_get(query, "dub").as_deref() == Some("1");
                     let resp = addon::handle_subtitle_file(
                         state,
+                        den,
                         &parts.headers,
                         config,
                         file_id,
@@ -298,7 +313,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             // `.status` is answered from the request alone, so it is dispatched before anything that
             // could make a poll expensive.
             if let Some(lang) = last.strip_suffix(".status") {
-                return addon::handle_translate_status(state, config, id, lang).await;
+                return addon::handle_translate_status(state, den, config, id, lang).await;
             }
             let (lang, want_json, want_vtt) = if let Some(l) = last.strip_suffix(".json") {
                 (l, true, false)
@@ -316,6 +331,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                 .filter(|index| *index <= 4095);
             let resp = addon::handle_translate(
                 state,
+                den,
                 &parts.headers,
                 config,
                 id,
@@ -597,6 +613,110 @@ mod tests {
         let resp = handle_request(revoking_state(IID, "0"), request(hyper::Method::GET, path)).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_string(resp).await, r#"{"error":"bad_config"}"#);
+    }
+
+    /// The Den addon's terms for Subtitles (hearth's `/den`): plaintext configs, links under `http://node.test/den`.
+    fn den_terms(revoked: &str, epoch: &str) -> den_seal::Addon {
+        den_seal::Addon {
+            keyring: None,
+            key_invalid: false,
+            revocation: userconfig::Revocation::from_env(revoked, Some(epoch)),
+            public_base: Some("http://node.test/den".into()),
+            slice: "subs",
+        }
+    }
+
+    /// `uri` as hearth hands Subtitles a request it routed under `/den`.
+    fn den_request(uri: &str, den: den_seal::Addon) -> Request<()> {
+        let mut req = request(hyper::Method::GET, uri);
+        req.extensions_mut().insert(Arc::new(den));
+        req
+    }
+
+    /// A combined config carrying the Subtitles member and the install `IID`.
+    fn combined() -> String {
+        plain_segment(&format!(
+            r#"{{"iid":"{IID}","ep":0,"subs":{{"osKey":"os-test"}},"reel":{{"tmdbKey":"t"}}}}"#
+        ))
+    }
+
+    /// The subtitle URLs a Den install is handed come back under the Den addon, carrying its config.
+    #[tokio::test]
+    async fn a_den_install_s_subtitle_urls_come_back_under_the_den_addon() {
+        let state = revoking_state("", "0");
+        let sub = crate::opensubtitles::Subtitle {
+            file_id: 4242,
+            lang: "en".into(),
+            hash_match: false,
+            downloads: 1,
+            release: "Some.Film.2020.1080p".into(),
+            hd: true,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            foreign_parts_only: false,
+            hearing_impaired: false,
+            ratings: 0.0,
+        };
+        let key = format!("{}tt0000093:0:0:", crate::cache::SEARCH_NS);
+        state.cache.put(key, serde_json::to_string(&vec![sub]).unwrap(), Duration::from_secs(60));
+        let seg = combined();
+        let list = handle_request(
+            state,
+            den_request(&format!("/{seg}/subtitles/movie/tt0000093.json"), den_terms("", "0")),
+        )
+        .await;
+        let list: serde_json::Value = serde_json::from_str(&body_string(list).await).unwrap();
+        let url = list["subtitles"][0]["url"].as_str().expect("a subtitle url");
+        assert!(url.starts_with(&format!("http://node.test/den/{seg}/subtitle/4242.srt")), "{url}");
+    }
+
+    /// A Den install is admitted by the Den addon's revocation, never by Subtitles' own, and each refuses
+    /// the other's configs.
+    #[tokio::test]
+    async fn the_den_addon_s_terms_decide_a_den_install() {
+        let manifest = |seg: String, state: Arc<AppState>, den: Option<den_seal::Addon>| async move {
+            let uri = format!("/{seg}/manifest.json");
+            let req = match den {
+                Some(den) => den_request(&uri, den),
+                None => request(hyper::Method::GET, &uri),
+            };
+            handle_request(state, req).await.status()
+        };
+        let own = plain_segment(&format!(r#"{{"osKey":"os-test","iid":"{IID}"}}"#));
+        let ok = StatusCode::OK;
+        let bad = StatusCode::BAD_REQUEST;
+        assert_eq!(manifest(combined(), revoking_state("", "0"), Some(den_terms("", "0"))).await, ok);
+        // Revoked, or stamped below the epoch, by the Den addon.
+        assert_eq!(manifest(combined(), revoking_state("", "0"), Some(den_terms(IID, "0"))).await, bad);
+        assert_eq!(manifest(combined(), revoking_state("", "0"), Some(den_terms("", "1"))).await, bad);
+        // Revoked by Subtitles alone: a Den install is not Subtitles' to revoke.
+        assert_eq!(manifest(combined(), revoking_state(IID, "3"), Some(den_terms("", "0"))).await, ok);
+        // Neither kind of config opens as the other.
+        assert_eq!(manifest(own.clone(), revoking_state("", "0"), Some(den_terms("", "0"))).await, bad);
+        assert_eq!(manifest(combined(), revoking_state("", "0"), None).await, bad);
+        assert_eq!(manifest(own, revoking_state("", "0"), None).await, ok);
+        // A Den config without a Subtitles member.
+        let reel_only = plain_segment(r#"{"reel":{"tmdbKey":"t"}}"#);
+        assert_eq!(manifest(reel_only, revoking_state("", "0"), Some(den_terms("", "0"))).await, bad);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_den_key_refuses_den_installs_only() {
+        let den = den_seal::Addon { key_invalid: true, ..den_terms("", "0") };
+        let resp = handle_request(
+            test_state(""),
+            den_request(&format!("/{}/subtitles/movie/tt0000001.json", combined()), den),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_string(resp).await.contains("config_key_invalid"));
+        let own = plain_segment(r#"{"osKey":"o"}"#);
+        let resp =
+            handle_request(test_state(""), request(hyper::Method::GET, &format!("/{own}/manifest.json")))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// /configure stamps the epoch into every link, sealed or not, so both answers carry it.

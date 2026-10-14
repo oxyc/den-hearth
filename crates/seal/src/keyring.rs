@@ -60,6 +60,25 @@ impl Keyring {
         self.keys.iter().find_map(|k| SecretKey::from(k.priv_key).unseal(sealed).ok())
     }
 
+    /// A ring of keys derived from these, one for one and in the same order (HKDF-SHA256 over each private key,
+    /// with `info`). A second addon can then seal under the operator's existing secret, and rotate with it,
+    /// while the two rings hold different private keys: neither opens what was sealed to the other, nor anything
+    /// derived from the other's keys.
+    pub fn derive(&self, info: &[u8]) -> Keyring {
+        let keys = self
+            .keys
+            .iter()
+            .map(|k| {
+                let mut derived = [0u8; 32];
+                hkdf::Hkdf::<sha2::Sha256>::new(None, &k.priv_key)
+                    .expand(info, &mut derived)
+                    .expect("32 bytes is within HKDF-SHA256's output limit");
+                KeyPair::new(derived)
+            })
+            .collect();
+        Keyring { keys }
+    }
+
     /// The current recipient public key (std base64), served at `/config-key` so a client can seal to it.
     /// Empty with no keys.
     pub fn current_pub_base64(&self) -> String {

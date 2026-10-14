@@ -309,9 +309,16 @@ pub fn manifest(install: Option<&crate::userconfig::UserConfig>) -> Value {
     manifest
 }
 
-/// The base URL this server is reachable at (for the `url` we hand back to the client/app).
-pub fn self_base(state: &AppState, headers: &HeaderMap, config: &str) -> String {
-    let root = if let Some(b) = &state.cfg.public_base_url {
+/// The base URL this server is reachable at (for the `url` we hand back to the client/app). Under the
+/// combined Den addon (`den`) that is the addon's base, so the URL comes back on its terms.
+pub fn self_base(
+    state: &AppState,
+    den: Option<&den_seal::Addon>,
+    headers: &HeaderMap,
+    config: &str,
+) -> String {
+    let public = if den.is_some() { None } else { state.cfg.public_base_url.as_ref() };
+    let root = if let Some(b) = public {
         b.trim_end_matches('/').to_string()
     } else {
         let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
@@ -328,7 +335,10 @@ pub fn self_base(state: &AppState, headers: &HeaderMap, config: &str) -> String 
             .to_string();
         format!("{proto}://{host}")
     };
-    format!("{root}/{config}")
+    match den {
+        Some(den) => format!("{}/{config}", den.base(&root)),
+        None => format!("{root}/{config}"),
+    }
 }
 
 /// A hostname/authority we're willing to reflect into a returned URL: letters, digits, and the few
@@ -403,12 +413,13 @@ fn extra_field(extra: &str, key: &str) -> Option<String> {
 /// (dodging the per-IP download quota). Hash matches are floated to the top by `search`.
 pub async fn handle_subtitles(
     state: &Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     headers: &HeaderMap,
     config: &str,
     id: &str,
     extra: &str,
 ) -> Response<Body> {
-    let Some(cfg) = state.decode_config(config) else {
+    let Some(cfg) = state.decode_config(den, config) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_config"}), "no-store");
     };
     let Some((imdb, season, episode)) = parse_id(id) else {
@@ -463,7 +474,7 @@ pub async fn handle_subtitles(
     opensubtitles::rank(&mut subs, filename.as_deref());
     log_rank(state, headers, &imdb, season, episode, filename.as_deref(), &subs, rank_started.elapsed());
 
-    let base = self_base(state, headers, config);
+    let base = self_base(state, den, headers, config);
     // Tier-1 auto-sync anchor: any hash-matched sub is a trusted, already-in-sync timing reference
     // for the rest. `None` when auto-sync is off for this install, or when the search returned no
     // hash match at all — the out-of-sync gap Tier-1 can't close (see `tier1_reference`); either way
@@ -840,6 +851,7 @@ fn tier1_ref_for(s: &opensubtitles::Subtitle, reference: Option<i64>) -> Option<
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_subtitle_file(
     state: &Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     req_headers: &HeaderMap,
     config: &str,
     file_id: i64,
@@ -853,7 +865,7 @@ pub async fn handle_subtitle_file(
     episode_key: Option<String>,
     dub_flagged: bool,
 ) -> Response<Body> {
-    let Some(cfg) = state.decode_config(config) else {
+    let Some(cfg) = state.decode_config(den, config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Vet BEFORE keying: a rejected URL changes which tier runs, so keying off the raw one filed a
@@ -2110,6 +2122,7 @@ fn short_hash(s: &str) -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_translate(
     state: &Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     headers: &HeaderMap,
     config: &str,
     id: &str,
@@ -2120,7 +2133,7 @@ pub async fn handle_translate(
     resync_key: Option<String>,
     resync_audio: Option<u32>,
 ) -> Response<Body> {
-    let Some(cfg) = state.decode_config(config) else {
+    let Some(cfg) = state.decode_config(den, config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Translation needs the (optional) LLM credential — a subtitles-only install has none.
@@ -2633,7 +2646,10 @@ pub async fn handle_translate(
         phase
     };
 
-    httputil::add_timing(translate_url_response(state, headers, config, season, id, extra, lang_seg), &phase)
+    httputil::add_timing(
+        translate_url_response(state, den, headers, config, season, id, extra, lang_seg),
+        &phase,
+    )
 }
 
 /// The `.json` form's answer: the `.srt` URL the engine should fetch.
@@ -2644,6 +2660,7 @@ pub async fn handle_translate(
 #[allow(clippy::too_many_arguments)]
 fn translate_url_response(
     state: &Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     headers: &HeaderMap,
     config: &str,
     season: Option<i64>,
@@ -2651,7 +2668,7 @@ fn translate_url_response(
     extra: &str,
     lang_seg: &str,
 ) -> Response<Body> {
-    let base = self_base(state, headers, config);
+    let base = self_base(state, den, headers, config);
     // The segment as it arrived, not the decoded name: this is a URL, and handing back a decoded
     // "Brazilian Portuguese" would put a raw space in it. The client fetching this lands on the same
     // cache key it just warmed, whichever spelling it used — and it must carry the same extras, or
@@ -2677,11 +2694,12 @@ fn translate_url_response(
 /// from here and is not worth inventing a state for.
 pub async fn handle_translate_status(
     state: &Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     config: &str,
     id: &str,
     lang: &str,
 ) -> Response<Body> {
-    let Some(cfg) = state.decode_config(config) else {
+    let Some(cfg) = state.decode_config(den, config) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_config"}), "no-store");
     };
     let Some(llm) = &cfg.llm else {
@@ -3448,7 +3466,7 @@ mod translate_retry_tests {
         ] {
             let state = state(name);
             let config = config_segment();
-            let cfg = state.decode_config(&config).unwrap();
+            let cfg = state.decode_config(None, &config).unwrap();
             let key = translate_body_key("tt123", None, None, "FR", cfg.llm.as_ref().unwrap());
             let stored = if legacy {
                 RAW.to_string()
@@ -3480,6 +3498,7 @@ mod translate_retry_tests {
             state.cache.put(sync_cache_key(&key, &None, Some(2)), ALIGNED.into(), CACHE_TTL);
             let resp = handle_translate(
                 &state,
+                None,
                 &HeaderMap::new(),
                 &config,
                 "tt123",
@@ -3535,7 +3554,8 @@ mod translate_retry_tests {
         // Twice: the second request lands inside the failure marker's window, which must not turn the
         // fallback back into an empty list.
         for attempt in ["live search failed", "failure marker"] {
-            let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000094", "").await;
+            let resp =
+                handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt0000094", "").await;
             assert_eq!(resp.status(), StatusCode::OK, "{attempt}");
             assert_eq!(resp.headers().get(httputil::X_DEN_DEGRADED).unwrap(), "stale_search", "{attempt}");
             assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), "private, max-age=60", "{attempt}");
@@ -3553,7 +3573,8 @@ mod translate_retry_tests {
         use hyper::header::CACHE_CONTROL;
         let state = state("fresh-search");
         store_search(&state, "tt0000095", 4243, unix_seconds() + 3600);
-        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000095", "").await;
+        let resp =
+            handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt0000095", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(httputil::X_DEN_DEGRADED).is_none());
         assert_eq!(
@@ -3582,7 +3603,8 @@ mod translate_retry_tests {
             serde_json::to_string(&entry).unwrap(),
             SEARCH_STALE_GRACE,
         );
-        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000096", "").await;
+        let resp =
+            handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt0000096", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         use http_body_util::BodyExt;
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -3620,7 +3642,8 @@ mod translate_retry_tests {
         state.cache.put(dead_file_key(6002), "no_cues".into(), DEAD_FILE_TTL);
         state.cache.put(dead_file_key(6003), "gone".into(), DEAD_FILE_TTL);
 
-        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000097", "").await;
+        let resp =
+            handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt0000097", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         use http_body_util::BodyExt;
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -3655,7 +3678,8 @@ mod translate_retry_tests {
         // `sparse`, never promoted to `dead_file_key`.
         state.cache.put_mem(suspect_backoff_key(3529838), "sparse".into(), SYNC_RETRY_TTL);
 
-        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
+        let resp =
+            handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         use http_body_util::BodyExt;
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -3683,7 +3707,8 @@ mod translate_retry_tests {
             SEARCH_STALE_GRACE,
         );
 
-        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
+        let resp =
+            handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
         use http_body_util::BodyExt;
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3753,7 +3778,8 @@ mod translate_retry_tests {
         // A pre-0.20.0 Gone marker: a second sparse refusal that used to escalate.
         state.cache.put(dead_file_key(3529838), "sparse".into(), DEAD_FILE_TTL);
 
-        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
+        let resp =
+            handle_subtitles(&state, None, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         use http_body_util::BodyExt;
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -3783,6 +3809,7 @@ mod translate_retry_tests {
 
         let resp = handle_translate(
             &state,
+            None,
             &HeaderMap::new(),
             &config,
             "tt0111161",
@@ -3823,6 +3850,7 @@ mod translate_retry_tests {
 
         let resp = handle_translate(
             &state,
+            None,
             &HeaderMap::new(),
             &config,
             "tt0111161",
@@ -4496,6 +4524,7 @@ mod translate_retry_tests {
 
         let resp = handle_subtitle_file(
             &state,
+            None,
             &HeaderMap::new(),
             &config_segment(),
             FILE_ID,
@@ -4562,20 +4591,20 @@ mod translate_retry_tests {
         };
 
         // Nothing running, nothing remembered.
-        let resp = handle_translate_status(&state, &config, "tt0111161", "Swedish").await;
+        let resp = handle_translate_status(&state, None, &config, "tt0111161", "Swedish").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(read(resp).await["state"], "idle");
 
         // A run in progress reports how far it has got.
         let reporter = state.progress.start(&job_key, 1200);
         reporter.set(340, 1200);
-        let body = read(handle_translate_status(&state, &config, "tt0111161", "Swedish").await).await;
+        let body = read(handle_translate_status(&state, None, &config, "tt0111161", "Swedish").await).await;
         assert_eq!(body["state"], "working");
         assert_eq!(body["done"], 340);
         assert_eq!(body["total"], 1200);
 
         // Another language is a different job and must not read this one's progress.
-        let other = read(handle_translate_status(&state, &config, "tt0111161", "Finnish").await).await;
+        let other = read(handle_translate_status(&state, None, &config, "tt0111161", "Finnish").await).await;
         assert_eq!(other["state"], "idle", "a different language saw Swedish's progress");
 
         // However the run ends — including cancelled mid-await, which is what the guard is for — the
@@ -4583,13 +4612,13 @@ mod translate_retry_tests {
         // run that is being backed off rather than polling a stale "working" forever.
         drop(reporter);
         state.cache.put(format!("{SYNCFAIL}{job_key}"), "1".into(), SYNC_RETRY_TTL);
-        let body = read(handle_translate_status(&state, &config, "tt0111161", "Swedish").await).await;
+        let body = read(handle_translate_status(&state, None, &config, "tt0111161", "Swedish").await).await;
         assert_eq!(body["state"], "failed");
 
         // Spellings of one language are one job here too, or a poll would never find its own run.
         let reporter = state.progress.start(&job_key, 2);
         reporter.set(1, 2);
-        let by_code = read(handle_translate_status(&state, &config, "tt0111161", "sv").await).await;
+        let by_code = read(handle_translate_status(&state, None, &config, "tt0111161", "sv").await).await;
         assert_eq!(by_code["state"], "working", "a code and a name polled different jobs");
     }
 
@@ -4603,6 +4632,7 @@ mod translate_retry_tests {
         let long = "x".repeat(MAX_LANG + 1);
         let resp = handle_translate(
             &state,
+            None,
             &HeaderMap::new(),
             &config,
             "tt0111161",
@@ -4626,6 +4656,7 @@ mod translate_retry_tests {
         // A real language still works its way through to the upstream check.
         let resp = handle_translate(
             &state,
+            None,
             &HeaderMap::new(),
             &config,
             "tt0111161",
@@ -4668,6 +4699,7 @@ mod translate_retry_tests {
         // Finnish is a different job: it must get past the marker and fail on its own merits.
         let resp = handle_translate(
             &state,
+            None,
             &HeaderMap::new(),
             &config,
             "tt0111161",
@@ -4689,6 +4721,7 @@ mod translate_retry_tests {
         // Swedish, the marked one, is still short-circuited.
         let resp = handle_translate(
             &state,
+            None,
             &HeaderMap::new(),
             &config,
             "tt0111161",

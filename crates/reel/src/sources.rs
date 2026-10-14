@@ -219,6 +219,10 @@ pub(crate) struct Media {
     pub i: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e: Option<u64>,
+    /// Minted for an install of the combined Den addon (hearth's `/den`): honoured only on its routes, against
+    /// its revocation. Absent on everything Reel mints for itself, so those blobs are what they always were.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub den: bool,
     /// When it stops being honoured, in epoch seconds.
     pub x: u64,
 }
@@ -309,6 +313,7 @@ impl CapabilityError {
 /// unsigned compatibility mode.
 fn checked_media(
     state: &AppState,
+    terms: &crate::userconfig::Terms,
     filed: &str,
     blob: &str,
     presented: Option<&str>,
@@ -325,11 +330,15 @@ fn checked_media(
     if !crate::is_valid_vid(&media.v) || segment(&media) != filed {
         return Err(if require_signed { CapabilityError::Refused } else { CapabilityError::NotFound });
     }
+    // Minted for one addon, refused on the other's routes, where the other's revocation would be asked.
+    if media.den != terms.addon.is_some() {
+        return Err(CapabilityError::Refused);
+    }
     if media.x.saturating_mul(1000) <= (state.clock)() {
         return Err(CapabilityError::Expired);
     }
     if let Some(ep) = media.e {
-        if let Err(why) = cfg.revocation.check(media.i.as_deref(), ep) {
+        if let Err(why) = terms.revocation.check(media.i.as_deref(), ep) {
             crate::log_limited("media_install_refused", || {
                 format!("bad_signature: media for {} refused — {why}", media.v)
             });
@@ -346,9 +355,15 @@ fn checked_media(
 /// without resolving its video, building an index, or opening any media body. A 204 names the form
 /// and expiry in fixed headers; all answers are no-store. This endpoint intentionally requires a
 /// MAC even while the legacy `/m/s` handler is in unsigned compatibility mode.
-pub fn validate_direct_capability(state: &AppState, blob: &str, query: &str) -> Response<Body> {
+pub fn validate_direct_capability(
+    state: &AppState,
+    den: Option<&den_seal::Addon>,
+    blob: &str,
+    query: &str,
+) -> Response<Body> {
     let presented = query_param(query, "s");
-    let media = match checked_media(state, "s", blob, presented.as_deref(), true) {
+    let terms = crate::userconfig::Terms::of(state, den);
+    let media = match checked_media(state, &terms, "s", blob, presented.as_deref(), true) {
         Ok(media) => media,
         Err(error) => return error.response(),
     };
@@ -384,6 +399,7 @@ pub(crate) fn parse_ask(query: &str) -> Result<(Surface, Player), &'static str> 
 
 pub async fn handle_sources(
     state: Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     headers: &HeaderMap,
     vid: String,
     query: &str,
@@ -392,7 +408,7 @@ pub async fn handle_sources(
         Ok(contract) => contract,
         Err(detail) => return httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail),
     };
-    match prepare_sources(state, headers, vid, query, None, false, true).await {
+    match prepare_sources(state, headers, vid, query, None, den.is_some(), false, true).await {
         Ok(prepared) => prepared.response(contract),
         Err(error) => *error,
     }
@@ -401,13 +417,15 @@ pub async fn handle_sources(
 /// The typed half of [`handle_sources`], also used by `/prepare` so discovery and the source ladder
 /// are produced in one request without making an internal HTTP request. `binding` overrides the
 /// query-carried install identity for that trusted path; ordinary `/sources` keeps reading `i`/`e`
-/// from its already signed URL.
+/// from its already signed URL. `den`: the media are minted for the combined Den addon (`Media::den`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_sources(
     state: Arc<AppState>,
     headers: &HeaderMap,
     vid: String,
     query: &str,
     binding: Option<crate::sign::Binding<'_>>,
+    den: bool,
     cheap_warm: bool,
     start_warm_resolve: bool,
 ) -> Result<PreparedSources, Box<Response<Body>>> {
@@ -585,7 +603,9 @@ pub(crate) async fn prepare_sources(
     let signer = state.cfg.play_secret.as_deref().map(crate::sign::Signer::new);
     let (iid, ep) = match binding {
         Some(crate::sign::Binding::Unbound) => (None, None),
-        Some(crate::sign::Binding::Install { iid, ep }) => (iid.map(str::to_owned), Some(ep)),
+        Some(crate::sign::Binding::Install { iid, ep } | crate::sign::Binding::Den { iid, ep }) => {
+            (iid.map(str::to_owned), Some(ep))
+        }
         None => (query_param(query, "i"), query_param(query, "e").and_then(|e| e.parse().ok())),
     };
     let report = crate::client::raw_report(headers, query);
@@ -636,6 +656,7 @@ pub(crate) async fn prepare_sources(
                                 i: iid.clone(),
                                 e: ep,
                                 x: expires,
+                                den,
                             },
                         ),
                     },
@@ -658,6 +679,7 @@ pub(crate) async fn prepare_sources(
                             i: iid.clone(),
                             e: ep,
                             x: expires,
+                            den,
                         },
                     ),
                 },
@@ -691,6 +713,7 @@ pub(crate) async fn prepare_sources(
                 i: iid,
                 e: ep,
                 x: expires,
+                den,
             },
         );
         sources.push(LogicalSource {
@@ -786,13 +809,15 @@ impl PreparedSources {
 /// segment it was minted for (`segment`).
 pub async fn handle_media(
     state: Arc<AppState>,
+    den: Option<&den_seal::Addon>,
     headers: &HeaderMap,
     filed: &str,
     blob: &str,
     query: &str,
 ) -> Response<Body> {
     let presented = query_param(query, "s");
-    let media = match checked_media(&state, filed, blob, presented.as_deref(), false) {
+    let terms = crate::userconfig::Terms::of(&state, den);
+    let media = match checked_media(&state, &terms, filed, blob, presented.as_deref(), false) {
         Ok(media) => media,
         Err(error) => return error.response(),
     };
@@ -901,6 +926,7 @@ mod tests {
             i: Some("iid".into()),
             e: Some(3),
             x: 4_000_000_000,
+            den: false,
         }
     }
 

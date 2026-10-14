@@ -5,9 +5,10 @@
 //! did around it is done here: a pooled client that refuses to replay a body across a redirect, a tiered
 //! cache with an hourly sweep, a bounded request read.
 //!
-//! There are TWO handlers over one client and one cache. They differ only in the public origin they put in
+//! There are THREE handlers over one client and one cache. Two differ only in the public origin they put in
 //! absolute URLs: the one behind `/scout` keeps that prefix (`HEARTH_PUBLIC_BASE_URL/scout`), the one on
-//! Scout's own listener uses `SCOUT_PUBLIC_BASE_URL` as-is, which is what the old container produced.
+//! Scout's own listener uses `SCOUT_PUBLIC_BASE_URL` as-is, which is what the old container produced. The
+//! third is the combined Den addon's (`den.rs`), on that addon's keys, revocation and base.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +35,9 @@ const MAX_BODY: usize = 64 << 10;
 pub struct Scout {
     mount: Handler,
     legacy: Handler,
+    /// The combined Den addon's (`/den`): `mount`'s settings, on that addon's keys and revocation, reading its
+    /// Scout member. Its play tickets are keyed from those keys, so they open only here.
+    den: Handler,
     cache: Arc<TieredCache>,
     summary: String,
 }
@@ -54,15 +58,32 @@ fn client() -> Arc<dyn Doer> {
 
 impl Scout {
     /// `mount` configures the handler behind `/scout`, `legacy` the one on Scout's own port. They must
-    /// agree on everything but `public_url`. Call from inside the runtime.
-    pub fn new(mount: Settings, legacy: Settings) -> Scout {
+    /// agree on everything but `public_url`. `den` is the combined Den addon's terms for Scout's member.
+    /// Call from inside the runtime.
+    pub fn new(mount: Settings, legacy: Settings, den: &den_seal::Addon) -> Scout {
         let cache = Arc::new(TieredCache::new(legacy.cache_bytes, std::path::Path::new(&legacy.cache_dir)));
         let client = client();
-        let handler = |settings: &Settings| {
-            new_handler(build_deps_shared(settings, client.clone(), cache.clone() as Arc<dyn Cache>))
+        let deps = |settings: &Settings| {
+            build_deps_shared(settings, client.clone(), cache.clone() as Arc<dyn Cache>)
         };
+        let mut den_deps = deps(&mount);
+        den_deps.seal_keyring = den.keyring.clone().map(Arc::new);
+        den_deps.config_key_invalid = den.key_invalid;
+        den_deps.revocation = den.revocation.clone();
+        den_deps.config_slice = Some(den.slice);
+        den_deps.public_url = den.public_base.clone().unwrap_or_default();
+        den_deps.mount = den_seal::addon::MOUNT;
+        // No list from before the Den addon can name a `/<config>/play` URL, so with tickets on that route is
+        // closed from the start; without them (no key) it is the only play route there is.
+        den_deps.legacy_play_until = den.keyring.as_ref().map(|_| std::time::UNIX_EPOCH);
         let summary = startup_summary(&legacy, cache.persistent().unwrap_or(false));
-        Scout { mount: handler(&mount), legacy: handler(&legacy), cache, summary }
+        Scout {
+            mount: new_handler(deps(&mount)),
+            legacy: new_handler(deps(&legacy)),
+            den: new_handler(den_deps),
+            cache,
+            summary,
+        }
     }
 
     /// Scout's own startup line, as Go printed it.
@@ -91,10 +112,30 @@ impl Scout {
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        let handler = if own_listener { &self.legacy } else { &self.mount };
+        Self::bounded(handler, !own_listener, req).await
+    }
+
+    /// Serve one request the combined Den addon routed to Scout (its path is final), on the main port.
+    pub async fn serve_den<B>(&self, req: Request<B>) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::bounded(&self.den, true, req).await
+    }
+
+    /// `handler` serving `req` after the head and body bounds. `shared_listener`: the connection is not
+    /// Scout's own, so its head was not capped there.
+    async fn bounded<B>(handler: &Handler, shared_listener: bool, req: Request<B>) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let (parts, body) = req.into_parts();
         // Scout's own listener caps the head at the connection (`max_buf_size`); the shared one cannot,
         // since the other services' heads are not Scout's, so the same ceiling is applied here.
-        if !own_listener && head_len(&parts) > MAX_HEAD {
+        if shared_listener && head_len(&parts) > MAX_HEAD {
             return error(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "header_too_large");
         }
         let body = match tokio::time::timeout(READ_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
@@ -102,7 +143,6 @@ impl Scout {
             Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
             Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
         };
-        let handler = if own_listener { &self.legacy } else { &self.mount };
         handler.serve(Request::from_parts(parts, body)).await
     }
 

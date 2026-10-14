@@ -49,7 +49,13 @@ pub use crate::config::Config;
 use crate::httputil::query_param;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+pub use crate::userconfig::is_valid as is_valid_config;
 pub use crate::ytdlp::kill_live_groups;
+
+/// The unconfigured manifest, for the combined Den addon's manifest to take Reel's resource from.
+pub fn unconfigured_manifest() -> serde_json::Value {
+    addon::manifest(None)
+}
 use std::sync::{Arc, OnceLock};
 
 /// The release the image carries, from `DEN_VERSION` (set by the Dockerfile from the repo's `VERSION` file).
@@ -484,7 +490,9 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
             &[("allow", "GET, HEAD, OPTIONS"), ("cache-control", "no-store")],
         )
     } else {
-        let resp = route(state, &parts).await;
+        // Set by hearth on a request it routed under `/den`; no client can put one here.
+        let den = parts.extensions.get::<Arc<den_seal::Addon>>().cloned();
+        let resp = route(state, den.as_deref(), &parts).await;
         // Honor a conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
         // collapses to a 304 (a no-op for unsafe methods, errors, and `no-store` bodies).
         httputil::apply_conditional(&parts.method, &parts.headers, resp)
@@ -608,9 +616,18 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
     den_http::log::redact_first_segment(path, &ROUTES)
 }
 
-async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
+/// `den` is the combined Den addon's terms when hearth routed the request under `/den`: its config and the
+/// install-bound links minted from it are read on those terms (`userconfig::Terms`), never on Reel's own.
+async fn route(
+    state: Arc<AppState>,
+    den: Option<&den_seal::Addon>,
+    parts: &hyper::http::request::Parts,
+) -> Response<Body> {
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
+    // Held apart from `state`, which the handlers below take by value.
+    let own = state.clone();
+    let terms = userconfig::Terms::of(&own, den);
 
     if path == "/health" {
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
@@ -655,7 +672,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // valid signed bearer capability without resolving a video or opening an upstream media body.
     // The capability itself is the authority: there is deliberately no member/session check here.
     if let Some(blob) = path.strip_prefix("/_internal/validate/m/s/") {
-        return sources::validate_direct_capability(&state, blob, query);
+        return sources::validate_direct_capability(&state, den, blob, query);
     }
     if path == "/manifest.json" {
         return httputil::json(
@@ -700,14 +717,14 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 
     // Legacy config-less discovery: /meta/(movie|series)/(.+).json — resolves with the env TMDB key.
     if let Some(rest) = path.strip_prefix("/meta/") {
-        if let Some(resp) = meta_from_rest(&state, &parts.headers, None, rest, query).await {
+        if let Some(resp) = meta_from_rest(&state, &parts.headers, den, None, rest, query).await {
             return resp;
         }
     }
     // Combined discovery + source ladder for latency-sensitive web clients. This mints capabilities
     // but does not activate any listener; the edge that observed the client owns that decision.
     if let Some(rest) = path.strip_prefix("/prepare/") {
-        if let Some(resp) = prepare_from_rest(&state, &parts.headers, None, rest, query).await {
+        if let Some(resp) = prepare_from_rest(&state, &parts.headers, den, None, rest, query).await {
             return resp;
         }
     }
@@ -717,14 +734,10 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // URL; Stremio then derives the /meta calls from the same base. Fail CLOSED on a bad config.
     if let Some((cfg_seg, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) {
         if rest == "manifest.json" || rest.starts_with("meta/") || rest.starts_with("prepare/") {
-            if state.config_key_invalid {
+            if terms.key_invalid {
                 return config_key_invalid_response();
             }
-            let cfg = match userconfig::decode_checked(
-                state.config_keyring.as_ref(),
-                &state.cfg.revocation,
-                cfg_seg,
-            ) {
+            let cfg = match terms.decode_checked(cfg_seg) {
                 Ok(c) => c,
                 Err(why) => {
                     // Say something. A key rolled out of CONFIG_KEYS_PREV makes every install
@@ -755,14 +768,16 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             }
             if let Some(prepare_rest) = rest.strip_prefix("prepare/") {
                 if let Some(resp) =
-                    prepare_from_rest(&state, &parts.headers, Some(&cfg), prepare_rest, query).await
+                    prepare_from_rest(&state, &parts.headers, den, Some(&cfg), prepare_rest, query).await
                 {
                     return resp;
                 }
                 return httputil::not_found();
             }
             let meta_rest = &rest["meta/".len()..];
-            if let Some(resp) = meta_from_rest(&state, &parts.headers, Some(&cfg), meta_rest, query).await {
+            if let Some(resp) =
+                meta_from_rest(&state, &parts.headers, den, Some(&cfg), meta_rest, query).await
+            {
                 return resp;
             }
             return httputil::not_found();
@@ -777,7 +792,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             // carry it across — so a hard 403 here would turn "the app did not propagate `s`" into
             // de-letterboxing that silently disappears, with no error to report and /health green.
             // The gate exists to protect the DOWNLOAD, and `unsigned_response` reaches none of it.
-            if !signature_ok(&state, id, query) {
+            if !signature_ok(&state, &terms, id, query) {
                 return crop::unsigned_response(id);
             }
             // `?detect=keyframes`: measure now, from YouTube's own keyframes, with no download.
@@ -794,7 +809,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // and unlike a crop hint there is no useful constant to answer with.
     if let Some(id) = path.strip_prefix("/direct/").and_then(|r| r.strip_suffix(".json")) {
         if is_valid_vid(id) {
-            if !signature_ok(&state, id, query) {
+            if !signature_ok(&state, &terms, id, query) {
                 return bad_signature();
             }
             let cap = direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
@@ -806,7 +821,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // player need not read every fragment before it starts (see `progressive.rs`). Signed like /direct.
     if let Some(id) = path.strip_prefix("/progressive/").and_then(|r| r.strip_suffix(".mp4")) {
         if is_valid_vid(id) {
-            if !signature_ok(&state, id, query) {
+            if !signature_ok(&state, &terms, id, query) {
                 return bad_signature();
             }
             let cap = direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
@@ -820,10 +835,10 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // resolve it waits for.
     if let Some(id) = path.strip_prefix("/sources/").and_then(|r| r.strip_suffix(".json")) {
         if is_valid_vid(id) {
-            if !signature_ok(&state, id, query) {
+            if !signature_ok(&state, &terms, id, query) {
                 return bad_signature();
             }
-            return sources::handle_sources(state, &parts.headers, id.to_string(), query).await;
+            return sources::handle_sources(state, den, &parts.headers, id.to_string(), query).await;
         }
     }
 
@@ -841,7 +856,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // carries the final downloaded-file fallback here as form d, so a client never derives /play.
     if let Some((filed, blob)) = path.strip_prefix("/m/").and_then(|r| r.split_once('/')) {
         if matches!(filed, "n" | "s") {
-            return sources::handle_media(state, &parts.headers, filed, blob, query).await;
+            return sources::handle_media(state, den, &parts.headers, filed, blob, query).await;
         }
     }
 
@@ -853,7 +868,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // `<video>` is not CORS-checked, so only the playlist crosses this box and none of the video.
     if let Some(id) = path.strip_prefix("/hls/").and_then(|r| r.strip_suffix(".m3u8")) {
         if is_valid_vid(id) {
-            if !signature_ok(&state, id, query) {
+            if !signature_ok(&state, &terms, id, query) {
                 return bad_signature();
             }
             let uris = match query_param(query, "native").as_deref() {
@@ -885,7 +900,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             )
         }
     };
-    if !signature_ok(&state, &vid, query) {
+    if !signature_ok(&state, &terms, &vid, query) {
         return bad_signature();
     }
     play::handle_play(state, &parts.headers, vid).await
@@ -915,7 +930,10 @@ fn refusal_condition(why: &userconfig::Rejected) -> &'static str {
 ///
 /// Both endpoints authorise the same work for the same id, and the tag does not cover the path, so a
 /// client can carry the query it was handed on the play URL straight over to `/crop`.
-fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
+///
+/// On the Den addon's routes (`terms`) an install-bound link is read as a Den one (`sign::Binding::Den`) and
+/// admitted by that addon's revocation, so a link verifies only on the routes of the addon that minted it.
+fn signature_ok(state: &Arc<AppState>, terms: &userconfig::Terms, vid: &str, query: &str) -> bool {
     let Some(secret) = state.cfg.play_secret.as_deref() else { return true };
     let prev = &state.cfg.play_secrets_prev;
     let Some(presented) = query_param(query, "s") else {
@@ -932,12 +950,12 @@ fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
         // Never minted: an install id always travels with its epoch.
         None => return false,
         Some(ep) => match ep.parse() {
-            Ok(ep) => sign::Binding::Install { iid: iid.as_deref(), ep },
+            Ok(ep) => terms.binding(iid.as_deref(), ep),
             Err(_) => return false,
         },
     };
     if sign::verify_any(secret, prev, &sign::message(vid, binding), Some(&presented)) {
-        return install_admitted(state, vid, binding);
+        return install_admitted(terms.revocation, vid, binding);
     }
     // A tag over the id alone, as releases before install binding minted it. It names no install,
     // so nothing can revoke it: honoured only inside the grace, like an untagged URL. A bound link
@@ -955,9 +973,9 @@ fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
 /// Is the install a verified link was minted for still admitted? An unbound link, from the
 /// config-less `/meta`, names none and is. A refusal gets the same answer as a bad tag; this log
 /// line, in the style of the config routes' `bad_config`, is the only place the two differ.
-fn install_admitted(state: &AppState, vid: &str, binding: sign::Binding) -> bool {
-    let sign::Binding::Install { iid, ep } = binding else { return true };
-    match state.cfg.revocation.check(iid, ep) {
+fn install_admitted(revocation: &userconfig::Revocation, vid: &str, binding: sign::Binding) -> bool {
+    let (sign::Binding::Install { iid, ep } | sign::Binding::Den { iid, ep }) = binding else { return true };
+    match revocation.check(iid, ep) {
         Ok(()) => true,
         Err(why) => {
             log_limited(&format!("play_{}", refusal_condition(&why)), || {
@@ -1024,6 +1042,7 @@ fn bad_signature() -> Response<Body> {
 async fn meta_from_rest(
     state: &Arc<AppState>,
     headers: &hyper::HeaderMap,
+    den: Option<&den_seal::Addon>,
     cfg: Option<&userconfig::UserConfig>,
     rest: &str,
     query: &str,
@@ -1031,7 +1050,7 @@ async fn meta_from_rest(
     let (seg, tail) = rest.split_once('/')?;
     if (seg == "movie" || seg == "series") && tail.ends_with(".json") && tail.len() > 5 {
         let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
-        return Some(addon::handle_meta(state, headers, cfg, seg, &raw, query).await);
+        return Some(addon::handle_meta(state, headers, den, cfg, seg, &raw, query).await);
     }
     None
 }
@@ -1042,6 +1061,7 @@ async fn meta_from_rest(
 async fn prepare_from_rest(
     state: &Arc<AppState>,
     headers: &hyper::HeaderMap,
+    den: Option<&den_seal::Addon>,
     cfg: Option<&userconfig::UserConfig>,
     rest: &str,
     query: &str,
@@ -1049,7 +1069,7 @@ async fn prepare_from_rest(
     let (seg, tail) = rest.split_once('/')?;
     if (seg == "movie" || seg == "series") && tail.ends_with(".json") && tail.len() > 5 {
         let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
-        return Some(prepare::handle_prepare(state, headers, cfg, seg, &raw, query).await);
+        return Some(prepare::handle_prepare(state, headers, den, cfg, seg, &raw, query).await);
     }
     None
 }

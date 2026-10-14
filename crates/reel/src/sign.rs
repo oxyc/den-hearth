@@ -59,17 +59,32 @@ pub enum Binding<'a> {
     Unbound,
     /// Minted for a configured install: its id (`None` on a config from before ids) and its epoch.
     Install { iid: Option<&'a str>, ep: u64 },
+    /// Minted for an install of the combined Den addon (hearth's `/den`), whose revocation is not Reel's own.
+    /// The same query as `Install`, under another message, so such a link verifies only on the Den addon's
+    /// routes and a Reel link only on Reel's: neither can be carried to where the other's revocation applies.
+    Den { iid: Option<&'a str>, ep: u64 },
 }
 
-impl Binding<'_> {
+impl<'a> Binding<'a> {
+    /// The binding of a link minted for an install: the Den addon's when `den`, else Reel's own.
+    pub fn install(iid: Option<&'a str>, ep: u64, den: bool) -> Binding<'a> {
+        if den {
+            Binding::Den { iid, ep }
+        } else {
+            Binding::Install { iid, ep }
+        }
+    }
+
     /// The query parameters after `s=<tag>` that carry this binding: `&i=<iid>&e=<ep>`, `&e=<ep>`
     /// for a config without an id, nothing when unbound. An install id is base64url and an epoch is
     /// digits, so neither needs encoding.
     pub fn query(&self) -> String {
         match self {
             Binding::Unbound => String::new(),
-            Binding::Install { iid: Some(iid), ep } => format!("&i={iid}&e={ep}"),
-            Binding::Install { iid: None, ep } => format!("&e={ep}"),
+            Binding::Install { iid: Some(iid), ep } | Binding::Den { iid: Some(iid), ep } => {
+                format!("&i={iid}&e={ep}")
+            }
+            Binding::Install { iid: None, ep } | Binding::Den { iid: None, ep } => format!("&e={ep}"),
         }
     }
 }
@@ -77,11 +92,12 @@ impl Binding<'_> {
 /// What a play URL's tag covers: a version prefix, the id, then the binding, NUL-separated. An absent
 /// install id is empty and an unbound link has an empty epoch, which no install's epoch can be, so
 /// each binding has exactly one message. The pre-binding format was the bare id, which never starts
-/// with `v2\0`.
+/// with `v2\0`; a Den addon link starts `den\0`, which neither an id nor a `v2` message can.
 pub fn message(vid: &str, binding: Binding) -> String {
     match binding {
         Binding::Unbound => format!("v2\0{vid}\0\0"),
         Binding::Install { iid, ep } => format!("v2\0{vid}\0{}\0{ep}", iid.unwrap_or("")),
+        Binding::Den { iid, ep } => format!("den\0{vid}\0{}\0{ep}", iid.unwrap_or("")),
     }
 }
 
@@ -222,12 +238,15 @@ mod tests {
             message(vid, Binding::Install { iid: Some(iid), ep: 1 }),
             message(vid, Binding::Install { iid: Some("_-_-_-_-_-_-_-_-_-_-_w"), ep: 0 }),
             message("dQw4w9WgXcQ", Binding::Install { iid: Some(iid), ep: 0 }),
+            message(vid, Binding::Den { iid: None, ep: 0 }),
+            message(vid, Binding::Den { iid: Some(iid), ep: 0 }),
         ];
         let tags: std::collections::HashSet<String> = msgs.iter().map(|m| tag("s3cret", m)).collect();
         assert_eq!(tags.len(), msgs.len(), "two bindings signed alike");
         assert_eq!(Binding::Unbound.query(), "");
         assert_eq!(Binding::Install { iid: None, ep: 3 }.query(), "&e=3");
         assert_eq!(Binding::Install { iid: Some(iid), ep: 3 }.query(), format!("&i={iid}&e=3"));
+        assert_eq!(Binding::Den { iid: Some(iid), ep: 3 }.query(), format!("&i={iid}&e=3"));
     }
 
     /// A secret longer than BLAKE2b's 64-byte key limit must be usable, not a startup error.

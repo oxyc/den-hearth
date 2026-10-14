@@ -128,8 +128,15 @@ impl AppState {
     /// config, including the `/subtitle` and `/translate` URLs handed out before it. A refused
     /// install gets the same answer as an undecodable segment; only the log line tells them apart,
     /// once a minute per reason, because a revoked install keeps polling.
-    pub fn decode_config(&self, blob: &str) -> Option<UserConfig> {
-        let why = match userconfig::decode_checked(self.config_keyring.as_ref(), &self.cfg.revocation, blob) {
+    ///
+    /// `den`: the request came under the combined Den addon (hearth's `/den`), so `blob` is its config, opened
+    /// with its keys down to the Subtitles member and admitted by its revocation, never Subtitles' own.
+    pub fn decode_config(&self, den: Option<&den_seal::Addon>, blob: &str) -> Option<UserConfig> {
+        let decoded = match den {
+            Some(den) => userconfig::decode_den(den, blob),
+            None => userconfig::decode_checked(self.config_keyring.as_ref(), &self.cfg.revocation, blob),
+        };
+        let why = match decoded {
             Ok(cfg) => return Some(cfg),
             Err(why) => why,
         };
@@ -144,6 +151,12 @@ impl AppState {
             eprintln!("bad_config: {why}");
         }
         None
+    }
+
+    /// Whether install configs on these terms are refused outright: the key that opens them is set but
+    /// malformed (Subtitles' own, or the Den addon's for a request under `/den`).
+    pub fn key_invalid(&self, den: Option<&den_seal::Addon>) -> bool {
+        den.map_or(self.config_key_invalid, |den| den.key_invalid)
     }
 
     /// Record a successful OpenSubtitles search. Logs, and returns true, only when it recovers

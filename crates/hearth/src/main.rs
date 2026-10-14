@@ -4,6 +4,7 @@
 //!   /reel/...   → den-reel      (`/reel/play/<id>.mp4` is Reel's `/play/<id>.mp4`)
 //!   /subs/...   → den-subtitles (`/subs/<config>/manifest.json` is Subtitles' `/<config>/manifest.json`)
 //!   /remux/...  → den-remux     (unchanged: Remux already serves everything under `/remux`)
+//!   /den/...    → the combined Den addon: one manifest and config for Scout, Subtitles and Reel (`den`)
 //!   /health     → all four, each as its own service reports it
 //!
 //! Each service also has a listener of its own on the port its old container used (`ports`), where every
@@ -14,6 +15,7 @@
 
 mod admit;
 mod alloc;
+mod den;
 mod env;
 mod media;
 mod ports;
@@ -54,6 +56,8 @@ struct Hearth {
     subs: Arc<den_subtitles::AppState>,
     remux: Arc<den_remux::AppState>,
     scout: scout::Scout,
+    /// The combined Den addon's terms (`/den`).
+    den: den::Den,
     /// One budget for the whole node: the main port and every service's own listener draw on it, so the
     /// bound on memory does not grow with the number of ports.
     admission: Arc<admit::Admission>,
@@ -75,6 +79,7 @@ impl Hearth {
         subs: Arc<den_subtitles::AppState>,
         remux: Arc<den_remux::AppState>,
         scout: scout::Scout,
+        den: den::Den,
         limits: Limits,
         metrics_token: Option<String>,
     ) -> Arc<Self> {
@@ -83,6 +88,7 @@ impl Hearth {
             subs,
             remux,
             scout,
+            den,
             admission: admit::Admission::new(limits.admission),
             media: media::MediaGate::new(limits.media),
             metrics_token,
@@ -188,7 +194,38 @@ where
             Some(req) => den_remux::handle_request(hearth.remux.clone(), req).await,
             None => bad_path(),
         },
+        Target::Den(route) => den_dispatch(hearth, route, req).await,
         Target::NotFound => json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"})),
+    }
+}
+
+/// A request under `/den`: a resource goes to its service, with the path it routes and, for Subtitles and Reel,
+/// the addon's terms in its extensions (Scout has a handler of its own on them); the rest hearth answers.
+async fn den_dispatch<B>(hearth: &Arc<Hearth>, route: den::Route, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let with_terms = |req: Request<B>, path: &str, terms: &Arc<den_seal::Addon>| {
+        with_path(req, path).map(|mut req| {
+            req.extensions_mut().insert(terms.clone());
+            req
+        })
+    };
+    match route {
+        den::Route::Scout(path) => match with_path(req, &path) {
+            Some(req) => hearth.scout.serve_den(req).await,
+            None => bad_path(),
+        },
+        den::Route::Subs(path) => match with_terms(req, &path, &hearth.den.subs) {
+            Some(req) => den_subtitles::handle_request(hearth.subs.clone(), req).await,
+            None => bad_path(),
+        },
+        den::Route::Reel(path) => match with_terms(req, &path, &hearth.den.reel) {
+            Some(req) => den_reel::handle_request(hearth.reel.clone(), req).await,
+            None => bad_path(),
+        },
+        own => hearth.den.answer(own, req.method(), req.headers()),
     }
 }
 
@@ -408,6 +445,7 @@ struct Configs {
     /// Scout behind `/scout` and on its own listener: the same environment but for the public origin.
     scout_mount: den_scout::deps::Settings,
     scout_own: den_scout::deps::Settings,
+    den: den::Den,
     metrics_token: Option<String>,
 }
 
@@ -423,7 +461,8 @@ async fn run(c: Configs) -> std::io::Result<()> {
         den_reel::init(c.reel),
         den_subtitles::init(c.subs),
         den_remux::init(c.remux).await,
-        scout::Scout::new(c.scout_mount, c.scout_own),
+        scout::Scout::new(c.scout_mount, c.scout_own, &c.den.scout),
+        c.den,
         Limits::default(),
         c.metrics_token,
     );
@@ -453,6 +492,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
     );
     eprintln!("{}", alloc::startup_line());
     eprintln!("scout: {}", hearth.scout.summary());
+    eprintln!("{}", hearth.den.summary());
     // Each service's own startup line: operators read `transcode=` and the like from them.
     eprintln!("{}", den_reel::startup_line(&hearth.reel));
     eprintln!("{}", den_remux::startup_line(&hearth.remux));
@@ -552,6 +592,13 @@ fn main() {
         scout_own.port = format!("{port}/scout");
     }
 
+    // Scout's key as Scout reads it: the Den addon's ring is derived from it when it has none of its own.
+    let den = den::Den::from_env(
+        |name| std::env::var(name).unwrap_or_default(),
+        &scout_own.config_key,
+        &scout_own.config_keys_prev,
+    );
+
     let metrics_token = std::env::var("HEARTH_METRICS_TOKEN")
         .or_else(|_| std::env::var("METRICS_TOKEN"))
         .ok()
@@ -562,7 +609,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let configs = Configs { port, own, reel, subs, remux, scout_mount, scout_own, metrics_token };
+    let configs = Configs { port, own, reel, subs, remux, scout_mount, scout_own, den, metrics_token };
     if let Err(e) = rt.block_on(run(configs)) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
@@ -573,7 +620,13 @@ fn main() {
 mod tests {
     use super::*;
 
+    mod den_addon;
+
     fn hearth_with(limits: Limits, token: Option<&str>) -> Arc<Hearth> {
+        hearth_den(limits, token, den::Den::new(None, false, Default::default(), None, "none"))
+    }
+
+    fn hearth_den(limits: Limits, token: Option<&str>, den: den::Den) -> Arc<Hearth> {
         // No disk tier: a test must not write the temp dir.
         let settings = || {
             let mut s = den_scout::deps::settings_from_env(|_| String::new());
@@ -584,7 +637,8 @@ mod tests {
             den_reel::AppState::new(den_reel::Config::from_env()),
             den_subtitles::AppState::new(den_subtitles::Config::from_env()),
             den_remux::AppState::new(den_remux::Config::from_env()),
-            scout::Scout::new(settings(), settings()),
+            scout::Scout::new(settings(), settings(), &den.scout),
+            den,
             limits,
             token.map(str::to_string),
         )

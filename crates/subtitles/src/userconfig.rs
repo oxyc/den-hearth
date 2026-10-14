@@ -119,15 +119,31 @@ pub fn decode_checked(
     Ok(cfg)
 }
 
+/// `decode_checked` for a combined Den addon config: its Subtitles member, opened with the addon's keys and
+/// admitted by the addon's revocation.
+pub fn decode_den(den: &den_seal::Addon, blob: &str) -> Result<UserConfig, Rejected> {
+    let cfg = parse(den.open(blob)?)?;
+    den.revocation.check(cfg.iid.as_deref(), cfg.ep)?;
+    Ok(cfg)
+}
+
 /// Decode the config path segment into a validated config. The decoded bytes are either a SEALED blob
 /// (decrypt with the keyring) or a plaintext JSON config. Sealed with no keyring, or a decrypt failure,
 /// fails CLOSED — never a partial/empty config. Plaintext decodes only with no keyring: with one, every
 /// install `/configure` issues is sealed, and `/config-key` is public, so a plaintext config is one anyone
 /// could have minted (`den_seal::open_segment`).
 fn decode_segment(keyring: Option<&Keyring>, blob: &str) -> Result<UserConfig, Rejected> {
-    let opened = open_segment(keyring, blob)?;
+    parse(open_segment(keyring, blob)?)
+}
+
+fn parse(opened: den_seal::Opened) -> Result<UserConfig, Rejected> {
     let raw: RawConfig = serde_json::from_slice(&opened.json).map_err(|_| Rejected::Undecodable)?;
     validate(raw).ok_or(Rejected::Undecodable)
+}
+
+/// Whether `json` is a config Subtitles would accept, for the combined Den addon to check its member with.
+pub fn is_valid(json: &[u8]) -> bool {
+    parse(den_seal::Opened { json: json.to_vec(), sealed: false }).is_ok()
 }
 
 /// `decode_segment` for the tests that only want the config.

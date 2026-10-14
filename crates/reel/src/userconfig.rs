@@ -52,9 +52,62 @@ pub fn decode_checked(
 /// install `/configure` issues is sealed, and `/config-key` is public, so a plaintext config is one anyone
 /// could have minted (`den_seal::open_segment`).
 fn decode_segment(keyring: Option<&Keyring>, blob: &str) -> Result<UserConfig, Rejected> {
-    let opened = open_segment(keyring, blob)?;
+    parse(open_segment(keyring, blob)?)
+}
+
+fn parse(opened: den_seal::Opened) -> Result<UserConfig, Rejected> {
     let raw: RawConfig = serde_json::from_slice(&opened.json).map_err(|_| Rejected::Undecodable)?;
     validate(raw).ok_or(Rejected::Undecodable)
+}
+
+/// Whether `json` is a config Reel would accept, for the combined Den addon to check its Reel member with.
+pub fn is_valid(json: &[u8]) -> bool {
+    parse(den_seal::Opened { json: json.to_vec(), sealed: false }).is_ok()
+}
+
+/// The terms a request's config and its install-bound links are read on: Reel's own, or the combined Den
+/// addon's when hearth routed the request under `/den` (`den_seal::Addon`). Each refuses the other's configs:
+/// the keys differ, and a combined config is read through its Reel member.
+#[derive(Clone, Copy)]
+pub(crate) struct Terms<'a> {
+    pub keyring: Option<&'a Keyring>,
+    pub key_invalid: bool,
+    pub revocation: &'a Revocation,
+    pub addon: Option<&'a den_seal::Addon>,
+}
+
+impl<'a> Terms<'a> {
+    pub fn of(state: &'a crate::AppState, addon: Option<&'a den_seal::Addon>) -> Terms<'a> {
+        match addon {
+            Some(addon) => Terms {
+                keyring: addon.keyring.as_ref(),
+                key_invalid: addon.key_invalid,
+                revocation: &addon.revocation,
+                addon: Some(addon),
+            },
+            None => Terms {
+                keyring: state.config_keyring.as_ref(),
+                key_invalid: state.config_key_invalid,
+                revocation: &state.cfg.revocation,
+                addon: None,
+            },
+        }
+    }
+
+    /// How a link minted on these terms for the install `iid`/`ep` is bound.
+    pub fn binding<'b>(&self, iid: Option<&'b str>, ep: u64) -> crate::sign::Binding<'b> {
+        crate::sign::Binding::install(iid, ep, self.addon.is_some())
+    }
+
+    /// `decode_checked` on these terms.
+    pub fn decode_checked(&self, blob: &str) -> Result<UserConfig, Rejected> {
+        let Some(addon) = self.addon else {
+            return decode_checked(self.keyring, self.revocation, blob);
+        };
+        let cfg = parse(addon.open(blob)?)?;
+        self.revocation.check(cfg.iid.as_deref(), cfg.ep)?;
+        Ok(cfg)
+    }
 }
 
 fn validate(raw: RawConfig) -> Option<UserConfig> {
