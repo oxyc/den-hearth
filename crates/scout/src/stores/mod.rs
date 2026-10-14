@@ -29,55 +29,86 @@ use crate::util::go_to_lower;
 /// Go `resolveCacheTTL` (stores.go:449): how long a remembered torrent id, file list or held mark lives.
 pub(crate) const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Go `maxStoreBytes`: caps a debrid API response body.
+/// Go `maxStoreBytes` caps a debrid API response body — these JSON payloads are small; the limit stops a
+/// hostile/misbehaving store from OOMing the container (mirrors maxScrapeBytes for indexers).
 pub const MAX_STORE_BYTES: usize = 4 << 20;
-/// Go `maxListingBytes`: the one exception, the account listing is the whole account.
+/// Go `maxListingBytes` is the ONE exception: the account listing is the whole account, and 4 MiB truncates a
+/// real large one (~13 MB at 2,000 torrents), which reads back as "this account holds nothing" and costs a
+/// duplicate add. It can be this large safely because the listing decode streams and keeps only hash→id — see
+/// fetchAccountListing. Measured at the cap rather than argued, since that is what the size rests on: a 60 MiB
+/// listing allocates 2.7 MiB in total and peaks 20 MiB above baseline, against 128.9 MiB for the buffering
+/// decode this replaced. Every other store read keeps the small cap.
 pub const MAX_LISTING_BYTES: usize = 64 << 20;
 
-/// FROZEN. Go `ResolveTarget`: an infohash plus either the exact file or the series episode to pick from
-/// a pack.
+// Debrid stores (ported from src/stores/*). Two ops: CacheCheck (which hashes are cached?) and Resolve
+// (infohash → playable https link). Scout resolves server-side; the token never leaves the server.
+
+/// FROZEN. Go `ResolveTarget`: an infohash + either the exact file, or the series episode to pick from a pack.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolveTarget {
     pub info_hash: String,
     pub file_idx: Option<i64>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
-    /// Forbids queueing the torrent: resolve it from what the account already has, or fail.
+    /// NoAdd forbids queueing the torrent: resolve it from what the account already has, or fail.
+    ///
+    /// A background caller cannot promise this by choosing carefully, because whether a Resolve adds is
+    /// decided deep inside each store. The probe path DID choose carefully — it only resolves releases a
+    /// cache check reported as held — and still POSTed createtorrent, because TorBox's checkcached reports
+    /// what TORBOX has, not what this ACCOUNT has. "Held" was never the same as "already added". Only the
+    /// store can enforce this, so the caller states the requirement and the store obeys it.
     pub no_add: bool,
-    /// An add nobody is waiting on (`/play?prefetch=1`); the budget keeps its last few adds from it.
+    /// Prefetch marks an add nobody is waiting on (/play?prefetch=1: the binge read-ahead, a queued
+    /// download). The budget keeps its last few adds from it for a viewer pressing Play — see
+    /// defaultPlayReserve. Unset is a viewer waiting, which is what every older client sends.
     pub prefetch: bool,
-    /// The indexer's size for the release, 0 when unknown. Stores do not read it; the link check does.
+    /// ReleaseSize is the indexer's size for the release, 0 when unknown. Stores do not read it; the link
+    /// check does, for a movie whose file size no store knows.
     pub release_size: i64,
-    /// Asks TorBox to list the torrent's files even for a movie.
+    /// ListFiles asks TorBox to list the torrent's files even for a movie, so the indexer's fileIdx — a
+    /// position in the torrent — is mapped through the list rather than sent raw as TorBox's file id. /play
+    /// sets it only after a movie link served a file far smaller than the release. Real-Debrid and
+    /// Premiumize always pick from a list already and ignore it.
     pub list_files: bool,
-    /// Diagnostic only; a store never reads them.
+    /// Title and IMDb are carried from the PlayTarget that named this resolve, diagnostic only — a store
+    /// never reads them. They are what lets a play/probe/cancel decision line (decisionlog.go) name the
+    /// release it is about instead of keying on shortHash(InfoHash) alone.
     pub title: String,
     pub imdb: String,
 }
 
-/// FROZEN. Go `statusAnswer`: three values, because "not being fetched" and "could not find out" are
-/// different facts and only the first may lead to an add.
+/// FROZEN. Go `statusAnswer`: three values, because "it is not being fetched" and "I could not find out" are
+/// different facts and only the first may lead to an add — collapsing them into a bool is what let a
+/// throttled account's 503 read as a definitive no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusAnswer {
-    /// The store answered, and it is not fetching this release. Includes a store with no status API.
+    /// statusNo — the store answered, and it is not fetching this release. Includes a store with no status
+    /// API at all (Real-Debrid, Premiumize): they can never say more, so treating them as "unknown" would
+    /// escalate on every request and never learn anything.
     No,
     Downloading,
     Unknown,
 }
 
-/// FROZEN. Go `StoreStatus`: how far along a queued release is.
+/// FROZEN. Go `StoreStatus` — how far along a queued release is. Progress is 0…1; ETASeconds is nil unless the
+/// store reports a real one (a made-up countdown is worse than none).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoreStatus {
     /// 0..=1
     pub progress: f64,
     /// None unless the store reports a real one.
     pub eta_seconds: Option<i64>,
+    /// Bytes per second the service reports for this fetch. A percentage that moves slowly and one that has
+    /// stopped look identical for minutes; the rate says which immediately, and zero says "stalled" while
+    /// there is still time to pick something else.
     pub bytes_per_second: Option<i64>,
-    /// One of the `FETCH_*` states; empty means the service named none, answered as "downloading".
+    /// One of the `FETCH_*` states, mapped from the service's own vocabulary; empty means the service named
+    /// none, and is answered as "downloading" — the only value clients before it knew.
     pub state: String,
+    /// The swarm as the service reports it: zero seeds is what tells a dead swarm from a slow one.
     pub seeds: Option<i64>,
     pub peers: Option<i64>,
-    /// The store that answered, set by the pool.
+    /// Service is the store that answered, set by the pool; the 503 body names a store the same way.
     pub service: Option<DebridService>,
 }
 
@@ -88,7 +119,10 @@ pub const FETCH_DOWNLOADING: &str = "downloading";
 pub const FETCH_STALLED: &str = "stalled";
 pub const FETCH_FAILED: &str = "failed";
 
-/// FROZEN. Go `CancelOutcome`: what a cancel (or reannounce) attempt found.
+/// FROZEN. Go `CancelOutcome` is what a cancel (or reannounce) attempt found. Done is true for a successful
+/// delete or reannounce; otherwise Reason says why nothing was done — "not_queued" (nothing of ours to cancel),
+/// "finished" (it already completed, so it is kept), or "not_ours" (the account held this before scout ever
+/// asked for it). Status carries the current wait, for a reannounce's 202 answer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CancelOutcome {
     pub done: bool,
@@ -112,17 +146,35 @@ impl fmt::Display for DeadLinkError {
 
 /// The reasons of Go's sentinel `DeadLinkError` values (`errWouldAdd`, `errTorrentGone`, `errCheckFailed`),
 /// which callers compare by identity in Go and by reason here.
+///
+/// errWouldAdd — a NoAdd target could only be resolved by queueing the torrent, so it was not resolved.
 pub const ERR_WOULD_ADD: &str = "not held by this account (add not permitted)";
+/// errTorrentGone — the service answered, and said it has no such torrent. The ONLY evidence that a
+/// remembered torrent id is stale.
+///
+/// It has to be positive evidence, because the alternative was measured: treating any failure of the held path
+/// as "the torrent is gone" meant a cancelled poll erased a perfectly good id and re-bought the torrent — ten
+/// polls of one already-downloaded release cost ten adds against a sixty-an-hour ceiling. A cancellation, a
+/// throttle, a timeout, and a pack that lacks the requested episode say nothing at all about whether the
+/// account still holds the file.
 pub const ERR_TORRENT_GONE: &str = "torbox no longer has this torrent";
+/// errCheckFailed marks a cache check that could not reach the store at all.
 pub const ERR_CHECK_FAILED: &str = "cache check failed";
 
-/// FROZEN. Go `StoreUnavailableError`: the SERVICE refused us, which says nothing about the release.
+/// FROZEN. Go `StoreUnavailableError` — the SERVICE refused us, which says nothing about the release. A rate
+/// limit or a 5xx answered as 404 told the client "this release is dead" and it fell through every remaining
+/// source getting the same answer, then sat on a wait for a download nobody had started. Distinct so the route
+/// can answer 503 and the app can say the debrid is the problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreUnavailableError {
     pub service: DebridService,
     pub reason: String,
-    /// The HTTP status the service answered with, when there was one (0 when none). Carried rather than
-    /// parsed back out of `reason`.
+    /// Status — the HTTP status the service answered with, when there was one (0 when none). Carried rather
+    /// than parsed back out of Reason: that string embeds the service's own words, including up to 200 bytes
+    /// of a non-JSON body, so matching "401"/"403" in it classified a rate-limit detail ("retry in 403 ms")
+    /// and a Cloudflare Ray ID as a rejected key and silenced a healthy account. Deriving a fact from prose
+    /// when the fact itself is available at the call site is the same mistake isPermanentFailure was deleted
+    /// for.
     pub status: u16,
 }
 
@@ -141,9 +193,16 @@ pub enum StoreError {
     /// Go `errScoutSide` wrapping a `StoreUnavailableError`: a refusal scout made itself (its own add
     /// allowance), not the service. `recordRefusal` never remembers it.
     ScoutSide(StoreUnavailableError),
-    /// Go `errAddInFlight`: an add for this release is already out and unanswered.
+    /// Go `errAddInFlight` — an add for this release is already out and unanswered, so the release IS being
+    /// fetched. Distinct from the hourly budget: this is per hash and per service, says nothing about the
+    /// account, and its honest answer is "coming", not "refused". Reported as a 503 naming the store, the tvOS
+    /// client told the viewer their debrid was refusing and stopped trying other sources — for a release scout
+    /// had itself queued moments earlier.
     AddInFlight,
-    /// Go `errAddQueued`: TorBox parked the add behind the account's slot limit.
+    /// Go `errAddQueued` — createtorrent answered with a queued_id rather than a torrent_id: TorBox accepted
+    /// the add but parked it behind the account's slot limit (`queued` setting on). The release IS being
+    /// fetched, eventually, same as errAddInFlight — the two are told apart only so callers can log which
+    /// happened. The route maps this to the same 202 "coming" a client already knows how to wait on.
     AddQueued,
     /// The caller's deadline or cancellation.
     Cancelled,
@@ -191,43 +250,62 @@ pub trait Store: Send + Sync {
     /// Infohash to a playable https link.
     async fn resolve(&self, t: &ResolveTarget) -> Result<String, StoreError>;
 
-    /// A release the store has been ASKED for but could not deliver yet: downloading, not dead. `None`
-    /// when this store knows nothing about the target.
+    /// Status reports on a release the store has been ASKED for but could not deliver yet: it is
+    /// downloading, not dead. Without this the two are the same 404 to the client, which then blacklists a
+    /// perfectly good release.
+    ///
+    /// `None` when this store knows nothing about the target — which deliberately conflates "it is not being
+    /// fetched" with "I could not find out". A store that CAN tell those apart implements `status_answer` as
+    /// well, and the pool prefers that; the two stores with no status API at all cannot, and for them `None`
+    /// really is all there is to say.
     async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus>;
 
-    /// Go `statusAnswerer.StatusAnswer`, the three-valued half of `status`. `None` when the store has no
-    /// such method, in which case the pool uses `status`.
+    /// Go `statusAnswerer.StatusAnswer`, the optional, three-valued half of `status`. `None` when the store
+    /// has no such method, in which case the pool uses `status`.
+    ///
+    /// Only TorBox has a status API, so only TorBox can be UNCERTAIN: a throttled 503, an unreadable account
+    /// listing, a body that will not decode. As a plain bool every one of those read as a definitive "nobody
+    /// is fetching it", so /play queued a duplicate — more load on an account already refusing, which is the
+    /// one failure mode that feeds itself. Real-Debrid and Premiumize answer false always and mean it, so
+    /// leaving them on the bool keeps "unknown" meaning something a caller can act on.
     async fn status_answer(&self, t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
         None
     }
 
-    /// Go `storeCanceller.Cancel`. `None` when the store cannot cancel (Real-Debrid, Premiumize).
+    /// Go `storeCanceller.Cancel`: the optional half of Store that can cancel (or reannounce) a release it is
+    /// fetching. Only TorBox implements it — Real-Debrid's delete exists but is unbuilt until someone uses RD
+    /// (see den#204), and Premiumize has no equivalent at all — so the route answers 501 "unsupported" for
+    /// either. `None` when the store cannot cancel.
     async fn cancel(&self, info_hash: &str, reannounce: bool) -> Option<Result<CancelOutcome, StoreError>> {
         None
     }
 
-    /// Go `refusalReporter.RecentRefusal`: the reason this store was turned away for the hash a moment
-    /// ago.
+    /// Go `refusalReporter.RecentRefusal` — a store that can say it was recently refused for a hash, with the
+    /// reason. Optional, because only a store with a cache can remember one; a store that doesn't implement it
+    /// simply never reports a refusal.
     fn recent_refusal(&self, info_hash: &str) -> Option<String> {
         None
     }
 
-    /// Go `addInFlightReporter.AddInFlight`.
+    /// Go `addInFlightReporter.AddInFlight` — a store that can say whether an add of OURS is out and
+    /// unanswered for a hash.
     fn add_in_flight(&self, info_hash: &str) -> Option<bool> {
         None
     }
 
-    /// Go `heldTorrentReporter.HoldsTorrent`.
+    /// Go `heldTorrentReporter.HoldsTorrent` — a store that already has an id for this release, so it can be
+    /// resolved without buying anything. A pure cache read in every implementation.
     fn holds_torrent(&self, t: &ResolveTarget) -> Option<bool> {
         None
     }
 
-    /// Go `scoutBudgetReporter.ScoutBudgetSpent`.
+    /// Go `scoutBudgetReporter.ScoutBudgetSpent` — a store that can say whether SCOUT's own hourly allowance
+    /// for its account is gone, without asking the service anything.
     fn scout_budget_spent(&self) -> Option<bool> {
         None
     }
 
-    /// Go `accountRefusalReporter.AccountRefused`.
+    /// Go `accountRefusalReporter.AccountRefused` — a store whose ACCOUNT the service rejected a moment ago.
     fn account_refused(&self) -> Option<String> {
         None
     }
@@ -277,7 +355,11 @@ impl CacheTruth {
     }
 }
 
-/// Go `torboxFetchState`: TorBox's `download_state` onto the stable `FETCH_*` set.
+/// Go `torboxFetchState` maps TorBox's `download_state` — documented as "downloading", "stalled (no seeds)",
+/// "uploading (no peers)", "metaDL", "paused", "completed", "cached", "failed", "failed (processing)",
+/// "expired", "missing", "incomplete" (gave up after two days of too few seeds) — onto the stable set. Matched
+/// on lowercase prefixes because the documented spellings carry parenthesised qualifiers and casing varies.
+/// Anything unrecognised is "downloading", which is what every wait was called before this existed.
 pub fn torbox_fetch_state(raw: &str) -> &'static str {
     let s = go_to_lower(raw.trim());
     if s.starts_with("failed")
@@ -402,8 +484,10 @@ pub(crate) fn is_cancellation_error(err: &(dyn std::error::Error + 'static)) -> 
     })
 }
 
-/// Go's `readStoreError` over a response: the service's own explanation of a failure, as " (detail)".
-/// Empty when the body cannot be read.
+/// Go `readStoreError` pulls the service's own explanation out of a failed response, as " (detail)" ready to
+/// append to a message. TorBox answers `{"error":"ACTIVE_LIMIT","detail":"..."}`; anything unparseable falls
+/// back to a clipped snippet of the raw body, because a truncated reason still beats none. Empty when the body
+/// cannot be read.
 pub(crate) async fn read_store_error(resp: &mut reqwest::Response) -> String {
     match read_limited(resp, 2048).await {
         Ok(raw) => store_error_text(&raw),
@@ -472,9 +556,11 @@ fn go_v(v: &serde_json::Value) -> String {
     }
 }
 
-/// Go `storeErrorText` reads the service's own explanation out of a failed body, as " (detail)" ready to
-/// append to a message. TorBox answers `{"error":"ACTIVE_LIMIT","detail":"..."}`; anything unparseable
-/// falls back to a clipped snippet of the raw body, because a truncated reason still beats none.
+/// Go `storeErrorText` is `read_store_error` over bytes already in hand, for a caller that had to read the body
+/// once for its own sake — RD's add answers with the torrent id and the reason for a failure in the same place,
+/// and decoding straight off the reader left nothing behind to explain a failure with. TorBox answers
+/// `{"error":"ACTIVE_LIMIT","detail":"..."}`; anything unparseable falls back to a clipped snippet of the raw
+/// body, because a truncated reason still beats none.
 pub(crate) fn store_error_text(raw: &[u8]) -> String {
     if raw.is_empty() {
         return String::new();

@@ -34,7 +34,8 @@ pub(crate) const PENDING_GIVE_UP: Duration = Duration::from_secs(10 * 60);
 pub(crate) const ADD_GIVE_UP: Duration = Duration::from_secs(10 * 60);
 /// Go `unknownOutcomeTTL` (stores.go:1005).
 pub(crate) const UNKNOWN_OUTCOME_TTL: Duration = Duration::from_secs(30 * 60);
-/// Go `refusalBackoff` (stores.go:1557): how long a refusal holds a store off.
+/// Go `refusalBackoff` (stores.go:1557): how long to stop asking after the service refuses. Long enough that a
+/// poll loop can't sustain a throttle, short enough that a passing 500 doesn't cost the viewer a real wait.
 pub(crate) const REFUSAL_BACKOFF: Duration = Duration::from_secs(60);
 /// Go `torrentMissTTL` (stores.go:800): how long "the account has no torrent for this hash" is remembered.
 pub(crate) const TORRENT_MISS_TTL: Duration = Duration::from_secs(15);

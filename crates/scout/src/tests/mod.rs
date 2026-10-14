@@ -44,6 +44,7 @@ mod shape;
 mod sources;
 mod stores;
 mod stores_failure;
+mod stores_fidelity;
 mod stores_pick;
 mod stores_preference;
 mod ticket;
