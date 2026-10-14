@@ -1,6 +1,6 @@
-# den-hearth — Reel, Subtitles and Remux in one binary, one image.
+# den-hearth — Scout, Reel, Subtitles and Remux in one binary, one image.
 #
-# One Rust binary (crates/hearth) and every tool the three services shell out to:
+# One Rust binary (crates/hearth) and every tool the services shell out to (Scout shells out to none):
 #   Reel       yt-dlp (+ its deno JS runtime, + a resident python resolver), MP4Box (clap box), ffmpeg
 #   Subtitles  alass, ffmpeg
 #   Remux      a minimal, source-built ffmpeg with VAAPI, and Intel's media driver for a GPU transcode
@@ -229,14 +229,18 @@ COPY --from=release-metadata /den-version /den-version
 # under $HOME. /cache is created owned by it with one directory per service, so a fresh volume mounted
 # at /cache is writable (the services create their own directory on first use).
 RUN useradd --system --uid 65532 --user-group --create-home --home-dir /home/nonroot nonroot \
-    && mkdir -p /cache/reel /cache/subs /cache/remux && chown -R nonroot:nonroot /cache
+    && mkdir -p /cache/scout /cache/reel /cache/subs /cache/remux && chown -R nonroot:nonroot /cache
 
 WORKDIR /app
-# hearth's own PORT default (8090) applies. Everything below is per-service (see README, Configuration):
+# hearth's own PORT default (8090) applies, and each service also listens on the port its old container used
+# (HEARTH_<SERVICE>_PORT, see README, Listeners). Everything below is per-service (see README, Configuration):
 # the services share names such as CACHE_DIR and FFMPEG_PATH, so each gets its own prefixed copy.
+# SCOUT_CACHE_DIR is Scout's own directory, never the Go den-scout's: the two disk formats are not proven
+# compatible, so the Go container (kept stopped as the rollback) keeps its own cache.
 # LIBVA_DRIVER_NAME: the UHD 630's driver, named, so libva does not probe for others; only Remux's
 # ffmpeg ever opens a VAAPI device.
-ENV REEL_CACHE_DIR=/cache/reel \
+ENV SCOUT_CACHE_DIR=/cache/scout \
+    REEL_CACHE_DIR=/cache/reel \
     REEL_FFMPEG_PATH=/usr/bin/ffmpeg \
     REEL_YTDLP_PATH=/usr/local/bin/yt-dlp \
     REEL_YTDLP_WORKER=/app/resolve.py \
@@ -248,7 +252,9 @@ ENV REEL_CACHE_DIR=/cache/reel \
     REMUX_FFMPEG_PATH=/usr/local/bin/ffmpeg-remux \
     LIBVA_DRIVER_NAME=iHD
 VOLUME ["/cache"]
-EXPOSE 8090
+# 8090 is the combined listener (/scout, /reel, /subs, /remux); the others are the old containers' ports:
+# Scout 8080, Reel 8092, Subtitles 8093, Remux 8095.
+EXPOSE 8090 8080 8092 8093 8095
 
 # /health answers 200 whenever the process is up (degraded or not), and runs each service's own cheap
 # health check. The old per-service images carried no HEALTHCHECK because a periodic probe keeps an idle box

@@ -1,0 +1,121 @@
+//! Scout as a hearth component: the outbound client, the cache, the two handlers and the adapter from
+//! hyper's request to Scout's.
+//!
+//! Scout is a library (`handler::new_handler`) with no server of its own. What Go's `cmd/den-scout/main.go`
+//! did around it is done here: a pooled client that refuses to replay a body across a redirect, a tiered
+//! cache with an hourly sweep, a bounded request read.
+//!
+//! There are TWO handlers over one client and one cache. They differ only in the public origin they put in
+//! absolute URLs: the one behind `/scout` keeps that prefix (`HEARTH_PUBLIC_BASE_URL/scout`), the one on
+//! Scout's own listener uses `SCOUT_PUBLIC_BASE_URL` as-is, which is what the old container produced.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{Request, Response, StatusCode};
+
+use den_scout::cache::Cache;
+use den_scout::deps::{build_deps, refuse_redirect_replay, startup_summary, Settings};
+use den_scout::diskcache::{TieredCache, SWEEP_INTERVAL};
+use den_scout::handler::{new_handler, Handler};
+
+use crate::Body;
+
+/// Go's `ReadTimeout`: the whole request, body included.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// The largest request body read. The one route that reads a body (`/validate`) looks at 4 KiB of it.
+const MAX_BODY: usize = 64 << 10;
+
+pub struct Scout {
+    mount: Handler,
+    legacy: Handler,
+    cache: Arc<TieredCache>,
+    summary: String,
+}
+
+/// Go's pooled keep-alive client (cmd/den-scout/main.go). A redirect is refused where it would hand a
+/// credential to another host (see `refuse_redirect_replay`).
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // reqwest does not say which method a redirected request carries, so every hop reads as a GET:
+            // the host rule (a debrid API redirecting elsewhere) holds, the method rule cannot.
+            let via: Vec<_> =
+                attempt.previous().iter().map(|url| (reqwest::Method::GET, url.clone())).collect();
+            if refuse_redirect_replay(&reqwest::Method::GET, attempt.url(), &via) {
+                attempt.stop()
+            } else if attempt.previous().len() >= 10 {
+                attempt.error("stopped after 10 redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .expect("scout http client")
+}
+
+impl Scout {
+    /// `mount` configures the handler behind `/scout`, `legacy` the one on Scout's own port. They must
+    /// agree on everything but `public_url`. Call from inside the runtime.
+    pub fn new(mount: Settings, legacy: Settings) -> Scout {
+        let cache = Arc::new(TieredCache::new(legacy.cache_bytes, std::path::Path::new(&legacy.cache_dir)));
+        let client = client();
+        let handler = |settings: &Settings| {
+            new_handler(build_deps(settings, client.clone(), cache.clone() as Arc<dyn Cache>))
+        };
+        let summary = startup_summary(&legacy, cache.persistent().unwrap_or(false));
+        Scout { mount: handler(&mount), legacy: handler(&legacy), cache, summary }
+    }
+
+    /// Scout's own startup line, as Go printed it.
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    /// The hourly sweep that gives the disk tier a ceiling. Supervised: a panic in it is said, not silent,
+    /// and does not touch a request.
+    pub fn start_sweep(&self) {
+        let cache = self.cache.clone();
+        let task = tokio::spawn(async move { cache.sweep_every(SWEEP_INTERVAL).await });
+        tokio::spawn(async move {
+            if let Err(e) = task.await {
+                if e.is_panic() {
+                    eprintln!("scout: cache sweep panicked ({e}); the disk tier is no longer swept");
+                }
+            }
+        });
+    }
+
+    /// Serve one request already routed to Scout (its path is final). `own_listener` picks the handler
+    /// whose public origin has no prefix.
+    pub async fn serve<B>(&self, own_listener: bool, req: Request<B>) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let (parts, body) = req.into_parts();
+        let body = match tokio::time::timeout(READ_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
+            Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+            Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
+            Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
+        };
+        let handler = if own_listener { &self.legacy } else { &self.mount };
+        let resp = handler.serve(Request::from_parts(parts, body)).await;
+        crate::boxed(resp.map(|bytes| Full::new(Bytes::from(bytes))))
+    }
+
+    /// Scout's own `/health`, for hearth's combined one.
+    pub async fn health(&self) -> Response<Body> {
+        let req = Request::get("/health").body(Vec::new()).expect("static request");
+        crate::boxed(self.mount.serve(req).await.map(|bytes| Full::new(Bytes::from(bytes))))
+    }
+}
+
+fn error(status: StatusCode, name: &str) -> Response<Body> {
+    crate::json(status, &serde_json::json!({ "error": name }))
+}

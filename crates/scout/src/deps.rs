@@ -26,6 +26,7 @@ use crate::seal::{parse_seal_keyring, SealKeyring};
 use crate::stores::pool::build_stores;
 use crate::stores::Store;
 use crate::ticket::DEFAULT_PLAY_TICKET_TTL;
+use crate::upstreampause::pause_on_refusal;
 
 /// FROZEN. Go `Settings`: configuration from env so the same binary runs anywhere. No debrid secret
 /// lives here; the token rides in the per-install addon URL. Go's zero `time.Time` is `None`.
@@ -374,7 +375,9 @@ pub fn build_deps(settings: &Settings, client: reqwest::Client, cache: Arc<dyn C
             go_duration(3 * settings.list_ttl)
         ));
     }
-    let doer: Arc<dyn Doer> = Arc::new(ReqwestDoer(client.clone()));
+    // Go wraps the client's transport in PauseOnRefusal (cmd/den-scout/main.go): every debrid and indexer
+    // request shares one memory of who asked to be left alone.
+    let doer: Arc<dyn Doer> = Arc::new(pause_on_refusal(ReqwestDoer(client.clone())));
     let source_doer = new_source_doer();
     let indexer_urls = settings.indexer_urls.clone();
     let scraper_doer = doer.clone();

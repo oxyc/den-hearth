@@ -374,10 +374,12 @@ dependencies = [
  "bytes",
  "den-reel",
  "den-remux",
+ "den-scout",
  "den-subtitles",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "reqwest",
  "serde_json",
  "tokio",
 ]

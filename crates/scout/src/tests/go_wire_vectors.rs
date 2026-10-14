@@ -327,7 +327,7 @@ struct Vector {
     expect: Value,
 }
 
-fn keys() -> BTreeMap<&'static str, &'static str> {
+pub(super) fn keys() -> BTreeMap<&'static str, &'static str> {
     VECTORS
         .lines()
         .filter_map(|l| l.strip_prefix("KEY\t"))
@@ -361,17 +361,17 @@ fn vectors(kind: &str) -> Vec<Vector> {
 
 /// The rotated ring Go decoded with: current key first, the prior key after it, and a junk entry the
 /// parser must skip.
-fn ring_rotated() -> SealKeyring {
+pub(super) fn ring_rotated() -> SealKeyring {
     let k = keys();
     parse_seal_keyring(k["current"], &format!("{}, not-a-key", k["prior"])).unwrap().unwrap()
 }
 
 /// The ring from before the rotation: only the prior key.
-fn ring_old() -> SealKeyring {
+pub(super) fn ring_old() -> SealKeyring {
     parse_seal_keyring(keys()["prior"], "").unwrap().unwrap()
 }
 
-fn now() -> SystemTime {
+pub(super) fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(keys()["now"].parse().unwrap())
 }
 
@@ -407,7 +407,7 @@ fn config_json(c: &Config) -> Value {
     })
 }
 
-fn target_json(t: &PlayTarget) -> Value {
+pub(super) fn target_json(t: &PlayTarget) -> Value {
     json!({
         "InfoHash": t.info_hash, "FileIdx": t.file_idx, "Season": t.season, "Episode": t.episode,
         "ReleaseSize": t.release_size, "Title": t.title, "IMDb": t.imdb,
@@ -415,7 +415,7 @@ fn target_json(t: &PlayTarget) -> Value {
 }
 
 /// What the Go generator printed for a config: `{"Config":..,"Quarantined":..}` or `null`.
-fn decoded_config_json(c: Option<Config>) -> Value {
+pub(super) fn decoded_config_json(c: Option<Config>) -> Value {
     match c {
         None => Value::Null,
         Some(c) => json!({
@@ -499,7 +499,7 @@ fn encoded_play_tokens_match_go_byte_for_byte() {
     assert_eq!(n, 5);
 }
 
-fn open_ticket(tk: &TicketKeys, ticket: &str) -> Value {
+pub(super) fn open_ticket(tk: &TicketKeys, ticket: &str) -> Value {
     match tk.open(ticket, now()) {
         Ok((c, t)) => json!({
             "Ok": true, "Err": "", "Config": config_json(&c), "Target": target_json(&t),

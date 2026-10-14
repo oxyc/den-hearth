@@ -1,33 +1,54 @@
 # den-hearth
 
-Den's self-hosted media node: Reel (trailers, yt-dlp + ffmpeg), Subtitles and Remux (HLS remux and
-transcode) in one process, one runtime and one listener.
+Den's self-hosted media node: Scout (stream addon), Reel (trailers, yt-dlp + ffmpeg), Subtitles and Remux (HLS
+remux and transcode) in one process and one runtime.
 
 ```
 crates/
+  scout/      den-scout      library: the Rust port of the Go den-scout (see crates/scout/PORTING.md)
   reel/       den-reel       library + the standalone `den-reel` binary
   subtitles/  den-subtitles  library + the standalone `den-subtitles` binary
   remux/      den-remux      library + the standalone `den-remux` binary
   hearth/     den-hearth     the combined binary
-  scout/      den-scout      skeleton of the Go -> Rust port, see crates/scout/PORTING.md
 ```
 
-The three services were imported with their full history (`git subtree`). Each is the same code its
+Reel, Subtitles and Remux were imported with their full history (`git subtree`). Each is the same code its
 repository ships, turned into a library: its old `main.rs` is now `lib.rs`, and `main.rs` is three lines.
-The standalone binaries still build and their tests still run from this workspace.
+The standalone binaries still build and their tests still run from this workspace. Scout is a library only:
+hearth is its server.
+
+## Scout, and the Go den-scout as the rollback
+
+Scout replaces the Go `den-scout` container. The Go container stays installed but stopped, and rolling back is
+starting it again: both listen on :8080, so only one runs at a time. Nothing installed changes either way.
+
+- **Wire compatibility runs both ways.** `crates/scout/src/tests/go_wire_vectors.rs` holds what the live Go code
+  minted (config segments, play tickets, play tokens), which Rust must open. `rust_wire_vectors.rs` is the reverse
+  and is what makes the rollback safe: what Rust minted, Go's own code opened to the same fields. A ticket or an
+  installed link made while Rust ran keeps working after a rollback, and the other way round, as long as
+  `SCOUT_CONFIG_KEY` / `SCOUT_CONFIG_KEYS_PREV` are the keys the Go service had.
+- **Scout's cache is its own**, `/cache/scout` (`SCOUT_CACHE_DIR`), never the Go service's directory: the two disk
+  formats are not proven compatible, so Go keeps its own volume and a rollback starts from the Go cache it left.
+- **Environment.** Scout reads the Go service's variables unchanged, with the `SCOUT_` prefix (see Configuration):
+  the Go `CONFIG_KEY` becomes `SCOUT_CONFIG_KEY`, `METRICS_TOKEN` becomes `SCOUT_METRICS_TOKEN`, `REMUX_KEY`
+  becomes `SCOUT_REMUX_KEY`, `PUBLIC_BASE_URL` becomes `SCOUT_PUBLIC_BASE_URL`, and so on.
+- **It runs inside hearth's runtime, supervised the way the others are.** A panic in a request is a 500 for that
+  request; the hourly cache sweep is a supervised task; Scout is part of the combined `/health` and the startup
+  line; and SIGTERM drains its requests with the rest.
 
 ## Run
 
 ```
-cargo run -p den-hearth        # listens on :8090
+cargo run -p den-hearth        # listens on :8090, and on the four ports below
 ```
 
-You need `ffmpeg` (all three), `yt-dlp` (Reel) and `alass` (Subtitles) on the path, as for the standalone
-services.
+You need `ffmpeg` (Reel, Subtitles, Remux), `yt-dlp` (Reel) and `alass` (Subtitles) on the path, as for the
+standalone services. Scout needs nothing outside the binary.
 
 ## Container image
 
-One image, `den-hearth`, replaces the three per-service images (`den-reel`, `den-subtitles`, `den-remux`). It is
+One image, `den-hearth`, replaces the per-service images (`den-reel`, `den-subtitles`, `den-remux`, and the Go
+`den-scout` once switched over). It is
 Debian trixie-slim (glibc: Reel's yt-dlp, deno and MP4Box are glibc builds) with:
 
 | Tool | For | Source |
@@ -40,17 +61,22 @@ Debian trixie-slim (glibc: Reel's yt-dlp, deno and MP4Box are glibc builds) with
 | `MP4Box` + `libgpac` | Reel's `clap` box | GPAC pinned to a commit |
 | `alass` | Subtitles' aligner | `cargo install --locked`, pinned |
 
-It runs as uid/gid 65532 (`nonroot`) with `/cache/{reel,subs,remux}` owned by it and `VOLUME /cache`. It listens on
-`PORT` (hearth's default, 8090). `HEALTHCHECK` polls `/health` every 5 minutes. The release number is `VERSION`, passed
+It runs as uid/gid 65532 (`nonroot`) with `/cache/{scout,reel,subs,remux}` owned by it and `VOLUME /cache`. It
+exposes 8090 (`PORT`) and the four legacy ports 8080, 8092, 8093 and 8095 (see Listeners). `HEALTHCHECK` polls `/health` every 5 minutes. The release number is `VERSION`, passed
 as `DEN_VERSION` (all three services report it); it is deliberately not in any `Cargo.toml`.
 
 ```
 docker build --platform linux/amd64 --build-arg DEN_VERSION="$(cat VERSION)" -t den-hearth:local .
-docker run --rm -p 8090:8090 den-hearth:local
+docker run --rm -p 8090:8090 -p 8080:8080 -p 8092:8092 -p 8093:8093 -p 8095:8095 den-hearth:local
 curl localhost:8090/health
+curl localhost:8090/scout/manifest.json
 curl localhost:8090/reel/manifest.json
 curl localhost:8090/subs/manifest.json
 curl localhost:8090/remux/health
+curl localhost:8080/manifest.json      # Scout on its old port, at the root
+curl localhost:8092/manifest.json      # Reel
+curl localhost:8093/manifest.json      # Subtitles
+curl localhost:8095/remux/health       # Remux
 docker run --rm --entrypoint ffmpeg-remux den-hearth:local -hwaccels
 ```
 
@@ -68,16 +94,42 @@ commits `VERSION`, waits for that commit's CI and tags it.
 
 | Path | Goes to | The service sees |
 |---|---|---|
+| `/scout/...` | Scout | `/...` (prefix removed) |
 | `/reel/...` | Reel | `/...` (prefix removed) |
 | `/subs/...` | Subtitles | `/...` (prefix removed) |
 | `/remux/...` | Remux | unchanged (Remux already serves everything under `/remux`) |
 | `/remux/metrics` | Remux | `/metrics` (its one route outside `/remux`) |
-| `/health` | hearth | all three side by side, below |
+| `/health` | hearth | all four side by side, below |
 | anything else | hearth | 404 |
 
-`/health` answers 200 with `{"status": "ok"|"degraded", "services": {"reel": {...}, "subs": {...},
+`/health` answers 200 with `{"status": "ok"|"degraded", "services": {"scout": {...}, "reel": {...}, "subs": {...},
 "remux": {...}}}`, each entry being that service's own `/health` body. It is `degraded` when any service
 says anything but `ok`. Each service's own `/health` and `/metrics` stay reachable under its prefix.
+
+## Listeners
+
+Besides `PORT` (8090, the table above), each service can have a listener of its own, on the port its old standalone
+container used, where **every request goes to that service with the path unchanged**, exactly as that container
+served it. That is what lets the switch-over change nothing outside the box: the tunnels, the relays, the LAN
+addresses in `ROUTES` and every installed link keep pointing at the ports they point at today.
+
+| Env | Default | Service | Reached by |
+|---|---|---|---|
+| `HEARTH_SCOUT_PORT` | 8080 | Scout | `/<config>/manifest.json`, `/<config>/stream/...`, `/<config>/play/...`, `/p/<ticket>`, `/configure`, `/health`, `/validate`, `/metrics`, `/config-key` |
+| `HEARTH_REEL_PORT` | 8092 | Reel | `/play/...`, `/manifest.json`, ... |
+| `HEARTH_SUBS_PORT` | 8093 | Subtitles | `/<config>/manifest.json`, ... |
+| `HEARTH_REMUX_PORT` | 8095 | Remux | `/remux/...` (it already serves under `/remux`, so this is a pass-through) |
+
+Unset takes the default; empty or `0` turns that listener off. A value that is not a port, or a port already used by
+another listener (`PORT` included), stops hearth at startup. On these listeners `/health` is the service's own, not
+hearth's combined one.
+
+Absolute URLs. On its own listener a service builds them exactly as its old container did: from its own
+`PUBLIC_BASE_URL` (`<SERVICE>_PUBLIC_BASE_URL`) as-is, else from the request's forwarded headers or `Host`. Under
+`/scout`, `/reel` and `/subs` on :8090 the prefix must survive, which is what `HEARTH_PUBLIC_BASE_URL` is for (below).
+Scout is built twice for this (same client and cache, one handler per origin), so both are exact. Reel and Subtitles
+are one instance each, so while one has its own listener `HEARTH_PUBLIC_BASE_URL` is not applied to it (the
+prefixed paths on :8090 then follow its own `PUBLIC_BASE_URL`, or the request's `Host`, without the prefix).
 
 ## Configuration
 
@@ -87,14 +139,16 @@ environment it has today, but several share names (`CACHE_DIR`, `CACHE_MAX_BYTES
 prefixed copy that wins over the bare name for that service alone:
 
 ```
-REEL_CACHE_DIR=/cache/reel   SUBS_CACHE_DIR=/cache/subs   REMUX_SCRATCH_DIR=/cache/remux
-REEL_METRICS_TOKEN=...       SUBS_METRICS_TOKEN=...
+SCOUT_CACHE_DIR=/cache/scout REEL_CACHE_DIR=/cache/reel   SUBS_CACHE_DIR=/cache/subs   REMUX_SCRATCH_DIR=/cache/remux
+SCOUT_METRICS_TOKEN=...      REEL_METRICS_TOKEN=...       SUBS_METRICS_TOKEN=...
 ```
 
-The prefixes are `REEL_*`, `SUBS_*` and `REMUX_*`; `HEARTH_*` (`HEARTH_WORKER_THREADS`, `HEARTH_PUBLIC_BASE_URL`) is
-hearth's own, and `PORT` is hearth's alone. The image sets these, which a deploy overrides as needed:
+The prefixes are `SCOUT_*`, `REEL_*`, `SUBS_*` and `REMUX_*`; `HEARTH_*` (`HEARTH_WORKER_THREADS`,
+`HEARTH_PUBLIC_BASE_URL`, `HEARTH_<SERVICE>_PORT`) is hearth's own, and `PORT` is hearth's alone. The image sets these,
+which a deploy overrides as needed:
 
 ```
+SCOUT_CACHE_DIR=/cache/scout
 REEL_CACHE_DIR=/cache/reel      REEL_FFMPEG_PATH=/usr/bin/ffmpeg  REEL_YTDLP_PATH=/usr/local/bin/yt-dlp
 REEL_YTDLP_WORKER=/app/resolve.py   REEL_MAX_HEIGHT=1080
 SUBS_CACHE_DIR=/cache/subs      SUBS_FFMPEG_PATH=/usr/bin/ffmpeg  SUBS_ALASS_PATH=/usr/local/bin/alass
@@ -107,14 +161,16 @@ Subtitles' `CONFIG_KEY` becomes `SUBS_CONFIG_KEY`, Remux's `EDGE_SECRET` becomes
 variables that already begin with `REMUX_` (`REMUX_URL_KEY`, `REMUX_SCOUT_KEY`) keep their names: the prefix is added
 as a second name, not stripped from the first.
 
-A bare name with no prefixed twin reaches all three (right for `FFMPEG_PATH`, wrong for `CACHE_DIR`). The
-services' defaults differ (`den-reel-cache` and `den-subtitles-cache` under the temp dir, Remux's scratch
-at `/cache`), so unset they do not collide.
+A bare name with no prefixed twin reaches every service (right for `FFMPEG_PATH`, wrong for `CACHE_DIR`). The
+services' defaults differ (`den-scout-cache`, `den-reel-cache` and `den-subtitles-cache` under the temp dir,
+Remux's scratch at `/cache`), so unset they do not collide.
 
-Reel and Subtitles put absolute URLs in what they return, built from `PUBLIC_BASE_URL` or, when unset,
+Scout, Reel and Subtitles put absolute URLs in what they return, built from `PUBLIC_BASE_URL` or, when unset,
 from the request's `Host`, which would drop the prefix. Set `HEARTH_PUBLIC_BASE_URL=https://node.example`
-and hearth gives Reel `https://node.example/reel` and Subtitles `https://node.example/subs` (an explicit
-`REEL_PUBLIC_BASE_URL` or `SUBS_PUBLIC_BASE_URL` wins).
+and hearth gives Scout `https://node.example/scout`, Reel `https://node.example/reel` and Subtitles
+`https://node.example/subs` (an explicit `SCOUT_PUBLIC_BASE_URL`, `REEL_PUBLIC_BASE_URL` or `SUBS_PUBLIC_BASE_URL`
+wins; see Listeners for what a service's own listener does). `SCOUT_ORIGINS`, which Subtitles reads, begins with the
+Scout prefix and so also reaches Scout as `ORIGINS`, a name Scout does not read.
 
 ## Legacy per-service build files (to delete after cutover)
 
