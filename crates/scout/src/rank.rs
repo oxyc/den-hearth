@@ -48,6 +48,18 @@ pub(crate) struct RankFilters {
     pub show_tokens: HashSet<String>,
     pub episode: Option<[i64; 2]>,
     pub client: Option<ClientPlayable>,
+    pub expected_year: Option<i64>,
+    pub expected_title_tokens: HashSet<String>,
+}
+
+/// Go `releaseYears`: the four-digit years a release title carries (resolution and codec digits excluded).
+pub(crate) fn release_years(_title: &str) -> Vec<i64> {
+    todo!()
+}
+
+/// Go `yearMismatch`: whether a title names only years that are not `expected` (±1 is tolerated).
+pub(crate) fn year_mismatch(_title: &str, _expected: i64) -> bool {
+    todo!()
 }
 
 /// Go `junkClass`: "" when the title carries no junk marker.

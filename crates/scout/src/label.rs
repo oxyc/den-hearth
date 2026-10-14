@@ -12,3 +12,8 @@ pub(crate) fn binge_group(_lower: &str, _title: &str) -> String {
 pub(crate) fn release_group(_title: &str) -> String {
     todo!()
 }
+
+/// Go `cleanLabel`: the short "1080p • WEB" caption shown under a stream.
+pub(crate) fn clean_label(_s: &crate::rank::RawStream) -> String {
+    todo!()
+}

@@ -133,6 +133,12 @@ pub(crate) const ID_PIXEL_HEIGHT: u32 = 0xBA;
 pub(crate) const ID_COLOUR: u32 = 0x55B0;
 pub(crate) const ID_TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 
+/// Go `codecFromMatroskaID`: the codec family a Matroska CodecID names ("h264", "hevc", "av1", ...), "" when
+/// none. Its spellings must match the title path's (`detectCodec`).
+pub(crate) fn codec_from_matroska_id(_id: &str) -> &'static str {
+    todo!()
+}
+
 /// Go `doviProfile`: dv_profile from a DOVIDecoderConfigurationRecord; 0 when the record is short.
 pub(crate) fn dovi_profile(_record: &[u8]) -> i64 {
     todo!()

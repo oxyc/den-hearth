@@ -15,3 +15,17 @@ pub struct TorrentFile {
 pub(crate) fn pick_episode_file(_files: &[TorrentFile], _season: i64, _episode: i64) -> Result<Option<i64>, String> {
     todo!()
 }
+
+/// Go `episodePatterns`' result: the matchers for one season and episode. Its fields come with the
+/// implementation.
+pub(crate) struct EpisodePatterns;
+
+/// Go `episodePatterns`: the matchers for `season`/`episode`, including the absolute-numbering forms.
+pub(crate) fn episode_patterns(_season: i64, _episode: i64) -> EpisodePatterns {
+    todo!()
+}
+
+/// Go `matchesEpisode`: whether a release title names the episode `p` was built for.
+pub(crate) fn matches_episode(_title: &str, _p: &EpisodePatterns) -> bool {
+    todo!()
+}
