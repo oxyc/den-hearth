@@ -14,7 +14,7 @@ use futures_util::future::Shared;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::seal::Keyring;
+use den_seal::Keyring;
 use crate::upstream::{HttpUpstream, Upstream};
 use crate::ytdlp::{self, PlayError};
 

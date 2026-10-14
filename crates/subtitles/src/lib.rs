@@ -20,7 +20,6 @@ mod metrics;
 mod opensubtitles;
 mod ratelimit;
 mod resync;
-mod seal;
 mod srt;
 mod state;
 mod sync;
@@ -173,7 +172,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         // not: a link stamped below it would be refused the moment it was built.
         "/config-key" => {
             let epoch = state.cfg.revocation.epoch();
-            return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
+            return match state.config_keyring.as_ref().map(|kr| kr.current_pub_base64()) {
                 Some(pub_b64) if !pub_b64.is_empty() => httputil::json(
                     StatusCode::OK,
                     &serde_json::json!({"key": pub_b64, "epoch": epoch}),

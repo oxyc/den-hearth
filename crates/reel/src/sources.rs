@@ -329,7 +329,7 @@ fn checked_media(
         return Err(CapabilityError::Expired);
     }
     if let Some(ep) = media.e {
-        if let Err(why) = cfg.revocation.check_install(media.i.as_deref(), ep) {
+        if let Err(why) = cfg.revocation.check(media.i.as_deref(), ep) {
             crate::log_limited("media_install_refused", || {
                 format!("bad_signature: media for {} refused — {why}", media.v)
             });

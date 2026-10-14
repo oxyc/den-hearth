@@ -12,7 +12,7 @@ den-net = { path = "../net" }
 async-trait = "0.1"
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
 # `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.
-base64 = "0.22"
+base64 = "0.23"
 # Go `crypto/sha256`: the 128-bit cache-key digest `key_hash` returns (util.go), the disk tier's file
 # names (diskcache.go), and HKDF-SHA256 for play tickets.
 sha2 = "0.11"
@@ -24,11 +24,9 @@ serde_json = { version = "1", features = ["raw_value"] }
 # XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`). The ticket owner uses it
 # in production; the tests build a legacy ticket with it.
 chacha20poly1305 = "0.10"
-# X25519 + XSalsa20-Poly1305 for the sealed config (Go `golang.org/x/crypto/nacl/box` and `curve25519`). The same
-# version den-subtitles and den-reel carry. Its `OsRng` is the Go `crypto/rand` behind the ephemeral seal key.
-crypto_box = "0.9"
-# BLAKE2b-192 for the seal nonce (Go `golang.org/x/crypto/blake2b`). crypto_box already depends on it.
-blake2 = "0.10"
+# The sealed-config keyring (crypto_box_seal; Go `seal.go`) and the install-revocation policy, shared with
+# Reel and Subtitles.
+den-seal = { path = "../seal" }
 # HKDF-SHA256 for the play-ticket key (Go `crypto/hkdf`), on the sha2/hmac pair den-remux already carries.
 hkdf = "0.13"
 # The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with

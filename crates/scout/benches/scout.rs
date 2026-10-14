@@ -13,7 +13,7 @@ use den_scout::config::{decode_config, Config, DebridAccount, DebridService};
 use den_scout::diskcache::TieredCache;
 use den_scout::play::PlayTarget;
 use den_scout::rank::RawStream;
-use den_scout::seal::{new_seal_keypair, seal, SealKeyring, SEALED_VERSION};
+use den_scout::seal::{seal, SealKeyring, SEALED_VERSION};
 use den_scout::season::TorrentFile;
 use den_scout::ticket::TicketKeys;
 use den_scout::util::b64url_encode;
@@ -156,7 +156,7 @@ fn keyring() -> SealKeyring {
     for (i, b) in priv_key.iter_mut().enumerate() {
         *b = i as u8 + 1;
     }
-    SealKeyring { keys: vec![new_seal_keypair(priv_key)] }
+    SealKeyring { keys: vec![den_seal::KeyPair::new(priv_key)] }
 }
 
 #[divan::bench(args = ["plain", "sealed"])]

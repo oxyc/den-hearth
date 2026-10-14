@@ -4,14 +4,12 @@
 
 use std::collections::HashSet;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-
 use crate::loglimit::log_limited;
 use crate::play::non_neg_int;
-use crate::seal::{SealKeyring, SEALED_VERSION};
+use crate::seal::SealKeyring;
 use crate::sources::normalize_sources;
-use crate::util::{b64url_decode, fold_json_keys, Shape, LEAF};
+use crate::util::{fold_json_keys, Shape, LEAF};
+use den_seal::{open_segment, InstallId, Rejected, MAX_EPOCH};
 
 /// FROZEN. Go `DebridService` (a string type); the three services, in resolve priority order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,11 +106,9 @@ pub const MAX_RESULT_CAP: i64 = 50;
 /// Go `scopeAvailability`: the read-only scope a browser holds.
 pub const SCOPE_AVAILABILITY: &str = "availability";
 
-/// An install id is 16 random bytes, unpadded base64url.
-pub const INSTALL_ID_BYTES: usize = 16;
-pub const INSTALL_ID_LEN: usize = 22;
-/// Ceiling on an epoch, so it always fits an int and a config cannot carry an absurd one.
-pub const MAX_CONFIG_EPOCH: i64 = i32::MAX as i64;
+/// Ceiling on an epoch, so it always fits an int and a config cannot carry an absurd one (`den_seal`'s,
+/// as an `i64` for `Config::epoch`).
+pub const MAX_CONFIG_EPOCH: i64 = MAX_EPOCH as i64;
 
 /// FROZEN. Go `DebridAccount`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,13 +163,6 @@ pub struct Config {
     /// serialised in Go (`json:"-"`): verdictPrefix hashes the config, and a verdict does not depend on what
     /// was not asked.
     pub quarantined: Vec<Indexer>,
-}
-
-/// Go `validInstallID` reports whether s is an install id in its one canonical spelling. Strict decoding
-/// refuses the non-zero trailing bits that would let the same 16 bytes be written another way, which would
-/// slip past REVOKED_INSTALLS.
-pub fn valid_install_id(s: &str) -> bool {
-    s.len() == INSTALL_ID_LEN && URL_SAFE_NO_PAD.decode(s).is_ok_and(|b| b.len() == INSTALL_ID_BYTES)
 }
 
 /// Go `hasCountedRepeat` reports whether a user-supplied pattern contains a counted repetition — the one regex
@@ -258,27 +247,23 @@ pub fn decode_config(kr: Option<&SealKeyring>, blob: &str) -> Option<Config> {
     if blob.len() > MAX_CONFIG_BLOB {
         return None;
     }
-    let mut data = b64url_decode(blob).ok()?;
-    if data.is_empty() {
-        return None;
-    }
-    let sealed = data[0] == SEALED_VERSION;
-    if sealed {
-        let kr = kr?; // sealed URL but no key configured → can't open; refuse
-        data = kr.open(&data[1..]).ok()?;
-    } else if kr.is_some() {
-        // With a key configured, every install /configure issues is sealed, so a plaintext one was not
-        // issued here: /config-key is public, and anyone could otherwise base64 their own debrid token into
-        // a working install. Sealing hides the token; this refusal is what makes an install one we issued.
-        // Without a key (local development) plaintext stays the only form there is.
-        log_limited("plaintext-refused", "config refused: plaintext config while sealing is on");
-        return None;
-    }
-    let raw = parse_raw(&data)?;
+    let opened = match open_segment(kr, blob) {
+        Ok(opened) => opened,
+        Err(Rejected::Plaintext) => {
+            // With a key configured, every install /configure issues is sealed, so a plaintext one was not
+            // issued here: /config-key is public, and anyone could otherwise base64 their own debrid token
+            // into a working install. Sealing hides the token; this refusal is what makes an install one we
+            // issued. Without a key (local development) plaintext stays the only form there is.
+            log_limited("plaintext-refused", "config refused: plaintext config while sealing is on");
+            return None;
+        }
+        Err(_) => return None, // undecodable, empty, or sealed with no key that opens it
+    };
+    let raw = parse_raw(&opened.json)?;
     // A scope only means something sealed. A plaintext segment IS the debrid token in the clear, so a
     // "scoped" plaintext URL would hand its holder the very thing the scope exists to keep from them —
     // refusing it makes that mistake loud instead of quietly shipping the token to a browser.
-    if raw.scope.is_some() && !sealed {
+    if raw.scope.is_some() && !opened.sealed {
         return None;
     }
     validate(raw)
@@ -507,7 +492,7 @@ fn validate(raw: RawConfig) -> Option<Config> {
     // list, and an epoch that does not parse cannot be compared with CONFIG_EPOCH.
     let iid = match raw.iid {
         None => String::new(),
-        Some(s) if valid_install_id(&s) => s,
+        Some(s) if InstallId::parse(&s).is_some() => s,
         Some(_) => return None,
     };
     let epoch = match raw.epoch {

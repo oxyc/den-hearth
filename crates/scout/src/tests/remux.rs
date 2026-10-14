@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::handler::new_handler;
 use crate::tests::availability::sealed_config;
 use crate::tests::handler::{
-    body_str, first_play_path, get, test_deps, test_iid, ticket_keyring, TICKET_CFG,
+    body_str, first_play_path, get, revocation, test_deps, test_iid, ticket_keyring, TICKET_CFG,
 };
 
 /// Go `TestRemuxTicket_preservesScopedAdmissionAndRevocation`: a scoped config's play tickets keep its admission
@@ -22,31 +22,24 @@ async fn remux_ticket_preserves_scoped_admission_and_revocation() {
             cfg.push_str(&format!(",\"iid\":\"{iid}\""));
         }
         let scoped = sealed_config(&kr, &format!("{cfg}}}"));
-        let mut deps = test_deps(|d| {
-            d.seal_keyring = Some(Arc::new(ticket_keyring()));
-            d.remux_key = "remux-secret".to_owned();
-            d.require_install_id = true;
-        });
+        let with_refusals = |revocation| {
+            test_deps(|d| {
+                d.seal_keyring = Some(Arc::new(ticket_keyring()));
+                d.remux_key = "remux-secret".to_owned();
+                d.revocation = revocation;
+            })
+        };
         let path = format!("/{scoped}/stream/movie/tt1234567.json");
-        let h = new_handler(test_deps(|d| {
-            d.seal_keyring = Some(Arc::new(ticket_keyring()));
-            d.remux_key = "remux-secret".to_owned();
-            d.require_install_id = true;
-        }));
+        let h = new_handler(with_refusals(revocation(&[], 0, true)));
         assert_eq!(get(&h, &path, &[]).await.status(), 403, "scoped list without remux key (iid={iid:?})");
         let rr = get(&h, &path, &headers).await;
         assert_eq!(rr.status(), 200, "authorized list (iid={iid:?}): {}", body_str(&rr));
         let play = first_play_path(&body_str(&rr), "/p/");
         assert_eq!(get(&h, &play, &headers).await.status(), 302, "fresh scoped ticket");
-        deps.config_epoch = 1;
-        assert_eq!(get(&new_handler(deps), &play, &headers).await.status(), 400, "old epoch ticket");
+        let stale = with_refusals(revocation(&[], 1, true));
+        assert_eq!(get(&new_handler(stale), &play, &headers).await.status(), 400, "old epoch ticket");
         if !iid.is_empty() {
-            let mut revoked = test_deps(|d| {
-                d.seal_keyring = Some(Arc::new(ticket_keyring()));
-                d.remux_key = "remux-secret".to_owned();
-                d.require_install_id = true;
-            });
-            revoked.revoked_installs.insert(iid.to_owned());
+            let revoked = with_refusals(revocation(&[iid], 0, true));
             assert_eq!(
                 get(&new_handler(revoked), &play, &headers).await.status(),
                 400,

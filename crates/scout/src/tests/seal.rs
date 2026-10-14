@@ -25,6 +25,18 @@ fn seal_interop_vector() {
     assert_eq!(String::from_utf8(pt).unwrap(), VEC_PLAIN, "plaintext");
 }
 
+// A config sealed by `den_seal::seal` today, framed as /configure frames it, opens through Scout's decoder:
+// the same wire format as the vectors above, minted by the shared crate.
+#[test]
+fn a_config_sealed_by_den_seal_opens() {
+    let kr = parse_seal_keyring(VEC_PRIV_B64, "").unwrap().unwrap();
+    let json = br#"{"debrid":[{"service":"torbox","token":"fresh-sealed"}]}"#;
+    let mut framed = vec![SEALED_VERSION];
+    framed.extend(den_seal::seal(&kr.keys[0].pub_key, json).unwrap());
+    let c = decode_config(Some(&kr), &b64url_encode(&framed));
+    assert!(matches!(&c, Some(c) if c.debrid[0].token == "fresh-sealed"), "{c:?}");
+}
+
 // A fixed segment MINTED by the /configure browser bundle (tweetnacl + blake2b crypto_box_seal) to
 // vecPub — the JS→Go interop gate, complementing the PyNaCl (libsodium→Go) vector above. Regenerate with
 // scratch/sealsrc/entry.js's denSeal() if the wire format ever changes.
@@ -44,7 +56,7 @@ fn seal_round_trip() {
     let msg = br#"{"hello":"world"}"#;
     let ct = seal(&kr.keys[0].pub_key, msg).expect("seal");
     let pt = kr.open(&ct);
-    assert!(matches!(&pt, Ok(p) if p == msg), "round-trip: pt={pt:?}");
+    assert!(matches!(&pt, Some(p) if p == msg), "round-trip: pt={pt:?}");
 }
 
 #[test]
@@ -56,13 +68,13 @@ fn seal_fails_closed() {
     let mut bad = ct.clone();
     let last = bad.len() - 1;
     bad[last] ^= 0xff;
-    assert!(kr.open(&bad).is_err(), "tampered blob opened");
+    assert!(kr.open(&bad).is_none(), "tampered blob opened");
     // Too short.
-    assert!(kr.open(b"nope").is_err(), "short blob should fail");
+    assert!(kr.open(b"nope").is_none(), "short blob should fail");
     // Wrong key (different recipient) → cannot open.
     let zero_key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
     let other = parse_seal_keyring(&zero_key, "").unwrap().unwrap();
-    assert!(other.open(&ct).is_err(), "wrong-key open should fail");
+    assert!(other.open(&ct).is_none(), "wrong-key open should fail");
 }
 
 #[test]
@@ -74,7 +86,7 @@ fn seal_keyring_rotation() {
     let new_current = base64::engine::general_purpose::STANDARD.encode(bytes_seq(0x40, 32)); // a different current key
     let kr = parse_seal_keyring(&new_current, VEC_PRIV_B64).expect("keyring").unwrap(); // old key kept as prev
     let pt = kr.open(&ct);
-    assert!(matches!(&pt, Ok(p) if p == b"rotate-me"), "rotation open: pt={pt:?}");
+    assert!(matches!(&pt, Some(p) if p == b"rotate-me"), "rotation open: pt={pt:?}");
     assert_eq!(kr.keys.len(), 2, "keyring size (current + prev)");
 }
 
