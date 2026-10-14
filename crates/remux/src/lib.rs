@@ -49,20 +49,14 @@ pub mod bench_api;
 #[cfg(test)]
 mod tests;
 
-use std::convert::Infallible;
-use std::future::Future;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::server::graceful::GracefulShutdown;
 use serde::Deserialize;
-use tokio::net::TcpListener;
 
 pub use crate::config::Config;
 pub use crate::httputil::Body;
@@ -1166,134 +1160,4 @@ pub fn startup_line(state: &AppState) -> String {
             "off(ffmpeg)".to_string()
         },
     )
-}
-
-async fn run(cfg: Config) -> std::io::Result<()> {
-    let state = init(cfg).await;
-
-    // Registered before the listener binds: until the handlers exist SIGTERM keeps its default
-    // disposition, and a stop in that window would kill the process outright (den-reel's lesson).
-    let shutdown = shutdown_signal();
-    let listener = TcpListener::bind(("0.0.0.0", state.cfg.port)).await?;
-    eprintln!("{}", startup_line(&state));
-
-    let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;
-
-    finish(&state).await;
-    if drained {
-        eprintln!("shut down cleanly");
-    }
-    Ok(())
-}
-
-/// How long in-flight requests get to finish after SIGTERM: under podman's default 10 s stop timeout.
-const DRAIN_GRACE: Duration = Duration::from_secs(8);
-
-/// How long a client may take to send a request head.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`; `true`
-/// when they all did.
-async fn serve_until(
-    listener: TcpListener,
-    state: Arc<AppState>,
-    shutdown: impl Future<Output = ()>,
-    grace: Duration,
-    header_timeout: Duration,
-) -> bool {
-    let graceful = GracefulShutdown::new();
-    tokio::pin!(shutdown);
-    loop {
-        let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
-                Err(e) => {
-                    log_limited("accept", || format!("accept: {e}"));
-                    // The listener stays readable while the process is out of descriptors; back off
-                    // rather than spin the one runtime thread.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-            _ = &mut shutdown => break,
-        };
-        let state = state.clone();
-        let peer = Peer(peer.ip());
-        let service = service_fn(move |mut req: Request<hyper::body::Incoming>| {
-            req.extensions_mut().insert(peer);
-            let state = state.clone();
-            async move { Ok::<_, Infallible>(handle_request(state, req).await) }
-        });
-        let conn = hyper::server::conn::http1::Builder::new()
-            .timer(TokioTimer::new())
-            .header_read_timeout(header_timeout)
-            .serve_connection(TokioIo::new(stream), service);
-        let conn = graceful.watch(conn);
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-    }
-    drop(listener);
-    tokio::select! {
-        _ = graceful.shutdown() => true,
-        _ = tokio::time::sleep(grace) => {
-            eprintln!("drain deadline ({grace:?}) reached with requests still in flight");
-            false
-        }
-    }
-}
-
-/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal); a second signal exits at once.
-fn shutdown_signal() -> impl Future<Output = ()> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let term = signal(SignalKind::terminate());
-    let int = signal(SignalKind::interrupt());
-    async move {
-        tokio::select! {
-            _ = wait_for(term, "SIGTERM") => {}
-            _ = wait_for(int, "SIGINT") => {}
-        }
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = quietly(signal(SignalKind::terminate())) => {}
-                _ = quietly(signal(SignalKind::interrupt())) => {}
-            }
-            eprintln!("second signal — exiting without finishing the drain");
-            job::kill_live_groups();
-            std::process::exit(0);
-        });
-    }
-}
-
-async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
-    match registered {
-        Ok(mut sig) => {
-            sig.recv().await;
-            eprintln!("{name} — draining in-flight requests");
-        }
-        Err(e) => {
-            eprintln!("{name} handler unavailable ({e}); it will be a hard kill");
-            std::future::pending::<()>().await
-        }
-    }
-}
-
-async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
-    match registered {
-        Ok(mut sig) => {
-            sig.recv().await;
-        }
-        Err(_) => std::future::pending::<()>().await,
-    }
-}
-
-/// The standalone `den-remux` binary: configuration from the environment, its own runtime, its own listener.
-pub fn run_main() {
-    let cfg = Config::from_env();
-    // current_thread: one runtime thread keeps idle RAM low; the heavy lifting is in ffmpeg.
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
-    if let Err(e) = rt.block_on(run(cfg)) {
-        eprintln!("fatal: {e}");
-        std::process::exit(1);
-    }
 }

@@ -30,17 +30,11 @@ mod userconfig;
 #[cfg(feature = "bench")]
 pub mod bench_api;
 
-use std::convert::Infallible;
-use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
-use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::server::graceful::GracefulShutdown;
-use tokio::net::TcpListener;
 
 pub use crate::config::Config;
 pub use crate::httputil::Body;
@@ -81,10 +75,6 @@ const INSTALL_CACHE: &str = "private, max-age=3600, stale-while-revalidate=600";
 
 /// The sealing key can rotate, so its freshness window is short; the ETag still busts a stale copy.
 const KEY_CACHE: &str = "public, max-age=300";
-
-/// How long a client gets to send a complete request head. Without it a socket that sends half a head
-/// holds a connection task open indefinitely.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Consecutive OpenSubtitles failures before /health reports `degraded` (ADDON-02).
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
@@ -431,150 +421,11 @@ pub fn startup_line(state: &AppState) -> String {
     )
 }
 
-async fn run(cfg: Config) -> std::io::Result<()> {
-    let port = cfg.port;
-    let state = init(cfg);
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    // Registered before the process says it is up, so a stop that arrives from here on drains.
-    let shutdown = shutdown_signal();
-    eprintln!("{}", startup_line(&state));
-
-    serve_until(listener, state, shutdown, DRAIN_GRACE).await;
-    Ok(())
-}
-
-/// How long in-flight requests get to finish after SIGTERM. Under podman's default 10s stop timeout,
-/// as den-atlas's and den-embed's are, so the drain works whether or not the Quadlet's --stop-timeout
-/// has reached the box.
-const DRAIN_GRACE: Duration = Duration::from_secs(8);
-
-static ACCEPT_FAILED: logging::LogGate = logging::LogGate::new();
-
-/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`. Without
-/// it a redeploy killed the process outright, cutting every fetch and translation mid-response.
-///
-/// The bound is the point: a graceful shutdown waits for every connection, and a client that sends
-/// half a request head and stops would otherwise decide how long a restart takes. Sync subprocesses
-/// are `kill_on_drop`, so any still running at the deadline die with their tasks.
-async fn serve_until(
-    listener: TcpListener,
-    state: Arc<AppState>,
-    shutdown: impl Future<Output = ()>,
-    grace: Duration,
-) {
-    let graceful = GracefulShutdown::new();
-    let mut http = hyper::server::conn::http1::Builder::new();
-    http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
-    tokio::pin!(shutdown);
-    loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // Out of file descriptors fails every accept in a row; say so once a minute.
-                    if ACCEPT_FAILED.allow() {
-                        eprintln!("accept: {e}");
-                    }
-                    // And back off before trying again. The listener stays readable while the process is
-                    // out of descriptors, so an immediate retry fails at once and the loop spins a core
-                    // at 100% until one frees up — on the one runtime thread that serves every request.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-            _ = &mut shutdown => break,
-        };
-        let state = state.clone();
-        let service = service_fn(move |req| {
-            let state = state.clone();
-            async move { Ok::<_, Infallible>(handle_request(state, req).await) }
-        });
-        let conn = http.serve_connection(TokioIo::new(stream), service);
-        let conn = graceful.watch(conn);
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-    }
-    drop(listener);
-    eprintln!("shutting down — draining in-flight requests");
-    tokio::select! {
-        _ = graceful.shutdown() => eprintln!("shut down cleanly"),
-        _ = tokio::time::sleep(grace) => {
-            eprintln!("drain deadline ({grace:?}) reached with requests still in flight");
-        }
-    }
-}
-
-/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal). The same handler den-atlas and den-embed
-/// use.
-fn shutdown_signal() -> impl Future<Output = ()> {
-    use tokio::signal::unix::{signal, SignalKind};
-    // Registered NOW, by the caller, not lazily when the future is first polled. Polling starts once
-    // the server is already accepting, and until then SIGTERM keeps its default disposition — so a
-    // stop arriving in that window killed the process outright rather than draining it.
-    let term = signal(SignalKind::terminate());
-    let int = signal(SignalKind::interrupt());
-    async move {
-        tokio::select! {
-            _ = wait_for(term, "SIGTERM") => {}
-            _ = wait_for(int, "SIGINT") => {}
-        }
-        // A SECOND signal ends it now. Both handles above are dropped by here, and tokio does not
-        // restore the default disposition when a `Signal` drops — so every later SIGTERM and ^C would
-        // be caught and discarded, and an operator could not get out of the drain short of SIGKILL.
-        // Exit 0, because asking twice is a deliberate choice, not a failure.
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = quietly(signal(SignalKind::terminate())) => {}
-                _ = quietly(signal(SignalKind::interrupt())) => {}
-            }
-            eprintln!("second signal — exiting without finishing the drain");
-            std::process::exit(0);
-        });
-    }
-}
-
-/// Like `wait_for`, but says nothing — for a caller that prints its own, different message.
-async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
-    match registered {
-        Ok(mut sig) => {
-            sig.recv().await;
-        }
-        Err(_) => std::future::pending::<()>().await,
-    }
-}
-
-/// Resolve when this signal arrives, or never if it could not be registered — returning at once would
-/// shut the server down the moment it started. The two signals are registered independently, so one
-/// failing does not take the other with it.
-async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
-    match registered {
-        Ok(mut sig) => {
-            sig.recv().await;
-            eprintln!("{name} — draining in-flight requests");
-        }
-        Err(e) => {
-            eprintln!("{name} handler unavailable ({e}); it will be a hard kill");
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
-/// The standalone `den-subtitles` binary: configuration from the environment, its own runtime, its own listener.
-pub fn run_main() {
-    let cfg = Config::from_env();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
-
-    if let Err(e) = rt.block_on(run(cfg)) {
-        eprintln!("fatal: {e}");
-        std::process::exit(1);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
+    use std::time::Duration;
 
     // Same fixed vector key + browser-minted sealed segment the seal/userconfig unit tests use, so the
     // HTTP layer is exercised against a real crypto_box_seal blob, not a mock.
@@ -814,42 +665,6 @@ mod tests {
         use http_body_util::BodyExt;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
-    }
-
-    /// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
-    async fn start_serve(
-        grace: Duration,
-    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let stop = async move {
-            let _ = rx.await;
-        };
-        (addr, tx, tokio::spawn(serve_until(listener, test_state(""), stop, grace)))
-    }
-
-    #[tokio::test]
-    async fn an_idle_server_stops_at_once() {
-        let (_, stop, server) = start_serve(Duration::from_secs(5)).await;
-        stop.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), server)
-            .await
-            .expect("an idle server waited out the grace instead of stopping")
-            .unwrap();
-    }
-
-    /// A graceful shutdown waits for every connection, so without a deadline a client that sends half
-    /// a request head and goes quiet would hold the stop open for as long as it liked.
-    #[tokio::test]
-    async fn a_half_sent_request_cannot_hold_the_stop_open() {
-        use tokio::io::AsyncWriteExt;
-        let (addr, stop, server) = start_serve(Duration::from_millis(300)).await;
-        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
-        tokio::time::sleep(Duration::from_millis(50)).await; // let the server accept it first
-        stop.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), server).await.expect("the drain is unbounded").unwrap();
     }
 
     // The HTTP-level mirror of den-scout's TestRoutesSealedConfig: drive the real router so a future

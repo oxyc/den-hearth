@@ -771,65 +771,6 @@ fn the_startup_line_says_whether_signing_is_in_grace() {
     assert_eq!(state(&cfg, 0), "on");
 }
 
-/// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
-async fn start_serve(
-    grace: std::time::Duration,
-    header_timeout: std::time::Duration,
-) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<bool>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state =
-        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let stop = async move {
-        let _ = rx.await;
-    };
-    (addr, tx, tokio::spawn(crate::serve_until(listener, state, stop, grace, header_timeout)))
-}
-
-/// A client that opens a socket and dribbles half a request head is dropped once the head is overdue,
-/// rather than holding a connection (and, at a stop, the drain) for as long as it likes.
-#[tokio::test]
-async fn a_request_head_that_never_finishes_is_dropped() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (addr, _stop, _server) =
-        start_serve(std::time::Duration::from_secs(5), std::time::Duration::from_millis(200)).await;
-    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
-    let mut rest = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), sock.read_to_end(&mut rest))
-        .await
-        .expect("a half-sent request head held its connection open")
-        .ok();
-}
-
-#[tokio::test]
-async fn an_idle_server_stops_at_once() {
-    let (_, stop, server) = start_serve(std::time::Duration::from_secs(5), crate::HEADER_READ_TIMEOUT).await;
-    stop.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), server)
-        .await
-        .expect("an idle server waited out the grace instead of stopping")
-        .unwrap();
-}
-
-/// A graceful shutdown waits for every connection, so without a deadline a client that sends half a
-/// request head and goes quiet would hold the stop open for as long as it liked.
-#[tokio::test]
-async fn a_half_sent_request_cannot_hold_the_stop_open() {
-    use tokio::io::AsyncWriteExt;
-    let (addr, stop, server) =
-        start_serve(std::time::Duration::from_millis(300), crate::HEADER_READ_TIMEOUT).await;
-    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the server accept it first
-    stop.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), server)
-        .await
-        .expect("the drain is unbounded")
-        .unwrap();
-}
-
 /// ...and with no secret configured, nothing changes: every install in the field is holding unsigned
 /// play URLs that /meta told it to cache for a week.
 #[tokio::test]

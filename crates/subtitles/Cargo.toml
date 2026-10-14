@@ -6,19 +6,14 @@ description = "Den subtitles, one container: Stremio subtitles addon that fetche
 publish = false
 license = "MIT"
 
-[[bin]]
-name = "den-subtitles"
-path = "src/main.rs"
-
 [dependencies]
 # The public-address classifier resync hops are vetted with, shared with Scout and Remux.
 den-net = { path = "../net" }
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
 hyper = { version = "1", features = ["server", "http1"] }
-# server-graceful: stop accepting on SIGTERM and let in-flight requests finish (see serve_until).
-hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -50,7 +45,7 @@ harness = false
 required-features = ["bench"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
 # Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
 divan = "0.1"
 tempfile = "3"

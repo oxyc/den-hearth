@@ -840,6 +840,45 @@ mod tests {
         serve_on(hearth, None).await
     }
 
+    /// `serve_until` with a drain grace of `grace`, keeping the server's handle so a test can watch it stop.
+    async fn serve_draining(
+        grace: Duration,
+    ) -> (std::net::SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let server = tokio::spawn(serve_until(listener, None, hearth(), stopped, grace));
+        (addr, stop, server)
+    }
+
+    #[tokio::test]
+    async fn an_idle_server_stops_at_once() {
+        let (_, stop, server) = serve_draining(Duration::from_secs(5)).await;
+        stop.send(true).unwrap();
+        let drained = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("an idle server waited out the grace instead of stopping")
+            .unwrap();
+        assert!(drained);
+    }
+
+    /// A graceful shutdown waits for every connection, so without a deadline a client that sends half a
+    /// request head and goes quiet would hold the stop open for as long as it liked.
+    #[tokio::test]
+    async fn a_half_sent_request_cannot_hold_the_stop_open() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, stop, server) = serve_draining(Duration::from_millis(300)).await;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the server accept it first
+        stop.send(true).unwrap();
+        let drained = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("the drain is unbounded")
+            .unwrap();
+        assert!(!drained, "the half-sent request should have run out the grace");
+    }
+
     /// Send one request on `sock` and read the status line back.
     async fn status_line(sock: &mut tokio::net::TcpStream, request: &[u8]) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

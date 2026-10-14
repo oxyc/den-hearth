@@ -8,20 +8,15 @@ description = "Den trailers, one container: addon (imdb→ytId via TMDB) + yt-dl
 publish = false
 license = "MIT"
 
-[[bin]]
-name = "den-reel"
-path = "src/main.rs"
-
 [dependencies]
 # The config segment's base64url decoder, shared with Scout and Subtitles.
 den-net = { path = "../net" }
 # Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
 # minimal on a homelab box.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
 hyper = { version = "1", features = ["server", "http1"] }
-# server-graceful: stop accepting on SIGTERM and let in-flight requests finish (see serve_until).
-hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -61,7 +56,7 @@ harness = false
 required-features = ["bench"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
 # Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
 divan = "0.1"
 
