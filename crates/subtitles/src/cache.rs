@@ -38,18 +38,24 @@ pub const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// Cloning is a refcount bump, so concurrent serves of a hot body hold one copy between them rather
 /// than one each. The cue-density numbers the serve log reports are measured at most once per body,
-/// on the first hit that asks, and shared by every later one.
+/// on the first hit that asks, and shared by every later one; so is its ETag.
 #[derive(Clone)]
 pub struct Text(Arc<TextInner>);
 
 struct TextInner {
     text: String,
     stats: OnceLock<Option<crate::srt::Stats>>,
+    etag: OnceLock<String>,
 }
 
 impl Text {
     pub fn new(text: String) -> Text {
-        Text(Arc::new(TextInner { text, stats: OnceLock::new() }))
+        Text(Arc::new(TextInner { text, stats: OnceLock::new(), etag: OnceLock::new() }))
+    }
+
+    /// `httputil::etag_of` over this body, hashed on the first call only.
+    pub fn etag(&self) -> &str {
+        self.0.etag.get_or_init(|| crate::httputil::etag_of(self.0.text.as_bytes()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -815,6 +821,10 @@ mod tests {
         assert_eq!(a.as_str(), "0123456789");
         assert_eq!(a.as_str().as_ptr(), b.as_str().as_ptr(), "a hit copied the body");
         assert_eq!(a.to_bytes().as_ptr(), a.as_str().as_ptr(), "the response payload copied the body");
+        // The memoized validator is exactly what hashing the body per response gave.
+        for _ in 0..2 {
+            assert_eq!(a.etag(), crate::httputil::etag_of(b"0123456789"));
+        }
         assert_eq!(c.stats().bytes, "k".len() + 10, "readers must not add to the budget");
         // A reader outlives the entry's eviction and still sees the same bytes.
         c.remove("k");

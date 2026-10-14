@@ -897,7 +897,8 @@ pub async fn handle_subtitle_file(
     };
     if let Some(hit) = state.cache.get_shared(&cache_key) {
         log_serve_cached(state, ctx, "served", "cache_hit", &hit);
-        let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes()));
+        let resp =
+            with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes(), hit.etag()));
         return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
     }
     let Some(http) = state.http.as_ref() else {
@@ -912,7 +913,11 @@ pub async fn handle_subtitle_file(
         let guard = state.inflight.acquire(&cache_key).await;
         if let Some(hit) = state.cache.get_shared(&cache_key) {
             log_serve_cached(state, ctx, "served", "cache_hit", &hit);
-            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes()));
+            let resp = with_cached_subtitle_offset(
+                state,
+                &cache_key,
+                httputil::srt_shared(hit.to_bytes(), hit.etag()),
+            );
             return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
         }
         Some(guard)
@@ -1106,7 +1111,11 @@ async fn sync_and_cache(
         // Settled while we waited: the alignment we were about to run has already been run.
         if let Some(hit) = state.cache.get_shared(&cache_key) {
             log_serve_cached(state, log, "served", "settled_while_waiting", &hit);
-            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt_shared(hit.to_bytes()));
+            let resp = with_cached_subtitle_offset(
+                state,
+                &cache_key,
+                httputil::srt_shared(hit.to_bytes(), hit.etag()),
+            );
             return httputil::add_timing(resp, CACHE_HIT);
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
@@ -2283,10 +2292,10 @@ pub async fn handle_translate(
             log_serve_cached(state, ctx, outcome, reason, &settled);
             let resp = match anchor_unknown {
                 true => httputil::degraded(
-                    httputil::srt_provisional_shared(settled.to_bytes()),
+                    httputil::srt_provisional_shared(settled.to_bytes(), settled.etag()),
                     "upstream_unavailable",
                 ),
-                false => httputil::srt_shared(settled.to_bytes()),
+                false => httputil::srt_shared(settled.to_bytes(), settled.etag()),
             };
             let resp = with_cached_subtitle_offset(state, &cache_key, resp);
             return httputil::add_timing(resp, CACHE_HIT);
