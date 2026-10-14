@@ -338,3 +338,377 @@ fn scrape_a_budget_spent_queueing_is_not_an_indexer_outage() {
     }
     todo!("pending: scrape_test.go TestScrape_aBudgetSpentQueueingIsNotAnIndexerOutage")
 }
+
+// Not in the Go suite: what the Rust port adds around the same behaviour. Go tells an unaskable scraper and an
+// HTTP status error apart by type; here they are typed errors, and the cache is shared with the Go build.
+mod beyond_the_go_suite {
+    use std::collections::HashMap;
+    use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use crate::cache::{Cache, MemoryCache};
+    use crate::config::{Config, DebridAccount, DebridService, Indexer};
+    use crate::coverage::{
+        OUTCOME_ANSWERED, OUTCOME_MISCONFIGURED, OUTCOME_REFUSED, OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE,
+    };
+    use crate::rank::RawStream;
+    use crate::scrape::{
+        classify_outcome, keep_answer, kept_answer, make_scrapers, parse_stremio_streams, scrape_all_cached,
+        scrape_covered, DeadlineExceeded, DoError, Doer, HttpStatusError, MintingScraper, Scraper, ScrapeQuery,
+        StremioScraper, UnaskableError,
+    };
+    use crate::sources::ERR_NOT_PUBLIC;
+    use crate::util::key_hash;
+
+    use super::super::mock::{resp, MockDoer};
+
+    type Answer = Result<reqwest::Response, DoError>;
+
+    fn movie(imdb: &str) -> ScrapeQuery {
+        ScrapeQuery { kind: "movie".into(), imdb: imdb.into(), ..Default::default() }
+    }
+
+    /// A doer that answers `{"streams":[]}` and records the URL of every request it gets.
+    fn recording_doer() -> (Arc<dyn Doer>, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let doer: Arc<dyn Doer> = Arc::new(MockDoer(move |r: reqwest::Request| -> Answer {
+            log.lock().expect("lock").push(r.url().to_string());
+            Ok(resp(200, r#"{"streams":[]}"#))
+        }));
+        (doer, seen)
+    }
+
+    fn failing_doer(message: &'static str) -> Arc<dyn Doer> {
+        Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer { Err(message.into()) }))
+    }
+
+    fn classify(e: &(dyn Error + 'static)) -> &'static str {
+        classify_outcome(Some(e))
+    }
+
+    fn text(e: &str) -> DoError {
+        e.into()
+    }
+
+    #[test]
+    fn classify_outcome_names_what_an_error_means_for_coverage() {
+        assert_eq!(classify_outcome(None), OUTCOME_ANSWERED);
+        let status = |code| HttpStatusError { name: "torrentio".into(), code };
+        let cases: Vec<(&str, Box<dyn Error + Send + Sync>, &str)> = vec![
+            ("deadline", Box::new(DeadlineExceeded), OUTCOME_TIMEOUT),
+            ("wrapped deadline", text("wrapped: context deadline exceeded"), OUTCOME_TIMEOUT),
+            ("queued past the budget", text("torrentio: queued past the scrape budget: deadline"), OUTCOME_TIMEOUT),
+            ("an io timeout", Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow")), OUTCOME_TIMEOUT),
+            ("http 408", Box::new(status(408)), OUTCOME_TIMEOUT),
+            ("http 429 (or a paused upstream)", Box::new(status(429)), OUTCOME_REFUSED),
+            ("http 403", Box::new(status(403)), OUTCOME_REFUSED),
+            ("http 502", Box::new(status(502)), OUTCOME_UNREACHABLE),
+            ("non-public household source", Box::new(std::io::Error::other(ERR_NOT_PUBLIC)), OUTCOME_REFUSED),
+            ("network failure", text("connection reset"), OUTCOME_UNREACHABLE),
+            (
+                "no config URL",
+                Box::new(UnaskableError { indexer: "mediafusion".into(), transient: false }),
+                OUTCOME_MISCONFIGURED,
+            ),
+            (
+                "config mint failed",
+                Box::new(UnaskableError { indexer: "mediafusion".into(), transient: true }),
+                OUTCOME_UNREACHABLE,
+            ),
+        ];
+        for (name, err, want) in cases {
+            assert_eq!(classify(&*err), want, "{name}");
+        }
+    }
+
+    // A scrape's report is the scraper's id and what its error meant; an unaskable one carries no latency or time.
+    #[tokio::test]
+    async fn scrape_covered_reports_each_source() {
+        struct Fixed(&'static str, Option<fn() -> DoError>);
+        #[async_trait]
+        impl Scraper for Fixed {
+            fn id(&self) -> Indexer {
+                Indexer(self.0.into())
+            }
+            async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+                match self.1 {
+                    Some(err) => Err(err()),
+                    None => Ok(vec![RawStream { info_hash: "a".repeat(40), ..Default::default() }]),
+                }
+            }
+        }
+        let scrapers: Vec<Arc<dyn Scraper>> = vec![
+            Arc::new(Fixed("torrentio", None)),
+            Arc::new(Fixed("comet", Some(|| Box::new(UnaskableError { indexer: "comet".into(), transient: false })))),
+            Arc::new(Fixed("torz", Some(|| Box::new(HttpStatusError { name: "torz".into(), code: 403 })))),
+        ];
+        let res = scrape_covered(&scrapers, &ScrapeQuery::default(), Duration::from_secs(1), None, Duration::ZERO).await;
+        let outcomes: Vec<(&str, &str, i64)> =
+            res.sources.iter().map(|s| (s.id.as_str(), s.outcome.as_str(), s.items)).collect();
+        assert_eq!(
+            outcomes,
+            [("torrentio", OUTCOME_ANSWERED, 1), ("comet", OUTCOME_MISCONFIGURED, 0), ("torz", OUTCOME_REFUSED, 0)]
+        );
+        assert!(res.sources[0].observed_at.is_some(), "an answer carries the time it arrived");
+        assert!(res.sources[1].observed_at.is_none() && res.sources[1].latency_ms.is_none(), "an unasked source has no time");
+        assert!(res.sources[2].observed_at.is_some(), "a refusal arrived at some time");
+        assert!(!res.complete, "a refusal is a source that did not answer");
+        assert!(res.any_ok);
+    }
+
+    // The cache is shared with the Go build across a redeploy, so an answer one wrote must read in the other: Go's
+    // untagged struct writes its field names as they are, a nil slice as `null`.
+    #[tokio::test]
+    async fn answers_cached_by_the_go_build_are_read_and_ours_read_in_go() {
+        let cache = MemoryCache::new(1 << 20);
+        let (client, seen) = recording_doer();
+        let sc = StremioScraper { indexer: Indexer("torrentio".into()), base_url: "https://go-compat.example/".into(), client };
+        let key = |id: &str| format!("answer:v1:{}:movie:{id}", key_hash("https://go-compat.example"));
+        let hash = "b".repeat(40);
+        cache.put(
+            &key("tt1"),
+            &format!(
+                r#"[{{"InfoHash":"{hash}","FileIdx":null,"Title":"Movie 1080p","SizeBytes":1234,"PackSizeBytes":null,"Seeders":5,"Cached":false,"CacheKnown":false,"Source":"torrentio","Probe":null}}]"#
+            ),
+            Duration::from_secs(60),
+        );
+        cache.put(&key("tt2"), "null", Duration::from_secs(60));
+
+        let one: Vec<Arc<dyn Scraper>> = vec![Arc::new(StremioScraper {
+            indexer: sc.indexer.clone(),
+            base_url: sc.base_url.clone(),
+            client: Arc::clone(&sc.client),
+        })];
+        let (out, ok, complete) =
+            scrape_all_cached(&one, &movie("tt1"), Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+        assert!(ok && complete && out.len() == 1, "{out:?}");
+        assert!(out[0].info_hash == hash && out[0].size_bytes == Some(1234) && out[0].seeders == Some(5) && out[0].file_idx.is_none());
+        let (out, ok, complete) =
+            scrape_all_cached(&one, &movie("tt2"), Duration::from_secs(1), Some(&cache), Duration::from_secs(60)).await;
+        assert!(out.is_empty() && ok && complete, "a nil slice cached by Go is an answer, not a miss");
+        assert!(seen.lock().expect("lock").is_empty(), "both were served from the cache");
+
+        keep_answer(Some(&cache), Duration::from_secs(60), &sc, &movie("tt3"), &out_streams(&hash));
+        let raw = cache.get(&key("tt3")).expect("kept");
+        assert!(raw.contains(r#""InfoHash":""#) && raw.contains(r#""Probe":null"#), "not Go's spelling: {raw}");
+        assert_eq!(kept_answer(Some(&cache), &sc, &movie("tt3")).expect("read back")[0].info_hash, hash);
+    }
+
+    fn out_streams(hash: &str) -> Vec<RawStream> {
+        vec![RawStream { info_hash: hash.into(), title: "T".into(), size_bytes: Some(7), ..Default::default() }]
+    }
+
+    // A scraper that panics inside the shared question must cost that answer, not wedge every later ask for it.
+    #[tokio::test]
+    async fn a_panicking_scraper_does_not_wedge_its_question() {
+        struct Panics;
+        #[async_trait]
+        impl Scraper for Panics {
+            fn id(&self) -> Indexer {
+                Indexer("torrentio".into())
+            }
+            async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+                panic!("a malformed answer")
+            }
+            fn answer_key(&self) -> Option<String> {
+                Some("panics".into())
+            }
+        }
+        let scrapers: Vec<Arc<dyn Scraper>> = vec![Arc::new(Panics)];
+        for _ in 0..2 {
+            let asked = tokio::time::timeout(
+                Duration::from_secs(5),
+                scrape_all_cached(&scrapers, &movie("tt-panics"), Duration::from_secs(1), None, Duration::ZERO),
+            )
+            .await;
+            let (out, ok, complete) = asked.expect("the caller was left waiting on a question nobody was asking");
+            assert!(out.is_empty() && !ok && !complete);
+        }
+    }
+
+    // The 502 line names the indexer, the class and the request, and never the URL: a configured source's carries
+    // an encrypted config, and a transport error's carries the whole thing.
+    #[test]
+    fn scrape_decision_line_names_the_class_and_never_the_url() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("runtime");
+        let bad = StremioScraper {
+            indexer: Indexer("torzlog".into()),
+            base_url: "https://torz.example/SECRET-PATH".into(),
+            client: Arc::new(MockDoer(|_r: reqwest::Request| -> Answer { Ok(resp(502, "{}")) })),
+        };
+        let q = ScrapeQuery { kind: "movie".into(), imdb: "tt1234567".into(), rid: "req-scrape-1".into(), ..Default::default() };
+        let out = crate::loglimit::capture(|| {
+            let (result, retryable) = rt.block_on(bad.scrape_once("", &q));
+            assert!(result.is_err() && retryable, "a 502 is a shed request");
+        });
+        for want in ["event=scrape", "upstream=torzlog", "rid=req-scrape-1", "reason=http 502"] {
+            assert!(out.contains(want), "scrape decision line missing {want:?}:\n{out}");
+        }
+        assert!(!out.contains("SECRET-PATH") && !out.contains("torz.example"), "the indexer base URL leaked:\n{out}");
+
+        let unreachable = StremioScraper {
+            indexer: Indexer("torzlog2".into()),
+            base_url: "https://torz.example/SECRET-PATH".into(),
+            client: failing_doer("dial tcp: lookup torz.example/SECRET-PATH?token=LEAK: no such host"),
+        };
+        let q = ScrapeQuery { kind: "movie".into(), imdb: "tt7654321".into(), rid: "req-scrape-2".into(), ..Default::default() };
+        let out = crate::loglimit::capture(|| {
+            let (result, retryable) = rt.block_on(unreachable.scrape_once("", &q));
+            assert!(result.is_err() && retryable, "a transport failure is worth another attempt");
+        });
+        assert!(out.contains("rid=req-scrape-2") && out.contains("event=scrape"), "no decision line:\n{out}");
+        assert!(!out.contains("SECRET-PATH") && !out.contains("LEAK"), "the transport error leaked into the log:\n{out}");
+    }
+
+    // A household source that points at a non-public address is refused once; a retry would only spend the budget.
+    #[tokio::test]
+    async fn a_refused_address_is_not_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = Arc::clone(&calls);
+        let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer {
+            n.fetch_add(1, Ordering::SeqCst);
+            Err(Box::new(std::io::Error::other(ERR_NOT_PUBLIC)))
+        }));
+        let sc = StremioScraper { indexer: Indexer("own".into()), base_url: "https://127.0.0.1".into(), client };
+        assert!(sc.scrape(&movie("tt1")).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a refusal was asked again");
+    }
+
+    // The body is bounded: an indexer that answers with more than MAX_SCRAPE_BYTES is read up to that and no further.
+    #[tokio::test]
+    async fn the_response_body_is_bounded() {
+        let stream = format!(r#"{{"infoHash":"{}","title":"Movie.1080p"}},"#, "c".repeat(40));
+        let mut body = String::from(r#"{"streams":["#);
+        while body.len() < crate::scrape::MAX_SCRAPE_BYTES + 1000 {
+            body.push_str(&stream);
+        }
+        body.push_str(r#"{"infoHash":"zzzz"}]}"#);
+        let client: Arc<dyn Doer> = Arc::new(MockDoer(move |_r: reqwest::Request| -> Answer { Ok(resp(200, &body)) }));
+        let sc = StremioScraper { indexer: Indexer("torrentio".into()), base_url: "https://big.example".into(), client };
+        // Cut mid-document, the JSON is unreadable, which is an empty answer rather than an unbounded read.
+        let got = sc.scrape(&movie("tt1")).await.expect("an answer");
+        assert!(got.is_empty(), "read past the cap: {} releases", got.len());
+    }
+
+    #[test]
+    fn parse_follows_go_json_decoding() {
+        let h = "a".repeat(40);
+        let parse = |body: String| parse_stremio_streams(body.as_bytes(), "torrentio");
+        // keys match case-insensitively, as encoding/json does
+        let got = parse(format!(r#"{{"STREAMS":[{{"INFOHASH":"{h}","Title":"Movie 1080p","BehaviorHints":{{"VideoSize":4096}}}}]}}"#));
+        assert!(got.len() == 1 && got[0].size_bytes == Some(4096), "{got:?}");
+        // a field of the wrong type skips that element only
+        let got = parse(format!(r#"{{"streams":[{{"infoHash":"{h}","fileIdx":1.5}},{{"infoHash":"{h}","name":7}},{{"infoHash":"{h}"}}]}}"#));
+        assert_eq!(got.len(), 1, "{got:?}");
+        // a negative file index is no index, and a hash with the wrong shape is no hash
+        let got = parse(format!(r#"{{"streams":[{{"infoHash":"{h}","fileIdx":-1}},{{"infoHash":"{}"}}]}}"#, "g".repeat(39)));
+        assert!(got.len() == 1 && got[0].file_idx.is_none(), "{got:?}");
+        // streams of the wrong type, a body that is not an object, and invalid JSON all read as nothing
+        for body in [r#"{"streams":{}}"#, r#"[1]"#, r#"{"streams":[1"#, r#"{"streams":null}"#, ""] {
+            assert!(parse(body.to_owned()).is_empty(), "{body}");
+        }
+        // an invalid byte inside a string is U+FFFD, as in Go, not a refusal of the whole body
+        let mut raw = format!(r#"{{"streams":[{{"infoHash":"{h}","title":"Caf"#).into_bytes();
+        raw.extend_from_slice(b"\xff\"}]}");
+        let got = parse_stremio_streams(&raw, "torrentio");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "Caf\u{fffd}");
+        // a seeder word spelled with a long s is the same word to Go's case folding
+        assert_eq!(crate::scrape::parse_seeders("ſeeders: 12"), Some(12));
+    }
+
+    // A playback link that does not parse as a URL names no hash, and the hash must be a whole path segment.
+    #[test]
+    fn a_hash_is_read_from_the_path_of_a_link_go_would_parse() {
+        let h = "d".repeat(40);
+        let from = |url: String| {
+            let body = format!(r#"{{"streams":[{{"url":"{url}","title":"Movie 1080p"}}]}}"#);
+            parse_stremio_streams(body.as_bytes(), "own").into_iter().map(|s| s.info_hash).collect::<Vec<_>>()
+        };
+        assert_eq!(from(format!("https://x.example/resolve/{h}/f.mkv")), [h.clone()]);
+        assert_eq!(from(format!("/playback/{h}")), [h.clone()]);
+        assert_eq!(from(format!("https://x.example/a%2F{h}")), [h.clone()]);
+        assert!(from(format!("https://x.example/play?h={h}")).is_empty());
+        assert!(from(format!("https://x.example/play#{h}")).is_empty());
+        assert!(from(format!("https://x.example/play/{h}x")).is_empty());
+        assert!(from(format!("mailto:{h}")).is_empty());
+        assert!(from(format!("https://x.example/%zz/{h}")).is_empty());
+    }
+
+    fn config_with(indexers: &[&str], sources: &[&str]) -> Config {
+        Config {
+            indexers: indexers.iter().map(|i| Indexer((*i).into())).collect(),
+            sources: sources.iter().map(|s| (*s).to_owned()).collect(),
+            debrid: vec![DebridAccount { service: DebridService::TorBox, token: "scrape-test-token".into() }],
+            ..Default::default()
+        }
+    }
+
+    // Torrentio is asked on its BARE path, an override wins, and an indexer that needs a config segment and has none
+    // stays in the list as one that cannot answer, so it still counts in the quorum.
+    #[tokio::test]
+    async fn make_scrapers_builds_the_list_the_quorum_counts() {
+        let (plain, plain_seen) = recording_doer();
+        let (guarded, guarded_seen) = recording_doer();
+        let cfg = config_with(&["torrentio", "mediafusion", "comet"], &["https://mf.example/cfg"]);
+        let overrides = HashMap::from([(Indexer("mediafusion".into()), "https://mf.self/CONFIG".to_owned())]);
+        let got = make_scrapers(&cfg, plain, guarded, &overrides);
+        let ids: Vec<String> = got.iter().map(|s| s.id().0).collect();
+        assert_eq!(ids, ["own", "torrentio", "mediafusion", "comet"]);
+        for sc in &got[..3] {
+            sc.scrape(&movie("tt1")).await.expect("an answer");
+        }
+        assert_eq!(guarded_seen.lock().expect("lock").as_slice(), ["https://mf.example/cfg/stream/movie/tt1.json"]);
+        assert_eq!(
+            plain_seen.lock().expect("lock").as_slice(),
+            ["https://torrentio.strem.fun/stream/movie/tt1.json", "https://mf.self/CONFIG/stream/movie/tt1.json"]
+        );
+        // Minting is off by default, so comet has no config: it cannot be asked, and says why.
+        let err = got[3].scrape(&movie("tt1")).await.expect_err("comet is unconfigured");
+        let unaskable = err.downcast_ref::<UnaskableError>().expect("a typed refusal");
+        assert!(!unaskable.transient, "an unconfigured indexer is not an outage");
+    }
+
+    // With minting on, comet's config is built from the account on the spot, and a mint that cannot be made leaves the
+    // indexer unaskable: transient when the host failed, permanent when there is nothing to mint.
+    #[tokio::test]
+    async fn a_minting_scraper_mints_when_asked_and_says_why_when_it_cannot() {
+        let (client, seen) = recording_doer();
+        let comet = MintingScraper {
+            indexer: Indexer("comet".into()),
+            config: config_with(&[], &[]),
+            env_var: "COMET_URL",
+            client,
+        };
+        comet.scrape(&movie("tt1")).await.expect("an answer");
+        let url = seen.lock().expect("lock")[0].clone();
+        assert!(
+            url.starts_with("https://comet.elfhosted.com/") && url.ends_with("/stream/movie/tt1.json") && url.len() > 80,
+            "comet was not asked on a minted path: {url}"
+        );
+        assert!(comet.answer_key().is_some());
+
+        let torz = MintingScraper {
+            indexer: Indexer("torz".into()),
+            config: config_with(&[], &[]),
+            env_var: "TORZ_URL",
+            client: failing_doer("never asked"),
+        };
+        let err = torz.scrape(&movie("tt1")).await.expect_err("torz has no minter");
+        assert!(!err.downcast_ref::<UnaskableError>().expect("typed").transient);
+
+        let mediafusion = MintingScraper {
+            indexer: Indexer("mediafusion".into()),
+            config: config_with(&[], &[]),
+            env_var: "MEDIAFUSION_URL",
+            client: failing_doer("dial tcp: i/o timeout"),
+        };
+        let err = mediafusion.scrape(&movie("tt1")).await.expect_err("the host is down");
+        assert!(err.downcast_ref::<UnaskableError>().expect("typed").transient, "an unreachable host is an outage");
+    }
+}

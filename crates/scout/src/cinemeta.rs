@@ -35,18 +35,13 @@ use reqwest::header::{HeaderValue, ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
-use crate::indexerconfig::{null_default, read_capped, Flight, SCRAPE_USER_AGENT};
+use crate::indexerconfig::{null_default, read_capped, Flight};
 use crate::rank::YEAR_TOKEN;
-use crate::scrape::Doer;
+use crate::scrape::{Doer, MAX_SCRAPE_BYTES, SCRAPE_USER_AGENT};
 use crate::util::{go_to_lower, key_hash};
 
 /// Go `cinemetaBase`: the public Cinemeta service.
 pub(crate) const CINEMETA_BASE: &str = "https://v3-cinemeta.strem.io";
-
-/// Go `maxScrapeBytes`: the most of an addon response body that is read (scrape.go). It belongs in scrape.rs, with
-/// `SCRAPE_USER_AGENT` (kept in indexerconfig.rs for now); scrape.rs is not part of this module's review, so both
-/// wait there for whoever ports scrape.go.
-const MAX_SCRAPE_BYTES: usize = 2 << 20;
 
 /// Go `cinemetaHitTTL` is how long a lookup is remembered. A film's title and year do not change, so an
 /// answer is kept for a week.
