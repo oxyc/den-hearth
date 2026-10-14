@@ -94,6 +94,7 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
     let mut d = Deps {
         cache: Arc::new(MemoryCache::new(1 << 20)),
         probe_client: None,
+        meta: None,
         scrape_timeout: Duration::from_secs(1),
         list_ttl: Duration::from_secs(5 * 60),
         public_url: String::new(),
@@ -269,7 +270,10 @@ pub(crate) fn streams_len(r: &http::Response<Vec<u8>>) -> usize {
 pub(crate) fn first_play_path(body: &str, marker: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(body).expect("a JSON stream list");
     let url = v["streams"][0]["url"].as_str().expect("a stream url").to_owned();
-    url[url.find(marker).expect("the play marker")..].to_owned()
+    let at = url.find(marker).expect("the play marker");
+    // A config blob names the segment without its slash; the path being asked for starts at that slash.
+    let at = if url[..at].ends_with('/') { at - 1 } else { at };
+    url[at..].to_owned()
 }
 
 #[tokio::test]

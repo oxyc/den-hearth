@@ -48,10 +48,33 @@ pub(crate) fn manifest_version() -> &'static str {
 
 /// Go `versionFrom`: DEN_VERSION when set, else DEV_VERSION.
 pub(crate) fn version_from(get: impl Fn(&str) -> String) -> String {
-    todo!("manifest.go versionFrom")
+    let v = get("DEN_VERSION");
+    if v.is_empty() {
+        DEV_VERSION.to_owned()
+    } else {
+        v
+    }
 }
 
 /// Go `buildManifest`: the manifest for a config (`None` = unconfigured).
 pub(crate) fn build_manifest(config: Option<&Config>) -> ManifestJson {
-    todo!("manifest.go buildManifest")
+    let mut description = "Self-hosted stream aggregator for Den — configure to add your debrid token.".to_owned();
+    let mut install_id = String::new();
+    if let Some(config) = config {
+        install_id = config.iid.clone();
+        let services: Vec<&str> = config.debrid.iter().map(|d| d.service.as_str()).collect();
+        description = format!("Cached-first, ranked, junk-filtered streams via {}.", services.join(", "));
+    }
+    ManifestJson {
+        id: "com.den.scout".to_owned(),
+        version: manifest_version().to_owned(),
+        name: "Den Scout".to_owned(),
+        description,
+        resources: vec!["stream".to_owned()],
+        types: vec!["movie".to_owned(), "series".to_owned()],
+        id_prefixes: vec!["tt".to_owned()],
+        catalogs: Vec::new(),
+        behavior_hints: ManifestHints { configurable: true, configuration_required: config.is_none() },
+        den_install_id: install_id,
+    }
 }

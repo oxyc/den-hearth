@@ -16,8 +16,9 @@ base64 = "0.22"
 sha2 = "0.11"
 # Go's `encoding/json`: `json.Marshal` for string literals in config fixtures (`jsonString`), the JSON
 # text `validate_config` takes, the streamed TorBox account listing (`decodeListing`), and the response
-# bodies the handler tests decode.
-serde_json = "1"
+# bodies the handler tests decode. `raw_value` is Go's `json.RawMessage`: a stale list keeps its `streams` array
+# exactly as it was written (coverage.rs `stale_body`).
+serde_json = { version = "1", features = ["raw_value"] }
 # XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`). The ticket owner uses it
 # in production; the tests build a legacy ticket with it.
 chacha20poly1305 = "0.10"
