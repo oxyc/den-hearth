@@ -45,6 +45,14 @@ pub(crate) fn parse_stremio_streams(_body: &[u8], _source: &str) -> Vec<RawStrea
     todo!()
 }
 
+/// Go `defaultIndexerURLs`: the base URL each indexer is asked at unless the config overrides it.
+pub(crate) const DEFAULT_INDEXER_URLS: [(&str, &str); 4] = [
+    ("torrentio", "https://torrentio.strem.fun"),
+    ("comet", "https://comet.elfhosted.com"),
+    ("mediafusion", "https://mediafusion.elfhosted.com"),
+    ("torz", "https://torz.strem.fun"),
+];
+
 /// Go `parseSize`: the size in bytes of a release described as "15.2 GB" or "700 MB", None when it says none.
 pub(crate) fn parse_size(_s: &str) -> Option<i64> {
     todo!()
