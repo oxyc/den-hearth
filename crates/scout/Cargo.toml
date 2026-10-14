@@ -44,6 +44,10 @@ regex = "1"
 fancy-regex = "0.19"
 # Go `net/url`, for the household source links in sources.go.
 url = "2"
+# Go `http.ParseTime` for a Retry-After date (upstreampause.go): IMF-fixdate, RFC 850 and asctime.
+httpdate = "1"
+# Go `math/rand` for the jitter on an unnamed pause (upstreampause.go).
+fastrand = "2"
 
 [dev-dependencies]
 # Go's `t.TempDir()`.

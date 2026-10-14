@@ -177,21 +177,17 @@ fn parse_stremio_streams_reads_the_hash_out_of_a_playback_link() {
     assert_eq!(got.join(" "), want.join(" "), "hashes = {got:?}, want {want:?}");
 }
 
-#[test]
-#[ignore = "needs newBoundedHostLimiter from hostlimit.rs (package 6)"]
-fn bounded_host_limiter_forgets_hosts_past_its_ceiling() {
-    #[cfg(any())]
-    async fn pending() {
-        use crate::hostlimit::new_bounded_host_limiter;
-        use std::time::Duration;
+#[tokio::test]
+async fn bounded_host_limiter_forgets_hosts_past_its_ceiling() {
+    use crate::hostlimit::{new_bounded_host_limiter, wait};
+    use std::time::Duration;
 
-        let l = new_bounded_host_limiter(Duration::from_secs(3600), 1, 2);
-        l.wait("a.example").await;
-        l.wait("b.example").await;
-        l.wait("c.example").await;
-        assert_eq!(l.bucket_count(), 1, "buckets = {}, want the map started over at the ceiling", l.bucket_count());
-    }
-    todo!("pending: sources_test.go TestBoundedHostLimiter_forgetsHostsPastItsCeiling")
+    let l = new_bounded_host_limiter(Duration::from_secs(3600), 1, 2);
+    wait(Some(&l), "a.example").await;
+    wait(Some(&l), "b.example").await;
+    wait(Some(&l), "c.example").await;
+    let buckets = l.buckets.lock().unwrap().len();
+    assert_eq!(buckets, 1, "buckets = {buckets}, want the map started over at the ceiling");
 }
 
 // Not in the Go suite. Go refuses a non-public address in the dialer's Control hook, which sees every connection's
