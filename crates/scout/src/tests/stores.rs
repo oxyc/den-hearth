@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::cache::{Cache, MemoryCache};
 use crate::config::{Config, DebridAccount, DebridService};
+use crate::handler::{rd_only, write_queued_body};
 use crate::scrape::{DoError, Doer};
 use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
@@ -1354,19 +1355,13 @@ fn has_cache_truth_reads_the_configured_services() {
 
 
 #[test]
-#[ignore = "needs hasCacheTruth and rdOnly from package 2 (handler.rs for rdOnly)"]
 fn has_cache_truth_and_rd_only() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        let rd = DebridAccount { service: DebridService::RealDebrid, token: "r".into() };
-        let tb = DebridAccount { service: DebridService::TorBox, token: "t".into() };
-        assert!(!has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }), "RD-only should have no cache truth");
-        assert!(has_cache_truth(&Config { debrid: vec![rd.clone(), tb.clone()], ..Default::default() }), "torbox present → cache truth");
-        assert!(rd_only(&Config { debrid: vec![rd.clone()], ..Default::default() }), "rd-only");
-        assert!(!rd_only(&Config { debrid: vec![rd, tb], ..Default::default() }), "not rd-only when torbox present");
-    }
-    todo!("pending: stores_test.go:625 TestHasCacheTruthAndRDOnly")
+    let rd = DebridAccount { service: DebridService::RealDebrid, token: "r".into() };
+    let tb = DebridAccount { service: DebridService::TorBox, token: "t".into() };
+    assert!(!has_cache_truth(&Config { debrid: vec![rd.clone()], ..Default::default() }), "RD-only should have no cache truth");
+    assert!(has_cache_truth(&Config { debrid: vec![rd.clone(), tb.clone()], ..Default::default() }), "torbox present → cache truth");
+    assert!(rd_only(&Config { debrid: vec![rd.clone()], ..Default::default() }), "rd-only");
+    assert!(!rd_only(&Config { debrid: vec![rd, tb], ..Default::default() }), "not rd-only when torbox present");
 }
 
 #[tokio::test]
@@ -1581,24 +1576,16 @@ async fn torbox_status_answer_coordination_includes_api_identity() {
 }
 
 #[test]
-#[ignore = "needs write_queued_body from handler.rs (package 4)"]
 fn queued_body_carries_state_and_swarm() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        // The 202 body names the state and the swarm when the store knew them, and omits the counts when it didn't.
-        let decode = |status: StoreStatus| -> serde_json::Value {
-            let mut buf = Vec::new();
-            write_queued_body(&mut buf, &status);
-            serde_json::from_slice(&buf).expect("decode")
-        };
-        let stalled = decode(StoreStatus { state: FETCH_STALLED.into(), seeds: Some(0), peers: Some(2), ..Default::default() });
-        assert!(stalled["state"] == "stalled" && stalled["seeds"] == 0 && stalled["peers"] == 2, "stalled body: {stalled}");
-        let plain = decode(StoreStatus { progress: 0.5, ..Default::default() });
-        assert_eq!(plain["state"], "downloading", "a store naming no state must still answer downloading");
-        assert!(plain.get("seeds").is_none(), "unknown seeds must be omitted, not zero: {plain}");
-    }
-    todo!("pending: stores_test.go:767 TestQueuedBodyCarriesStateAndSwarm")
+    // The 202 body names the state and the swarm when the store knew them, and omits the counts when it didn't.
+    let decode = |status: StoreStatus| -> serde_json::Value {
+        serde_json::from_slice(&write_queued_body(&status).body).expect("decode")
+    };
+    let stalled = decode(StoreStatus { state: FETCH_STALLED.into(), seeds: Some(0), peers: Some(2), ..Default::default() });
+    assert!(stalled["state"] == "stalled" && stalled["seeds"] == 0 && stalled["peers"] == 2, "stalled body: {stalled}");
+    let plain = decode(StoreStatus { progress: 0.5, ..Default::default() });
+    assert_eq!(plain["state"], "downloading", "a store naming no state must still answer downloading");
+    assert!(plain.get("seeds").is_none(), "unknown seeds must be omitted, not zero: {plain}");
 }
 
 #[tokio::test]

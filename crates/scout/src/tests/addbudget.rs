@@ -314,7 +314,7 @@ fn pm(token: &str, client: Arc<dyn Doer>, cache: Option<Arc<dyn Cache>>) -> Prem
 
 /// Go `isAddEndpoint` — the three calls that actually queue a torrent. Reads (mylist, checkcached, requestdl)
 /// are not adds, and a test that counts every request cannot tell the difference.
-fn is_add_endpoint(r: &reqwest::Request) -> bool {
+pub(crate) fn is_add_endpoint(r: &reqwest::Request) -> bool {
     let p = r.url().path();
     p.contains("createtorrent") || p.contains("addMagnet") || p.contains("directdl")
 }
@@ -598,25 +598,18 @@ fn spend_add_our_ceiling_is_not_the_stores_refusal() {
 
 /// /health reports the allowance without naming accounts. The route is unauthenticated, and a stable
 /// service:hash(token) key would make it a confirmation oracle for a guessed token.
-#[test]
-#[ignore = "needs package 4: handler.rs and deps.rs (Deps, the /health route)"]
-fn health_reports_the_budget_without_naming_accounts() {
-    // Enable when the owning package lands: move the body up and delete this wrapper.
-    #[cfg(any())]
-    fn pending() {
-        let _budget = install_budget(HOUR, 10);
-        global_add_budget().take(&budget_account(TorBox, "secret-token"), false);
+#[tokio::test]
+async fn health_reports_the_budget_without_naming_accounts() {
+    let _budget = install_budget(HOUR, 10);
+    global_add_budget().take(&budget_account(TorBox, "secret-token"), false);
 
-        let deps = crate::deps::Deps::for_test(new_cache());
-    let req = http::Request::get("/health").body(String::new()).unwrap();
-    let body = crate::handler::serve(&deps, req).into_body();
-        assert!(body.contains("addBudgetRemaining"), "a spent allowance must be visible: {body}");
-        assert!(
-            !body.contains(&key_hash("secret-token")) && !body.contains("torbox"),
-            "/health discloses which account is spending: {body}"
-        );
-    }
-    todo!("needs package 4: handler.rs and deps.rs (Deps, the /health route)");
+    let h = crate::handler::new_handler(crate::tests::handler::test_deps(|_| {}));
+    let body = crate::tests::handler::body_str(&crate::tests::handler::get(&h, "/health", &[]).await);
+    assert!(body.contains("addBudgetRemaining"), "a spent allowance must be visible: {body}");
+    assert!(
+        !body.contains(&key_hash("secret-token")) && !body.contains("torbox"),
+        "/health discloses which account is spending: {body}"
+    );
 }
 
 /// Scout's own in-flight marker is not the STORE refusing, and must not be recorded or reported as one.
