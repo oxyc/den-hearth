@@ -214,3 +214,5 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check        # each crate keeps its own rustfmt.toml
 ```
+
+Benchmarks, the load and soak harness, and the baseline tables: [BENCHMARKS.md](BENCHMARKS.md).

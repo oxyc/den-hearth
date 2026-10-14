@@ -319,6 +319,24 @@ async fn run(c: Configs) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Benchmark builds only (`--features stub-upstreams`, `bench/http/`): the services' upstream bases are fixed to
+/// the public APIs, so a load test that must make no external call points them at local stubs here. The feature
+/// is off in every image that ships, because a base taken from the environment would let whoever sets it
+/// collect the TMDB and OpenSubtitles keys.
+#[cfg(feature = "stub-upstreams")]
+fn stub_upstreams(reel: &mut den_reel::Config, subs: &mut den_subtitles::Config) {
+    if let Ok(base) = std::env::var("HEARTH_STUB_TMDB") {
+        reel.tmdb_base = base;
+    }
+    if let Ok(base) = std::env::var("HEARTH_STUB_KINOCHECK") {
+        reel.kinocheck_base = base;
+    }
+    if let Ok(base) = std::env::var("HEARTH_STUB_OPENSUBTITLES") {
+        subs.os_api_base = base;
+    }
+    eprintln!("stub-upstreams: the TMDB, KinoCheck and OpenSubtitles bases come from HEARTH_STUB_* (benchmark build)");
+}
+
 fn main() {
     // Read before the runtime exists: the services read their configuration from the environment
     // inside `from_env`, and `env::scoped` edits the environment to give each its own.
@@ -332,9 +350,13 @@ fn main() {
     // its own keeps the origin its own `PUBLIC_BASE_URL` names, as its old container did, so it gets none.
     let mount =
         |service: Service, name: &'static str| (!own.iter().any(|(s, _)| *s == service)).then_some(name);
-    let reel = env::scoped("REEL_", mount(Service::Reel, "reel"), den_reel::Config::from_env);
-    let subs = env::scoped("SUBS_", mount(Service::Subs, "subs"), den_subtitles::Config::from_env);
+    #[allow(unused_mut)]
+    let mut reel = env::scoped("REEL_", mount(Service::Reel, "reel"), den_reel::Config::from_env);
+    #[allow(unused_mut)]
+    let mut subs = env::scoped("SUBS_", mount(Service::Subs, "subs"), den_subtitles::Config::from_env);
     let remux = env::scoped("REMUX_", None, den_remux::Config::from_env);
+    #[cfg(feature = "stub-upstreams")]
+    stub_upstreams(&mut reel, &mut subs);
     let scout_settings =
         || den_scout::deps::settings_from_env(|name| std::env::var(name).unwrap_or_default());
     let scout_mount = env::scoped("SCOUT_", Some("scout"), scout_settings);

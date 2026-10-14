@@ -1,0 +1,38 @@
+{"kind":"meta","date":"20261014T035048Z","commit":"1e507b4","dirty":true,"machine":"Apple M4","cpus":10,"load_before":"5.45, 13.67, 25.65"}
+{"kind":"build","case":"clean","seconds":29.96}
+{"kind":"run","case":"all tests, warm build","seconds":21.46}
+{"kind":"build","case":"incremental: touch crates/scout/src/util.rs","seconds":1.35}
+{"kind":"build","case":"incremental: touch crates/remux/src/redact.rs","seconds":1.61}
+{"kind":"build","case":"incremental: touch crates/hearth/src/route.rs","seconds":1.14}
+{"kind": "crate", "binary": "den-hearth (src/main.rs)", "result": "ok", "passed": 12, "failed": 0, "ignored": 0, "seconds": 0.01}
+{"kind": "crate", "binary": "den-reel (src/lib.rs)", "result": "ok", "passed": 286, "failed": 0, "ignored": 6, "seconds": 5.41}
+{"kind": "crate", "binary": "den-reel (src/main.rs)", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "crate", "binary": "den-remux (src/lib.rs)", "result": "ok", "passed": 245, "failed": 0, "ignored": 17, "seconds": 2.68}
+{"kind": "crate", "binary": "den-remux (src/main.rs)", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "crate", "binary": "den-scout (src/lib.rs)", "result": "FAILED", "passed": 460, "failed": 43, "ignored": 162, "seconds": 6.81}
+{"kind": "crate", "binary": "den-subtitles (src/lib.rs)", "result": "ok", "passed": 288, "failed": 0, "ignored": 0, "seconds": 2.55}
+{"kind": "crate", "binary": "den-subtitles (src/main.rs)", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "crate", "binary": "doc-tests den_reel", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "crate", "binary": "doc-tests den_remux", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "crate", "binary": "doc-tests den_scout", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "crate", "binary": "doc-tests den_subtitles", "result": "ok", "passed": 0, "failed": 0, "ignored": 0, "seconds": 0.0}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::rank::lookaround_patterns_answer_for_a_title_of_any_length", "outcome": "ok", "seconds": 6.587}
+{"kind": "slowest", "binary": "den-reel (src/lib.rs)", "test": "tests::a_lingering_descendant_does_not_pin_a_finished_download", "outcome": "ok", "seconds": 5.155}
+{"kind": "slowest", "binary": "den-remux (src/lib.rs)", "test": "source::tests::growing_ranges_need_far_fewer_round_trips_on_a_controlled_high_bdp_path", "outcome": "ok", "seconds": 2.668}
+{"kind": "slowest", "binary": "den-subtitles (src/lib.rs)", "test": "srt::tests::escaping_a_hostile_line_stays_linear", "outcome": "ok", "seconds": 2.505}
+{"kind": "slowest", "binary": "den-remux (src/lib.rs)", "test": "source::tests::a_read_paused_longer_than_any_total_timeout_carries_on", "outcome": "ok", "seconds": 2.132}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::episode_patterns_bare_ranges_span_a_whole_season", "outcome": "ok", "seconds": 1.946}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::episode_patterns_a_tight_dash_is_not_enough_to_make_a_range", "outcome": "ok", "seconds": 1.926}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::episode_patterns_the_range_second_element_must_be_an_episode", "outcome": "ok", "seconds": 1.91}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::cached_episode_patterns_answers_for_the_episode_asked_about", "outcome": "ok", "seconds": 1.872}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::names_episode_a_range_holds_every_episode_in_it", "outcome": "ok", "seconds": 1.828}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::names_episode_reads_every_episode_in_a_chain", "outcome": "ok", "seconds": 1.626}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::pick_episode_file_a_bare_number_never_outranks_a_label", "outcome": "ok", "seconds": 1.484}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::pick_episode_file_a_title_number_is_not_an_episode", "outcome": "ok", "seconds": 1.426}
+{"kind": "slowest", "binary": "den-reel (src/lib.rs)", "test": "tests::concurrent_asks_for_one_id_share_a_single_resolve", "outcome": "ok", "seconds": 1.192}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::scrape::scraper_url", "outcome": "ok", "seconds": 1.131}
+{"kind": "slowest", "binary": "den-subtitles (src/lib.rs)", "test": "cache::tests::the_sweep_bounds_the_disk_tier", "outcome": "ok", "seconds": 1.112}
+{"kind": "slowest", "binary": "den-subtitles (src/lib.rs)", "test": "cache::tests::the_sweep_spends_the_cheap_entries_first", "outcome": "ok", "seconds": 1.107}
+{"kind": "slowest", "binary": "den-subtitles (src/lib.rs)", "test": "opensubtitles::download_tests::a_rate_limit_on_one_title_holds_every_title_until_an_answer", "outcome": "ok", "seconds": 1.104}
+{"kind": "slowest", "binary": "den-scout (src/lib.rs)", "test": "tests::stores_pick::pick_episode_file_bare_numbered_packs", "outcome": "ok", "seconds": 0.961}
+{"kind": "slowest", "binary": "den-reel (src/lib.rs)", "test": "tests::duplicates_of_one_title_do_not_spend_the_prewarm_cap", "outcome": "ok", "seconds": 0.827}

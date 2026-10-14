@@ -30,7 +30,9 @@ FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json -p den-hearth
 COPY . .
-RUN cargo build --release --locked -p den-hearth   # `strip = true` in the release profile
+# Empty in every release build. bench/http builds with `stub-upstreams`, which points the upstream bases at local stubs.
+ARG HEARTH_FEATURES=""
+RUN cargo build --release --locked -p den-hearth ${HEARTH_FEATURES:+--features "$HEARTH_FEATURES"}   # `strip = true` in the release profile
 
 # ---- build MP4Box (GPAC) — writes the clap box; gpac is gone from Debian repos ----------------------
 # Plain default build → MP4Box + libgpac.so (~10 MB total), linking only libc/libm/libz. Copying the

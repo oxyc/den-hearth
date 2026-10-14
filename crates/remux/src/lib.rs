@@ -43,6 +43,9 @@ mod source;
 mod state;
 mod subs;
 
+#[cfg(feature = "bench")]
+pub mod bench_api;
+
 #[cfg(test)]
 mod tests;
 

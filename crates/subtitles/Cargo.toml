@@ -38,5 +38,17 @@ subtle = "2"
 chardetng = "1"
 encoding_rs = "0.8"
 
+[features]
+# Forwards to the private modules' hot paths for benches/subtitles.rs (src/bench_api.rs). Off in every build that ships.
+bench = []
+
+[[bench]]
+name = "subtitles"
+harness = false
+required-features = ["bench"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+# Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
+divan = "0.1"
+tempfile = "3"

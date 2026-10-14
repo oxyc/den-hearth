@@ -6,6 +6,10 @@ description = "Den's self-hosted media node: Reel (trailers), Subtitles and Remu
 publish = false
 license = "MIT"
 
+[features]
+# Benchmark builds only: the upstream bases come from HEARTH_STUB_* (see main.rs). Never in a shipped image.
+stub-upstreams = []
+
 [dependencies]
 den-reel = { path = "../reel" }
 den-subtitles = { path = "../subtitles" }

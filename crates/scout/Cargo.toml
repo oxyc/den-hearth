@@ -51,7 +51,18 @@ httpdate = "1"
 # Go `math/rand` for the jitter on an unnamed pause (upstreampause.go).
 fastrand = "2"
 
+[features]
+# Forwards to the pub(crate) hot paths for benches/scout.rs (src/bench_api.rs). Off in every build that ships.
+bench = []
+
+[[bench]]
+name = "scout"
+harness = false
+required-features = ["bench"]
+
 [dev-dependencies]
+# Benchmarks, with an allocation-counting global allocator (benches/*.rs; `bench/micro.sh`).
+divan = "0.1"
 # Go's `t.TempDir()`.
 tempfile = "3"
 # A response whose body fails mid-read (`brokenBodyResponse`, `cancelledBodyResponse`): a stream that yields an error.

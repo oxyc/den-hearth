@@ -38,6 +38,9 @@ mod userconfig;
 mod worker;
 mod ytdlp;
 
+#[cfg(feature = "bench")]
+pub mod bench_api;
+
 #[cfg(test)]
 mod tests;
 

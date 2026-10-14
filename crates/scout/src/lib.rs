@@ -51,5 +51,8 @@ pub fn release_version() -> &'static str {
     manifest::manifest_version()
 }
 
+#[cfg(feature = "bench")]
+pub mod bench_api;
+
 #[cfg(test)]
 mod tests;
