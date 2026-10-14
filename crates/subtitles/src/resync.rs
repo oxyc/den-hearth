@@ -8,7 +8,8 @@
 //! media fed to ffmpeg's parsers. Two rules close it:
 //!
 //!   * **Only den-scout's play routes at an operator-listed origin.** A target must be
-//!     `<origin>/<config>/play/<token>` or `<origin>/p/<ticket>`, with `<origin>` in `SCOUT_ORIGINS`.
+//!     `<origin>/<config>/play/<token>` or `<origin>/p/<ticket>`, with `<origin>` in `SCOUT_ORIGINS` — or the
+//!     same behind hearth's `/scout` or `/den` mount.
 //!     Those are the URLs the Den app sends (the playing source's scout link: the legacy form
 //!     carries the install config, the ticket form a short-lived play ticket), and scout answers
 //!     them only for a valid install config or ticket — so a caller without one cannot make scout
@@ -165,7 +166,13 @@ pub fn vet(raw: &str, origins: &[Origin]) -> Option<Url> {
         return None;
     }
     let segments: Vec<&str> = url.path_segments()?.collect();
-    match segments.as_slice() {
+    // Hearth serves Scout's play routes under `/scout` on its main port, and the Den addon's under `/den`: the
+    // same routes behind one mount segment, at the same vetted origin.
+    let segments = match segments.as_slice() {
+        ["scout" | "den", route @ ..] => route,
+        all => all,
+    };
+    match segments {
         [config, "play", token] if !config.is_empty() && !token.is_empty() => Some(url),
         ["p", ticket] if is_ticket(ticket) => Some(url),
         _ => None,
@@ -418,6 +425,11 @@ mod tests {
             // The ticket form: one base64url segment under /p/.
             "http://192.168.86.193:8080/p/AbC-_09xyz",
             "https://scout.example.com/p/tkt",
+            // Both forms under hearth's Scout mount and the Den addon's.
+            "https://scout.example.com/scout/p/tkt",
+            "https://scout.example.com/den/p/tkt",
+            "https://scout.example.com/scout/cfg/play/tok",
+            "https://scout.example.com/den/cfg/play/tok",
         ];
         for u in ok {
             assert!(vet(u, &list).is_some(), "refused {u}");
@@ -474,6 +486,20 @@ mod tests {
             "http://127.0.0.1:8080/p/tkt",
             "http://user@192.168.86.193:8080/p/tkt",
             "http://192.168.86.193:8080@evil.tld/p/tkt",
+            // A mount is one segment, only these two, only first, and vetted at a listed origin like the rest.
+            "http://192.168.86.193:8080/den/den/p/tkt",
+            "http://192.168.86.193:8080/scout/den/p/tkt",
+            "http://192.168.86.193:8080/reel/p/tkt",
+            "http://192.168.86.193:8080/Den/p/tkt",
+            "http://192.168.86.193:8080/den/p",
+            "http://192.168.86.193:8080/den/p/tkt/extra",
+            "http://192.168.86.193:8080/den/p/tk.t",
+            "http://192.168.86.193:8080/den",
+            "http://192.168.86.193:8080/den/play/tok",
+            "http://10.0.0.1/den/p/tkt",
+            "http://127.0.0.1:8080/scout/p/tkt",
+            "http://192.168.86.193:8080@evil.tld/den/p/tkt",
+            "http://192.168.86.193:8081/scout/cfg/play/tok",
         ];
         for u in refused {
             assert!(vet(u, &list).is_none(), "accepted {u}");

@@ -1,13 +1,16 @@
 //! The config segment of an addon URL, read the same way by Scout, Reel and Subtitles: the sealed-config
 //! keyring (`Keyring`, `seal`, `open_segment`) and the install-revocation policy (`InstallId`, `Revocation`,
-//! `Rejected`). What a config MEANS (its JSON fields) stays in each service.
+//! `Rejected`), and the combined Den addon's config that holds a part for each (`addon`). What a config MEANS
+//! (its JSON fields) stays in each service.
 //!
 //! Wire format, shared with the Go addon and the browser bundle: the base64url-decoded segment is either
 //! `version_byte(0x01) ‖ crypto_box_seal(config_json)` or, where the addon has no key, the plaintext JSON.
 
+pub mod addon;
 mod install;
 mod keyring;
 
+pub use addon::Addon;
 pub use install::{InstallId, Rejected, Revocation, MAX_EPOCH};
 pub use keyring::{decode_key, seal, KeyPair, Keyring, SEALED_VERSION};
 

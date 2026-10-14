@@ -17,6 +17,8 @@ den-remux = { path = "../remux" }
 den-scout = { path = "../scout" }
 # The body type every service answers with, the JSON builders and the metrics bearer check.
 den-http = { path = "../http" }
+# The combined Den addon's keys, revocation and config (`den.rs`).
+den-seal = { path = "../seal" }
 # The services were written for a current_thread runtime; one process serving all of them has more to
 # do, so hearth runs a small multi-thread pool instead (HEARTH_WORKER_THREADS).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
@@ -35,5 +37,8 @@ tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
+# Config segments, and Reel's link tags, for the Den addon's tests (`tests/den_addon.rs`).
+base64 = "0.23"
+blake2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tokio = { version = "1", features = ["test-util", "io-util"] }

@@ -56,6 +56,11 @@ pub(crate) fn version_from(get: impl Fn(&str) -> String) -> String {
     }
 }
 
+/// The unconfigured manifest as JSON, for the combined Den addon's manifest to take Scout's resource from.
+pub fn unconfigured_manifest() -> serde_json::Value {
+    serde_json::to_value(build_manifest(None)).expect("the manifest serialises")
+}
+
 /// Go `buildManifest`: the manifest for a config (`None` = unconfigured).
 pub(crate) fn build_manifest(config: Option<&Config>) -> ManifestJson {
     let mut description =

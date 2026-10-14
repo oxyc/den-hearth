@@ -1114,7 +1114,11 @@ impl Inner {
         if deps.play_ticket_ttl.is_zero() {
             deps.play_ticket_ttl = crate::ticket::DEFAULT_PLAY_TICKET_TTL;
         }
-        let tickets = TicketKeys::new(deps.seal_keyring.as_deref());
+        let info = match deps.config_slice {
+            Some(_) => crate::ticket::DEN_PLAY_TICKET_INFO,
+            None => crate::ticket::PLAY_TICKET_INFO,
+        };
+        let tickets = TicketKeys::with_info(deps.seal_keyring.as_deref(), info);
         let ttl_sec = deps.list_ttl.as_secs();
         // Private, every list: its play URLs are bearer tickets good for a day, so no shared cache between the client
         // and scout (a CDN in front of den-edge, a corporate proxy) may keep a copy to hand to someone else.
@@ -3338,7 +3342,7 @@ impl Inner {
                 .or_else(|| req.uri().authority().map(|a| a.as_str()))
                 .unwrap_or("");
         }
-        format!("{proto}://{host}")
+        format!("{proto}://{host}{}", self.deps.mount)
     }
 
     /// remuxAuthorized reports whether the request carries den-remux's service key (X-Den-Remux-Key), compared
@@ -3367,7 +3371,11 @@ impl Inner {
     /// A warm stream-list hit opens nothing (handleStream), so for a few minutes after a revocation the install
     /// can still read a list it had cached. Every play URL in that list is refused.
     pub(crate) fn open_config(&self, blob: &str) -> Option<Config> {
-        let config = crate::config::decode_config(self.deps.seal_keyring.as_deref(), blob)?;
+        let config = crate::config::decode_config_slice(
+            self.deps.seal_keyring.as_deref(),
+            blob,
+            self.deps.config_slice,
+        )?;
         self.admit_install(&config).then_some(config)
     }
 

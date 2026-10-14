@@ -422,11 +422,14 @@ dependencies = [
 name = "den-hearth"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "blake2",
  "bytes",
  "den-http",
  "den-reel",
  "den-remux",
  "den-scout",
+ "den-seal",
  "den-subtitles",
  "futures-util",
  "http-body-util",
@@ -557,6 +560,9 @@ dependencies = [
  "base64 0.23.1",
  "crypto_box",
  "den-net",
+ "hkdf",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

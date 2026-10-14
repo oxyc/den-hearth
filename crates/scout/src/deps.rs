@@ -371,6 +371,12 @@ pub struct Deps {
     pub play_ticket_ttl: Duration,
     /// Closes the /<config>/play route once passed, while tickets are on. None leaves it open.
     pub legacy_play_until: Option<SystemTime>,
+    /// The member of a combined Den addon config this handler reads (`den_seal::addon`), for the handler hearth
+    /// serves under `/den`. None reads Scout's own config, as every other handler does.
+    pub config_slice: Option<&'static str>,
+    /// What follows an origin derived from the request (no `public_url`): the path hearth serves this handler
+    /// under. Empty for every handler but the Den addon's, whose links must come back under `/den`.
+    pub mount: &'static str,
 }
 
 /// A `reqwest::Client` as the `Doer` the stores, the scrapers and the link check take.
@@ -452,6 +458,8 @@ fn build_deps_with(
         remux_key: settings.remux_key.clone(),
         play_ticket_ttl: settings.play_ticket_ttl,
         legacy_play_until: settings.legacy_play_until,
+        config_slice: None,
+        mount: "",
     }
 }
 

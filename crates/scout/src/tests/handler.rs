@@ -134,6 +134,8 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
         remux_key: String::new(),
         play_ticket_ttl: crate::ticket::DEFAULT_PLAY_TICKET_TTL,
         legacy_play_until: None,
+        config_slice: None,
+        mount: "",
     };
     over(&mut d);
     d

@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Den — Configure</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0d0f13; color: #e6e8ec;
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif; }
+  main { max-width: 34rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  p.sub { color: #9aa0aa; margin: 0 0 1.5rem; }
+  h2 { font-size: .78rem; color: #9aa0aa; text-transform: uppercase; letter-spacing: .06em;
+       margin: 1.75rem 0 .7rem; }
+  h3 { font-size: 1.05rem; margin: 2.25rem 0 .2rem; color: #e6e8ec; }
+  label { display: block; font-weight: 600; margin: 0 0 .35rem; color: #c9ccd3; }
+  input[type=text], input[type=password], input[type=number], select, textarea#sources {
+    width: 100%; padding: .65rem .7rem; border-radius: 9px; border: 1px solid #2a2f38;
+    background: #161a20; color: inherit; font: inherit; outline: none; }
+  input:focus, select:focus, textarea#sources:focus { border-color: #5b8cff; }
+  textarea#sources { resize: vertical; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .field { margin-top: .9rem; }
+  .hint { color: #8b919b; font-size: .82rem; margin-top: .3rem; }
+  .hint a { color: #7fb0ff; }
+  .row-inputs { display: flex; gap: .75rem; } .row-inputs > * { flex: 1; }
+  .chk { display: inline-flex; align-items: center; gap: .5rem; margin: 0 1rem .55rem 0;
+         color: #c9ccd3; font-weight: 400; }
+  .chk input { width: auto; }
+  .optional { font-weight: 400; color: #8b919b; }
+  button.primary { width: 100%; margin-top: 1.75rem; padding: .8rem; border: 0; border-radius: 10px;
+    background: #3b82f6; color: #fff; font-weight: 600; font-size: 1rem; cursor: pointer; }
+  #out { margin-top: 1.5rem; }
+  #out.hidden { display: none; }
+  #url { width: 100%; padding: .7rem; border: 1px solid #2a2f38; border-radius: 9px; background: #10141a;
+    color: #8ab4ff; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    resize: vertical; overflow-wrap: anywhere; box-sizing: border-box; }
+  .row { display: flex; gap: .6rem; margin-top: .6rem; }
+  #copy { padding: .55rem 1.1rem; border: 1px solid #2a2f38; border-radius: 9px; background: #1c212a;
+    color: #e6e8ec; font: inherit; cursor: pointer; }
+  .note { font-size: .86rem; margin: .8rem 0 0; font-weight: 600; }
+  .note.sealed { color: #56d18c; }
+  .note.unsealed { color: #f0b74a; }
+  .disclaimer { color: #9aa0aa; font-size: .8rem; line-height: 1.55; margin: .55rem 0 0;
+    padding: .8rem .9rem; background: #12151b; border: 1px solid #222833; border-radius: 9px; }
+  .disclaimer b { color: #c9ccd3; font-weight: 600; }
+  .err { color: #ff6b6b; min-height: 1.1rem; margin-top: .5rem; font-size: .85rem; }
+  .foot { margin-top: 1rem; color: #8b919b; font-size: .8rem; }
+  .foot a { color: #8b919b; }
+  #installId { color: #c9ccd3; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
+</style></head><body>
+<main>
+<h1>Den</h1>
+<p class="sub">One addon for streams, subtitles and trailers. Fill in the parts you want — each is optional, and
+  the addon offers only what you set up. Your keys stay in this link and are stored in the Den Keychain — treat
+  the link like a password.</p>
+
+<h3>Streams</h3>
+<p class="optional">Resolved through your own debrid account. Leave the token blank for no streams.</p>
+<h2>Debrid</h2>
+<label for="service">Service</label>
+<select id="service">
+  <option value="torbox">TorBox</option>
+  <option value="realdebrid">Real-Debrid</option>
+  <option value="premiumize">Premiumize</option>
+</select>
+<div class="field">
+  <label for="token">API token</label>
+  <input id="token" type="password" autocomplete="off" placeholder="paste your debrid API key">
+</div>
+<div class="row"><button id="test" type="button">Test token</button></div>
+<p class="note" id="testResult"></p>
+<h2>Your own addons <span class="optional">(optional)</span></h2>
+<label for="sources">Stream addon links <span class="optional">(one per line, up to 3)</span></label>
+<textarea id="sources" rows="3" autocomplete="off" spellcheck="false"
+  placeholder="https://mediafusion.elfhosted.com/…/manifest.json"></textarea>
+<p class="hint">Stremio stream addons you set up yourself — MediaFusion, Comet or Torrentio with your debrid
+  account — asked alongside the indexers. Their links carry your settings, so they are sealed into this link
+  with your token.</p>
+<p class="note" id="sourcesResult"></p>
+<h2>Sources</h2>
+<label class="chk"><input type="checkbox" id="useDefaults" checked> Use the server's defaults</label>
+<p class="optional" id="defaultsNote">Your link carries only your debrid account, so everything else
+  follows this server — change the defaults here later and every link built this way follows, with no
+  re-configuring. Untick to see them and pin your own.</p>
+<div id="tunables">
+<h2>Indexers <span class="optional">(all if none)</span></h2>
+<label class="chk"><input type="checkbox" name="indexer" value="torrentio" checked> Torrentio</label>
+<label class="chk"><input type="checkbox" name="indexer" value="comet" checked> Comet</label>
+<label class="chk"><input type="checkbox" name="indexer" value="mediafusion" checked> MediaFusion</label>
+<label class="chk"><input type="checkbox" name="indexer" value="torz" checked> Torz</label>
+<h2>Filters</h2>
+<label class="chk"><input type="checkbox" id="excludeCam" checked> Hide CAM / TS / screeners</label><br>
+<label class="chk"><input type="checkbox" id="cachedOnly"> Cached only (hide anything the debrid must fetch first)</label><br>
+<label class="chk"><input type="checkbox" id="hdrOnly"> HDR / Dolby Vision only</label>
+<div class="field">
+  <label>Resolutions <span class="optional">(all if none)</span></label>
+  <div>
+    <label class="chk"><input type="checkbox" name="res" value="2160p"> 4K</label>
+    <label class="chk"><input type="checkbox" name="res" value="1080p"> 1080p</label>
+    <label class="chk"><input type="checkbox" name="res" value="720p"> 720p</label>
+    <label class="chk"><input type="checkbox" name="res" value="480p"> 480p</label>
+  </div>
+</div>
+<div class="field">
+  <label for="preferResolution">Prefer <span class="optional">(ranked first, others still shown)</span></label>
+  <select id="preferResolution">
+    <option value="">No preference</option>
+    <option value="2160p">4K</option>
+    <option value="1080p">1080p</option>
+    <option value="720p">720p</option>
+    <option value="480p">480p</option>
+  </select>
+</div>
+<div class="field"><label for="maxSizeGB">Max size (GB, blank = no cap)</label>
+  <input id="maxSizeGB" type="number" min="0" placeholder="e.g. 25"></div>
+<div class="field"><label for="minSeeders">Min seeders (blank = any)</label>
+  <input id="minSeeders" type="number" min="0" placeholder="e.g. 3"></div>
+<div class="field"><label for="resultCap">Max results</label>
+  <input id="resultCap" type="number" min="1" max="50" value="20"></div>
+</div>
+
+<h3>Subtitles</h3>
+<p class="optional">Hash-matched OpenSubtitles, auto-sync, and your-own-key AI translation. Leave the
+  OpenSubtitles key blank for no subtitles.</p>
+<label for="osKey">OpenSubtitles API key</label>
+<input id="osKey" type="password" autocomplete="off" placeholder="your opensubtitles.com consumer key">
+<div class="hint">Register a free app at
+  <a href="https://www.opensubtitles.com/consumers">opensubtitles.com/consumers</a>. This is the subtitle source.</div>
+<div class="field">
+  <label for="osToken">OpenSubtitles token <span class="optional">(optional)</span></label>
+  <input id="osToken" type="password" autocomplete="off" placeholder="service-account JWT — raises download quota">
+</div>
+<label class="chk" style="margin-top:1rem"><input id="autoSync" type="checkbox" checked> Auto-sync subtitles (hash + reference alignment)</label>
+<h2>AI translation <span class="optional" style="text-transform:none;letter-spacing:0">— optional</span></h2>
+<label for="provider">Provider</label>
+<select id="provider"></select>
+<div class="field">
+  <label for="modelSelect">Model</label>
+  <div class="row-inputs">
+    <select id="modelSelect"></select>
+    <input id="modelCustom" type="text" placeholder="or a custom model id">
+  </div>
+  <div class="hint">Default is the cheap/fast/decent tier. Pick a bigger model to re-translate a title that reads badly.</div>
+</div>
+<div class="field">
+  <label for="apiKey">Provider API key <span class="optional">(leave blank for subtitles only)</span></label>
+  <input id="apiKey" type="password" autocomplete="off" placeholder="leave blank for fetch + sync without translation">
+</div>
+
+<h3>Trailers</h3>
+<p class="optional">Inline trailers resolved from your own TMDB key. Leave it blank for no trailers.</p>
+<label for="tmdbKey">TMDB API key</label>
+<input id="tmdbKey" type="password" autocomplete="off" placeholder="your themoviedb.org API key (v3) or read token (v4)">
+<div class="hint">Free from <a href="https://www.themoviedb.org/settings/api">themoviedb.org/settings/api</a>.
+  This is the trailer source (imdb → YouTube trailer).</div>
+<div class="field">
+  <label for="kinocheckKey">KinoCheck API key <span class="optional">(optional)</span></label>
+  <input id="kinocheckKey" type="password" autocomplete="off" placeholder="fallback trailer source — leave blank to skip">
+</div>
+
+<button id="go" class="primary">Build install link</button>
+<div class="err" id="err"></div>
+<div id="out" class="hidden">
+  <h2>Your install link</h2>
+  <textarea id="url" readonly rows="3" aria-label="Install URL"></textarea>
+  <div class="row"><button id="copy" type="button">Copy link</button></div>
+  <p class="foot">Install id: <code id="installId"></code> — put this in <code>HEARTH_REVOKED_INSTALLS</code> to revoke just this link.</p>
+  <p class="note" id="sealNote"></p>
+  <p class="disclaimer" id="sealDisclaimer"></p>
+  <p class="foot">In Den: Settings → Plugins → Add, paste this link. &nbsp;·&nbsp;
+     <a href="#" id="forget">Forget saved settings on this browser</a></p>
+</div>
+</main>
+<!-- DenSeal bundle -->
+<script>
+// Den (hearth's combined addon) — one config with a member per service: `scout` for streams, `subs` for
+// subtitles, `reel` for trailers. Each member is exactly what that service's own /configure page builds, so
+// the fields, defaults and checks below are theirs.
+var PRODUCT = "Den";
+var STORE_KEY = "den-addon.configure";
+var $ = function (id) { return document.getElementById(id); };
+// Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
+// every link it builds sits beside it.
+var BASE = location.pathname.replace(/\/(configure\/?)?$/, "");
+
+// --- Streams (Scout) -------------------------------------------------------------------------------------
+var ALL_INDEXERS = ["torrentio", "comet", "mediafusion", "torz"];
+var MAX_SOURCES = 3, MAX_SOURCE_URL = 2048;
+
+function parseSources() {
+  var out = [], lines = $("sources").value.split(/\s+/);
+  for (var i = 0; i < lines.length; i++) {
+    var s = lines[i].trim();
+    if (!s) continue;
+    s = s.replace(/^stremio:\/\//i, "https://").replace(/\/manifest\.json$/, "").replace(/\/+$/, "");
+    if (!/^https:\/\/[^\/?#]+/i.test(s) || /[?#]/.test(s)) return { error: "Each addon link has to be an https:// (or stremio://) link." };
+    if (s.length > MAX_SOURCE_URL) return { error: "An addon link is longer than " + MAX_SOURCE_URL + " characters." };
+    if (out.indexOf(s) < 0) out.push(s);
+  }
+  if (out.length > MAX_SOURCES) return { error: "Up to " + MAX_SOURCES + " addon links." };
+  return { sources: out };
+}
+
+function checkSources() {
+  var out = $("sourcesResult"), parsed = parseSources();
+  out.className = "note";
+  if (parsed.error) { out.textContent = parsed.error; out.className = "note unsealed"; return; }
+  if (!parsed.sources.length) { out.textContent = ""; return; }
+  out.textContent = "Checking…";
+  Promise.all(parsed.sources.map(function (base) {
+    var host = base.replace(/^https:\/\//i, "").split("/")[0];
+    return fetch(base + "/manifest.json")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (m) {
+        var streams = (m.resources || []).some(function (r) { return r === "stream" || (r && r.name === "stream"); });
+        return { ok: streams, text: (streams ? "✓ " : "✗ ") + (m.name || host) + (streams ? "" : " serves no streams") };
+      })
+      .catch(function () { return { ok: false, text: "? " + host + ": couldn't read its manifest" }; });
+  })).then(function (results) {
+    out.textContent = results.map(function (r) { return r.text; }).join("  ·  ");
+    out.className = results.every(function (r) { return r.ok; }) ? "note sealed" : "note unsealed";
+  });
+}
+$("sources").addEventListener("change", checkSources);
+
+function checkedVals(name) {
+  return Array.prototype.slice
+    .call(document.querySelectorAll("input[name='" + name + "']:checked"))
+    .map(function (e) { return e.value; });
+}
+function numVal(id) { var v = parseInt($(id).value, 10); return isNaN(v) ? undefined : v; }
+function clampedNumVal(id) {
+  var v = numVal(id);
+  if (v === undefined) return undefined;
+  var el = $(id), lo = parseInt(el.min, 10), hi = parseInt(el.max, 10);
+  if (!isNaN(lo) && v < lo) v = lo;
+  if (!isNaN(hi) && v > hi) v = hi;
+  el.value = String(v);
+  return v;
+}
+
+// The `scout` member, `undefined` when no token was given, or `null` (with the error said) when the section
+// cannot be used as filled in.
+function collectScout(err) {
+  var token = $("token").value.trim();
+  var parsed = parseSources();
+  if (parsed.error) { err.textContent = parsed.error; $("sources").focus(); return null; }
+  if (!token) {
+    if (parsed.sources.length) { err.textContent = "Your own addons need a debrid token."; $("token").focus(); return null; }
+    return undefined;
+  }
+  // Defaults means the member carries ONLY the account, so the link follows the server's defaults as they change.
+  var config = { debrid: [{ service: $("service").value, token: token }] };
+  if (parsed.sources.length) config.sources = parsed.sources;
+  if (!$("useDefaults").checked) {
+    config.indexers = checkedVals("indexer");
+    config.resultCap = clampedNumVal("resultCap") || 20;
+    config.filters = {
+      excludeCam: $("excludeCam").checked,
+      resolutions: checkedVals("res"),
+      preferResolution: $("preferResolution").value || undefined,
+      hdrOnly: $("hdrOnly").checked,
+      minSeeders: numVal("minSeeders"),
+      maxSizeGB: numVal("maxSizeGB"),
+    };
+    config.cachedOnly = $("cachedOnly").checked;
+    Object.keys(config.filters).forEach(function (k) {
+      var v = config.filters[k];
+      if (v === undefined || (Array.isArray(v) && v.length === 0)) delete config.filters[k];
+    });
+    if (!config.indexers.length) delete config.indexers;
+  }
+  return config;
+}
+
+function setChecks(name, values) {
+  var wanted = {};
+  (values || []).forEach(function (v) { wanted[v] = true; });
+  Array.prototype.slice.call(document.querySelectorAll("input[name='" + name + "']"))
+    .forEach(function (el) { el.checked = !!wanted[el.value]; });
+}
+
+function syncDefaults() {
+  var useDefaults = $("useDefaults").checked;
+  $("tunables").style.display = useDefaults ? "none" : "";
+  $("defaultsNote").style.display = useDefaults ? "" : "none";
+}
+
+function fillScout(s) {
+  if (s.debrid && s.debrid[0]) {
+    if (s.debrid[0].service) $("service").value = s.debrid[0].service;
+    if (s.debrid[0].token) $("token").value = s.debrid[0].token;
+  }
+  if (s.sources && s.sources.length) $("sources").value = s.sources.join("\n");
+  setChecks("indexer", s.indexers && s.indexers.length ? s.indexers : ALL_INDEXERS);
+  var pinned = !!s.filters || typeof s.cachedOnly === "boolean" || !!s.indexers || s.resultCap != null;
+  $("useDefaults").checked = !pinned;
+  syncDefaults();
+  var f = s.filters || {};
+  if ("excludeCam" in f) $("excludeCam").checked = !!f.excludeCam;
+  if (typeof s.cachedOnly === "boolean") $("cachedOnly").checked = s.cachedOnly;
+  if ("hdrOnly" in f) $("hdrOnly").checked = !!f.hdrOnly;
+  if (f.resolutions) setChecks("res", f.resolutions);
+  if (f.preferResolution) $("preferResolution").value = f.preferResolution;
+  if (f.maxSizeGB != null) $("maxSizeGB").value = f.maxSizeGB;
+  if (f.minSeeders != null) $("minSeeders").value = f.minSeeders;
+  if (s.resultCap != null) $("resultCap").value = s.resultCap;
+}
+
+// --- Subtitles ----------------------------------------------------------------------------------------------
+var MODELS = {
+  openai:     ["gpt-4o-mini", "gpt-4o"],
+  google:     ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+  anthropic:  ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"],
+  xai:        ["grok-2"],
+  openrouter: ["openai/gpt-4o-mini", "anthropic/claude-haiku-4-5", "google/gemini-2.0-flash"],
+  deepl:      [],
+};
+var LABELS = { openai: "OpenAI", google: "Google Gemini", anthropic: "Anthropic Claude",
+               xai: "xAI Grok", openrouter: "OpenRouter", deepl: "DeepL (no AI context)" };
+
+function fillModels() {
+  var sel = $("modelSelect");
+  sel.innerHTML = "";
+  var list = MODELS[$("provider").value] || [];
+  sel.disabled = list.length === 0;
+  list.forEach(function (m) {
+    var o = document.createElement("option"); o.value = m; o.textContent = m; sel.appendChild(o);
+  });
+}
+
+(function initProviders() {
+  var provider = $("provider");
+  Object.keys(MODELS).forEach(function (p) {
+    var o = document.createElement("option"); o.value = p; o.textContent = LABELS[p]; provider.appendChild(o);
+  });
+  provider.addEventListener("change", fillModels);
+  fillModels();
+})();
+
+// The `subs` member, `undefined` when nothing was filled in, `null` when it cannot be used.
+function collectSubs(err) {
+  var osKey = $("osKey").value.trim(), osToken = $("osToken").value.trim(), apiKey = $("apiKey").value.trim();
+  if (!osKey) {
+    if (osToken || apiKey) { err.textContent = "Subtitles need an OpenSubtitles API key."; $("osKey").focus(); return null; }
+    return undefined;
+  }
+  var config = { osKey: osKey, autoSync: $("autoSync").checked };
+  if (osToken) config.osToken = osToken;
+  if (apiKey) {
+    config.provider = $("provider").value;
+    config.model = $("modelCustom").value.trim() || $("modelSelect").value || "";
+    config.apiKey = apiKey;
+  }
+  return config;
+}
+
+function fillSubs(s) {
+  if (s.osKey) $("osKey").value = s.osKey;
+  if (s.osToken) $("osToken").value = s.osToken;
+  if (typeof s.autoSync === "boolean") $("autoSync").checked = s.autoSync;
+  if (s.provider) { $("provider").value = s.provider; fillModels(); }
+  if (s.model) $("modelCustom").value = s.model;
+  if (s.apiKey) $("apiKey").value = s.apiKey;
+}
+
+// --- Trailers (Reel) ----------------------------------------------------------------------------------------
+function collectReel(err) {
+  var tmdb = $("tmdbKey").value.trim(), kino = $("kinocheckKey").value.trim();
+  if (!tmdb) {
+    if (kino) { err.textContent = "Trailers need a TMDB API key."; $("tmdbKey").focus(); return null; }
+    return undefined;
+  }
+  var config = { tmdbKey: tmdb };
+  if (kino) config.kinocheckKey = kino;
+  return config;
+}
+
+function fillReel(s) {
+  if (s.tmdbKey) $("tmdbKey").value = s.tmdbKey;
+  if (s.kinocheckKey) $("kinocheckKey").value = s.kinocheckKey;
+}
+
+// The combined config without its install id and epoch: a member per section that was filled in. null (and
+// the error said) when a section is half filled in, or none is.
+function collectConfig() {
+  var err = $("err");
+  err.textContent = "";
+  var config = {}, parts = { scout: collectScout, subs: collectSubs, reel: collectReel };
+  for (var name in parts) {
+    var member = parts[name](err);
+    if (member === null) return null;
+    if (member !== undefined) config[name] = member;
+  }
+  if (!Object.keys(config).length) {
+    err.textContent = "Fill in at least one of streams, subtitles or trailers.";
+    $("token").focus();
+    return null;
+  }
+  return config;
+}
+
+function fillForm(s) {
+  if (s.scout) fillScout(s.scout);
+  if (s.subs) fillSubs(s.subs);
+  if (s.reel) fillReel(s.reel);
+}
+
+(function () {
+  // The addon's X25519 public key: when served, the config is SEALED to it in this browser; when not, the
+  // addon only takes plaintext. Either answer carries the addon's config epoch, stamped into the link so it is
+  // not born revoked. no-cache, so an epoch raised a minute ago is not read from a stale copy.
+  var sealPublicKey = null, configEpoch = 0;
+  fetch(BASE + "/config-key", { cache: "no-cache" })
+    .then(function (r) {
+      return r.json().then(function (j) {
+        if (r.ok && j.key) sealPublicKey = j.key;
+        if (typeof j.epoch === "number") configEpoch = j.epoch;
+      });
+    })
+    .catch(function () { /* offline / no key served → plaintext fallback below */ });
+
+  // A fresh install id for every link: 16 random bytes, base64url without padding (22 characters).
+  function mintInstallId() {
+    var bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function encodePlain(config) {
+    var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(config))));
+    return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  var lastBuildSealed = false;
+  function toSegment(config) {
+    if (sealPublicKey && window.DenSeal) {
+      try {
+        var segment = window.DenSeal.denSeal(sealPublicKey, JSON.stringify(config));
+        lastBuildSealed = true;
+        return segment;
+      } catch (e) { /* fall through to plaintext */ }
+    }
+    lastBuildSealed = false;
+    return encodePlain(config);
+  }
+
+  function saveSettings(config) { try { localStorage.setItem(STORE_KEY, JSON.stringify(config)); } catch (e) {} }
+  function loadSettings() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } }
+
+  function copyInstallURL() {
+    var field = $("url");
+    field.focus();
+    field.select();
+    field.setSelectionRange(0, 999999);
+    var copied = false;
+    try { copied = document.execCommand("copy"); } catch (e) {}
+    if (navigator.clipboard) { navigator.clipboard.writeText(field.value).catch(function () {}); copied = true; }
+    if (copied) flashCopied();
+  }
+  function flashCopied() {
+    var btn = $("copy");
+    var label = btn.getAttribute("data-label") || btn.textContent;
+    btn.setAttribute("data-label", label);
+    btn.textContent = "Copied ✓";
+    setTimeout(function () { btn.textContent = label; }, 1500);
+  }
+
+  function build() {
+    var config = collectConfig();
+    if (!config) return;
+    saveSettings(config);
+    // Stamped after saving, so every build is a new install that can be revoked on its own.
+    var install = Object.assign({ iid: mintInstallId(), ep: configEpoch }, config);
+    $("url").value = location.origin + BASE + "/" + toSegment(install) + "/manifest.json";
+    $("installId").textContent = install.iid;
+    $("out").classList.remove("hidden");
+    renderSecurityNote();
+    copyInstallURL();
+  }
+
+  // The one request that sends the debrid token unsealed: only when this button is pressed, to check it now
+  // rather than as an empty list on the sofa. The server neither logs nor stores it.
+  function testToken() {
+    var out = $("testResult"), token = $("token").value.trim();
+    if (!token) { out.textContent = "Paste a token first."; out.className = "note"; return; }
+    out.textContent = "Checking…";
+    out.className = "note";
+    fetch(BASE + "/validate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ service: $("service").value, token: token })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.valid) {
+          out.textContent = "✓ This token works.";
+          out.className = "note sealed";
+        } else {
+          out.textContent = "✗ " + ((j && j.reason) || "That token did not work.");
+          out.className = "note unsealed";
+        }
+      })
+      .catch(function () {
+        out.textContent = "Could not reach the addon to check.";
+        out.className = "note unsealed";
+      });
+  }
+
+  function renderSecurityNote() {
+    var note = $("sealNote"), disclaimer = $("sealDisclaimer");
+    if (lastBuildSealed) {
+      note.textContent = "🔒 Sealed — your keys are encrypted inside this link.";
+      note.className = "note sealed";
+      disclaimer.innerHTML =
+        "Your keys were encrypted <b>in this browser</b>, to " + PRODUCT + "’s public key, before the " +
+        "link was built — the link carries <b>ciphertext, not your keys</b>. Anyone who later sees the " +
+        "link (a server log, your browser history, a screenshot, the reverse proxy) cannot read your keys " +
+        "from it. " + PRODUCT + " decrypts them only in memory to answer a request and <b>stores nothing</b>." +
+        "<br><br>This is not zero-knowledge: the " + PRODUCT + " server itself decrypts the keys to use them. " +
+        "And the link is still a <b>bearer token</b> — whoever holds it can spend your accounts’ " +
+        "quota — so keep it private.";
+    } else {
+      note.textContent = "⚠︎ Not sealed — your keys are in plain text in this link.";
+      note.className = "note unsealed";
+      disclaimer.innerHTML =
+        "This addon isn’t configured with an encryption key, so your keys ride in the link as <b>plain " +
+        "text</b> — anyone who sees the link can read them. Treat the link like a password, or ask the " +
+        "operator to set a config key so the link can be sealed.";
+    }
+  }
+
+  var saved = loadSettings();
+  if (saved) { try { fillForm(saved); } catch (e) {} }
+  syncDefaults();
+  $("useDefaults").addEventListener("change", syncDefaults);
+  $("go").addEventListener("click", build);
+  $("test").addEventListener("click", testToken);
+  $("copy").addEventListener("click", copyInstallURL);
+  $("forget").addEventListener("click", function (e) {
+    e.preventDefault();
+    try { localStorage.removeItem(STORE_KEY); } catch (e2) {}
+    location.reload();
+  });
+})();
+</script>
+</body></html>

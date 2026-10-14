@@ -226,6 +226,12 @@ fn counted_repeat_at(b: &[u8]) -> bool {
 /// keyring) or a legacy plaintext JSON config (first byte '{'). Sealed with no keyring, or a decrypt
 /// failure, fails CLOSED — never falls through to an empty/partial config. See docs/SEALED-CONFIG.md.
 pub fn decode_config(kr: Option<&SealKeyring>, blob: &str) -> Option<Config> {
+    decode_config_slice(kr, blob, None)
+}
+
+/// `decode_config`, reading either Scout's own config (`slice` None) or Scout's member of a combined Den addon
+/// config (`den_seal::addon::open_slice`). Everything after the opening is the same.
+pub fn decode_config_slice(kr: Option<&SealKeyring>, blob: &str, slice: Option<&str>) -> Option<Config> {
     // Refuse an absurd segment before decoding it. Nothing bounded this, and net/http accepts a request
     // line up to its 1 MiB default — measured: a real server hands the handler a 1,054,721-character
     // path, and 716,770 characters of it decode to a VALID config with 16,289 debrid accounts. The build
@@ -246,7 +252,11 @@ pub fn decode_config(kr: Option<&SealKeyring>, blob: &str) -> Option<Config> {
     if blob.len() > MAX_CONFIG_BLOB {
         return None;
     }
-    let opened = match open_segment(kr, blob) {
+    let opened = match slice {
+        None => open_segment(kr, blob),
+        Some(slice) => den_seal::addon::open_slice(kr, blob, slice),
+    };
+    let opened = match opened {
         Ok(opened) => opened,
         Err(Rejected::Plaintext) => {
             // With a key configured, every install /configure issues is sealed, so a plaintext one was not
