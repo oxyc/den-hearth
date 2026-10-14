@@ -55,7 +55,7 @@ async fn delete(h: &Handler, path: &str) -> http::Response<Vec<u8>> {
     method(h, http::Method::DELETE, path, &[]).await
 }
 
-fn cancel_path(hash: &str) -> String {
+pub(crate) fn cancel_path(hash: &str) -> String {
     format!(
         "/{}/play/{}",
         valid_blob(),

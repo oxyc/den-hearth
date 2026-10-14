@@ -83,13 +83,13 @@ fn want_not_in_torrent(got: Result<Option<i64>, StoreError>, what: &str) {
 }
 
 /// A Real-Debrid store that is never asked anything, for the tests that call a picker directly.
-fn idle_real_debrid() -> RealDebridStore {
+pub(crate) fn idle_real_debrid() -> RealDebridStore {
     let client: Arc<dyn Doer> =
         Arc::new(MockDoer(|_r: reqwest::Request| -> Answer { Ok(resp(200, "{}")) }));
     RealDebridStore { token: String::new(), client, cache: None, api: REAL_DEBRID_API.into() }
 }
 
-fn idle_premiumize() -> PremiumizeStore {
+pub(crate) fn idle_premiumize() -> PremiumizeStore {
     let client: Arc<dyn Doer> =
         Arc::new(MockDoer(|_r: reqwest::Request| -> Answer { Ok(resp(200, "{}")) }));
     PremiumizeStore { token: String::new(), client, cache: None, api: PREMIUMIZE_API.into() }

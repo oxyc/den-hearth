@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+#[cfg(not(test))]
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,29 @@ pub(crate) struct LimitedEntry {
 }
 
 /// Go `limitedLog`: the last write of every condition. Tests rewind `at` to let a condition speak again.
-pub(crate) static LIMITED_LOG: Mutex<BTreeMap<String, LimitedEntry>> = Mutex::new(BTreeMap::new());
+#[cfg(not(test))]
+static LIMITED_LOG: Mutex<BTreeMap<String, LimitedEntry>> = Mutex::new(BTreeMap::new());
+
+// A TEST build keeps it per thread, as the add budget, the counters and LOG_IDENTITY are: one condition that is
+// limited for a minute in one test would silence the same condition in a test running beside it. Go's tests run one
+// at a time and `forgetLogged` the conditions they read.
+#[cfg(test)]
+thread_local! {
+    static LIMITED_LOG: RefCell<BTreeMap<String, LimitedEntry>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Runs `f` on the limiter's table: the last write of every condition.
+pub(crate) fn with_limited_log<R>(f: impl FnOnce(&mut BTreeMap<String, LimitedEntry>) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        // Every edit under this lock finishes before anything can panic, so a poisoned guard is still consistent.
+        f(&mut LIMITED_LOG.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        LIMITED_LOG.with(|l| f(&mut l.borrow_mut()))
+    }
+}
 
 thread_local! {
     /// The lines a `capture` on this thread is collecting; `None` outside one.
@@ -87,25 +110,22 @@ impl Drop for Capture {
 /// service. Never a hash, a title or anything a caller picks, or the map grows with traffic.
 pub fn log_limited(key: &str, message: &str) {
     let now = Instant::now();
-    let held_back = {
-        // Every edit under this lock finishes before anything can panic, so a poisoned guard is still consistent.
-        let mut last = LIMITED_LOG.lock().unwrap_or_else(PoisonError::into_inner);
-        match last.get_mut(key) {
-            Some(e) if now.duration_since(e.at) < LOG_INTERVAL => {
-                e.suppressed += 1;
-                return;
-            }
-            Some(e) => {
-                let held = e.suppressed;
-                *e = LimitedEntry { at: now, suppressed: 0 };
-                held
-            }
-            None => {
-                last.insert(key.to_owned(), LimitedEntry { at: now, suppressed: 0 });
-                0
-            }
+    let held_back = with_limited_log(|last| match last.get_mut(key) {
+        Some(e) if now.duration_since(e.at) < LOG_INTERVAL => {
+            e.suppressed += 1;
+            None
         }
-    };
+        Some(e) => {
+            let held = e.suppressed;
+            *e = LimitedEntry { at: now, suppressed: 0 };
+            Some(held)
+        }
+        None => {
+            last.insert(key.to_owned(), LimitedEntry { at: now, suppressed: 0 });
+            Some(0)
+        }
+    });
+    let Some(held_back) = held_back else { return };
     if held_back > 0 {
         emit(&format!("{message} ({held_back} more like this since the last line)"));
     } else {

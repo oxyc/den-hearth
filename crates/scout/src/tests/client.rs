@@ -118,65 +118,64 @@ fn client_playable_cost() {
     );
 }
 
-// Needs the handler (package 4): `crate::handler::serve` and `crate::deps::Deps::for_test`. The body sits in
-// a `cfg(any())` item so it parses now; move it up and delete the wrapper when package 4 lands.
-#[test]
-#[ignore = "needs crate::handler::serve and Deps::for_test from package 4 (handler)"]
-fn stream_list_ranked_for_the_browser_that_asked() {
-    #[cfg(any())]
-    fn pending() {
-        use crate::handler::serve;
-        use crate::deps::Deps;
-        use crate::rank::RawStream;
+#[tokio::test]
+async fn stream_list_ranked_for_the_browser_that_asked() {
+    use std::sync::Arc;
 
-        // Go: seeds := func(context.Context) ([]RawStream, error) { ... } with repeat("a", 40) etc.
-        let seeds = vec![
-            RawStream {
-                info_hash: "a".repeat(40),
-                title: "Movie 2160p WEB-DL HDR HEVC AAC".into(),
-                size_bytes: Some(18 * GIB),
-                seeders: Some(100),
-                file_idx: Some(0),
-                ..Default::default()
-            },
-            RawStream {
-                info_hash: "b".repeat(40),
-                title: "Movie 1080p WEB-DL H.264 AAC".into(),
-                size_bytes: Some(8 * GIB),
-                seeders: Some(50),
-                file_idx: Some(0),
-                ..Default::default()
-            },
-        ];
-        let deps = Deps::for_test(|d| d.make_scrapers = fake_scrapers(seeds));
-        let path = format!("/{}/stream/movie/tt1234567.json", VALID_BLOB);
-        let first = |rr: &http::Response<String>| -> String {
-            let list: StreamsResponse = serde_json::from_str(rr.body()).expect("list json");
-            assert!(rr.status() == 200 && !list.streams.is_empty(), "list: {} {}", rr.status(), rr.body());
-            list.streams[0].title.clone()
-        };
-        let no_hevc = serde_json::to_string(&a_browser(|p| {
-            p.hevc_main = 0;
-            p.hevc_main10 = 0;
-        }))
-        .expect("json");
+    use crate::handler::{new_handler, PLAYABLE_HEADER};
+    use crate::tests::handler::{fake_scraper, get, hdr, test_deps, valid_blob};
 
-        let tv = serve(&deps, request(&path, None));
-        assert!(first(&tv).contains("2160p"), "the TV's list starts {:?}, want the 4K release", first(&tv));
-        let vary = tv.headers().get("vary").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
-        assert!(vary.contains(PLAYABLE_HEADER), "vary = {vary:?}, want it to name {PLAYABLE_HEADER}");
-        assert!(
-            first(&serve(&deps, request(&path, Some(&no_hevc)))).contains("1080p"),
-            "a browser without HEVC gets a list whose first release is not the 1080p H.264"
-        );
-        assert!(
-            first(&serve(&deps, request(&path, None))).contains("2160p"),
-            "after a browser's list the TV gets the wrong first release: the two lists must be cached apart"
-        );
-        assert!(
-            first(&serve(&deps, request(&path, Some("{not json")))).contains("2160p"),
-            "a report that doesn't parse gets the wrong first release, want the TV's list"
-        );
-    }
-    todo!("pending: client_test.go TestStreamList_rankedForTheBrowserThatAsked")
+    const GIB: i64 = 1 << 30;
+    let h = new_handler(test_deps(|d| {
+        d.make_scrapers = Arc::new(|_| {
+            vec![fake_scraper("torrentio", || {
+                Box::pin(async {
+                    Ok(vec![
+                        RawStream {
+                            info_hash: "a".repeat(40),
+                            title: "Movie 2160p WEB-DL HDR HEVC AAC".into(),
+                            size_bytes: Some(18 * GIB),
+                            seeders: Some(100),
+                            file_idx: Some(0),
+                            ..Default::default()
+                        },
+                        RawStream {
+                            info_hash: "b".repeat(40),
+                            title: "Movie 1080p WEB-DL H.264 AAC".into(),
+                            size_bytes: Some(8 * GIB),
+                            seeders: Some(50),
+                            file_idx: Some(0),
+                            ..Default::default()
+                        },
+                    ])
+                })
+            })]
+        });
+    }));
+    let path = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+    let first = |rr: &http::Response<Vec<u8>>| -> String {
+        let list: serde_json::Value = serde_json::from_slice(rr.body()).unwrap_or(serde_json::Value::Null);
+        let title = list["streams"][0]["title"].as_str();
+        match (rr.status().as_u16(), title) {
+            (200, Some(title)) => title.to_owned(),
+            _ => panic!("list: {} {}", rr.status(), String::from_utf8_lossy(rr.body())),
+        }
+    };
+    let no_hevc = serde_json::to_string(&a_browser(|p| {
+        p.hevc_main = 0;
+        p.hevc_main10 = 0;
+    }))
+    .expect("json");
+
+    let tv = get(&h, &path, &[]).await;
+    let got = first(&tv);
+    assert!(got.contains("2160p"), "the TV's list starts {got:?}, want the 4K release");
+    let vary = hdr(&tv, "vary");
+    assert!(vary.contains(PLAYABLE_HEADER), "vary = {vary:?}, want it to name {PLAYABLE_HEADER}");
+    let got = first(&get(&h, &path, &[(PLAYABLE_HEADER, no_hevc.as_str())]).await);
+    assert!(got.contains("1080p"), "a browser without HEVC gets {got:?} first, want the 1080p H.264");
+    let got = first(&get(&h, &path, &[]).await);
+    assert!(got.contains("2160p"), "after a browser's list the TV gets {got:?} first: the two lists must be cached apart");
+    let got = first(&get(&h, &path, &[(PLAYABLE_HEADER, "{not json")]).await);
+    assert!(got.contains("2160p"), "a report that doesn't parse gets {got:?} first, want the TV's list");
 }

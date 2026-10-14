@@ -420,30 +420,60 @@ fn rank_min_seeders_keeps_unknown() {
     );
 }
 
-#[test]
-#[ignore = "needs NewHandler/testDeps/fakeScraper/fakeStore and do from package 4 (handler)"]
-fn series_stream_and_forwarded_origin() {
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::serve;
+#[tokio::test]
+async fn series_stream_and_forwarded_origin() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-        // Go: a torrentio fake answers one 1080p WEB-DL release (3 GiB, file index 4) for the episode; the TorBox
-        // fake reports it cached. The request arrives through a proxy with X-Forwarded-Proto/Host.
-        let deps = Deps::for_test(|d| {
-            d.make_scrapers = fake_scrapers_one_release(3 * GIB, 4);
-            d.make_stores = fake_torbox_cached("a".repeat(40));
+    use crate::config::DebridService;
+    use crate::handler::new_handler;
+    use crate::play::decode_play_token;
+    use crate::tests::handler::{body_str, fake_scraper, get, test_deps, valid_blob, FakeStore};
+
+    let h = new_handler(test_deps(|d| {
+        d.make_scrapers = Arc::new(|_| {
+            vec![fake_scraper("torrentio", || {
+                Box::pin(async {
+                    Ok(vec![RawStream {
+                        info_hash: "a".repeat(40),
+                        title: "Show 1080p WEB-DL".into(),
+                        size_bytes: Some(3 * (1 << 30)),
+                        file_idx: Some(4),
+                        ..Default::default()
+                    }])
+                })
+            })]
         });
-        let rr = serve(&deps, forwarded_request("/VALID_BLOB/stream/series/tt99:1:2.json"));
-        assert_eq!(rr.status(), 200, "series stream");
-        let body: StreamsBody = serde_json::from_str(rr.body()).expect("json");
-        assert_eq!(body.streams.len(), 1, "want 1 series stream");
-        let first = &body.streams[0];
-        assert!(first.url.starts_with("https://scout.den.example/"), "forwarded origin: {}", first.url);
-        assert_eq!(first.behavior_hints.binge_group, "den-scout|1080p|webdl||", "bingeGroup");
-        let tok = &first.url[first.url.rfind("/play/").expect("play route") + "/play/".len()..];
-        let pt = decode_play_token(tok).expect("play token decodes");
-        assert!(pt.season == Some(1) && pt.episode == Some(2), "series play token: {pt:?}");
-    }
-    todo!("pending: extra_test.go TestSeriesStreamAndForwardedOrigin")
+        d.make_stores = Arc::new(|_| {
+            vec![Box::new(FakeStore {
+                svc: DebridService::TorBox,
+                check: HashMap::from([("a".repeat(40), true)]),
+                check_err: None,
+                resolve: Arc::new(|| Ok(String::new())),
+                status: None,
+                status_blocks: false,
+            })]
+        });
+    }));
+    let rr = get(
+        &h,
+        &format!("/{}/stream/series/tt99:1:2.json", valid_blob()),
+        &[("X-Forwarded-Proto", "https"), ("X-Forwarded-Host", "scout.den.example")],
+    )
+    .await;
+    assert_eq!(rr.status(), 200, "series stream: {}", rr.status());
+    let body: serde_json::Value = serde_json::from_str(&body_str(&rr)).unwrap_or(serde_json::Value::Null);
+    let streams = body["streams"].as_array().cloned().unwrap_or_default();
+    assert_eq!(streams.len(), 1, "want 1 series stream, got {}", streams.len());
+    let first = &streams[0];
+    let url = first["url"].as_str().unwrap_or_default();
+    assert!(url.starts_with("https://scout.den.example/"), "forwarded origin: {url}");
+    let binge = first["behaviorHints"]["bingeGroup"].as_str().unwrap_or_default();
+    assert_eq!(binge, "den-scout|1080p|webdl||", "bingeGroup: {binge}");
+    let tok = &url[url.rfind("/play/").expect("a play route") + "/play/".len()..];
+    let pt = decode_play_token(tok);
+    assert!(
+        matches!(&pt, Some(pt) if pt.season == Some(1) && pt.episode == Some(2)),
+        "series play token: {pt:?}"
+    );
 }

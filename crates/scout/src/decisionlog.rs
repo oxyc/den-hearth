@@ -12,6 +12,7 @@
 //! site can forget the gate.
 
 use std::collections::HashMap;
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -29,11 +30,34 @@ pub const MAX_LOGGED_TITLE: usize = 140;
 
 /// Go `logIdentity`, which mirrors `Settings.LogIdentity` (LOG_IDENTITY, default on). Set once at startup, never from
 /// a request.
+#[cfg(not(test))]
 static LOG_IDENTITY: AtomicBool = AtomicBool::new(true);
+
+// A TEST build keeps the switch per thread, as the add budget and the counters are (addbudget.rs, metrics.rs). Go's
+// tests run one at a time and put it back after turning it off; cargo runs ours in parallel, and a test that has it
+// off would strip the identity from another test's lines. A `#[tokio::test]` keeps all its tasks on its own thread.
+#[cfg(test)]
+thread_local! {
+    static LOG_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
 
 /// Go `SetLogIdentity`: turns the identity fields on new decision lines on or off. Called once at startup.
 pub fn set_log_identity(on: bool) {
+    #[cfg(not(test))]
     LOG_IDENTITY.store(on, Ordering::Relaxed);
+    #[cfg(test)]
+    LOG_IDENTITY.with(|c| c.set(on));
+}
+
+fn log_identity() -> bool {
+    #[cfg(not(test))]
+    {
+        LOG_IDENTITY.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        LOG_IDENTITY.with(std::cell::Cell::get)
+    }
 }
 
 /// Go `decisionLine`: composes the shared shape. `identity` is whatever the caller built; this is the one place
@@ -57,7 +81,7 @@ pub fn decision_line(
         line.push_str(" rid=");
         line.push_str(rid);
     }
-    if LOG_IDENTITY.load(Ordering::Relaxed) && !identity.is_empty() {
+    if log_identity() && !identity.is_empty() {
         line.push(' ');
         line.push_str(identity);
     }

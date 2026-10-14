@@ -7,12 +7,12 @@ use async_trait::async_trait;
 use crate::scrape::{DoError, Doer};
 use crate::stores::torbox::TorBoxStore;
 
-const LEAK_TOKEN: &str = "tb-super-secret-token-do-not-log";
+pub(crate) const LEAK_TOKEN: &str = "tb-super-secret-token-do-not-log";
 
 /// Go `failingDoer` reproduces what an http.Client returns on a transport failure: a *url.Error carrying the
 /// full request URL — including, for TorBox's requestdl, the account token in its query string.
-struct FailingDoer {
-    last_url: Mutex<String>,
+pub(crate) struct FailingDoer {
+    pub(crate) last_url: Mutex<String>,
 }
 
 #[async_trait]

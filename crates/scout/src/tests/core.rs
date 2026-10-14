@@ -299,35 +299,26 @@ fn select_file_id_torbox() {
         assert!(matches!(got, Ok(None)), "no selector → nil, got {got:?}");
 }
 
-// Needs `realDebridStore.pickFileID` and `premiumizeStore.pickIndex` (work package 2). The body is ported and
-// compiled out until it lands.
 #[test]
-#[ignore = "needs pick_file_id / pick_index from stores/realdebrid.rs and premiumize.rs (package 2)"]
 fn pick_file_id_prefers_episode_match() {
-    // Enable when package 2 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::season::TorrentFile;
-        use crate::stores::premiumize::PremiumizeStore;
-        use crate::stores::realdebrid::RealDebridStore;
-        use crate::stores::ResolveTarget;
-        // fileIdx=0 would (wrongly) point at E01 by position
-        let t = ResolveTarget { season: Some(1), episode: Some(2), file_idx: Some(0), ..Default::default() };
-        let rd_pack = vec![
-            TorrentFile { index: 10, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
-            TorrentFile { index: 20, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
-        ];
-        let got = RealDebridStore::default().pick_file_id(&rd_pack, &t);
-        assert!(matches!(got, Ok(Some(20))), "RD episode match over fileIdx: got {got:?} want 20");
-        // Premiumize index == position
-        let pm_pack = vec![
-            TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
-            TorrentFile { index: 1, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
-        ];
-        let got = PremiumizeStore::default().pick_index(&pm_pack, &t);
-        assert!(matches!(got, Ok(Some(1))), "PM episode match over fileIdx: got {got:?} want 1");
-    }
-    todo!("pending: core_test.go:262 TestPickFileIDPrefersEpisodeMatch")
+    use crate::season::TorrentFile;
+    use crate::stores::ResolveTarget;
+    use crate::tests::stores_pick::{idle_premiumize, idle_real_debrid};
+    // fileIdx=0 would (wrongly) point at E01 by position
+    let t = ResolveTarget { season: Some(1), episode: Some(2), file_idx: Some(0), ..Default::default() };
+    let rd_pack = vec![
+        TorrentFile { index: 10, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+        TorrentFile { index: 20, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
+    ];
+    let got = idle_real_debrid().pick_file_id(&rd_pack, &t);
+    assert!(matches!(got, Ok(Some(20))), "RD episode match over fileIdx: got {got:?} want 20");
+    // Premiumize index == position
+    let pm_pack = vec![
+        TorrentFile { index: 0, name: "Show.S01E01.mkv".into(), size_bytes: Some(100) },
+        TorrentFile { index: 1, name: "Show.S01E02.mkv".into(), size_bytes: Some(100) },
+    ];
+    let got = idle_premiumize().pick_index(&pm_pack, &t);
+    assert!(matches!(got, Ok(Some(1))), "PM episode match over fileIdx: got {got:?} want 1");
 }
 
 #[test]

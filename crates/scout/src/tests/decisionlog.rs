@@ -1,14 +1,23 @@
 //! Go: `internal/scout/decisionlog_test.go` (192 lines). Work package 6.
 //!
-//! The line shape, the drop ranking and the pick label are live. The rank, scrape and cancel decision lines come
-//! out of the handler, the Stremio scraper and the cancel route (packages 4, 5 and 1), so those are ignored with
-//! their bodies compiled out.
+//! The rank, scrape and cancel decision lines come out of the handler, the Stremio scraper and the cancel route.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::Indexer;
 use crate::decisionlog::{decision_line, format_pick, set_log_identity, top_drop_reasons, MAX_LOGGED_TITLE};
+use crate::handler::new_handler;
 use crate::rank::RawStream;
+use crate::scrape::{ScrapeQuery, StremioScraper};
+use crate::stores::refusal::torrent_id_key;
+use crate::stores::torbox::{mark_added_by_us, RESOLVE_CACHE_TTL};
+use crate::tests::cancel::{cancel_path, cancel_torbox_handler};
+use crate::tests::handler::{get, method, test_deps, valid_blob};
+use crate::tests::mock::{resp, MockDoer};
+use crate::tests::reqlog::{forget_logged, LogCapture};
+use crate::tests::token_leak::{FailingDoer, LEAK_TOKEN};
 
 const GIB: i64 = 1 << 30;
 
@@ -69,110 +78,107 @@ fn format_pick_labels_a_release() {
     assert!(!got.contains(&"x".repeat(MAX_LOGGED_TITLE + 1)), "formatPick did not truncate a long title: {got}");
 }
 
+/// Go `lastLineContaining`: the last line of a captured log containing `needle`, for asserting on one decision line
+/// within a buffer that accumulated several.
+fn last_line_containing(buf: &str, needle: &str) -> String {
+    match buf.lines().rev().find(|l| l.contains(needle)) {
+        Some(l) => l.to_owned(),
+        None => panic!("no line containing {needle:?} in:\n{buf}"),
+    }
+}
+
 // Every list build logs its own pick — not just ?debug=1 — with the title id, how many candidates were
 // in contention, the chosen release and its runner-up, and the drop reason that removed the junk one.
 // LOG_IDENTITY off keeps rid but drops all of that.
-#[test]
-#[ignore = "needs handler::serve, capture_log and forget_logged (packages 4, 6)"]
-fn rank_decision_line() {
-    // Enable when package 4 lands: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::deps::Deps;
-        use crate::handler::serve;
-        use crate::tests::reqlog::{capture_log, forget_logged, last_line_containing};
-        set_log_identity(true);
-        let out = capture_log(|| {
-            let deps = Deps::for_test(|_| {});
-            forget_logged("rank-decision");
-            serve(&deps, get_with_rid("/tt9000001", "req-rank-1"));
-        });
-        for want in ["event=rank", "outcome=served", "rid=req-rank-1", "imdb=tt9000001", "type=movie", "top_drops=cam:1", "picked=", "runnerup1="] {
-            assert!(out.contains(want), "rank decision line missing {want:?}:\n{out}");
-        }
+#[tokio::test]
+async fn rank_decision_line() {
+    set_log_identity(true);
+    let out = LogCapture::start();
+    let h = new_handler(test_deps(|_| {}));
 
-        set_log_identity(false);
-        let out = capture_log(|| {
-            let deps = Deps::for_test(|_| {});
-            forget_logged("rank-decision");
-            serve(&deps, get_with_rid("/tt9000002", "req-rank-2"));
-        });
-        let line2 = last_line_containing(&out, "req-rank-2");
-        assert!(line2.contains("rid=req-rank-2"), "rid must survive LOG_IDENTITY=off: {line2}");
-        for leak in ["imdb=", "picked=", "top_drops="] {
-            assert!(!line2.contains(leak), "LOG_IDENTITY=off still carries {leak:?}: {line2}");
-        }
-        set_log_identity(true);
+    forget_logged("rank-decision");
+    get(&h, &format!("/{}/stream/movie/tt9000001.json", valid_blob()), &[("X-Request-Id", "req-rank-1")]).await;
+    let got = out.text();
+    for want in ["event=rank", "outcome=served", "rid=req-rank-1", "imdb=tt9000001", "type=movie", "top_drops=cam:1", "picked=", "runnerup1="] {
+        assert!(got.contains(want), "rank decision line missing {want:?}:\n{got}");
     }
-    todo!("pending: decisionlog_test.go:~101 TestRankDecisionLine")
+
+    set_log_identity(false);
+    forget_logged("rank-decision");
+    get(&h, &format!("/{}/stream/movie/tt9000002.json", valid_blob()), &[("X-Request-Id", "req-rank-2")]).await;
+    let line2 = last_line_containing(&out.text(), "req-rank-2");
+    assert!(line2.contains("rid=req-rank-2"), "rid must survive LOG_IDENTITY=off: {line2}");
+    for leak in ["imdb=", "picked=", "top_drops="] {
+        assert!(!line2.contains(leak), "LOG_IDENTITY=off still carries {leak:?}: {line2}");
+    }
+    set_log_identity(true);
 }
 
 // A scrape failure names the indexer, the error CLASS, how long it took and the request/title that hit
 // it — never the indexer's base URL, which for a configured source can carry an encrypted config.
-#[test]
-#[ignore = "needs stremioScraper (scrape.rs, package 5), handler test doubles and capture_log (packages 4, 5, 6)"]
-fn scrape_decision_line() {
-    // Enable when packages 4, 5 and 6 land: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::scrape::{ScrapeQuery, StremioScraper};
-        use crate::tests::reqlog::{capture_log, forget_logged};
-        let out = capture_log(|| {
-            forget_logged("indexer-status:torz");
-            let bad = StremioScraper::new("torz", "https://torz.example/SECRET-PATH", mock_doer(|_| resp(502, "{}")));
-            let _ = bad.scrape_once(&ScrapeQuery { kind: "movie".into(), imdb: "tt1234567".into(), rid: "req-scrape-1".into(), ..Default::default() });
-        });
-        for want in ["event=scrape", "upstream=torz", "rid=req-scrape-1", "imdb=tt1234567", "type=movie", "reason=http 502"] {
-            assert!(out.contains(want), "scrape decision line missing {want:?}:\n{out}");
-        }
-        assert!(!out.contains("SECRET-PATH") && !out.contains("torz.example"), "the indexer base URL leaked into the log:\n{out}");
+#[tokio::test]
+async fn scrape_decision_line() {
+    let out = LogCapture::start();
 
-        // A transport failure never logs the error itself — Go's http.Client wraps a *url.Error carrying the
-        // full request URL, which for a debrid-backed indexer carries the account token in its query string.
-        let out = capture_log(|| {
-            forget_logged("indexer-unreachable:torz");
-            let unreachable = StremioScraper::new("torz", "https://torz.example/SECRET-PATH", failing_doer());
-            let _ = unreachable.scrape_once(&ScrapeQuery { kind: "movie".into(), imdb: "tt7654321".into(), rid: "req-scrape-2".into(), ..Default::default() });
-        });
-        assert!(out.contains("rid=req-scrape-2") && out.contains("event=scrape"), "transport-failure decision line missing its shape:\n{out}");
-        assert!(!out.contains("SECRET-PATH") && !out.contains(LEAK_TOKEN), "the transport error (or its URL) leaked into the log:\n{out}");
+    forget_logged("indexer-status:torz");
+    let bad = StremioScraper {
+        indexer: Indexer("torz".into()),
+        base_url: "https://torz.example/SECRET-PATH".into(),
+        client: Arc::new(MockDoer(|_r: reqwest::Request| Ok(resp(502, "{}")))),
+    };
+    let _ = bad.scrape_once("", &ScrapeQuery { kind: "movie".into(), imdb: "tt1234567".into(), rid: "req-scrape-1".into(), ..Default::default() }).await;
+    let got = out.text();
+    for want in ["event=scrape", "upstream=torz", "rid=req-scrape-1", "imdb=tt1234567", "type=movie", "reason=http 502"] {
+        assert!(got.contains(want), "scrape decision line missing {want:?}:\n{got}");
     }
-    todo!("pending: decisionlog_test.go:~146 TestScrapeDecisionLine")
+    assert!(!got.contains("SECRET-PATH") && !got.contains("torz.example"), "the indexer base URL leaked into the log:\n{got}");
+
+    // A transport failure never logs the error itself — Go's http.Client wraps a *url.Error carrying the
+    // full request URL, which for a debrid-backed indexer carries the account token in its query string.
+    forget_logged("indexer-unreachable:torz");
+    let unreachable = StremioScraper {
+        indexer: Indexer("torz".into()),
+        base_url: "https://torz.example/SECRET-PATH".into(),
+        client: Arc::new(FailingDoer { last_url: std::sync::Mutex::new(String::new()) }),
+    };
+    let _ = unreachable.scrape_once("", &ScrapeQuery { kind: "movie".into(), imdb: "tt7654321".into(), rid: "req-scrape-2".into(), ..Default::default() }).await;
+    let got = out.text();
+    assert!(got.contains("rid=req-scrape-2") && got.contains("event=scrape"), "transport-failure decision line missing its shape:\n{got}");
+    assert!(!got.contains("SECRET-PATH") && !got.contains(LEAK_TOKEN), "the transport error (or its URL) leaked into the log:\n{got}");
 }
 
 // A play/probe/cancel decision line never carries the debrid token, even when the store's own error
 // text would have — the redaction is at the store (stores.go), and this proves the new line respects it
 // end to end, through the real DELETE /play route.
-#[test]
-#[ignore = "needs the cancel route, cancelTorBoxHandler and the TorBox store (packages 1, 4)"]
-fn cancel_decision_line_never_leaks_the_token() {
-    // Enable when packages 1 and 4 land: move this body up and delete the wrapper.
-    #[cfg(any())]
-    fn pending() {
-        use crate::tests::reqlog::{capture_log, forget_logged};
-        let out = capture_log(|| {
-            forget_logged("cancel-store-unavailable");
-            let hash = "a".repeat(40);
-            let h = cancel_torbox_handler(
-                |r| match last_segment(r.path()) {
-                    "mylist" if r.query("id").is_some() => resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false}}"#),
-                    "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
-                    "controltorrent" => resp(503, r#"{"error":"proxy_error","detail":"upstream rejected Bearer tb-secret"}"#),
-                    _ => resp(404, "{}"),
-                },
-                |cache| {
-                    cache.put(&torrent_id_key("tb-secret", &hash), "42", RESOLVE_CACHE_TTL);
-                    mark_added_by_us(cache, "tb-secret", &hash);
-                },
-            );
-            let rr = do_method(&h, "DELETE", &cancel_path(&hash), &[("X-Request-Id", "req-cancel-1")]);
-            assert_eq!(rr.status(), 503, "cancel: want 503: {}", rr.body());
-        });
-        assert!(out.contains("event=cancel") && out.contains("rid=req-cancel-1") && out.contains("upstream=torbox"), "cancel decision line missing its shape:\n{out}");
-        // The precondition: the refusal detail really did reach the error, so redaction — not the fixture's
-        // silence — is what the assertion below is proving.
-        assert!(out.contains("proxy_error"), "precondition failed: the refusal detail never reached the line:\n{out}");
-        assert!(!out.contains("tb-secret"), "the debrid token leaked into the cancel decision line:\n{out}");
-    }
-    todo!("pending: decisionlog_test.go:~179 TestCancelDecisionLine_neverLeaksTheToken")
+#[tokio::test]
+async fn cancel_decision_line_never_leaks_the_token() {
+    let out = LogCapture::start();
+    forget_logged("cancel-store-unavailable");
+    let hash = "a".repeat(40);
+    let prime_hash = hash.clone();
+    let (h, _) = cancel_torbox_handler(
+        |r| match r.url().path().rsplit('/').next().unwrap_or("") {
+            "mylist" if r.url().query_pairs().any(|(k, v)| k == "id" && !v.is_empty()) => {
+                resp(200, r#"{"success":true,"data":{"id":42,"download_finished":false}}"#)
+            }
+            "mylist" => resp(200, r#"{"success":true,"data":[]}"#),
+            "controltorrent" => resp(503, r#"{"error":"proxy_error","detail":"upstream rejected Bearer tb-secret"}"#),
+            _ => resp(404, "{}"),
+        },
+        Some(Box::new(move |cache| {
+            cache.put(&torrent_id_key("tb-secret", &prime_hash), "42", RESOLVE_CACHE_TTL);
+            mark_added_by_us(cache, "tb-secret", &prime_hash);
+        })),
+    );
+    let rr = method(&h, http::Method::DELETE, &cancel_path(&hash), &[("X-Request-Id", "req-cancel-1")]).await;
+    assert_eq!(rr.status(), 503, "cancel: {}, want 503: {}", rr.status(), String::from_utf8_lossy(rr.body()));
+    let got = out.text();
+    assert!(
+        got.contains("event=cancel") && got.contains("rid=req-cancel-1") && got.contains("upstream=torbox"),
+        "cancel decision line missing its shape:\n{got}"
+    );
+    // The precondition: the refusal detail really did reach the error, so redaction — not the fixture's
+    // silence — is what the assertion below is proving.
+    assert!(got.contains("proxy_error"), "precondition failed: the refusal detail never reached the line:\n{got}");
+    assert!(!got.contains("tb-secret"), "the debrid token leaked into the cancel decision line:\n{got}");
 }

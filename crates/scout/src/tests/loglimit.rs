@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::deps::{settings_from_env, startup_summary as startup_line};
 use crate::handler::{new_handler, INDEXERS_DOWN_DETAIL, SCRAPE_FAIL_THRESHOLD};
-use crate::loglimit::{LIMITED_LOG, LOG_INTERVAL};
+use crate::loglimit::{with_limited_log, LOG_INTERVAL};
 use crate::manifest::manifest_version;
 use crate::scrape::DoError;
 
@@ -16,10 +16,11 @@ use super::reqlog::{capture_log, LogCapture};
 /// Go `ageLogLimit`: pushes a condition's last-seen time back a full interval, so a test that checks for its exact
 /// line is not silenced by unrelated coverage of the same condition moments earlier in this run.
 pub(crate) fn age_log_limit(key: &str) {
-    let mut last = LIMITED_LOG.lock().unwrap();
-    if let Some(e) = last.get_mut(key) {
-        e.at -= LOG_INTERVAL;
-    }
+    with_limited_log(|last| {
+        if let Some(e) = last.get_mut(key) {
+            e.at -= LOG_INTERVAL;
+        }
+    });
 }
 
 // /health's flip is logged as a change of state: one line going degraded however many builds keep

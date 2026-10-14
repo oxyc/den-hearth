@@ -19,7 +19,7 @@ pub(crate) use crate::loglimit::Capture as LogCapture;
 
 /// Go `forgetLogged`: lets a condition speak again, whatever an earlier test's line did to its minute.
 pub(crate) fn forget_logged(key: &str) {
-    crate::loglimit::LIMITED_LOG.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(key);
+    crate::loglimit::with_limited_log(|last| last.remove(key));
 }
 
 // Only the per-install segments go; the route and the stream id stay, so the line still says what was
