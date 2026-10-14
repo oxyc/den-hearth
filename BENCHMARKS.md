@@ -256,6 +256,108 @@ Remux session case. `cargo build --release -p den-hearth --features stub-upstrea
 The emulated amd64 container is within noise of native arm64 on the CPU-bound cases; the byte-moving cases are faster in
 the container because Linux's loopback and veth are faster than macOS's loopback.
 
+### Allocators
+
+Does another global allocator, or glibc tuning, pay for itself ([#282](https://github.com/oxyc/den/issues/282): about 2x
+on the target metric, or a clear memory win with no throughput loss)? Four builds of the same code through the container
+run above, `den-hearth:alloc-<name>` from the `Dockerfile` with `HEARTH_FEATURES=stub-upstreams[,<feature>]`:
+
+| candidate | how | image size |
+|---|---|---:|
+| `glibc` | the system allocator (the shipped one) | 775.32 MB |
+| `glibc-arena2` | the same image with `MALLOC_ARENA_MAX=2` (`EXTRA_ENV=MALLOC_ARENA_MAX=2`) | same |
+| `mimalloc` | `--features mimalloc` (`mimalloc` 0.1.52, its default v2 allocator) | +0.18 MB |
+| `jemalloc` | `--features jemalloc` (`tikv-jemallocator` 0.7, jemalloc 5.3.1) with `background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,lg_tcache_max:16` in `crates/hearth/src/alloc.rs` | +0.57 MB |
+
+The features are off by default. **Six full runs per candidate** (`KEEP_GOING=1`, so every case is measured even where a
+build misses the gate), 24 in all: rounds 1 to 4 ran glibc, arena2, mimalloc, jemalloc in that order, round 5 in the
+reverse order and round 6 rotated. The reason is in the control row below. The raw reports are
+`bench/results/allocator/http-<candidate>-r<round>.jsonl` and `tables.md` has every per-run table
+(`bench/allocator_summary.py`). **Load average on the machine ranged from 2.6 to 27 during the runs** (OrbStack VM, other
+containers and other agents' builds on the same laptop), and req/s of one candidate moves by up to 2x between runs.
+
+**Memory** is the signal that held still. Median of the six runs, MiB, range in brackets (cgroup `anon` is hearth plus
+the ffmpeg children it spawns; `oom` and `oom_kill` were 0 in all 24 runs):
+
+| | glibc | glibc-arena2 | mimalloc | jemalloc |
+|---|---:|---:|---:|---:|
+| anon peak, any case | 152 (144 to 168) | 154 (140 to 170) | 159 (146 to 165) | **135 (129 to 138)** |
+| anon after the 121 s idle drain | 123 (115 to 145) | 127 (114 to 148) | 123 (116 to 134) | **98 (94 to 100)** |
+| RSS after the idle drain | 124 | 129 | 124 | **99** |
+| `memory.current` after the idle drain | 143 | 143 | 144 | **119** |
+| anon peak, `reel-meta-warm` (a process that has done nothing yet) | 12 | 12 | 21 to 39 | 15 |
+| gate failures | 2 of 6 | 1 of 6 | 5 of 6 | 0 of 6 |
+
+- **Nothing returns to the 11 MiB baseline, for any allocator.** After the idle drain the process holds 98 to 128 MiB
+  of anonymous memory. Most of it is live: Subtitles' memory tier is full (64 MiB) and Reel's resolve cache holds a few
+  MiB, so the process is expected at about 82 MiB. glibc and arena2 hold about 40 MiB more than that (retained freed
+  bodies, as suspected in the Subtitles note above), jemalloc about 16 MiB more. The arithmetic uses the declared cache
+  sizes and is an inference; nothing walked the heap.
+- **jemalloc is the only one that moved memory**: 20% less anon after idle and 11% less at peak, with its worst run
+  better than glibc's best run (100 against 115 at idle). It is 25 MiB, not 2x: the container's page cache (380 MiB in
+  the cold subtitle cases) dwarfs it, and no run was near an OOM kill.
+- **`MALLOC_ARENA_MAX=2` does nothing for memory** (127 against 123 MiB). The arena theory in the baseline notes is not
+  what holds the memory.
+- **mimalloc keeps more**: 21 to 39 MiB of anon on an untouched process (its eager arenas), the same retention as glibc
+  afterwards, and it missed the gate's "memory back within 8 MiB of the case start" in `remux-session-flow` in three
+  runs (16 to 19 MiB above) and in `subs-serve-warm` once. The other gate failures, for every candidate, are
+  `memory.events max` moving in `remux-speed` (the page cache reaching the limit) and a few 429s in `mixed-soak` (one
+  glibc-arena2 and one mimalloc run): not the allocator.
+
+**Throughput** is not resolved. Median of six, with the median of per-round ratios to glibc in brackets (round *i* of a
+candidate against round *i* of glibc). `control-health`, a handler that allocates next to nothing, shows what the
+harness does on its own:
+
+| case | glibc req/s | arena2 | mimalloc | jemalloc | p99 ms glibc | arena2 | mimalloc | jemalloc |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| control-health (control) | 41,120 | 50,476 (1.29x) | 54,659 (1.33x) | 51,142 (1.47x) | 1.6 | 1.1 | 1.1 | 1.4 |
+| reel-meta-cold | 6,658 | 6,503 (1.01x) | 7,343 (1.09x) | 7,362 (1.15x) | 6.2 | 6.6 | 5.6 | 5.2 |
+| subs-search-warm | 20,618 | 13,521 (0.64x) | 26,023 (1.34x) | 25,731 (1.30x) | 2.1 | 4.1 | 1.6 | 1.6 |
+| subs-search-cold | 4,144 | 4,885 (1.02x) | 6,011 (1.37x) | 5,585 (1.38x) | 12.9 | 10.6 | 10.2 | 12.1 |
+| subs-serve-warm | 2,037 | 1,888 (0.90x) | 2,294 (1.19x) | 2,483 (1.12x) | 17.1 | 21.5 | 15.6 | 12.0 |
+| subs-serve-cold | 339 | 351 (1.02x) | 448 (1.34x) | 399 (1.24x) | 146.9 | 177.8 | 140.1 | 151.9 |
+| remux-speed | 555 | 571 (1.04x) | 509 (0.97x) | 578 (1.06x) | 65.8 | 49.4 | 84.1 | 48.2 |
+| remux-session-flow | 85 | 68 (0.84x) | 78 (0.86x) | 87 (1.12x) | 321.7 | 1,066 | 769 | 1,021 |
+| mixed-soak | 2,097 | 2,227 (1.10x) | 2,057 (1.06x) | 1,922 (0.98x) | | | | |
+
+Every candidate "beats" glibc by 1.3x to 1.5x on the control, including arena2, which is glibc. The allocation-heavy
+Subtitles cases (`subs-search-warm`, `subs-search-cold`, `subs-serve-cold`) are at 1.2x to 1.4x: the same size as the
+control, so nothing separates them from the harness. The ffmpeg and bytes cases (`remux-*`) are flat or worse, and
+their p99 is dominated by ffmpeg's timing. Nothing approaches 2x. Requests per CPU-second (which divides out how much
+CPU the host gave the process) gives the same picture; `tables.md` has it, and p50.
+
+**Divan microbenchmarks** (`alloc-*` features on den-scout and den-subtitles; `bench/allocator_micro_summary.py`; a
+native aarch64 glibc container, three rounds, median of the fastest sample). divan's counting allocator is itself the
+global allocator, so it cannot wrap a feature-selected one with its counts intact: with an `alloc-*` feature the
+allocator is installed bare, no allocation counts are printed, and the `system` row is the bare `std::alloc::System` so
+the profiler's bookkeeping is in no timing. Allocation counts come from the default build, unchanged from the table
+above.
+
+| benchmark | system | mimalloc | jemalloc |
+|---|---:|---:|---:|
+| subtitles `rank_candidates/400` | 5.61 ms | 3.85 ms (0.69x) | 3.91 ms (0.70x) |
+| subtitles `rank_candidates/100` | 1.04 ms | 734 µs (0.70x) | 727 µs (0.70x) |
+| subtitles `srt_parse/2000` | 384 µs | 335 µs (0.87x) | 351 µs (0.91x) |
+| scout `parse_stremio_streams/streams-500.json` | 493 µs | 460 µs (0.93x) | 464 µs (0.94x) |
+| scout `decode_torbox_listing` (457,788 allocations) | 15.7 ms | 15.3 ms (0.97x) | 15.2 ms (0.97x) |
+| scout `rank_movie/500` | 3.2 ms | 4.67 ms (1.46x) | 3.36 ms (1.05x) |
+
+The hot loop of a single thread is the best case for a faster allocator, and Subtitles' ranking (about 640 allocations
+per candidate) gains 1.4x from either; that is a few ms per search request out of a latency the HTTP run shows at 2 to
+3 ms p50. The 457,788-allocation TorBox listing decode moves 3%. mimalloc is 1.4x slower on scout's ranking.
+
+**Verdict: adopt nothing.** No candidate reaches 2x on anything the HTTP run can resolve. jemalloc is a reproducible
+20% (25 MiB) memory win with no throughput loss the noise can show, but at a cost of a C build dependency and a tuned
+`malloc_conf`, and it moves a number nothing is limited by: no run came near an OOM kill, and the page cache is 380 of the
+512 MiB. mimalloc and `MALLOC_ARENA_MAX=2` are rejected. The features stay in the tree, off, so a node that does become
+memory-bound can build `HEARTH_FEATURES=jemalloc` and the same comparison reruns with `EXTRA_ENV`, `IMAGE` and
+`KEEP_GOING`. The gate's `RUN_CACHE_FILL` allowance (160 MiB) stays, since glibc remains the shipped allocator and its
+anon after the drain is 104 to 134 MiB above the baseline of 11. The cheaper lever for the retention is fewer big allocations in Subtitles (the cache put clones a 157 KB
+body, the handler ranks 640 allocations per candidate), which every allocator would also benefit from.
+
+**Caveats.** The HTTP numbers are amd64 under emulation on a loaded laptop, not the box; a quiet host with the amd64
+kernel may separate the allocators more. The microbenchmarks are aarch64. Neither tool measured fragmentation directly.
+
 ### Test suite
 
 `cargo test --workspace --no-fail-fast`, Apple M4, debug profile, commit `1e507b4`, load average 5.5 at the start.
@@ -332,7 +434,9 @@ takes `COUNT` runs per benchmark.
 
 Environment for the HTTP run: `MEMORY=512m` (the limit; swap is set to the same), `DURATION=10`, `SOAK_DURATION=60`,
 `CONCURRENCY=16`, `HEARTH_WORKER_THREADS=2`, `PROCS=4` (driver processes), `RECOVERY_TIMEOUT=20`, `DRAIN_TIMEOUT=150`,
-`IMAGE=den-hearth:bench`, `PLATFORM=linux/amd64`, `CONTAINER_ENGINE=docker`. If the image does not exist it is built from
+`IMAGE=den-hearth:bench`, `PLATFORM=linux/amd64`, `CONTAINER_ENGINE=docker`, `EXTRA_ENV=A=1,B=2` (more variables for
+the process under test) and `KEEP_GOING=1` (measure every case after a gate failure and publish the report with the
+failures in its last row; for comparing builds, never for a gate run). If the image does not exist it is built from
 the repo's `Dockerfile` with `--build-arg DEN_VERSION=$(cat VERSION) --build-arg HEARTH_FEATURES=stub-upstreams`; the
 first build compiles GPAC, ffmpeg and alass from source (about 25 minutes under emulation), later ones reuse the layers.
 Exit 77 means no container engine was available, so a misleading host-only run was not made.

@@ -46,6 +46,9 @@ SOAK_DURATION = float(os.environ.get("SOAK_DURATION", "60"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "16"))
 RECOVERY_TIMEOUT = float(os.environ.get("RECOVERY_TIMEOUT", "20"))
 WORKERS = os.environ.get("HEARTH_WORKER_THREADS", "2")
+# KEEP_GOING=1: run every case even after a gate failure, and publish the report with the failures recorded (the
+# exit code is still non-zero). For comparing builds; a gate run leaves it unset.
+KEEP_GOING = os.environ.get("KEEP_GOING") == "1"
 RESULTS = pathlib.Path(os.environ.get("RESULTS", ROOT / "bench" / "results"))
 RUN_ID = f"hearth-bench-{os.getpid()}"
 NET, HEARTH, STUB, DRIVER, OBSERVER = (f"{RUN_ID}-{n}" for n in ("net", "hearth", "stub", "driver", "observer"))
@@ -436,9 +439,9 @@ def main():
             run.run_case(case)
             with partial.open("a") as f:
                 f.write(json.dumps(run.rows[-1], separators=(",", ":")) + "\n")
-            if run.failures:
+            if run.failures and not KEEP_GOING:
                 break
-        if not run.failures and not args.only:
+        if (not run.failures or KEEP_GOING) and not args.only:
             row = idle_drain(run)
             print(json.dumps(row, separators=(",", ":")), flush=True)
             with partial.open("a") as f:
@@ -450,6 +453,13 @@ def main():
             partial.rename(final)
             print(f"report={final}")
             code = 0
+        elif KEEP_GOING:
+            # A comparison of builds wants every case's numbers even where one build misses the gate. The report is
+            # published with the failures in its terminal row, and the exit code stays non-zero.
+            with partial.open("a") as f:
+                f.write(json.dumps({"run": RUN_ID, "gate": "failed", "complete": not args.only, "failures": run.failures}) + "\n")
+            partial.rename(final)
+            print(f"report={final}")
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         run.failures.append(str(error))
