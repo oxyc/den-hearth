@@ -6,16 +6,15 @@ remux and transcode) in one process and one runtime.
 ```
 crates/
   scout/      den-scout      library: the Rust port of the Go den-scout (see crates/scout/PORTING.md)
-  reel/       den-reel       library + the standalone `den-reel` binary
-  subtitles/  den-subtitles  library + the standalone `den-subtitles` binary
-  remux/      den-remux      library + the standalone `den-remux` binary
+  reel/       den-reel       library
+  subtitles/  den-subtitles  library
+  remux/      den-remux      library
   hearth/     den-hearth     the combined binary
 ```
 
 Reel, Subtitles and Remux were imported with their full history (`git subtree`). Each is the same code its
-repository ships, turned into a library: its old `main.rs` is now `lib.rs`, and `main.rs` is three lines.
-The standalone binaries still build and their tests still run from this workspace. Scout is a library only:
-hearth is its server.
+repository ships, turned into a library: its old `main.rs` is now `lib.rs`. They no longer have a binary or a
+serve loop of their own; hearth is every service's server.
 
 ## Scout, and the Go den-scout as the rollback
 

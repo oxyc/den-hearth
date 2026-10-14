@@ -279,11 +279,10 @@ only `ServeCtx` (title/file/language identity) and already-redacted text, never 
 ## Run
 
 Subtitles runs inside den-hearth: see the repository README for the image and the env prefixes (`SUBS_*`).
-On its own:
+There is no standalone binary; run it through hearth (needs alass on PATH for the sync tiers):
 
 ```sh
-cp .env.example .env          # infra only — keys are entered at /configure
-cargo run -p den-subtitles    # local (needs alass on PATH for the sync tiers)
+cargo run -p den-hearth       # Subtitles on :8093 and under /subs; configure it with SUBS_* variables
 
 cargo test -p den-subtitles
 ./scripts/tier1-corpus.py     # parity + >=2x runtime/RSS gate (needs legacy ffsubsync too)

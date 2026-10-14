@@ -19,10 +19,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 b64url() { python3 -c 'import base64,sys; print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip("="))'; }
 
 echo "→ building…"
-( cd "$ROOT" && cargo build --quiet )
+( cd "$ROOT" && cargo build --quiet -p den-hearth )
 
-echo "→ starting den-subtitles on :$PORT"
-PORT="$PORT" CACHE_DIR="$CACHE" "$ROOT/target/debug/den-subtitles" &
+# Subtitles runs inside den-hearth: serve it on its own legacy port ($PORT) and switch the other services'
+# ports off. Hearth's main port moves out of the way.
+echo "→ starting den-hearth (subtitles) on :$PORT"
+PORT="$((PORT + 1))" HEARTH_SUBS_PORT="$PORT" HEARTH_SCOUT_PORT=0 HEARTH_REEL_PORT=0 HEARTH_REMUX_PORT=0 \
+  SUBS_CACHE_DIR="$CACHE" "$ROOT/../../target/debug/den-hearth" &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null || true; rm -rf "$CACHE"' EXIT
 for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.2; done
