@@ -36,6 +36,8 @@ serde = { version = "1", features = ["derive"] }
 http = "1"
 # Go `time.NewTicker`: `TieredCache::sweep_every` runs on a tokio interval and cancels by dropping the future.
 tokio = { version = "1", features = ["time"] }
+# Go's `regexp` (RE2 syntax, linear time): label.go's `releaseGroup` and the rank matchers that reuse it.
+regex = "1"
 
 [dev-dependencies]
 # Go's `t.TempDir()`.
