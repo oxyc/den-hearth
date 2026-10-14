@@ -6537,18 +6537,77 @@ async fn a_throttled_tmdb_is_not_asked_again_until_its_retry_after() {
     assert_eq!(kc_hits.load(Ordering::SeqCst), 1);
 }
 
-/// KinoCheck gets the same pause, from its own exponential window when a 5xx says nothing about how
-/// long. And a good answer that spends the rate limit is used, while the call after it waits.
+/// A 500, or a 503 that names no Retry-After, is one request failing: the next title is still asked, and
+/// nothing is paused for anyone.
 #[tokio::test]
-async fn kinocheck_pauses_on_a_5xx_and_a_spent_rate_limit_pauses_after_the_answer() {
+async fn a_5xx_without_a_retry_after_pauses_nobody() {
+    for head in [
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json",
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json",
+    ] {
+        let (tmdb, tmdb_hits) = serve_counting(head, "{}").await;
+        let (kc, kc_hits) = serve_counting(head, "{}").await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = tmdb;
+        cfg.kinocheck_base = kc;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        assert_eq!(up.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await, Err(NoAnswer));
+        assert_eq!(up.tmdb_candidates("test-key", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+        assert_eq!(tmdb_hits.load(Ordering::SeqCst), 2, "{head}: a 5xx paused TMDB for every title");
+        assert_eq!(up.kinocheck_youtube_id(None, "tt0816692", "movie", "en").await, Err(NoAnswer));
+        assert_eq!(up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await, Err(NoAnswer));
+        assert_eq!(kc_hits.load(Ordering::SeqCst), 2, "{head}: a 5xx paused KinoCheck for every title");
+        assert!(up.recent_failures() >= 2, "a 5xx must still count toward /health");
+    }
+}
+
+/// One install's throttle is that install's: another BYOK key, and the server-side fallback, are still
+/// asked. The same key is not.
+#[tokio::test]
+async fn a_429_pauses_only_the_credential_that_was_throttled() {
+    let (tmdb, tmdb_hits) = serve_counting(
+        "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-type: application/json",
+        "{}",
+    )
+    .await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = tmdb;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+    assert_eq!(up.tmdb_candidates("key-a", "tmdb:157336", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(up.tmdb_candidates("key-a", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1, "the throttled key was asked again");
+    assert_eq!(up.tmdb_candidates("key-b", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 2, "another install's key was held back");
+}
+
+/// A 503 that says how long is the same instruction a 429 gives.
+#[tokio::test]
+async fn a_503_with_a_retry_after_pauses_that_credential() {
+    let (tmdb, tmdb_hits) = serve_counting(
+        "HTTP/1.1 503 Service Unavailable\r\nretry-after: 120\r\ncontent-type: application/json",
+        "{}",
+    )
+    .await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = tmdb;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+    assert_eq!(up.tmdb_candidates("key-a", "tmdb:157336", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(up.tmdb_candidates("key-a", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1);
+}
+
+/// KinoCheck gets the same pause on a 429. And a good answer that spends the rate limit is used, while
+/// the call after it waits.
+#[tokio::test]
+async fn kinocheck_pauses_on_a_429_and_a_spent_rate_limit_pauses_after_the_answer() {
     let (kc, kc_hits) =
-        serve_counting("HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json", "{}").await;
+        serve_counting("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json", "{}").await;
     let mut cfg = test_cfg(temp_dir());
     cfg.kinocheck_base = kc;
     let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
     assert_eq!(up.kinocheck_youtube_id(None, "tt0816692", "movie", "en").await, Err(NoAnswer));
     assert_eq!(up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await, Err(NoAnswer));
-    assert_eq!(kc_hits.load(Ordering::SeqCst), 1, "a failing KinoCheck was asked again at once");
+    assert_eq!(kc_hits.load(Ordering::SeqCst), 1, "a throttling KinoCheck was asked again at once");
 
     const VIDEOS: &str = "{\"results\":[{\"site\":\"YouTube\",\"key\":\"dQw4w9WgXcQ\",\
         \"type\":\"Trailer\",\"official\":true,\"iso_639_1\":\"en\"}]}";
