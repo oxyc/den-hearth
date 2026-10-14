@@ -505,3 +505,85 @@ fn rank_streams_preference_never_lifts_junk() {
     );
     assert_ne!(got[0].title, cam.title, "a preference lifted a CAM above a legitimate release");
 }
+
+// Not in the Go suite. The Go engines read `\d`, `\w`, `\s` and `\b` one way (RE2: ASCII only; regexp2: .NET's
+// classes) and the Rust ones another by default, so these pin the spellings that make them agree.
+
+#[test]
+fn re2_patterns_read_ascii_classes() {
+    // `19\d\d` is RE2's yearToken: Arabic-Indic digits are not digits to it.
+    assert!(prod::release_years("Movie 19\u{669}\u{669} 1080p").is_empty(), "a non-ASCII digit was read as a year");
+    // RE2's `\s` is [\t\n\f\r ]: a vertical tab does not end `.ts` as a container extension, so the TS tag stands.
+    assert_eq!(prod::junk_class("Show.S01E01.ts\u{b}"), "telesync", "a vertical tab was read as whitespace");
+    assert_eq!(prod::junk_class("Show.S01E01.ts\n"), "", "a newline ends a container extension");
+    // The same pair, through a pattern that is Unicode for its `.` and ASCII for the rest: Opus counts only once
+    // the technical half of the name has begun.
+    let opus = |title: &str| crate::attributes::detect_audio_codec(&title.to_lowercase());
+    assert_eq!(opus("mr.hollands.opus.1995.1080p"), "", "a film called Opus is not Opus audio");
+    assert_eq!(opus("show.1080p.web-dl.opus.5.1"), "opus");
+    assert_eq!(opus("show.\u{661}\u{660}\u{668}\u{660}p.opus"), "", "non-ASCII digits are not a resolution");
+}
+
+#[test]
+fn a_users_exclude_regex_reads_as_re2_does() {
+    let kept = |pattern: &str, title: &str| {
+        let out = prod::rank_streams(
+            &[rs(title, |_| {})],
+            RankFilters { exclude_regex: pattern.into(), result_cap: 10, ..Default::default() },
+        );
+        !out.is_empty()
+    };
+    // `\d`, `\w`, `\s`, `\b` and their negations are ASCII-only, in a class and out of one.
+    assert!(kept(r"x\d", "Movie x\u{663} WEB"), r"\d matched a non-ASCII digit");
+    assert!(!kept(r"x\d", "Movie x3 WEB"));
+    assert!(kept(r"[\d]x", "Movie \u{663}x WEB"), r"[\d] matched a non-ASCII digit");
+    assert!(kept(r"movie\wweb", "Movie\u{e9}WEB"), r"\w matched a letter outside ASCII");
+    assert!(!kept(r"movie\Wweb", "Movie\u{e9}WEB"), r"\W did not match a letter outside ASCII");
+    assert!(kept(r"movie\sweb", "Movie\u{a0}WEB"), r"\s matched a no-break space");
+    assert!(!kept(r"movie\Sweb", "Movie\u{a0}WEB"), r"\S did not match a no-break space");
+    assert!(!kept(r"\bcam\b", "Movie cam\u{e9} WEB"), r"\b took a letter outside ASCII as a word character");
+    assert!(!kept(r"[^\w]cam", "Movie \u{e9}cam WEB"), r"[^\w] did not take a letter outside ASCII");
+    // `.` is a whole codepoint, as in RE2.
+    assert!(!kept(r"^movie .$", "Movie \u{e9}"), "`.` did not match one codepoint");
+    // Syntax RE2 has and the regex crate does not.
+    assert!(!kept(r"\Qa.b\E", "Movie a.b WEB"), r"\Q..\E was not read as a literal");
+    assert!(kept(r"\Qa.b\E", "Movie axb WEB"), r"\Q..\E matched a wildcard");
+    assert!(!kept(r"[a[]b", "Movie [b WEB"), "a `[` inside a class was read as a nested class");
+    assert!(!kept(r"[[:alpha:]\d]9", "Movie a9 WEB"), "a POSIX class inside a class broke the translation");
+    assert!(!kept(r"[a&&b]", "Movie & WE"), "`&&` inside a class was read as a set operation");
+    // A pattern that does not compile is ignored, not an error.
+    assert!(kept("(", "Movie WEB"));
+}
+
+#[test]
+fn net_patterns_read_as_regexp2_does() {
+    use crate::season::{bare_episode_patterns, matches_episode, names_episode};
+
+    // .NET's `$` also matches before a final newline.
+    assert!(matches_episode("Show - 05\n", &bare_episode_patterns(5)), "`$` did not match before a final newline");
+    assert!(!matches_episode("Show - 05\n\n", &bare_episode_patterns(5)), "`$` matched before two newlines");
+    // `\b` is .NET's `\w`: a non-spacing mark (Mn) is a word character, a spacing mark (Mc) and a letter number
+    // (Nl) are not, though the regex crate's `\w` takes both.
+    let patterns = crate::season::episode_patterns(1, 2);
+    assert!(!matches_episode("e\u{301}102", &patterns), "a non-spacing mark ended the word");
+    assert!(matches_episode("\u{903}102", &patterns), "a spacing mark was a word character");
+    assert!(matches_episode("\u{2167}102", &patterns), "a letter number was a word character");
+    assert!(names_episode("Show.S01E02.mkv", 1, 2));
+}
+
+// regexp2 has no backtrack limit and fancy-regex stops at a million, reporting an error that reads as "no match".
+// An indexer title is as long as the response it came in (2 MiB), so none of these may fall off that edge.
+#[test]
+fn lookaround_patterns_answer_for_a_title_of_any_length() {
+    use crate::season::{episode_patterns, matches_episode, names_episode, unresolved_season_pack};
+
+    let pad = "a ".repeat(1 << 20);
+    assert_eq!(prod::junk_class(&format!("{pad} upscaled")), "upscaled", "a long title escaped the upscaled check");
+    let pad = "a ".repeat(1 << 17);
+    assert!(names_episode(&format!("{pad} S01E02"), 1, 2), "a long name stopped naming its episode");
+    assert!(matches_episode(&format!("{pad} S01E02"), &episode_patterns(1, 2)));
+    assert!(names_episode(&format!("{pad} S01E01-06"), 1, 4), "a long name stopped holding its range");
+    assert!(unresolved_season_pack(&format!("{pad} S01E01-06"), 1, 4));
+    let chain = "E01".repeat(1 << 17);
+    assert!(names_episode(&format!("S01{chain}"), 1, 1));
+}
