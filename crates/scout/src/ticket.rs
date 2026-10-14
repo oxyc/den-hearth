@@ -30,7 +30,9 @@ pub enum TicketError {
 /// Go `ticketKeys`: one AEAD per keyring key, current first; tickets are minted with the first and
 /// opened with any.
 pub struct TicketKeys {
-    keys: Vec<[u8; 32]>,
+    /// One 32-byte AEAD key per keyring key, current first (Go's `aeads`, held as raw keys here). The tests
+    /// seal legacy tickets with these directly.
+    pub(crate) keys: Vec<[u8; 32]>,
 }
 
 impl TicketKeys {

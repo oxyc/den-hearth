@@ -106,6 +106,7 @@ fn decode_config_sealed() {
     assert!(decode_config(None, &plain).is_some(), "a plaintext config must decode with sealing off");
 }
 
-fn bytes_seq(start: u8, n: usize) -> Vec<u8> {
+/// Go `bytesSeq`: `n` bytes counting up from `start`. Shared with the ticket and install-id tests.
+pub(crate) fn bytes_seq(start: u8, n: usize) -> Vec<u8> {
     (0..n).map(|i| start.wrapping_add(i as u8)).collect()
 }
