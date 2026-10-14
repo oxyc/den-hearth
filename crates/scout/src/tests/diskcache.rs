@@ -121,6 +121,8 @@ fn tiered_cache_serves_files_an_earlier_run_wrote() {
     let dir = TempDir::new().unwrap();
     let far = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600;
     let name = TieredCache::new(1, dir.path()).path("probe:v1:abc");
+    // The name the live box's file already has: the base64url of the key's SHA-256.
+    assert_eq!(name.file_name().unwrap(), "IrrFwxQaIC1ssrurL97CDVMz31-BnvStmiJBy7o7rJQ.ent");
     write_file(&name, &format!("{far}\n{{\"audio\":[\"eng\"]}}")).unwrap();
 
     let c = TieredCache::new(1 << 20, dir.path());
@@ -361,10 +363,10 @@ fn tiered_cache_sweep_survives_a_write_failure() {
 #[test]
 fn tiered_cache_sweep_enforces_a_byte_budget() {
     let dir = TempDir::new().unwrap();
-    let mut c = TieredCache::new(1 << 20, dir.path());
+    let c = TieredCache::new(1 << 20, dir.path());
     // Budget off while writing, so the burst-triggered sweep inside Put does not do the trimming this
     // test is here to observe. Turned on for the explicit Sweep below.
-    c.max_bytes = 0;
+    c.set_max_bytes(0);
 
     // Well past the budget, all long-lived so expiry reclaims nothing.
     let body = "x".repeat(8 << 10);
@@ -379,15 +381,15 @@ fn tiered_cache_sweep_enforces_a_byte_budget() {
         written > budget,
         "the fixture only wrote {written} bytes — it cannot exercise a {budget} budget"
     );
-    c.max_bytes = budget;
+    c.set_max_bytes(budget);
 
     c.sweep();
 
     let after = disk_bytes(dir.path());
     assert!(
-        after <= c.max_bytes,
+        after <= c.max_bytes(),
         "after the sweep the volume holds {after} bytes, over the {} budget",
-        c.max_bytes
+        c.max_bytes()
     );
     assert!(after != 0, "the sweep emptied the store rather than trimming it to the budget");
     // The newest entry is the one worth keeping, and it survived.

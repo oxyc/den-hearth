@@ -534,7 +534,7 @@ fn memory_cache_ttl_and_eviction() {
     // The Go test moves `now` by reassigning a variable the closure captures; a shared clock does the same.
     let clock = Arc::new(Mutex::new(UNIX_EPOCH + Duration::from_secs(1000)));
     let mut c = MemoryCache::new(1 << 20);
-    c.now = clock_fn(&clock);
+    c.set_clock(clock_fn(&clock));
     c.put("k", "v", Duration::from_secs(10));
     assert_eq!(c.get("k").as_deref(), Some("v"), "should hit within TTL");
     *clock.lock().unwrap() += Duration::from_secs(11);
@@ -543,7 +543,7 @@ fn memory_cache_ttl_and_eviction() {
     // byte-budget eviction (audit #1): the resident bytes stay within the budget however much is written, and
     // an entry that keeps being read outlives a stream of one-shot writes.
     let mut c2 = MemoryCache::new(1000);
-    c2.now = clock_fn(&clock);
+    c2.set_clock(clock_fn(&clock));
     c2.put("hot", "0123456789", Duration::from_secs(3600));
     let scan: Vec<String> = (0..200).map(|i| format!("scan{i:03}")).collect();
     for key in &scan {
@@ -568,13 +568,13 @@ fn memory_cache_expiry_does_not_remove_a_concurrent_fresh_put() {
     let mut c = MemoryCache::new(1 << 20);
     {
         let (clock, armed, cell) = (Arc::clone(&clock), Arc::clone(&armed), Arc::clone(&cell));
-        c.now = Box::new(move || {
+        c.set_clock(Box::new(move || {
             let t = *clock.lock().unwrap();
             if armed.swap(false, Ordering::SeqCst) {
                 cell.get().expect("cache set").put("k", "new", Duration::from_secs(3600));
             }
             t
-        });
+        }));
     }
     let c = Arc::new(c);
     cell.set(Arc::clone(&c)).ok().expect("set once");

@@ -212,7 +212,8 @@ fn etag_of_body(bencher: Bencher) {
 #[divan::bench]
 fn cache_put_disk(bencher: Bencher) {
     let dir = tempfile::tempdir().unwrap();
-    let cache = subs::Cache::new(1 << 20, Some(dir.path().to_path_buf()));
+    // A disk budget the run cannot reach, so it measures the write and not the sweep a burst past the budget starts.
+    let cache = subs::Cache::new(1 << 30, Some(dir.path().to_path_buf()));
     let body = srt(2000);
     let mut i = 0usize;
     bencher.counter(BytesCount::new(body.len())).bench_local(|| {

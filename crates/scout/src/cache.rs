@@ -2,13 +2,18 @@
 //!
 //! The default backend is an in-memory TTL cache bounded by BYTES (audit #1: a count cap let a large
 //! resultCap × many titles blow the heap and OOM the container). Thread-safe, and sharded: a hit on one shard
-//! never waits for a write on another.
+//! never waits for a write on another. The engine is `den-cache`, shared with Subtitles.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::SystemTime;
 
-use quick_cache::sync::Cache as Sharded;
-use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
+use den_cache::Options;
+
+/// Go `CacheClass`: facts worth surviving a deploy versus coordination state useful only to this
+/// process.
+pub use den_cache::Class as CacheClass;
 
 /// Go `Cache`. Thread-safe. `get` returns `None` for a missing or expired key.
 pub trait Cache: Send + Sync {
@@ -31,14 +36,6 @@ pub trait Cache: Send + Sync {
     }
 }
 
-/// Go `CacheClass`: facts worth surviving a deploy versus coordination state useful only to this
-/// process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheClass {
-    Durable,
-    Volatile,
-}
-
 /// Go `MemoryCache`: in-memory TTL cache bounded by BYTES (key + value). Only the constructor and the `Cache` impl
 /// are the surface.
 ///
@@ -47,79 +44,28 @@ pub enum CacheClass {
 /// eviction, which keeps an entry that is read again over one written once. Go's strict LRU is gone with the
 /// recency list it needed a global lock for.
 pub struct MemoryCache {
-    /// Go's `c.now`: the clock expiry reads. A test swaps it for one it can move.
-    pub(crate) now: Box<dyn Fn() -> SystemTime + Send + Sync>,
-    entries: Sharded<String, CacheEntry, ByteWeight>,
+    inner: den_cache::Cache<Arc<str>>,
 }
-
-#[derive(Clone)]
-struct CacheEntry {
-    value: Arc<str>,
-    expires: SystemTime,
-}
-
-/// Go `size`: the key + value bytes an entry counts against the budget.
-#[derive(Clone)]
-struct ByteWeight;
-
-impl Weighter<String, CacheEntry> for ByteWeight {
-    fn weight(&self, key: &String, entry: &CacheEntry) -> u64 {
-        (key.len() + entry.value.len()) as u64
-    }
-}
-
-/// The smallest budget a shard gets. An entry heavier than its shard's budget is not kept (a maximum-size stream
-/// list is ~430 KiB), so shards are only added while each stays well above that.
-const MIN_SHARD_BYTES: usize = 2 << 20;
-const MAX_SHARDS: usize = 16;
-/// What the entries are expected to average, for sizing the table and the ghost list.
-const TYPICAL_ENTRY_BYTES: usize = 2048;
 
 impl MemoryCache {
     /// Go `NewMemoryCache`.
     pub fn new(max_bytes: usize) -> MemoryCache {
-        let options = OptionsBuilder::new()
-            .shards((max_bytes / MIN_SHARD_BYTES).clamp(1, MAX_SHARDS))
-            .estimated_items_capacity(max_bytes / TYPICAL_ENTRY_BYTES + 1)
-            .weight_capacity(max_bytes as u64)
-            .build()
-            .expect("capacity and estimate are both set");
-        let entries = Sharded::with_options(
-            options,
-            ByteWeight,
-            DefaultHashBuilder::default(),
-            quick_cache::sync::DefaultLifecycle::default(),
-        );
-        MemoryCache { now: Box::new(SystemTime::now), entries }
+        MemoryCache { inner: den_cache::Cache::new(Options::new(max_bytes)) }
+    }
+
+    /// Go's `c.now`: the clock expiry reads. A test swaps it for one it can move.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, now: Box<dyn Fn() -> SystemTime + Send + Sync>) {
+        self.inner.set_clock(Arc::from(now));
     }
 }
 
 impl Cache for MemoryCache {
     fn get(&self, key: &str) -> Option<Arc<str>> {
-        let entry = self.entries.get(key)?;
-        let now = (self.now)();
-        if now > entry.expires {
-            // Conditional, under the shard lock: a `put` that landed since the read above has replaced the
-            // expired entry, and removing by key alone would delete the fresh one.
-            self.entries.remove_if(key, |e| now > e.expires);
-            return None;
-        }
-        Some(entry.value)
+        self.inner.get(key)
     }
 
     fn put(&self, key: &str, value: &str, ttl: Duration) {
-        self.put_shared(key, Arc::from(value), ttl);
-    }
-}
-
-impl MemoryCache {
-    /// `put` for a value the caller already holds shared, so it is stored without another copy.
-    pub(crate) fn put_shared(&self, key: &str, value: Arc<str>, ttl: Duration) {
-        let now = (self.now)();
-        // Go's `Add` does not panic on an absurd TTL; neither may this. A TTL past what the clock can hold
-        // never expires in any lifetime of this process.
-        let expires =
-            now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 60 * 60));
-        self.entries.insert(key.to_owned(), CacheEntry { value, expires });
+        self.inner.put(key, Arc::from(value), ttl, CacheClass::Durable);
     }
 }

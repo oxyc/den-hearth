@@ -75,7 +75,7 @@ fn render(state: &AppState) -> String {
         &mut out,
         "subtitles_cache_disk_enabled",
         "gauge",
-        "1 when the disk cache tier is on, 0 when its directory was unwritable at boot.",
+        "1 when the disk cache tier is on, 0 when its directory was unwritable at boot or a write failed since the last hourly sweep.",
         "",
         u8::from(cache.disk),
     );

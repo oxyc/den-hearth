@@ -100,8 +100,8 @@ pub fn replay_hourly(cache: &TieredCache) -> i64 {
 /// A tiered cache with the disk budget off, so a long write benchmark measures the write and not the sweep a
 /// burst past the budget starts (the Go benchmark does the same).
 pub fn tiered_cache_without_disk_budget(memory_bytes: usize, dir: &Path) -> TieredCache {
-    let mut cache = TieredCache::new(memory_bytes, dir);
-    cache.max_bytes = 0;
+    let cache = TieredCache::new(memory_bytes, dir);
+    cache.set_max_bytes(0);
     cache
 }
 

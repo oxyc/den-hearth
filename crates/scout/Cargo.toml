@@ -56,9 +56,8 @@ regex = "1"
 fancy-regex = "0.19"
 # Go `net/url`, for the household source links in sources.go.
 url = "2"
-# The memory tier (cache.rs `MemoryCache`): a sharded, byte-weighted cache, so a hit does not queue behind a
-# write and the budget is bytes, not entries.
-quick_cache = "0.6"
+# The two-tier cache (cache.rs `MemoryCache`, diskcache.rs `TieredCache`), shared with Subtitles.
+den-cache = { path = "../cache" }
 # Go `crypto/subtle`: the constant-time compare behind the metrics token and the config key. The same
 # version den-reel, den-remux and den-subtitles carry.
 subtle = "2"

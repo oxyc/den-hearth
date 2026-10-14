@@ -13,6 +13,8 @@ den-net = { path = "../net" }
 den-http = { path = "../http" }
 # Client profiles, the address guard, Retry-After and the per-credential pause, shared with Reel, Remux and Scout.
 den-upstream = { path = "../upstream" }
+# The two-tier artifact cache, shared with Scout.
+den-cache = { path = "../cache" }
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }

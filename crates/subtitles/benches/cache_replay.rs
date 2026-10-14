@@ -9,10 +9,11 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-use den_subtitles::bench_api::{self as subs, Cache};
+use den_subtitles::bench_api as subs;
 
 /// Live and peak heap bytes: the memory the cache costs, with its index and bookkeeping.
 struct Counting;
@@ -114,11 +115,16 @@ fn main() {
     let titles: usize = arg("--titles").and_then(|v| v.parse().ok()).unwrap_or(400);
     let label = arg("--label").unwrap_or_else(|| "run".to_owned());
 
-    subs::set_clock(0);
+    let base = SystemTime::now();
+    let offset = Arc::new(AtomicU64::new(0));
+    let clock: Arc<dyn Fn() -> SystemTime + Send + Sync> = {
+        let offset = Arc::clone(&offset);
+        Arc::new(move || base + Duration::from_secs(offset.load(Ordering::Relaxed)))
+    };
     let dir = tempfile::tempdir().unwrap();
     let heap_before = LIVE.load(Ordering::Relaxed);
     PEAK.store(heap_before, Ordering::Relaxed);
-    let cache = Cache::new(DISK_BYTES, Some(dir.path().to_path_buf()));
+    let cache = subs::replay_cache(DISK_BYTES, dir.path(), Arc::clone(&clock));
     let mut rng = Rng(0x9E3779B97F4A7C15);
 
     let weights: Vec<f64> = (0..titles).map(|i| 1.0 / (i as f64 + 1.0)).collect();
@@ -152,15 +158,15 @@ fn main() {
 
     for minute in 0..hours * 60 {
         let now = minute * 60;
-        subs::set_clock(now);
-        let mult = match (minute / 60) % 24 {
+        offset.store(now, Ordering::Relaxed);
+        let mult: f64 = match (minute / 60) % 24 {
             0..=6 => 0.1,
             7..=16 => 1.0,
             _ => 4.0,
         };
         let n_requests = {
             let mut n = 0;
-            let mut p = (-mult as f64).exp();
+            let mut p = (-mult).exp();
             let mut s = p;
             let u = rng.unit();
             while u > s && n < 50 {
@@ -173,7 +179,13 @@ fn main() {
         for _ in 0..n_requests {
             requests += 1;
             let title = pick_title(&mut rng);
-            let lang_ix = if rng.unit() < 0.6 { 0 } else if rng.unit() < 0.75 { 1 } else { 2 };
+            let lang_ix = if rng.unit() < 0.6 {
+                0
+            } else if rng.unit() < 0.75 {
+                1
+            } else {
+                2
+            };
             let lang = LANGS[lang_ix];
             let install = rng.below(INSTALLS);
             let episodic = title % 3 != 0;
@@ -195,7 +207,8 @@ fn main() {
             }
 
             // The download: one candidate usually, a different one now and then.
-            let file_id = 9_000_000 + title * 40 + lang_ix * 8 + if rng.unit() < 0.85 { 0 } else { 1 + rng.below(6) };
+            let file_id =
+                9_000_000 + title * 40 + lang_ix * 8 + if rng.unit() < 0.85 { 0 } else { 1 + rng.below(6) };
             let os_key = format!("os:{file_id}");
             lookups += 2;
             assert!(cache.get(&format!("syncfail:dead:{file_id}")).is_none());
@@ -243,7 +256,11 @@ fn main() {
                     let pin = format!("source:{tt}:{s}:{e}");
                     put!(now, pin.clone(), file_id.to_string(), PIN_TTL);
                     for b in 0..BATCHES_PER_FILM {
-                        cache.put_mem(format!("batch:{tkey}:{b}"), padded("", 1_500 + rng.below(1_000)), Duration::from_secs(BATCH_TTL));
+                        cache.put_mem(
+                            format!("batch:{tkey}:{b}"),
+                            padded("", 1_500 + rng.below(1_000)),
+                            Duration::from_secs(BATCH_TTL),
+                        );
                     }
                     let quota_key = format!("quota:{install}:{}", now / 86_400);
                     lookups += 1;
@@ -265,14 +282,14 @@ fn main() {
     let (files, bytes) = dir_stats(dir.path());
     let heap_end = LIVE.load(Ordering::Relaxed).saturating_sub(heap_before);
     let heap_peak = PEAK.load(Ordering::Relaxed).saturating_sub(heap_before);
-    let (writes, bytes_written) = subs::disk_writes();
+    let (writes, bytes_written, skipped) = subs::disk_writes(&cache);
     drop(cache);
 
     // A restart: a new process over the same directory.
     let end = hours * 3600;
-    subs::set_clock(end);
+    offset.store(end, Ordering::Relaxed);
     let started = Instant::now();
-    let restarted = Cache::new(DISK_BYTES, Some(dir.path().to_path_buf()));
+    let restarted = subs::replay_cache(DISK_BYTES, dir.path(), Arc::clone(&clock));
     let startup_ms = started.elapsed().as_secs_f64() * 1e3;
     let (mut expected, mut restored) = (0u64, 0u64);
     for (key, valid_until) in &durable {
@@ -289,6 +306,7 @@ fn main() {
         "requests": requests, "puts": puts,
         "hit_rate": (hits as f64 / lookups as f64 * 1000.0).round() / 1000.0,
         "writes_per_hour": r1(writes as f64 / h), "bytes_written_per_hour": r1(bytes_written as f64 / h),
+        "skipped_unchanged": skipped,
         "disk_files_end": files, "disk_bytes_end": bytes,
         "mem_entries_end": stats.entries, "mem_bytes_end": stats.bytes,
         "heap_bytes_end": heap_end, "heap_bytes_peak": heap_peak,
