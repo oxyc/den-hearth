@@ -32,7 +32,7 @@ pub mod bench_api;
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
@@ -45,6 +45,13 @@ use tokio::net::TcpListener;
 pub use crate::config::Config;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+
+/// Lock `m`, recovering the data if a panic poisoned it. Every map behind these locks is left
+/// consistent between statements, and a `Drop` that unwrapped a poisoned lock would panic while
+/// unwinding and abort the whole process (hearth hosts four services in it).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The release the image carries (`DEN_VERSION`, set from the repo's `VERSION` file at build time). Keeping it
 /// out of Cargo.toml means a release does not invalidate the cached dependency build merely to change its tag.

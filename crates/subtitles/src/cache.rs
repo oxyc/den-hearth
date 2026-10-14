@@ -116,7 +116,7 @@ pub struct Stats {
 
 impl Cache {
     pub fn stats(&self) -> Stats {
-        let g = self.inner.lock().unwrap();
+        let g = crate::lock(&self.inner);
         Stats {
             entries: g.map.len(),
             bytes: g.bytes,
@@ -160,7 +160,7 @@ impl Cache {
         // are the norm now that a film leaves ~150 batch entries behind, and every one of them holds
         // its bytes against the budget until something else needs the room.
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = crate::lock(&self.inner);
             let now = Instant::now();
             let dead: Vec<String> =
                 g.map.iter().filter(|(_, e)| e.expires <= now).map(|(k, _)| k.clone()).collect();
@@ -319,7 +319,7 @@ impl Cache {
     /// backoff a client is told to wait out. Reads the tiers the way `get` does.
     pub fn ttl(&self, key: &str) -> Option<Duration> {
         {
-            let g = self.inner.lock().unwrap();
+            let g = crate::lock(&self.inner);
             if let Some(left) = g.map.get(key).and_then(|e| e.expires.checked_duration_since(Instant::now()))
             {
                 return Some(left);
@@ -355,7 +355,7 @@ impl Cache {
     /// "delete this".
     pub fn remove(&self, key: &str) {
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = crate::lock(&self.inner);
             if let Some(e) = g.map.remove(key) {
                 g.bytes -= e.size;
             }
@@ -369,7 +369,7 @@ impl Cache {
     /// one also unlinks a file, which for a key nothing ever wrote to disk is a syscall to delete
     /// something that was never there.
     pub fn remove_mem(&self, key: &str) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = crate::lock(&self.inner);
         if let Some(e) = g.map.remove(key) {
             g.bytes -= e.size;
         }
@@ -385,7 +385,7 @@ impl Cache {
     // ---- memory tier -------------------------------------------------------
 
     fn mem_get(&self, key: &str) -> Option<Text> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = crate::lock(&self.inner);
         g.tick += 1;
         let tick = g.tick;
         match g.map.get_mut(key) {
@@ -406,7 +406,7 @@ impl Cache {
     /// are freed when its last reader finishes, so a body still being served is briefly resident
     /// outside the budget, but never duplicated by it.
     fn mem_put(&self, key: String, value: Text, ttl: Duration) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = crate::lock(&self.inner);
         g.tick += 1;
         let size = key.len() + value.as_str().len();
         if let Some(old) = g.map.remove(&key) {

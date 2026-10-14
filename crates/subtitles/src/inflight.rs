@@ -37,7 +37,7 @@ impl InFlight {
     /// Wait for the exclusive right to produce `key`.
     pub async fn acquire(self: &Arc<Self>, key: &str) -> Guard {
         let lock = {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = crate::lock(&self.keys);
             // Sweep entries nobody holds any more. `Guard::drop` keeps an entry alive while a waiter
             // still needs it, and relies on that waiter to remove it later — but a waiter whose
             // request is CANCELLED never reaches `Guard::drop`, and leaves the entry behind with only
@@ -53,13 +53,13 @@ impl InFlight {
 
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.keys.lock().unwrap().len()
+        crate::lock(&self.keys).len()
     }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        let mut keys = self.owner.keys.lock().unwrap();
+        let mut keys = crate::lock(&self.owner.keys);
         let Some(lock) = keys.get(&self.key) else { return };
         // The map's own copy, plus the one held inside our permit. Anything beyond those two is a
         // waiter that still needs this entry: dropping it would let that waiter and the next arrival
@@ -96,18 +96,18 @@ impl Progress {
     /// before the failure marker, a stale entry does not merely go stale, it MASKS the failure and
     /// leaves a poller waiting on a run that is not happening.
     pub fn start(&self, key: &str, total: usize) -> Reporter<'_> {
-        self.jobs.lock().unwrap().insert(key.to_string(), (0, total));
+        crate::lock(&self.jobs).insert(key.to_string(), (0, total));
         Reporter { owner: self, key: key.to_string() }
     }
 
     pub fn get(&self, key: &str) -> Option<(usize, usize)> {
-        self.jobs.lock().unwrap().get(key).copied()
+        crate::lock(&self.jobs).get(key).copied()
     }
 
     /// Jobs reporting right now — which, since a reporter clears its entry however the job ends, is
     /// the number running.
     pub fn tracked(&self) -> usize {
-        self.jobs.lock().unwrap().len()
+        crate::lock(&self.jobs).len()
     }
 }
 
@@ -120,13 +120,13 @@ pub struct Reporter<'a> {
 
 impl Reporter<'_> {
     pub fn set(&self, done: usize, total: usize) {
-        self.owner.jobs.lock().unwrap().insert(self.key.clone(), (done, total));
+        crate::lock(&self.owner.jobs).insert(self.key.clone(), (done, total));
     }
 }
 
 impl Drop for Reporter<'_> {
     fn drop(&mut self) {
-        self.owner.jobs.lock().unwrap().remove(&self.key);
+        crate::lock(&self.owner.jobs).remove(&self.key);
     }
 }
 
@@ -209,6 +209,33 @@ mod tests {
         let unrelated = flight.acquire("other").await;
         drop(unrelated);
         assert_eq!(flight.tracked(), 0, "a cancelled waiter left its key in the map forever");
+    }
+
+    /// A panic while a lock is held must not turn every later lock into a panic: `Guard::drop` runs
+    /// during unwinding, and a panic inside a `Drop` there aborts the whole process.
+    #[tokio::test]
+    async fn a_poisoned_lock_is_recovered_not_panicked_on() {
+        let flight = Arc::new(InFlight::default());
+        let poisoner = flight.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.keys.lock().unwrap();
+            panic!("poison the map");
+        })
+        .join();
+        assert!(flight.keys.is_poisoned());
+
+        drop(flight.acquire("k").await);
+        assert_eq!(flight.tracked(), 0);
+
+        let progress = Progress::default();
+        let poisoner = std::panic::AssertUnwindSafe(&progress);
+        let _ = std::panic::catch_unwind(|| {
+            let _held = poisoner.jobs.lock().unwrap();
+            panic!("poison the jobs");
+        });
+        assert!(progress.jobs.is_poisoned());
+        drop(progress.start("job", 1));
+        assert_eq!(progress.tracked(), 0);
     }
 
     /// Different keys are independent — a slow translation must not block an unrelated one.
