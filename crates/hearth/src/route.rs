@@ -2,15 +2,38 @@
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Target {
-    /// Hearth's own `/health`, which reports all three.
+    /// Hearth's own `/health`, which reports every service.
     Health,
     /// `/reel/<rest>`, served as `/<rest>`.
     Reel(String),
     /// `/subs/<rest>`, served as `/<rest>`.
     Subs(String),
+    /// `/scout/<rest>`, served as `/<rest>`.
+    Scout(String),
     /// `/remux/<rest>`, served as it came: Remux's routes already live under `/remux`.
     Remux(String),
     NotFound,
+}
+
+/// A service with a listener of its own, where every request goes to it with the path as it came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    Scout,
+    Reel,
+    Subs,
+    Remux,
+}
+
+/// What a request to a service's own listener is: always that service, and always the path unchanged,
+/// exactly as the old standalone container served it (`/health` is the service's, not hearth's).
+pub fn legacy(service: Service, path: &str) -> Target {
+    let path = path.to_string();
+    match service {
+        Service::Scout => Target::Scout(path),
+        Service::Reel => Target::Reel(path),
+        Service::Subs => Target::Subs(path),
+        Service::Remux => Target::Remux(path),
+    }
 }
 
 pub fn target(path: &str) -> Target {
@@ -22,6 +45,9 @@ pub fn target(path: &str) -> Target {
     }
     if let Some(rest) = mounted(path, "/subs") {
         return Target::Subs(rest);
+    }
+    if let Some(rest) = mounted(path, "/scout") {
+        return Target::Scout(rest);
     }
     if path == "/remux" || path.starts_with("/remux/") {
         // Everything Remux serves begins `/remux/` except its Prometheus endpoint, which sits at its
@@ -67,6 +93,32 @@ mod tests {
             Target::Subs("/CONFIG/subtitles/movie/tt1.json".into())
         );
         assert_eq!(target("/subs/"), Target::Subs("/".into()));
+    }
+
+    #[test]
+    fn scout_loses_its_mount() {
+        assert_eq!(target("/scout/CONFIG/manifest.json"), Target::Scout("/CONFIG/manifest.json".into()));
+        assert_eq!(target("/scout/p/ticket"), Target::Scout("/p/ticket".into()));
+        assert_eq!(target("/scout"), Target::Scout("/".into()));
+        assert_eq!(target("/scouting"), Target::NotFound);
+    }
+
+    #[test]
+    fn a_legacy_listener_never_touches_the_path() {
+        assert_eq!(
+            legacy(Service::Scout, "/CONFIG/stream/movie/tt1.json"),
+            Target::Scout("/CONFIG/stream/movie/tt1.json".into())
+        );
+        assert_eq!(legacy(Service::Scout, "/health"), Target::Scout("/health".into()));
+        assert_eq!(legacy(Service::Scout, "/scout/health"), Target::Scout("/scout/health".into()));
+        assert_eq!(legacy(Service::Reel, "/play/x.mp4"), Target::Reel("/play/x.mp4".into()));
+        assert_eq!(legacy(Service::Reel, "/reel/x"), Target::Reel("/reel/x".into()));
+        assert_eq!(
+            legacy(Service::Subs, "/CONFIG/manifest.json"),
+            Target::Subs("/CONFIG/manifest.json".into())
+        );
+        assert_eq!(legacy(Service::Remux, "/remux/session"), Target::Remux("/remux/session".into()));
+        assert_eq!(legacy(Service::Remux, "/metrics"), Target::Remux("/metrics".into()));
     }
 
     #[test]

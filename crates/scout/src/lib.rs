@@ -1,7 +1,7 @@
 //! den-scout, ported from `internal/scout` in the Go repository. A skeleton: one module per Go source
 //! file, the shared types the tests need, and no logic. See `PORTING.md`.
 //!
-//! Nothing here is wired into den-hearth yet.
+//! den-hearth serves it (`crates/hearth`): `handler::new_handler` over `deps::build_deps`.
 
 // Every module is a stub until its work package lands, so unused items are expected for now.
 #![allow(dead_code, unused_variables)]
@@ -45,6 +45,11 @@ pub mod ticket;
 pub mod upstreampause;
 pub mod util;
 pub mod validate;
+
+/// The release this process reports (manifest, startup line, `/metrics`).
+pub fn release_version() -> &'static str {
+    manifest::manifest_version()
+}
 
 #[cfg(test)]
 mod tests;

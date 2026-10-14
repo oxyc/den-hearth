@@ -10,9 +10,12 @@ license = "MIT"
 den-reel = { path = "../reel" }
 den-subtitles = { path = "../subtitles" }
 den-remux = { path = "../remux" }
-# The services were written for a current_thread runtime; one process serving all three has more to
+den-scout = { path = "../scout" }
+# The services were written for a current_thread runtime; one process serving all of them has more to
 # do, so hearth runs a small multi-thread pool instead (HEARTH_WORKER_THREADS).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+# Scout's outbound client: the one the Go service built in cmd/den-scout/main.go.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
 http-body-util = "0.1"
