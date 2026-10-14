@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::cache::{Cache, MemoryCache};
 use crate::config::{Config, DebridAccount, DebridService};
-use crate::handler::{rd_only, write_queued_body};
+use crate::handler::{queued_body, rd_only};
 use crate::scrape::{DoError, Doer};
 use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
@@ -1826,7 +1826,7 @@ async fn torbox_status_answer_coordination_includes_api_identity() {
 fn queued_body_carries_state_and_swarm() {
     // The 202 body names the state and the swarm when the store knew them, and omits the counts when it didn't.
     let decode = |status: StoreStatus| -> serde_json::Value {
-        serde_json::from_slice(&write_queued_body(&status).body).expect("decode")
+        serde_json::from_slice(&serde_json::to_vec(&queued_body(&status)).expect("encode")).expect("decode")
     };
     let stalled = decode(StoreStatus {
         state: FETCH_STALLED.into(),

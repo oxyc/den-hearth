@@ -9,8 +9,11 @@ license = "MIT"
 [dependencies]
 # The public-address classifier household sources are guarded with, shared with Subtitles and Remux.
 den-net = { path = "../net" }
-# The pure helpers Scout shares with the other addons: FNV hash, weak If-None-Match, the bearer check, the request-id filter.
+# The response body, conditional GETs, CORS, the bearer check and the request log line every addon shares.
 den-http = { path = "../http" }
+# The request and response bodies the handler serves.
+bytes = "1"
+http-body-util = "0.1"
 async-trait = "0.1"
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
 # `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.

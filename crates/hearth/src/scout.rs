@@ -1,5 +1,5 @@
-//! Scout as a hearth component: the outbound client, the cache, the two handlers and the adapter from
-//! hyper's request to Scout's.
+//! Scout as a hearth component: the outbound client, the cache, the two handlers, and the bounded body read in
+//! front of them.
 //!
 //! Scout is a library (`handler::new_handler`) with no server of its own. What Go's `cmd/den-scout/main.go`
 //! did around it is done here: a pooled client that refuses to replay a body across a redirect, a tiered
@@ -98,19 +98,17 @@ impl Scout {
             return error(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, "header_too_large");
         }
         let body = match tokio::time::timeout(READ_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await {
-            Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+            Ok(Ok(collected)) => collected.to_bytes(),
             Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
             Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
         };
         let handler = if own_listener { &self.legacy } else { &self.mount };
-        let resp = handler.serve(Request::from_parts(parts, body)).await;
-        resp.map(den_http::full)
+        handler.serve(Request::from_parts(parts, body)).await
     }
 
     /// Scout's own `/health`, for hearth's combined one.
     pub async fn health(&self) -> Response<Body> {
-        let req = Request::get("/health").body(Vec::new()).expect("static request");
-        self.mount.serve(req).await.map(den_http::full)
+        self.mount.serve(Request::get("/health").body(Bytes::new()).expect("static request")).await
     }
 }
 

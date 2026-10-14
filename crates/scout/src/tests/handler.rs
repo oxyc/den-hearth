@@ -435,7 +435,10 @@ pub(crate) fn dead_link(reason: &str) -> StoreError {
 
 /// One request through the handler, its response body read whole.
 pub(crate) async fn send(h: &Handler, req: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
-    h.serve(req).await
+    use http_body_util::BodyExt;
+    let (parts, body) = h.serve(req).await.into_parts();
+    let body = body.collect().await.expect("a whole body never fails").to_bytes().to_vec();
+    http::Response::from_parts(parts, body)
 }
 
 /// handler_test.go's `do`: a GET with the given headers.
@@ -2879,7 +2882,7 @@ async fn play_multi_store_status_timeout_does_not_add() {
 /// client sends the weak form back.
 #[test]
 fn if_none_match_compares_weakly_over_a_list() {
-    use crate::handler::etag_matches;
+    use den_http::if_none_match_matches as etag_matches;
     assert!(etag_matches("\"x\"", "\"x\""));
     assert!(etag_matches("W/\"x\"", "\"x\""));
     assert!(etag_matches("\"x\"", "W/\"x\""));

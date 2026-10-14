@@ -183,27 +183,27 @@ pub async fn handler_bench(streams: Vec<RawStream>) -> HandlerBench {
     };
     let handler = new_handler(deps);
     let list = format!("/{blob}/stream/movie/tt0111161.json");
-    let (status, etag, body) = request(&handler, &list, None).await;
-    assert_eq!(status, 200, "the list did not build");
+    let resp = request(&handler, &list, None).await;
+    assert_eq!(resp.status(), 200, "the list did not build");
+    let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+    let body = http_body_util::BodyExt::collect(resp.into_body()).await.expect("a whole body").to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON list");
     let url = body["streams"][0]["url"].as_str().expect("a play URL").to_owned();
     let ticket = url.trim_start_matches("https://scout.example").to_owned();
-    assert_eq!(request(&handler, &ticket, None).await.0, 302, "the ticket did not play");
+    assert_eq!(request(&handler, &ticket, None).await.status(), 302, "the ticket did not play");
     HandlerBench { handler, list, etag, ticket }
 }
 
-/// One GET through the handler: its status, ETag and body.
-async fn request(h: &Handler, path: &str, if_none_match: Option<&str>) -> (u16, String, Vec<u8>) {
+/// One GET through the handler.
+async fn request(h: &Handler, path: &str, if_none_match: Option<&str>) -> crate::handler::Resp {
     let mut req = http::Request::get(path);
     if let Some(tag) = if_none_match {
         req = req.header("if-none-match", tag);
     }
-    let resp = h.serve(req.body(Vec::new()).expect("a valid request")).await;
-    let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
-    (resp.status().as_u16(), etag, resp.into_body())
+    h.serve(req.body(bytes::Bytes::new()).expect("a valid request")).await
 }
 
 /// A GET of `path` through the warmed handler, revalidating with `if_none_match`; the status it answered.
 pub async fn handler_get(b: &HandlerBench, path: &str, if_none_match: Option<&str>) -> u16 {
-    request(&b.handler, path, if_none_match).await.0
+    request(&b.handler, path, if_none_match).await.status().as_u16()
 }

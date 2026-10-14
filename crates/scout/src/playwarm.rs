@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::cache::CacheClass;
-use crate::handler::{write_queued, Inner, Out};
+use crate::handler::{write_queued, Inner, Resp};
 use crate::stores::{ResolveTarget, StoreStatus};
 
 /// How long /play remembers answering "downloading" for a file, so the next poll skips the held step and
@@ -32,7 +32,7 @@ impl Inner {
         rid: &str,
         dur: Duration,
         status: &StoreStatus,
-    ) -> Out {
+    ) -> Resp {
         self.deps.cache.put_class(pending_key, "1", PLAY_PENDING_TTL, CacheClass::Volatile);
         write_queued(rt, rid, dur, status)
     }

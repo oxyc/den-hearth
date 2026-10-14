@@ -519,6 +519,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
  "chacha20poly1305",
  "den-http",
  "den-net",
@@ -529,6 +530,7 @@ dependencies = [
  "futures-util",
  "hkdf",
  "http",
+ "http-body-util",
  "httpdate",
  "quick_cache",
  "regex",
