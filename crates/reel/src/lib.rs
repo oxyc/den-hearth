@@ -58,6 +58,7 @@ pub use crate::config::Config;
 use crate::httputil::query_param;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+pub use crate::ytdlp::kill_live_groups;
 use std::sync::{Arc, OnceLock};
 
 /// The release the image carries, from `DEN_VERSION` (set by the Dockerfile from the repo's `VERSION` file).

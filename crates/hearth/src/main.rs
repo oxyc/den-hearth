@@ -176,8 +176,7 @@ async fn serve_until(
         let mut http = hyper::server::conn::http1::Builder::new();
         http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
         if own == Some(Service::Scout) {
-            // Go's MaxHeaderBytes: twice the largest config segment a URL legitimately carries.
-            http.max_buf_size(32 << 10);
+            http.max_buf_size(scout::MAX_HEAD);
         }
         let conn = http.serve_connection(TokioIo::new(stream), service);
         let conn = graceful.watch(conn);
@@ -217,6 +216,7 @@ fn shutdown_signal() -> impl Future<Output = ()> {
             }
             eprintln!("second signal — exiting without finishing the drain");
             den_remux::kill_live_groups();
+            den_reel::kill_live_groups();
             std::process::exit(0);
         });
     }
@@ -341,11 +341,24 @@ fn stub_upstreams(reel: &mut den_reel::Config, subs: &mut den_subtitles::Config)
     eprintln!("stub-upstreams: the TMDB, KinoCheck and OpenSubtitles bases come from HEARTH_STUB_* (benchmark build)");
 }
 
+/// `raw`, the value of variable `name`, parsed as a `T`; `default` when it is unset, and also when it
+/// is set but unusable, which is said rather than silently replaced.
+fn parsed_or<T: std::str::FromStr + std::fmt::Display>(name: &str, raw: Option<String>, default: T) -> T {
+    let Some(raw) = raw else { return default };
+    match raw.parse() {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("{name}={raw:?} is not a valid value; using {default}");
+            default
+        }
+    }
+}
+
 fn main() {
     // Read before the runtime exists: the services read their configuration from the environment
     // inside `from_env`, and `env::scoped` edits the environment to give each its own.
-    let port = std::env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT);
-    let threads = std::env::var("HEARTH_WORKER_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let port = parsed_or("PORT", std::env::var("PORT").ok(), DEFAULT_PORT);
+    let threads = parsed_or("HEARTH_WORKER_THREADS", std::env::var("HEARTH_WORKER_THREADS").ok(), 2);
     let own = ports::legacy_ports(|name| std::env::var(name).ok(), port).unwrap_or_else(|e| {
         eprintln!("fatal: {e}");
         std::process::exit(1);
@@ -413,6 +426,23 @@ mod tests {
 
     async fn get(path: &str) -> (StatusCode, serde_json::Value) {
         get_on(None, path).await
+    }
+
+    #[test]
+    fn a_bad_value_falls_back_to_the_default() {
+        assert_eq!(parsed_or("PORT", None, 8090u16), 8090);
+        assert_eq!(parsed_or("PORT", Some("9000".into()), 8090u16), 9000);
+        assert_eq!(parsed_or("PORT", Some("http".into()), 8090u16), 8090);
+        assert_eq!(parsed_or("HEARTH_WORKER_THREADS", Some("-1".into()), 2usize), 2);
+    }
+
+    /// Scout's header ceiling (Go's MaxHeaderBytes) holds under `/scout` too, not only on its own port.
+    #[tokio::test]
+    async fn scout_under_the_main_port_refuses_an_oversized_head() {
+        let (status, _) = get(&format!("/scout/{}/manifest.json", "a".repeat(40 << 10))).await;
+        assert_eq!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+        let (status, _) = get(&format!("/scout/{}/manifest.json", "a".repeat(16 << 10))).await;
+        assert_ne!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
     }
 
     #[tokio::test]
