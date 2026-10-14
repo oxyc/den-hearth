@@ -76,11 +76,16 @@ fn public_addr() {
         ("198.18.0.1", false),
         ("2001:4860:4860::8888", true),
         ("::ffff:8.8.8.8", true),
-        // documentation range, unroutable either way
-        ("2001:db8::1", true),
-        // documentation range, unroutable either way
-        ("192.0.2.1", true),
-        ("203.0.113.9", true),
+        // documentation ranges, Teredo, and the IPv4-compatible block: unroutable, and refused with Subtitles'
+        ("2001:db8::1", false),
+        ("192.0.2.1", false),
+        ("198.51.100.7", false),
+        ("203.0.113.9", false),
+        ("2001::1", false),
+        ("::127.0.0.1", false),
+        // NAT64 and 6to4 are judged as the IPv4 address they carry
+        ("64:ff9b::808:808", true),
+        ("2002:808:808::1", true),
         ("93.184.216.34", true),
         ("2a00:1450:4001::200e", true),
         ("240.0.0.1", false),

@@ -436,6 +436,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "den-net"
+version = "0.0.0"
+
+[[package]]
 name = "den-reel"
 version = "0.56.0"
 dependencies = [
@@ -493,6 +497,7 @@ dependencies = [
  "blake2",
  "chacha20poly1305",
  "crypto_box",
+ "den-net",
  "divan",
  "fancy-regex",
  "fastrand",
@@ -520,6 +525,7 @@ dependencies = [
  "bytes",
  "chardetng",
  "crypto_box",
+ "den-net",
  "divan",
  "encoding_rs",
  "futures-util",

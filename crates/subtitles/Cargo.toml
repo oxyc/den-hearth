@@ -11,6 +11,8 @@ name = "den-subtitles"
 path = "src/main.rs"
 
 [dependencies]
+# The public-address classifier resync hops are vetted with, shared with Scout and Remux.
+den-net = { path = "../net" }
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }

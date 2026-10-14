@@ -1,0 +1,7 @@
+[package]
+name = "den-net"
+version = "0.0.0"
+edition = "2021"
+description = "The one answer to \"is this address on the public internet\", shared by every service that fetches a URL it was handed"
+publish = false
+license = "MIT"
