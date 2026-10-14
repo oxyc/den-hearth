@@ -35,7 +35,7 @@ Debian trixie-slim (glibc: Reel's yt-dlp, deno and MP4Box are glibc builds) with
 | `den-hearth` | the binary, built with cargo-chef so dependencies are a cached layer | this workspace |
 | `ffmpeg` (Debian) | Reel (mux, cropdetect) and Subtitles (audio decode for sync) | apt |
 | `ffmpeg-remux` | Remux: minimal source build, VAAPI, checksummed tarball | `FFMPEG_VERSION` / `FFMPEG_SHA256` |
-| `intel-media-va-driver` | Remux's GPU transcode (UHD 630, driver `iHD`), amd64 only | apt |
+| `intel-media-va-driver-non-free` | Remux's GPU transcode (UHD 630, driver `iHD`), amd64 only. The free package has no bitrate-controlled encode (CQP only) and no `scale_vaapi` kernels, so the non-free component is enabled for this one install | apt |
 | `yt-dlp` (binary + zipapp), `deno`, `python3` | Reel's extractor and its resident resolver | pinned versions, SHA-256 checked |
 | `MP4Box` + `libgpac` | Reel's `clap` box | GPAC pinned to a commit |
 | `alass` | Subtitles' aligner | `cargo install --locked`, pinned |
@@ -57,6 +57,22 @@ docker run --rm --entrypoint ffmpeg-remux den-hearth:local -hwaccels
 `docker buildx bake` builds the same image from `docker-bake.hcl`; `docker buildx bake e2e` runs Remux's `#[ignore]`d
 end-to-end tests against the image's own `ffmpeg-remux`. A transcode needs the GPU: pass `--device /dev/dri` and add
 the host's `render` gid with `--group-add` (the old `den-remux` quadlet did the same).
+
+On a host with a GPU, `scripts/probe-image.sh` also runs Remux's real encode (`h264_vaapi` with `-b:v/-maxrate/-bufsize`,
+after `scale_vaapi`) on a six-frame clip, and by hand it is:
+
+```
+docker run --rm -i --device /dev/dri/renderD128 --group-add "$(stat -c %g /dev/dri/renderD128)" \
+  --entrypoint ffmpeg-remux den-hearth:local -hide_banner -loglevel error \
+  -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -f matroska -i pipe:0 -map 0:V:0 \
+  -vf scale_vaapi=w=256:h=144:format=nv12 -c:v h264_vaapi -profile:v high -level:v 4.1 \
+  -b:v 4000000 -maxrate 6000000 -bufsize 8000000 -frames:v 6 -f mp4 -movflags frag_keyframe+empty_moov pipe:1 \
+  < crates/remux/testdata/gpu-probe.mkv > /dev/null
+```
+
+Remux runs the same encode once at start-up; if it fails, transcoding is off and `/remux/health` says
+`transcode_unavailable` with ffmpeg's reason in the startup log. `ffmpeg -h encoder=h264_vaapi` listing the encoder
+proves nothing: the free `intel-media-va-driver` lists it and then fails with "Driver does not support any RC mode".
 
 CI (`.github/workflows/`): `ci.yml` formats, lints and tests the workspace, runs the e2e stage, and on `main` builds,
 probes (`scripts/probe-image.sh`) and scans an immutable candidate. `docker-publish.yml` promotes that digest on a

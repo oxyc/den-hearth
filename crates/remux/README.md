@@ -440,7 +440,8 @@ A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-
 
 `/health` is 200 with `status: ok`, or `degraded` with the first reason sessions cannot work:
 `ffmpeg_unavailable` (checked at start: matroska and mov demuxers, hls muxer, aac encoder, https),
-`scratch_unwritable`, `scout_unconfigured` (neither `SCOUT_ORIGINS` nor `SCOUT_INSTALL_URL`),
+`scratch_unwritable`, `transcode_unavailable` (the GPU is present and ffmpeg lists `h264_vaapi`, but a six-frame
+encode with a session's flags failed at start; transcoding is off), `scout_unconfigured` (neither `SCOUT_ORIGINS` nor `SCOUT_INSTALL_URL`),
 `scout_key_missing`, `url_key_ephemeral`.
 
 `/metrics` (gauges and counters prefixed `remux_`): sessions and their cap, active/waiting producers and their cap,
