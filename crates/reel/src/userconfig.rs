@@ -287,11 +287,9 @@ mod tests {
         let loose = format!("{head}{}", &alphabet[idx | 1..(idx | 1) + 1]);
         assert_ne!(loose, seg, "the fixture must differ in a trailing bit");
         let wrapped = format!("{}\r\n{}\n", &seg[..10], &seg[10..]);
-        for (what, blob) in [
-            ("padded", format!("{seg}=")),
-            ("wrapped", wrapped),
-            ("non-zero trailing bits", loose),
-        ] {
+        for (what, blob) in
+            [("padded", format!("{seg}=")), ("wrapped", wrapped), ("non-zero trailing bits", loose)]
+        {
             let cfg = decode(None, &blob).unwrap_or_else(|| panic!("a {what} segment did not open"));
             assert_eq!(cfg.tmdb_key, "abc123", "{what}");
         }
