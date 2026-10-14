@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use crate::cache::Cache;
 use crate::config::DebridService;
 use crate::scrape::Doer;
+use crate::season::TorrentFile;
 use crate::stores::{ResolveTarget, Store, StoreError, StoreStatus};
 
 /// Go `realDebridAPI`.
@@ -25,6 +26,15 @@ pub struct RealDebridStore {
 /// season and episode selector in it.
 pub(crate) fn rd_torrent_key(token: &str, info_hash: &str, t: &ResolveTarget) -> String {
     todo!("stores.go rdTorrentKey")
+}
+
+impl RealDebridStore {
+    /// Go `realDebridStore.pickFileID` (stores.go:4269): the file id to unrestrict. Name match first, then
+    /// the caller's position mapped to RD's own id, then the largest video; a refusal when the pack names
+    /// episodes and not the one asked for.
+    pub(crate) fn pick_file_id(&self, files: &[TorrentFile], t: &ResolveTarget) -> Result<Option<i64>, StoreError> {
+        todo!("stores.go realDebridStore.pickFileID")
+    }
 }
 
 #[async_trait]
