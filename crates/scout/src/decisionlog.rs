@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use regex::Regex;
 
-use crate::rank::{RawStream, GIB};
+use crate::id::StreamId;
+use crate::loglimit::log_limited;
+use crate::rank::{RankDebug, RawStream, GIB};
 use crate::scrape::ScrapeQuery;
 use crate::stores::{short_hash, ResolveTarget};
 
@@ -180,8 +182,49 @@ pub fn play_decision(
     decision_line(event, outcome, reason, upstream, dur, rid, &resolve_identity(rt))
 }
 
-// TODO(rank): Go `logRankDecision`, `rankIdentity` and `rankRunnerUps` also live in decisionlog.go. They read
-// `rankDebug.DroppedBy`, and `RankDebug` is not in rank.rs yet; port them with it.
+/// Go `logRankDecision` is the per-list-build decision line: title id, how many candidates were in contention,
+/// the chosen release and its runner-ups, and the top drop reasons — everything ?debug=1 used to require a client
+/// to ask for, now on every build, rate-limited like any other decision line.
+pub(crate) fn log_rank_decision(
+    sid: &StreamId,
+    candidates: i64,
+    ranked: &[RawStream],
+    dbg: &RankDebug,
+    dur: Duration,
+    rid: &str,
+) {
+    let (outcome, reason) = if ranked.is_empty() {
+        ("skipped", format!("no survivors among {candidates} candidates"))
+    } else {
+        ("served", format!("picked from {candidates} candidates"))
+    };
+    log_limited("rank-decision", &decision_line("rank", outcome, &reason, "", dur, rid, &rank_identity(sid, ranked, dbg)));
+}
+
+/// Go `rankRunnerUps`: "the chosen first release and the next 2-3 runner-ups".
+const RANK_RUNNER_UPS: usize = 3;
+
+/// Go `rankIdentity` is the rank decision line's identity suffix: title id, the chosen release and its
+/// runner-ups, and the top drop reasons — one unit, gated by LOG_IDENTITY like every other identity suffix here.
+pub(crate) fn rank_identity(sid: &StreamId, ranked: &[RawStream], dbg: &RankDebug) -> String {
+    let mut b = format!("imdb={} type={} ", sid.imdb, sid.kind);
+    if sid.has_ep {
+        b.push_str(&format!("season={} episode={} ", sid.season, sid.episode));
+    }
+    let counts: HashMap<String, i64> = dbg.dropped_by.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let drops = top_drop_reasons(&counts, 3);
+    if !drops.is_empty() {
+        b.push_str(&format!("top_drops={drops} "));
+    }
+    for (i, s) in ranked.iter().enumerate().take(RANK_RUNNER_UPS + 1) {
+        let label = if i == 0 { "picked".to_owned() } else { format!("runnerup{i}") };
+        b.push_str(&format!("{label}={} ", format_pick(s)));
+    }
+    if b.ends_with(' ') {
+        b.pop();
+    }
+    b
+}
 
 /// Go `topDropReasons`: the `n` largest drop counts as `reason:count`, highest first, ties broken by name.
 /// Empty when nothing was dropped.

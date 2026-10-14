@@ -42,6 +42,33 @@ fn want_pick(got: Result<Option<i64>, StoreError>, want: i64, what: &str) {
     }
 }
 
+/// Go `ep`.
+fn ep(season: i64, episode: i64) -> ResolveTarget {
+    ResolveTarget { info_hash: H.into(), season: Some(season), episode: Some(episode), ..Default::default() }
+}
+
+/// Go's `ResolveTarget{InfoHash: H}`, which the pending bodies spell `target_none()`.
+fn target_none() -> ResolveTarget {
+    ResolveTarget { info_hash: H.into(), ..Default::default() }
+}
+
+/// Go's `ResolveTarget{InfoHash: H, FileIdx: idx(i)}`, which the pending bodies spell `target_idx(i)`.
+fn target_idx(i: i64) -> ResolveTarget {
+    ResolveTarget { info_hash: H.into(), file_idx: Some(i), ..Default::default() }
+}
+
+/// Go `nameOfIndex` reports which file an answer actually names, so a failure says what was served rather than
+/// which bucket the number fell in.
+fn name_of_index(files: &[TorrentFile], idx: i64) -> String {
+    if let Some(f) = files.iter().find(|f| f.index == idx) {
+        return f.name.clone();
+    }
+    if let Some(f) = usize::try_from(idx).ok().and_then(|i| files.get(i)) {
+        return format!("{} (by position)", f.name);
+    }
+    format!("index {idx}, which is in no file")
+}
+
 /// Go `wantNotInTorrent` asserts a picker REFUSED, rather than substituting some other file.
 fn want_not_in_torrent(got: Result<Option<i64>, StoreError>, what: &str) {
     match got {
