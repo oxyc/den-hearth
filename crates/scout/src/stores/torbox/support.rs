@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +22,7 @@ use tokio::sync::watch;
 
 use crate::cache::{Cache, CacheClass};
 use crate::config::DebridService;
+use crate::loglimit::log_limited;
 use crate::scrape::DoError;
 use crate::stores::refusal::{
     account_refused_key, add_outcome_unknown, record_refusal, transport_kind, unknown_outcome_key, ADD_GIVE_UP,
@@ -369,11 +371,29 @@ pub(crate) fn unavailable(service: DebridService, reason: impl Into<String>, sta
 }
 
 /// A transport failure from the HTTP seam as the error a store call returns: its cause, never its URL.
+///
+/// A caller going away or its deadline running out is `Cancelled` (Go `isCancellation`: the error wraps
+/// `context.Canceled` or `context.DeadlineExceeded`, which is also how a client's own timeout reads). Nothing
+/// can be concluded about the store or the release from it. Anything else is the transport failing, and says
+/// only what failed.
 pub(crate) fn transport_error(err: DoError) -> StoreError {
-    match transport_kind(Some(err.as_ref())).as_str() {
-        "cancelled" => StoreError::Cancelled,
-        kind => StoreError::Other(kind.to_owned()),
+    let mut chain = Vec::new();
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+    while let Some(e) = link {
+        chain.push(e.to_string());
+        link = e.source();
     }
+    let cancelled = err.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+        || chain.iter().any(|m| {
+            m.contains("context canceled")
+                || m.contains("context deadline exceeded")
+                || m.contains("operation cancelled")
+                || m.contains("operation was canceled")
+        });
+    if cancelled {
+        return StoreError::Cancelled;
+    }
+    StoreError::Other(transport_kind(Some(err.as_ref())))
 }
 
 // --- store helpers from the shared head (stores.go:323-442) ---
@@ -661,44 +681,93 @@ pub(crate) fn scoped(key: &str) -> String {
 /// for a mint and wrong here, where the work is a 64 MiB listing a follower is still waiting on.
 ///
 /// The work runs in its own task, so a panic in it ends that task and nothing else: every waiter is answered
-/// `None` rather than left waiting, where Go would have died (see `recoverBackground`).
-pub(super) struct DetachedFlight<T>(Mutex<BTreeMap<String, watch::Receiver<Option<Option<T>>>>>);
+/// `None` rather than left waiting, where Go would have died. This is Go's `recoverBackground`: a singleflight
+/// closure that panics re-raises on a bare goroutine nothing can recover, so each of these jobs recovers its own,
+/// counts it, and abandons the work.
+pub(super) struct DetachedFlight<T> {
+    calls: Mutex<BTreeMap<String, watch::Receiver<Option<Option<T>>>>>,
+    /// What the work is, for the log line a panic writes. Always a literal, so it is a fixed vocabulary for the
+    /// limiter's key.
+    what: &'static str,
+}
 
 impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
-    pub(super) const fn new() -> Self {
-        DetachedFlight(Mutex::new(BTreeMap::new()))
+    pub(super) const fn new(what: &'static str) -> Self {
+        DetachedFlight { calls: Mutex::new(BTreeMap::new()), what }
     }
 
     /// Runs `make()` for the first caller of `key`; a caller that arrives while it is in flight waits for the same
     /// answer. The key is forgotten before the answer is published, so a caller arriving after it runs the work
-    /// again: nothing is cached here. `None` is a run that panicked.
-    pub(super) async fn run<F, Fut>(&'static self, key: &str, make: F) -> Option<T>
+    /// again: nothing is cached here. The answer is `None` for a run that panicked, and the flag says whether
+    /// this caller shared a flight someone else started (Go's `result.Shared`).
+    pub(super) async fn run<F, Fut>(&'static self, key: &str, make: F) -> (Option<T>, bool)
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T> + Send + 'static,
     {
         let key = scoped(key);
-        let mut rx = {
-            let mut calls = lock(&self.0);
+        let (mut rx, shared) = {
+            let mut calls = lock(&self.calls);
             match calls.get(&key) {
-                Some(rx) => rx.clone(),
+                Some(rx) => (rx.clone(), true),
                 None => {
                     let (tx, rx) = watch::channel(None);
                     calls.insert(key.clone(), rx.clone());
                     let work = make();
                     tokio::spawn(async move {
-                        let answer = tokio::spawn(work).await.ok();
-                        lock(&self.0).remove(&key);
+                        let answer = match tokio::spawn(work).await {
+                            Ok(answer) => Some(answer),
+                            Err(e) => {
+                                if e.is_panic() {
+                                    crate::metrics::metrics().background_panic.fetch_add(1, Ordering::Relaxed);
+                                    log_limited(
+                                        &format!("panic:{}", self.what),
+                                        &format!("{} panicked, abandoning it: {}", self.what, panic_text(e.into_panic())),
+                                    );
+                                }
+                                None
+                            }
+                        };
+                        lock(&self.calls).remove(&key);
                         let _ = tx.send(Some(answer));
                     });
-                    rx
+                    (rx, false)
                 }
             }
         };
-        let answered = rx.wait_for(|v| v.is_some()).await.ok()?;
+        let Ok(answered) = rx.wait_for(|v| v.is_some()).await else {
+            return (None, shared);
+        };
         let answer = (*answered).clone().flatten();
         drop(answered);
-        answer
+        (answer, shared)
+    }
+}
+
+/// A panic's payload as Go's `%v` of the recovered value would print it.
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<&str>() {
+        Ok(s) => (*s).to_owned(),
+        Err(payload) => match payload.downcast::<String>() {
+            Ok(s) => *s,
+            Err(_) => "a panic with no message".to_owned(),
+        },
+    }
+}
+
+/// Adds one to a gauge while it lives (Go's `Add(1)` and a deferred `Add(-1)`).
+pub(super) struct GaugeGuard(&'static AtomicI64);
+
+impl GaugeGuard {
+    pub(super) fn new(gauge: &'static AtomicI64) -> GaugeGuard {
+        gauge.fetch_add(1, Ordering::Relaxed);
+        GaugeGuard(gauge)
+    }
+}
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
