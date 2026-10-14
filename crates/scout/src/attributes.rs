@@ -5,7 +5,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::label::clean_label_lower;
 use crate::probe::Probe;
+use crate::util::go_to_lower;
 use crate::rank::{
     detect_resolution_lower, junk_class_of, re2, RawStream, RE_3D, RE_AC3, RE_ATMOS, RE_AV1, RE_BLURAY,
     RE_BR_RIP, RE_DTS, RE_DTSHD_MA, RE_DTSX, RE_DVD_RIP, RE_EAC3, RE_HDR10P, RE_HDTV, RE_KORSUB_HC, RE_REMUX,
@@ -103,9 +105,10 @@ static RE_FLAC: LazyLock<Regex> = LazyLock::new(|| re2(r"flac|lpcm|pcm"));
 /// A digit or a boundary after "aac" ("AAC2.0", "AAC5 1", "HE-AAC"), so "Aachen" is not audio.
 static RE_AAC: LazyLock<Regex> = LazyLock::new(|| re2(r"\baac(?:[0-9]|\b)"));
 /// Opus counts only once the technical half of the name has begun: "Mr.Hollands.Opus.1995.1080p" is a film
-/// title, and a bare \bopus\b would call it Opus audio. It has `.`, so it stays in Unicode mode.
+/// title, and a bare \bopus\b would call it Opus audio. RE2's `.` is a whole codepoint but its `\d` and `\b` are
+/// ASCII, so this stays in Unicode mode (for the dots) and spells the ASCII classes out with `(?-u:…)`.
 static RE_OPUS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:\d{3,4}p|x26[45]|h\.?26[45]|hevc|av1|10.?bits?|web-?dl|webrip|bluray)\b.*\bopus\b")
+    Regex::new(r"(?:(?-u:\d){3,4}p|x26[45]|h\.?26[45]|hevc|av1|10.?bits?|web-?dl|webrip|bluray)(?-u:\b).*(?-u:\bopus\b)")
         .expect("static pattern")
 });
 static RE_MP3: LazyLock<Regex> = LazyLock::new(|| re2(r"\bmp3\b"));
@@ -123,7 +126,7 @@ fn str_opt(s: &str) -> Option<String> {
 }
 
 /// Go `detectSourceAttr`.
-fn detect_source_attr(t: &str) -> &'static str {
+pub(crate) fn detect_source_attr(t: &str) -> &'static str {
     let junk = junk_class_of(t);
     if matches!(junk, "cam" | "telesync" | "screener") {
         return junk;
@@ -258,7 +261,7 @@ fn detect_audio(t: &str) -> &'static str {
 
 /// Go `streamAttributes`: the attributes of one stream, read from its title and, when probed, the file.
 pub(crate) fn stream_attributes(s: RawStream) -> StreamAttributes {
-    let t = s.title.to_lowercase();
+    let t = go_to_lower(&s.title);
     let dolby_vision = RE_DOVI_ATTR.is_match(&t);
     let hdr = dolby_vision || RE_HDR_EXTRA.is_match(&t);
     let mut attrs = StreamAttributes {
@@ -278,7 +281,7 @@ pub(crate) fn stream_attributes(s: RawStream) -> StreamAttributes {
         pack_size_bytes: s.pack_size_bytes,
         seeders: s.seeders,
         cached: cached_claim(&s),
-        label: crate::label::clean_label(&s),
+        label: clean_label_lower(&t, &s), // reuse the title we already lowercased
         bit_depth: detect_bit_depth(&t, hdr),
         ..Default::default()
     };
@@ -370,7 +373,7 @@ pub(crate) fn container_of(s: RawStream) -> String {
             return p.container.clone();
         }
     }
-    let t = s.title.to_lowercase();
+    let t = go_to_lower(&s.title);
     if t.ends_with(".mp4") || t.ends_with(".m4v") {
         "mp4".to_string()
     } else if t.ends_with(".mkv") {

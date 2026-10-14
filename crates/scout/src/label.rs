@@ -1,13 +1,72 @@
 //! Port of `internal/scout/label.go`. Work package 5.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
 
-use crate::rank::GIB;
+use crate::attributes::detect_source_attr;
+use crate::rank::{
+    detect_resolution_lower, re2, RawStream, GIB, RES_1080, RES_1440, RES_2160, RES_480, RES_4K_UHD, RES_540,
+    RES_576, RES_720, RE_ATMOS, RE_BLURAY, RE_BR_RIP, RE_DOVI, RE_HDR10P, RE_REMUX, RE_WEB, RE_WEB_DL, RE_WEB_RIP,
+};
+use crate::util::go_to_lower;
 
 /// Go `mib` (label.go).
 pub(crate) const MIB: i64 = 1_048_576;
+
+/// Go `reHDRLabel`.
+static RE_HDR_LABEL: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhdr\b|hdr10|\bhlg\b"));
+
+/// Go `resolutionLabel`.
+fn resolution_label(t: &str, size_bytes: Option<i64>) -> &'static str {
+    if RES_2160.is_match(t) {
+        return "4K";
+    }
+    if RES_1440.is_match(t) {
+        return "1440p";
+    }
+    if RES_1080.is_match(t) {
+        return "1080p";
+    }
+    if RES_720.is_match(t) {
+        return "720p";
+    }
+    if RES_480.is_match(t) || RES_576.is_match(t) || RES_540.is_match(t) {
+        return "SD";
+    }
+    if RES_4K_UHD.is_match(t) && size_bytes.unwrap_or(0) > 3 * GIB {
+        return "4K";
+    }
+    ""
+}
+
+/// Go `dynamicRangeLabel`.
+fn dynamic_range_label(t: &str) -> &'static str {
+    if RE_DOVI.is_match(t) {
+        "Dolby Vision"
+    } else if RE_HDR10P.is_match(t) {
+        "HDR10+"
+    } else if RE_HDR_LABEL.is_match(t) {
+        "HDR"
+    } else {
+        ""
+    }
+}
+
+/// Go `sourceLabelForDisplay`.
+fn source_label_for_display(t: &str) -> &'static str {
+    if RE_REMUX.is_match(t) {
+        "REMUX"
+    } else if RE_BLURAY.is_match(t) || RE_BR_RIP.is_match(t) {
+        "BluRay"
+    } else if RE_WEB_DL.is_match(t) {
+        "WEB-DL"
+    } else if RE_WEB_RIP.is_match(t) || RE_WEB.is_match(t) {
+        "WEB"
+    } else {
+        ""
+    }
+}
 
 /// Go `sizeLabel`: bytes → "18 GB" / "720 MB" (one decimal under 10 GB so small files stay legible).
 pub(crate) fn size_label(bytes: i64) -> String {
@@ -22,9 +81,21 @@ pub(crate) fn size_label(bytes: i64) -> String {
     format!("{} MB", mb.max(1))
 }
 
-/// Go `bingeGroup`: the release identity two episodes of one season share, or differ on.
-pub(crate) fn binge_group(_lower: &str, _title: &str) -> String {
-    todo!("label.go bingeGroup: needs rank.go's dolby-vision/HDR matchers and attributes.go's detectors")
+/// Go `bingeGroup` names the release a stream belongs to, for next-episode continuity: a client plays the next
+/// episode from the source whose bingeGroup matches the one it just played. It used to be
+/// `den-scout-<imdb>` — the same for every release of a title — so the first candidate always matched and
+/// "stay on the same release" never happened. Resolution, source, dynamic range and release group are
+/// what make two episodes "the same release".
+pub(crate) fn binge_group(t: &str, title: &str) -> String {
+    let dr = if RE_DOVI.is_match(t) {
+        "dv"
+    } else if RE_HDR_LABEL.is_match(t) || RE_HDR10P.is_match(t) {
+        "hdr"
+    } else {
+        ""
+    };
+    let group = release_group(title);
+    ["den-scout", detect_resolution_lower(t), detect_source_attr(t), dr, group.as_str()].join("|")
 }
 
 /// Go `fileExt`: the extension a release name may end on, which is dropped before its group is read.
@@ -54,11 +125,11 @@ pub(crate) fn release_group(title: &str) -> String {
         return String::new();
     }
     let tail = base[dash + 1..].trim();
-    let lower = tail.to_lowercase();
+    let lower = go_to_lower(tail);
     if tail.is_empty() || tail.len() > 14 || tail.contains(' ') || lower.contains("www") {
         return String::new();
     }
-    let lower_base = base.to_lowercase();
+    let lower_base = go_to_lower(&base);
     for m in GROUP_METADATA {
         // The suffix test catches a hyphenated token straddling the last dash: "…1080p WEB-DL" ends on metadata,
         // and its "group" would otherwise be "dl".
@@ -69,7 +140,46 @@ pub(crate) fn release_group(title: &str) -> String {
     lower
 }
 
-/// Go `cleanLabel`: the short "1080p • WEB" caption shown under a stream.
-pub(crate) fn clean_label(_s: &crate::rank::RawStream) -> String {
-    todo!()
+/// Go `cleanLabel` is the bullet-joined quality summary shown as attributes.label.
+pub(crate) fn clean_label(s: &RawStream) -> String {
+    clean_label_lower(&go_to_lower(&s.title), s)
+}
+
+/// Go `cleanLabelLower` is `clean_label` when the caller already has the lowercased title.
+pub(crate) fn clean_label_lower(t: &str, s: &RawStream) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let res = resolution_label(t, s.size_bytes);
+    if !res.is_empty() {
+        parts.push(res.to_owned());
+    }
+    let src = source_label_for_display(t);
+    if !src.is_empty() {
+        parts.push(src.to_owned());
+    }
+    let dr = dynamic_range_label(t);
+    if !dr.is_empty() {
+        parts.push(dr.to_owned());
+    }
+    if RE_ATMOS.is_match(t) {
+        parts.push("Atmos".to_owned());
+    }
+    if let Some(size) = s.size_bytes {
+        parts.push(size_label(size));
+    } else if let Some(pack) = s.pack_size_bytes {
+        // The episode's own size is unknown — unresolvedSeasonPack (season.go) left SizeBytes nil rather
+        // than keep the indexer's pack-wide number as if it were this file's. State what the number
+        // actually is instead of staying silent or, worse, naming it plainly as this release's size.
+        parts.push(format!("{} pack", size_label(pack)));
+    }
+    let mut label = if parts.is_empty() { "Stream".to_owned() } else { parts.join(" • ") };
+    // The pack is context, not a correction — this stream still plays the file sized above. Appended after
+    // the bullets rather than folded into them, so a client that wants only the short form can cut the
+    // string at " · " instead of re-parsing bullets. Only when SizeBytes is ITSELF known: an unknown
+    // episode size already named the pack as the headline bullet above, and repeating it here is noise.
+    if let (Some(_), Some(pack)) = (s.size_bytes, s.pack_size_bytes) {
+        label.push_str(" · from a ");
+        label.push_str(&size_label(pack));
+        label.push_str(" pack");
+    }
+    label
 }
