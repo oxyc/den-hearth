@@ -255,6 +255,26 @@ impl Drop for AbandonedAnswer<'_> {
     }
 }
 
+/// What `CacheCheck` remembers for a caller that goes away before every batch has come back: the held releases it
+/// already knew and those the finished batches reported, which Go writes after `g.Wait()` returns on the cancelled
+/// context. Armed from the first batch until they have all been joined.
+struct AbandonedCacheCheck<'a> {
+    store: &'a TorBoxStore,
+    known: &'a HashMap<String, bool>,
+    hashes: &'a [String],
+    answered: &'a Mutex<Vec<Option<HashMap<String, bool>>>>,
+    armed: bool,
+}
+
+impl Drop for AbandonedCacheCheck<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let answers = lock(self.answered).clone();
+            self.store.settle_cache_check(self.known.clone(), self.hashes, &answers);
+        }
+    }
+}
+
 /// The torrent id `resolveHeldTorrent` remembers unconditionally, written for it when its caller goes away while the
 /// pack's file list is being read: the id (with the status snapshot cleared) is what Go's flow leaves behind once the
 /// cancelled read has come back as "no answer". Armed across that one await.
@@ -347,8 +367,32 @@ impl TorBoxStore {
         TorboxCheckResult { cached: answer, ok: true }
     }
 
+    /// What `CacheCheck` makes of the batches that came back. Only a batch that came back describes its hashes. One
+    /// that failed leaves them ABSENT from the map, which the pool reads as "we do not know" — writing false there
+    /// states that TorBox does not hold them, which is a different and costly claim: it drops a genuinely cached
+    /// release from a cached-only list, or pays an add at play time for a torrent the account already had. With
+    /// 500 seeds in batches of 100, one timed-out batch made that claim about 100 releases and reported no error
+    /// at all. The held releases are remembered whatever came back. Returns the map and which batches answered.
+    fn settle_cache_check(
+        &self,
+        mut result: HashMap<String, bool>,
+        hashes: &[String],
+        answers: &[Option<HashMap<String, bool>>],
+    ) -> (HashMap<String, bool>, Vec<bool>) {
+        let mut batch_ok = vec![false; answers.len()];
+        for (i, (batch, answer)) in hashes.chunks(CACHE_BATCH).zip(answers).enumerate() {
+            let Some(answer) = answer else { continue };
+            batch_ok[i] = true;
+            for h in batch {
+                result.insert(h.clone(), answer.get(&go_to_lower(h)).copied().unwrap_or(false));
+            }
+        }
+        remember_cached(self.cache(), DebridService::TorBox, &self.account_identity(), &result);
+        (result, batch_ok)
+    }
+
     /// Go `torBoxStore.checkCachedBatch`.
-    async fn check_cached_batch(&self, hashes: &[String]) -> Option<HashMap<String, bool>> {
+    pub(crate) async fn check_cached_batch(&self, hashes: &[String]) -> Option<HashMap<String, bool>> {
         let mut set: Vec<String> = hashes.iter().map(|h| go_to_lower(h)).collect();
         set.sort();
         let key = format!("{}:{}", key_hash(&self.account_identity()), key_hash(&set.join(",")));
@@ -2415,26 +2459,35 @@ impl Store for TorBoxStore {
 
     async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
         let identity = self.account_identity();
-        let (mut result, hashes) = known_cached(self.cache(), DebridService::TorBox, &identity, hashes);
+        let (result, hashes) = known_cached(self.cache(), DebridService::TorBox, &identity, hashes);
         if hashes.is_empty() {
             return Ok(result);
         }
         let batches = hashes.len().div_ceil(CACHE_BATCH);
-        let answers = join_all(hashes.chunks(CACHE_BATCH).map(|batch| self.check_cached_batch(batch)).collect()).await;
-        // Only a batch that came back describes its hashes. One that failed leaves them ABSENT from the map,
-        // which the pool reads as "we do not know" — writing false there states that TorBox does not hold
-        // them, which is a different and costly claim: it drops a genuinely cached release from a cached-only
-        // list, or pays an add at play time for a torrent the account already had. With 500 seeds in batches
-        // of 100, one timed-out batch made that claim about 100 releases and reported no error at all.
-        let mut batch_ok = vec![false; batches];
-        for (i, (batch, answer)) in hashes.chunks(CACHE_BATCH).zip(answers).enumerate() {
-            let Some(answer) = answer else { continue };
-            batch_ok[i] = true;
-            for h in batch {
-                result.insert(h.clone(), answer.get(&go_to_lower(h)).copied().unwrap_or(false));
-            }
-        }
-        remember_cached(self.cache(), DebridService::TorBox, &identity, &result);
+        // Each batch leaves its answer here as it lands, so that a caller that goes away part way still has the
+        // batches that came back remembered, as Go's `g.Wait()` and `rememberCached` do after its goroutines have
+        // all returned on the cancelled context.
+        let answered: Mutex<Vec<Option<HashMap<String, bool>>>> = Mutex::new(vec![None; batches]);
+        let mut abandoned =
+            AbandonedCacheCheck { store: self, known: &result, hashes: &hashes, answered: &answered, armed: true };
+        join_all(
+            hashes
+                .chunks(CACHE_BATCH)
+                .enumerate()
+                .map(|(i, batch)| {
+                    let answered = &answered;
+                    async move {
+                        let answer = self.check_cached_batch(batch).await;
+                        lock(answered)[i] = answer;
+                    }
+                })
+                .collect(),
+        )
+        .await;
+        abandoned.armed = false;
+        drop(abandoned);
+        let answers = std::mem::take(&mut *lock(&answered));
+        let (result, batch_ok) = self.settle_cache_check(result, &hashes, &answers);
         batches_failed(&batch_ok)?;
         Ok(result)
     }

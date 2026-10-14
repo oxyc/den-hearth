@@ -14,7 +14,7 @@ use crate::addbudget::{budget_account, global_add_budget};
 use crate::cache::{Cache, MemoryCache};
 use crate::config::DebridService;
 use crate::scrape::{DoError, Doer};
-use crate::stores::refusal::{add_outcome_unknown, backed_off};
+use crate::stores::refusal::{add_outcome_unknown, backed_off, cached_key};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{ResolveTarget, Store};
 use crate::tests::addbudget::{install_budget, HOUR};
@@ -160,4 +160,47 @@ async fn a_call_dropped_before_it_is_answered_is_counted_as_an_error() {
     let dropped = tokio::time::timeout(Duration::from_secs(1), s.account_summary()).await;
     assert!(dropped.is_err(), "user/me never answers");
     assert!(calls("user", "error") > before, "the abandoned user/me call was not counted");
+}
+
+// Go's CacheCheck waits for every batch goroutine even when its context has ended, then remembers what the batches
+// that finished reported. A caller that goes away while one batch is still out must still have the others
+// remembered — here the first batch is read by a flight that another request started, so it lands while the
+// second is still being asked.
+#[tokio::test(start_paused = true)]
+async fn a_cache_check_dropped_part_way_remembers_the_batches_that_came_back() {
+    let hashes: Vec<String> = (0..101).map(|i| format!("{i:040x}")).collect();
+    let first_batch = hashes[..100].to_vec();
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let s = store("tb-review-cache-check", &cache, Arc::new(DelayedBatch { first: first_batch[0].clone() }));
+    let x = s.check_cached_batch(&first_batch);
+    let y = async {
+        // After the first request's batcher has fired and while its answer is still on the way.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_millis(100), s.cache_check(&hashes)).await
+    };
+    let (x, y) = tokio::join!(x, y);
+    assert!(x.is_some(), "the first request's answer");
+    assert!(y.is_err(), "the check should still have been waiting for its second batch");
+    let held = cached_key(DebridService::TorBox, &s.account_identity(), &hashes[0]);
+    assert!(cache.get(&held).is_some(), "a batch that came back was not remembered");
+}
+
+/// A checkcached that answers the batch starting at `first` after 50 ms, with every hash in it held, and never
+/// answers any other.
+struct DelayedBatch {
+    first: String,
+}
+
+#[async_trait]
+impl Doer for DelayedBatch {
+    async fn do_request(&self, req: reqwest::Request) -> Result<reqwest::Response, DoError> {
+        let list: String =
+            req.url().query_pairs().find(|(k, _)| k == "hash").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        if !list.starts_with(&self.first) {
+            return pending::<Result<reqwest::Response, DoError>>().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let data: Vec<String> = list.split(',').map(|h| format!(r#""{h}":{{}}"#)).collect();
+        Ok(resp(200, &format!(r#"{{"success":true,"data":{{{}}}}}"#, data.join(","))))
+    }
 }
