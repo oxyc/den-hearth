@@ -23,6 +23,9 @@ chacha20poly1305 = "0.10"
 crypto_box = "0.9"
 # BLAKE2b-192 for the seal nonce (Go `golang.org/x/crypto/blake2b`). crypto_box already depends on it.
 blake2 = "0.10"
+# HKDF-SHA256 for the play-ticket key (Go `crypto/hkdf`), on the sha2/hmac pair den-remux already carries.
+hkdf = "0.13"
+sha2 = "0.11"
 # The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
