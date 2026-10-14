@@ -14,7 +14,7 @@ use super::probe_containers::testdata;
 // difference between a v0 and a v1 mdhd is one visible byte, not a hexdump.
 
 // mp4box assembles size+type+payload. Sizes are 32-bit, which is what every box below needs.
-fn mp4box(typ: &str, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn mp4box(typ: &str, payload: &[u8]) -> Vec<u8> {
     let mut out = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
     out.extend_from_slice(typ.as_bytes());
     out.extend_from_slice(payload);
@@ -22,12 +22,12 @@ fn mp4box(typ: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 // Concatenates boxes or payload parts.
-fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.concat()
 }
 
 // hdlr — `handlerKind` reads the four bytes at payload offset 8.
-fn hdlr(kind: &str) -> Vec<u8> {
+pub(crate) fn hdlr(kind: &str) -> Vec<u8> {
     let mut p = vec![0u8; 12];
     p[8..12].copy_from_slice(kind.as_bytes());
     mp4box("hdlr", &p)
@@ -49,25 +49,25 @@ fn mdhd(lang: &str, version: u8) -> Vec<u8> {
 }
 
 // stsd wraps sample entries behind a version/flags word and an entry count.
-fn stsd(entries: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn stsd(entries: &[Vec<u8>]) -> Vec<u8> {
     let mut head = vec![0u8; 8]; // version+flags, entry count
     head[4..8].copy_from_slice(&(entries.len() as u32).to_be_bytes());
     mp4box("stsd", &[head, concat(entries)].concat())
 }
 
 // An audio sample entry: 16 bytes of reserved/version fields, then the channel count.
-fn audio_entry(four_cc: &str, channels: u16) -> Vec<u8> {
+pub(crate) fn audio_entry(four_cc: &str, channels: u16) -> Vec<u8> {
     let mut p = vec![0u8; 18];
     p[16..18].copy_from_slice(&channels.to_be_bytes());
     mp4box(four_cc, &p)
 }
 
 // A video sample entry. `extra` boxes live past the fixed 78-byte visual header — where dvcC/dvvC go.
-fn video_entry(four_cc: &str, extra: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn video_entry(four_cc: &str, extra: &[Vec<u8>]) -> Vec<u8> {
     mp4box(four_cc, &[vec![0u8; 78], concat(extra)].concat())
 }
 
-fn trak(kind: &str, lang: &str, version: u8, entries: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn trak(kind: &str, lang: &str, version: u8, entries: &[Vec<u8>]) -> Vec<u8> {
     let mdia = mp4box(
         "mdia",
         &concat(&[hdlr(kind), mdhd(lang, version), mp4box("minf", &mp4box("stbl", &stsd(entries)))]),
@@ -75,7 +75,7 @@ fn trak(kind: &str, lang: &str, version: u8, entries: &[Vec<u8>]) -> Vec<u8> {
     mp4box("trak", &mdia)
 }
 
-fn mp4_file(traks: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn mp4_file(traks: &[Vec<u8>]) -> Vec<u8> {
     [mp4box("ftyp", &[0u8; 8]), mp4box("moov", &concat(traks))].concat()
 }
 

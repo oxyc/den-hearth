@@ -113,3 +113,42 @@ pub(crate) fn channel_layout(_n: i64) -> &'static str {
 pub(crate) fn channel_count(_layout: &str) -> i64 {
     todo!()
 }
+
+/// Matroska EBML ids, as in Go's `probe.go` const block (kept with the parser that reads them). Ids are
+/// `u32`, so they can be fed to the EBML builders in the tests as well as the parser.
+pub(crate) const ID_SEGMENT: u32 = 0x1853_8067;
+pub(crate) const ID_TRACKS: u32 = 0x1654_AE6B;
+pub(crate) const ID_TRACK_ENTRY: u32 = 0xAE;
+pub(crate) const ID_CODEC_ID: u32 = 0x86;
+pub(crate) const ID_VIDEO: u32 = 0xE0;
+pub(crate) const TRACK_TYPE_VIDEO: u8 = 1;
+pub(crate) const ID_LANGUAGE: u32 = 0x22_B59C;
+pub(crate) const ID_CODEC_PRIVATE: u32 = 0x63A2;
+pub(crate) const ID_BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
+pub(crate) const ID_BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
+pub(crate) const ID_BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
+pub(crate) const ID_DEFAULT_DURATION: u32 = 0x23_E383;
+pub(crate) const ID_PIXEL_WIDTH: u32 = 0xB0;
+pub(crate) const ID_PIXEL_HEIGHT: u32 = 0xBA;
+pub(crate) const ID_COLOUR: u32 = 0x55B0;
+pub(crate) const ID_TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+
+/// Go `doviProfile`: dv_profile from a DOVIDecoderConfigurationRecord; 0 when the record is short.
+pub(crate) fn dovi_profile(_record: &[u8]) -> i64 {
+    todo!()
+}
+
+/// Go `avcBitDepth`: the luma bit depth from an avcC record, 0 when unknown.
+pub(crate) fn avc_bit_depth(_record: &[u8]) -> i64 {
+    todo!()
+}
+
+/// Go `hevcBitDepth`: the luma bit depth from an hvcC record, 0 when unknown.
+pub(crate) fn hevc_bit_depth(_record: &[u8]) -> i64 {
+    todo!()
+}
+
+/// Go `bitDepthFromConfig`: dispatches on the codec to the matching record reader; 0 for a codec with none.
+pub(crate) fn bit_depth_from_config(_codec: &str, _record: &[u8]) -> i64 {
+    todo!()
+}

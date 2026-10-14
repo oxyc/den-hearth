@@ -58,3 +58,14 @@ pub(crate) struct StreamAttributes {
 pub(crate) fn stream_attributes(_s: RawStream) -> StreamAttributes {
     todo!()
 }
+
+/// Go `detectAudioCodec`: the normalized audio family of a release title, "" when it names none.
+pub(crate) fn detect_audio_codec(_t: &str) -> &'static str {
+    todo!()
+}
+
+/// Go `containerOf`: the file's container, from the probe when it read the file, else the release name's
+/// extension, else "".
+pub(crate) fn container_of(_s: RawStream) -> &'static str {
+    todo!()
+}
