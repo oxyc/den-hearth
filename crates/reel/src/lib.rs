@@ -473,7 +473,7 @@ fn metrics_body(state: &AppState) -> String {
             ("index=\"waited\"", state.index_waits.load(Relaxed)),
         ],
     );
-    counter("reel_resolves_total", "yt-dlp resolves that ran.", &[("", state.resolves.count.load(Relaxed))]);
+    counter("reel_resolves_total", "Resolves that ran, whichever resolver answered.", &[("", state.resolves.count.load(Relaxed))]);
     let resolver = &state.resolver;
     counter(
         "reel_resolver_answers_total",
