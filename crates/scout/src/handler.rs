@@ -20,6 +20,15 @@ pub const JSON_TYPE: &str = "application/json";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Go `defaultListTTL`.
 pub const DEFAULT_LIST_TTL: Duration = Duration::from_secs(5 * 60);
+/// Go `partialListTTL`: how long a list is kept when an indexer did not answer.
+pub const PARTIAL_LIST_TTL: Duration = Duration::from_secs(60);
+/// Go `scrapeFailThreshold`: after this many consecutive builds where no indexer responded, /health says so.
+pub const SCRAPE_FAIL_THRESHOLD: i32 = 3;
+
+/// Go `etagFor`: the quoted 64-bit ETag of a body.
+pub fn etag_for(body: &str) -> String {
+    todo!("handler.go etagFor")
+}
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
 pub struct Handler {

@@ -69,9 +69,46 @@ async fn spawn_server(respond: impl Fn(&str, &str) -> Reply + Send + Sync + 'sta
 #[tokio::test]
 #[ignore = "needs stores::torbox::TorBoxStore and addbudget's global budget from packages 1 and 3"]
 async fn an_add_is_not_replayed_to_the_redirect_target() {
-    // Port once the TorBox store lands: for 307, 308 and 302 answer POST /torrents/createtorrent with a
-    // redirect to /moved; count the hits on each path, and check the hourly allowance moved by at most one.
-    todo!("needs the TorBox store (package 1) to drive a resolve through a redirecting client")
+    // Enable when packages 1 and 3 land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
+        for (status, name) in [(307u16, "307 temporary"), (308, "308 permanent"), (302, "302 found")] {
+            let first_hop = Arc::new(AtomicI32::new(0));
+            let replayed = Arc::new(AtomicI32::new(0));
+            let (fh, rp) = (first_hop.clone(), replayed.clone());
+            let base = spawn_server(move |method, path| match path {
+                "/torrents/createtorrent" => {
+                    fh.fetch_add(1, Ordering::SeqCst);
+                    (status, Some("/moved".to_owned()), "")
+                }
+                "/moved" => {
+                    if method == "POST" {
+                        rp.fetch_add(1, Ordering::SeqCst);
+                    }
+                    (200, None, r#"{"data":{"torrent_id":9}}"#)
+                }
+                _ => (200, None, r#"{"success":true,"data":[]}"#),
+            })
+            .await;
+            let token = format!("redirect-{name}");
+            let hash = "a".repeat(40);
+            let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::custom(|a| {
+                    let via = a.previous().iter().map(|u| (Method::POST, u.clone())).collect::<Vec<_>>();
+                    if refuse_redirect_replay(&Method::POST, a.url(), &via) { a.stop() } else { a.follow() }
+                }))
+                .build()
+                .expect("a client");
+            let s = TorBoxStore { token: token.clone(), cache: Arc::new(MemoryCache::new(1 << 20)), api: base, client };
+            let _ = s.resolve(&ResolveTarget { info_hash: hash, ..ResolveTarget::default() }).await;
+            assert_eq!(replayed.load(Ordering::SeqCst), 0, "{name}: the add was re-sent to the redirect target");
+            assert_eq!(first_hop.load(Ordering::SeqCst), 1, "{name}: the add reached the original endpoint");
+            let after = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+            assert!(before - after <= 1, "{name}: the hourly allowance moved by {}", before - after);
+        }
+    }
+    todo!("pending: go redirect_test.go:TestRefuseRedirectReplay_anAddIsNotReplayedToTheRedirectTarget")
 }
 
 // A credential in the query string must not follow a redirect off the debrid's API host — Go strips the

@@ -115,6 +115,9 @@ fn settings_from_env() {
 #[tokio::test]
 #[ignore = "needs scrape::make_scrapers, stores::build_stores and the unaskable scraper from packages 1, 2 and 5"]
 async fn build_deps() {
+    // Enable when packages 1, 2 and 5 land: move `pending` up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
     let settings = deps::settings_from_env(|_| String::new());
     let built = deps::build_deps(&settings, reqwest::Client::new(), Arc::new(MemoryCache::new(1 << 20)));
     let cfg = Config {
@@ -138,5 +141,6 @@ async fn build_deps() {
     // package 5's (scrape.go:433) and is not in this crate yet, so that assertion waits for its port.
     // NOT transient: the distinction decides whether the operator is told to configure something or told an
     // upstream is down, and it is read one level up to decide whether an empty list is an outage.
-    todo!("assert the unaskableScraper transient flag once scrape.rs lands UnaskableScraper")
+    }
+    todo!("pending: go deps_test.go:TestBuildDeps")
 }
