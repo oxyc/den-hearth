@@ -104,8 +104,10 @@ def main():
             elapsed = time.perf_counter() - started
             with lock:
                 statuses[response.status] += 1
-                if response.status == 503 and kind == "segment":
+                if response.status == 503 and kind in ("segment", "mp4"):
                     pending_503 += 1
+                    if kind == "mp4":  # a player asks for its init section again, after the Retry-After
+                        plan.insert(0, name)
                 elif response.status != 200:
                     errors[f"{name}: status {response.status}"] += 1
                 else:

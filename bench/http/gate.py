@@ -173,6 +173,10 @@ def evaluate_case(spec, result, samples, before, after, recovered, baseline, hea
             "peak_kernel_cumulative": cg_a["peak"],
             "anon_peak_sampled": _peak(samples, lambda s: s["cgroup"]["anon"], cg_b["anon"]),
             "file_peak_sampled": _peak(samples, lambda s: s["cgroup"]["file"], cg_b["file"]),
+            # What the kernel cannot reclaim (anon + kernel + sock), and the socket part of it: the number a
+            # bounded server must hold down, and the one RSS never shows.
+            "unreclaimable_peak_sampled": _peak(samples, unreclaimable, unreclaimable(before)),
+            "sock_peak_sampled": _peak(samples, lambda s: s["cgroup"]["sock"], cg_b["sock"]),
             "events_delta": delta,
             "swap_current_after": cg_a["swap_current"],
         },

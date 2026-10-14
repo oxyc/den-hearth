@@ -12,10 +12,13 @@
 //! Each service is the same library its standalone binary runs; hearth supplies the listeners, the
 //! runtime and the signal handling, and gives each service its own environment (see `env`).
 
+mod admit;
 mod env;
+mod media;
 mod ports;
 mod route;
 mod scout;
+mod sock;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -33,9 +36,10 @@ use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use media::Guarded;
 use route::{Service, Target};
 
-type Body = BoxBody<Bytes, std::io::Error>;
+pub(crate) type Body = BoxBody<Bytes, std::io::Error>;
 
 const DEFAULT_PORT: u16 = 8090;
 
@@ -50,6 +54,40 @@ struct Hearth {
     subs: Arc<den_subtitles::AppState>,
     remux: Arc<den_remux::AppState>,
     scout: scout::Scout,
+    /// One budget for the whole node: the main port and every service's own listener draw on it, so the
+    /// bound on memory does not grow with the number of ports.
+    admission: Arc<admit::Admission>,
+    media: Arc<media::MediaGate>,
+    /// Bearer token for hearth's own `/metrics`; `None` turns it off (a 404, as in the services).
+    metrics_token: Option<String>,
+}
+
+/// Every bound the node enforces; `Default` is production, tests shrink it.
+#[derive(Clone, Copy, Default)]
+struct Limits {
+    admission: admit::Limits,
+    media: media::Limits,
+}
+
+impl Hearth {
+    fn new(
+        reel: Arc<den_reel::AppState>,
+        subs: Arc<den_subtitles::AppState>,
+        remux: Arc<den_remux::AppState>,
+        scout: scout::Scout,
+        limits: Limits,
+        metrics_token: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Hearth {
+            reel,
+            subs,
+            remux,
+            scout,
+            admission: admit::Admission::new(limits.admission),
+            media: media::MediaGate::new(limits.media),
+            metrics_token,
+        })
+    }
 }
 
 fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
@@ -84,7 +122,18 @@ fn boxed(resp: Response<http_body_util::Full<Bytes>>) -> Response<Body> {
 
 // Generic over the request body only so tests can drive it with an empty one; the bounds are Remux's.
 // `own`: the service whose own listener the request arrived on, or `None` for the main one.
-async fn handle<B>(hearth: Arc<Hearth>, own: Option<Service>, req: Request<B>) -> Response<Body>
+//
+// Admission wraps routing and is the same on every listener: a request is admitted into its lane before
+// any service sees it, and what it was admitted to follows its response body
+// (`admit::RequestPermit::hold`, `media::MediaGate::guard`).
+//
+// `probation`: the connection was accepted past the connection cap, and may ask control routes only.
+async fn handle<B>(
+    hearth: Arc<Hearth>,
+    own: Option<Service>,
+    probation: bool,
+    req: Request<B>,
+) -> Response<Body>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -93,8 +142,47 @@ where
         Some(service) => route::legacy(service, req.uri().path()),
         None => route::target(req.uri().path()),
     };
+    let class = route::classify(&target, req.method());
+    if probation && class.lane != route::Lane::Control {
+        hearth.admission.probation_refused();
+        return admit::busy("server_busy");
+    }
+    let Ok(permit) = hearth.admission.admit(class.lane).await else {
+        return admit::busy("server_busy");
+    };
+    // A stream permit is taken up front and never waited for: a player's retry is cheaper than a queue.
+    let lease = match class.media {
+        Some(media) => match hearth.media.try_enter(media) {
+            Some(lease) => Some(lease),
+            None => return admit::busy("media_busy"),
+        },
+        None => None,
+    };
+    let response = admit::with_retry_after(dispatch(&hearth, own, target, req).await);
+    match lease {
+        Some(lease) => match hearth.media.guard(response, lease) {
+            // The stream permit owns the body from here, so the request position is free for the next
+            // request instead of idling for as long as a viewer takes to watch a segment.
+            Guarded::Streaming(response) => response,
+            Guarded::Plain(response) => permit.hold(response),
+        },
+        None => permit.hold(response),
+    }
+}
+
+async fn dispatch<B>(
+    hearth: &Arc<Hearth>,
+    own: Option<Service>,
+    target: Target,
+    req: Request<B>,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     match target {
-        Target::Health => json(StatusCode::OK, &health(&hearth).await),
+        Target::Metrics => metrics(hearth, req.headers()),
+        Target::Health => json(StatusCode::OK, &health(hearth).await),
         Target::Scout(path) => match with_path(req, &path) {
             Some(req) => hearth.scout.serve(own == Some(Service::Scout), req).await,
             None => bad_path(),
@@ -113,6 +201,35 @@ where
         },
         Target::NotFound => json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"})),
     }
+}
+
+/// Hearth's own `/metrics`: what admission is holding. The services keep theirs at `/scout/metrics`,
+/// `/reel/metrics`, `/subs/metrics` and `/remux/metrics` (and at `/metrics` on their own ports). Behind a
+/// bearer token and a plain 404 without it, so nobody is told there is something to poke at; the series
+/// are low-cardinality by construction (two lanes, two media classes), never per-route or per-peer.
+fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
+    use subtle::ConstantTimeEq;
+    let presented = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    let allowed = match (hearth.metrics_token.as_deref(), presented) {
+        (Some(token), Some(presented)) => presented.as_bytes().ct_eq(token.as_bytes()).into(),
+        _ => false,
+    };
+    if !allowed {
+        return json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}));
+    }
+    let mut text = String::with_capacity(4096);
+    hearth.admission.render(&mut text);
+    hearth.media.render(&mut text);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Body::new(http_body_util::Full::new(Bytes::from(text)).map_err(|never| match never {})))
+        .expect("static response")
 }
 
 /// Each service's own `/health` answer, side by side. `degraded` when any of them says anything but
@@ -151,36 +268,90 @@ async fn serve_until(
     grace: Duration,
 ) -> bool {
     let graceful = GracefulShutdown::new();
+    // Hyper's adaptive read buffer would otherwise grow to ~400 KiB per connection.
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .max_buf_size(admit::read_buffer(own));
+    // Connections past the cap: control requests only, one response, a short head timeout.
+    let mut probation_http = hyper::server::conn::http1::Builder::new();
+    probation_http
+        .timer(TokioTimer::new())
+        .header_read_timeout(admit::PROBATION_HEADER_TIMEOUT)
+        .keep_alive(false)
+        .max_buf_size(admit::read_buffer(own));
     loop {
-        let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("accept: {e}");
-                    // The listener stays readable while the process is out of descriptors; back off
-                    // rather than spin.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+        // Capacity is taken BEFORE `accept`. Once the cap is reached the next peer waits in the kernel's
+        // listen backlog and costs hearth no task, buffer or descriptor. Every listener draws on the same
+        // cap, so a service's own port cannot add connections on top of the main port's.
+        //
+        // But a flood of persistent clients can hold every position for as long as it lasts, and a new
+        // connection (the container's /health probe) would wait behind it the whole time. So past the cap a
+        // few connections are accepted on probation: they may ask control routes only, get one response and
+        // are closed (see `handle`). A general position that frees up while the loop waits is preferred.
+        let mut probation = None;
+        let mut accepted = None;
+        let mut connection = hearth.admission.try_connection();
+        if connection.is_none() {
+            probation = hearth.admission.try_probation();
+            tokio::select! {
+                biased;
+                _ = async { let _ = shutdown.wait_for(|stop| *stop).await; } => break,
+                general = hearth.admission.connection() => {
+                    connection = Some(general);
+                    probation = None;
+                }
+                pair = listener.accept(), if probation.is_some() => accepted = Some(pair),
+            }
+        }
+        let mut on_probation = false;
+        let pair = match accepted {
+            Some(pair) => pair,
+            None => tokio::select! {
+                pair = listener.accept() => pair,
+                _ = async { let _ = shutdown.wait_for(|stop| *stop).await; } => break,
+            },
+        };
+        let (stream, peer) = match pair {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("accept: {e}");
+                // The listener stays readable while the process is out of descriptors; back off
+                // rather than spin.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // A position that freed up while this connection was arriving makes it an ordinary one.
+        let connection = match (connection, probation) {
+            (Some(general), _) => general,
+            (None, Some(extra)) => match hearth.admission.try_connection() {
+                Some(general) => general,
+                None => {
+                    on_probation = true;
+                    hearth.admission.probation_accepted();
+                    extra
                 }
             },
-            _ = async { let _ = shutdown.wait_for(|stop| *stop).await; } => break,
+            (None, None) => unreachable!("a connection is accepted only with a permit"),
         };
+        // A connection whose kernel queues cannot be bounded is refused rather than served unbounded.
+        if let Err(e) = sock::bound_connection_buffers(&stream) {
+            eprintln!("refusing {peer}: cannot bound TCP buffers: {e}");
+            continue;
+        }
         let hearth = hearth.clone();
         let peer = den_remux::Peer(peer.ip());
         let service = service_fn(move |mut req: Request<Incoming>| {
             // Remux decides who is a trusted proxy and who is the visitor from the socket's address.
             req.extensions_mut().insert(peer);
             let hearth = hearth.clone();
-            async move { Ok::<_, Infallible>(handle(hearth, own, req).await) }
+            async move { Ok::<_, Infallible>(handle(hearth, own, on_probation, req).await) }
         });
-        let mut http = hyper::server::conn::http1::Builder::new();
-        http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
-        if own == Some(Service::Scout) {
-            http.max_buf_size(scout::MAX_HEAD);
-        }
-        let conn = http.serve_connection(TokioIo::new(stream), service);
-        let conn = graceful.watch(conn);
+        let builder = if on_probation { &probation_http } else { &http };
+        let conn = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
         tokio::spawn(async move {
+            let _connection = connection;
             let _ = conn.await;
         });
     }
@@ -258,6 +429,7 @@ struct Configs {
     /// Scout behind `/scout` and on its own listener: the same environment but for the public origin.
     scout_mount: den_scout::deps::Settings,
     scout_own: den_scout::deps::Settings,
+    metrics_token: Option<String>,
 }
 
 async fn bind(port: u16) -> std::io::Result<TcpListener> {
@@ -268,12 +440,14 @@ async fn bind(port: u16) -> std::io::Result<TcpListener> {
 
 async fn run(c: Configs) -> std::io::Result<()> {
     let port = c.port;
-    let hearth = Arc::new(Hearth {
-        reel: den_reel::init(c.reel),
-        subs: den_subtitles::init(c.subs),
-        remux: den_remux::init(c.remux).await,
-        scout: scout::Scout::new(c.scout_mount, c.scout_own),
-    });
+    let hearth = Hearth::new(
+        den_reel::init(c.reel),
+        den_subtitles::init(c.subs),
+        den_remux::init(c.remux).await,
+        scout::Scout::new(c.scout_mount, c.scout_own),
+        Limits::default(),
+        c.metrics_token,
+    );
     hearth.scout.start_sweep();
     let (stop, shutdown) = watch::channel(false);
     let signal = shutdown_signal();
@@ -303,6 +477,19 @@ async fn run(c: Configs) -> std::io::Result<()> {
     eprintln!("{}", den_reel::startup_line(&hearth.reel));
     eprintln!("{}", den_remux::startup_line(&hearth.remux));
     eprintln!("{}", den_subtitles::startup_line(&hearth.subs));
+    let (adm, media) = (admit::Limits::default(), media::Limits::default());
+    eprintln!(
+        "bounds (all listeners): connections={} requests={} (bulk {}) media={} (reel {}, remux {}) idle={}s lifetime={}s metrics={}",
+        adm.connections,
+        adm.requests,
+        adm.bulk_requests,
+        media.total,
+        media.reel,
+        media.remux,
+        media.idle.as_secs(),
+        media.lifetime.as_secs(),
+        if hearth.metrics_token.is_some() { "on" } else { "off" },
+    );
 
     let servers: Vec<_> = listeners
         .into_iter()
@@ -385,12 +572,17 @@ fn main() {
         scout_own.port = format!("{port}/scout");
     }
 
+    let metrics_token = std::env::var("HEARTH_METRICS_TOKEN")
+        .or_else(|_| std::env::var("METRICS_TOKEN"))
+        .ok()
+        .filter(|token| !token.is_empty());
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let configs = Configs { port, own, reel, subs, remux, scout_mount, scout_own };
+    let configs = Configs { port, own, reel, subs, remux, scout_mount, scout_own, metrics_token };
     if let Err(e) = rt.block_on(run(configs)) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
@@ -401,27 +593,43 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn hearth() -> Arc<Hearth> {
+    fn hearth_with(limits: Limits, token: Option<&str>) -> Arc<Hearth> {
         // No disk tier: a test must not write the temp dir.
         let settings = || {
             let mut s = den_scout::deps::settings_from_env(|_| String::new());
             s.cache_dir = String::new();
             s
         };
-        Arc::new(Hearth {
-            reel: den_reel::AppState::new(den_reel::Config::from_env()),
-            subs: den_subtitles::AppState::new(den_subtitles::Config::from_env()),
-            remux: den_remux::AppState::new(den_remux::Config::from_env()),
-            scout: scout::Scout::new(settings(), settings()),
-        })
+        Hearth::new(
+            den_reel::AppState::new(den_reel::Config::from_env()),
+            den_subtitles::AppState::new(den_subtitles::Config::from_env()),
+            den_remux::AppState::new(den_remux::Config::from_env()),
+            scout::Scout::new(settings(), settings()),
+            limits,
+            token.map(str::to_string),
+        )
+    }
+
+    fn hearth() -> Arc<Hearth> {
+        hearth_with(Limits::default(), None)
+    }
+
+    async fn send_on(hearth: &Arc<Hearth>, own: Option<Service>, path: &str) -> Response<Body> {
+        handle(hearth.clone(), own, false, Request::get(path).body(Empty::<Bytes>::new()).unwrap()).await
+    }
+
+    async fn send(hearth: &Arc<Hearth>, path: &str) -> Response<Body> {
+        send_on(hearth, None, path).await
+    }
+
+    async fn json_of(resp: Response<Body>) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
     async fn get_on(own: Option<Service>, path: &str) -> (StatusCode, serde_json::Value) {
-        let req = Request::get(path).body(Empty::<Bytes>::new()).unwrap();
-        let resp = handle(hearth(), own, req).await;
-        let status = resp.status();
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let resp = send_on(&hearth(), own, path).await;
+        (resp.status(), json_of(resp).await)
     }
 
     async fn get(path: &str) -> (StatusCode, serde_json::Value) {
@@ -443,6 +651,358 @@ mod tests {
         assert_eq!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
         let (status, _) = get(&format!("/scout/{}/manifest.json", "a".repeat(16 << 10))).await;
         assert_ne!(status, StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+    }
+
+    /// A node with room for two requests, one of them bulk, and one media stream.
+    fn tiny() -> Arc<Hearth> {
+        let limits = Limits {
+            admission: admit::Limits {
+                connections: 2,
+                probation: 1,
+                requests: 2,
+                bulk_requests: 1,
+                wait: Duration::from_millis(5),
+                body_idle: Duration::from_secs(30),
+            },
+            media: media::Limits {
+                total: 1,
+                reel: 1,
+                remux: 1,
+                idle: Duration::from_secs(30),
+                remux_idle: Duration::from_secs(30),
+                lifetime: Duration::from_secs(60),
+            },
+        };
+        hearth_with(limits, Some("secret"))
+    }
+
+    #[tokio::test]
+    async fn the_control_lane_answers_while_bulk_is_saturated() {
+        let hearth = tiny();
+        let _bulk = hearth.admission.admit(route::Lane::Bulk).await.unwrap();
+
+        // Bulk is full: a bulk request is refused, promptly and in the stable shape.
+        let refused = send(&hearth, "/reel/meta/movie/tt0111161.json").await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.headers()["retry-after"], "1");
+        assert_eq!(json_of(refused).await["error"], "server_busy");
+
+        // The reserved position is still there for health and the manifests.
+        for path in
+            ["/health", "/scout/manifest.json", "/reel/manifest.json", "/subs/manifest.json", "/remux/health"]
+        {
+            let resp = send(&hearth, path).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path} starved by bulk work");
+        }
+    }
+
+    /// Scout and every service's own listener are in the same lanes as the main port: the bulk work of each
+    /// is refused when bulk is full, and each one's probe and manifest still answer.
+    #[tokio::test]
+    async fn every_listener_shares_the_lanes() {
+        let hearth = tiny();
+        let _bulk = hearth.admission.admit(route::Lane::Bulk).await.unwrap();
+
+        for (own, bulk, control) in [
+            (Service::Scout, "/CONFIG/stream/movie/tt1.json", "/manifest.json"),
+            (Service::Scout, "/p/ticket", "/health"),
+            (Service::Reel, "/meta/movie/tt0111161.json", "/manifest.json"),
+            (Service::Subs, "/CONFIG/subtitles/movie/tt1.json", "/manifest.json"),
+            (Service::Remux, "/remux/session", "/remux/health"),
+        ] {
+            let refused = send_on(&hearth, Some(own), bulk).await;
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{own:?} {bulk}");
+            assert_eq!(refused.headers()["retry-after"], "1", "{own:?} {bulk}");
+            assert_eq!(json_of(refused).await["error"], "server_busy", "{own:?} {bulk}");
+
+            let resp = send_on(&hearth, Some(own), control).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{own:?} {control} starved by bulk work");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_gives_nothing_back_to_leak() {
+        let hearth = tiny();
+        let held = hearth.admission.admit(route::Lane::Bulk).await.unwrap();
+        for _ in 0..20 {
+            assert_eq!(send(&hearth, "/reel/nope").await.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                send_on(&hearth, Some(Service::Scout), "/nope/nope").await.status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        drop(held);
+        // Every refused request returned whatever it had taken.
+        assert_eq!(send(&hearth, "/reel/nope").await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            send_on(&hearth, Some(Service::Scout), "/nope/nope").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn media_is_refused_with_its_own_stable_503_when_its_permits_are_spent() {
+        let hearth = tiny();
+        let _stream = hearth.media.try_enter(route::MediaClass::Remux).unwrap();
+
+        let refused = send(&hearth, "/remux/s/abc/def/seg0.m4s").await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.headers()["retry-after"], "1");
+        assert_eq!(json_of(refused).await["error"], "media_busy");
+        // The class limit is per class and the total is shared: Reel is refused too.
+        assert_eq!(
+            send(&hearth, "/reel/play/dQw4w9WgXcQ.mp4").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // Playlists are not media: they do not need a stream permit, so a player can still ask.
+        let playlist = send(&hearth, "/remux/s/abc/def/master.m3u8").await;
+        assert_ne!(playlist.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // And the request positions the refusals passed through are free again.
+        assert_eq!(send(&hearth, "/health").await.status(), StatusCode::OK);
+    }
+
+    /// The streaming services' own ports draw on the same media permits as their prefixes on the main port.
+    #[tokio::test]
+    async fn media_on_a_service_port_spends_the_same_permits() {
+        let hearth = tiny();
+        let _stream = hearth.media.try_enter(route::MediaClass::Reel).unwrap();
+
+        for (own, path) in [
+            (Service::Reel, "/play/dQw4w9WgXcQ.mp4"),
+            (Service::Reel, "/progressive/dQw4w9WgXcQ.mp4"),
+            // The total is shared across classes.
+            (Service::Remux, "/remux/s/abc/def/seg0.m4s"),
+            (Service::Remux, "/remux/speed"),
+        ] {
+            let refused = send_on(&hearth, Some(own), path).await;
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{own:?} {path}");
+            assert_eq!(json_of(refused).await["error"], "media_busy", "{own:?} {path}");
+        }
+        // Scout and Subtitles have nothing to stream, so a spent media budget does not reach them.
+        for (own, path) in [(Service::Scout, "/manifest.json"), (Service::Subs, "/manifest.json")] {
+            assert_eq!(send_on(&hearth, Some(own), path).await.status(), StatusCode::OK, "{own:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_need_the_token_and_name_the_lanes() {
+        let hearth = tiny();
+        let anonymous = send(&hearth, "/metrics").await;
+        assert_eq!(anonymous.status(), StatusCode::NOT_FOUND);
+
+        let req = Request::get("/metrics")
+            .header("authorization", "Bearer secret")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = handle(hearth.clone(), None, false, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        for needle in [
+            "den_hearth_request_admission_active{lane=\"control\"}",
+            "den_hearth_request_admission_refused_total{lane=\"bulk\"}",
+            "den_hearth_connection_admission_waited_total",
+            "den_hearth_media_active{class=\"remux\"}",
+            "den_hearth_media_refused_total{class=\"reel\"}",
+        ] {
+            assert!(text.contains(needle), "{needle}\n{text}");
+        }
+        // No token configured, no endpoint.
+        assert_eq!(
+            send(&hearth_with(Limits::default(), None), "/metrics").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A service's own `/metrics` is the service's, not hearth's: admission counters live on the main port.
+    #[tokio::test]
+    async fn a_service_port_metrics_is_the_services_own() {
+        let hearth = tiny();
+        let resp = send_on(&hearth, Some(Service::Scout), "/metrics").await;
+        // Scout's own endpoint is off without its token: its 404, not hearth's text.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let text = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).to_string();
+        assert!(!text.contains("den_hearth_"), "{text}");
+    }
+
+    async fn serve_on(
+        hearth: Arc<Hearth>,
+        own: Option<Service>,
+    ) -> (std::net::SocketAddr, watch::Sender<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = watch::channel(false);
+        tokio::spawn(serve_until(listener, own, hearth, stopped, Duration::from_millis(200)));
+        (addr, stop)
+    }
+
+    async fn serve(hearth: Arc<Hearth>) -> (std::net::SocketAddr, watch::Sender<bool>) {
+        serve_on(hearth, None).await
+    }
+
+    /// Send one request on `sock` and read the status line back.
+    async fn status_line(sock: &mut tokio::net::TcpStream, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        sock.write_all(request).await.unwrap();
+        let mut buf = [0u8; 256];
+        let n = sock.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+    }
+
+    const HEALTH: &[u8] = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    /// The cap is one budget for the node: a connection on a service's own port counts against the same
+    /// permits as one on the main port, so adding listeners does not add connections.
+    #[tokio::test]
+    async fn the_connection_cap_holds_peers_in_the_backlog_not_in_userspace() {
+        let hearth = hearth_with(
+            Limits {
+                // No probation, so the cap itself is what is under test.
+                admission: admit::Limits { connections: 1, probation: 0, ..admit::Limits::default() },
+                media: media::Limits::default(),
+            },
+            Some("secret"),
+        );
+        let (main_addr, _stop_main) = serve(hearth.clone()).await;
+        let (scout_addr, _stop_scout) = serve_on(hearth.clone(), Some(Service::Scout)).await;
+
+        let mut first = tokio::net::TcpStream::connect(main_addr).await.unwrap();
+        assert!(status_line(&mut first, HEALTH).await.contains("200"));
+
+        // The second connect, to ANOTHER listener, succeeds (the kernel completes the handshake) but is not
+        // served: hearth has not accepted it, so it has no task and no buffer.
+        let mut second = tokio::net::TcpStream::connect(scout_addr).await.unwrap();
+        let held = tokio::time::timeout(Duration::from_millis(300), status_line(&mut second, HEALTH)).await;
+        assert!(held.is_err(), "a connection beyond the cap was served");
+
+        // The first closes, capacity returns, and the waiting peer is served without reconnecting.
+        drop(first);
+        let served = tokio::time::timeout(Duration::from_secs(5), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 256];
+            let n = second.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+        })
+        .await
+        .expect("the waiting peer was never served");
+        assert!(served.contains("200"), "{served}");
+        let mut text = String::new();
+        hearth.admission.render(&mut text);
+        // The accept loops waited for capacity while the first connection held it (and again for the
+        // second's, which is why this is not an exact count).
+        assert!(!text.contains("den_hearth_connection_admission_waited_total 0"), "{text}");
+        assert!(
+            text.contains("den_hearth_connection_admission_high_water 1"),
+            "never more than the cap: {text}"
+        );
+    }
+
+    /// A full connection pool must not keep a new control connection out: past the cap a few connections are
+    /// accepted on probation, answer control routes once and are closed, and refuse everything else in the
+    /// stable shape.
+    #[tokio::test]
+    async fn a_full_pool_still_answers_a_new_control_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hearth = hearth_with(
+            Limits {
+                admission: admit::Limits { connections: 1, probation: 2, ..admit::Limits::default() },
+                media: media::Limits::default(),
+            },
+            Some("secret"),
+        );
+        let (addr, _stop) = serve(hearth.clone()).await;
+
+        // A persistent client takes the only general position and keeps it.
+        let mut holder = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(status_line(&mut holder, HEALTH).await.contains("200"));
+
+        // New control connections are served however long the holder stays, and are closed after one answer.
+        for _ in 0..6 {
+            let mut probe = tokio::net::TcpStream::connect(addr).await.unwrap();
+            probe.write_all(HEALTH).await.unwrap();
+            let mut all = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut all))
+                .await
+                .expect("a probation connection must be closed after its answer")
+                .unwrap();
+            let text = String::from_utf8_lossy(&all).to_string();
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert!(text.to_ascii_lowercase().contains("connection: close"), "{text}");
+        }
+
+        // A non-control request on probation is told so, in the contract's shape, and the connection closes.
+        let mut bulk = tokio::net::TcpStream::connect(addr).await.unwrap();
+        bulk.write_all(b"GET /reel/meta/movie/tt0111161.json HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut all = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), bulk.read_to_end(&mut all)).await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&all).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 503"), "{text}");
+        assert!(text.contains("retry-after: 1") && text.contains("server_busy"), "{text}");
+
+        // The holder was never disturbed. (`status_line` read only the head of its first answer: drain the rest.)
+        let mut rest = [0u8; 8192];
+        let _ = tokio::time::timeout(Duration::from_millis(100), holder.read(&mut rest)).await;
+        assert!(status_line(&mut holder, HEALTH).await.contains("200"));
+        let mut metrics = String::new();
+        hearth.admission.render(&mut metrics);
+        assert!(metrics.contains("den_hearth_connection_admission_probation_total 7"), "{metrics}");
+        assert!(metrics.contains("den_hearth_connection_admission_probation_refused_total 1"), "{metrics}");
+    }
+
+    /// A position that frees up while the loop waits goes to the next peer as an ordinary connection, which
+    /// may then ask anything: probation is for overflow, not for the first connection after a busy moment.
+    #[tokio::test]
+    async fn a_connection_after_the_pool_frees_is_not_on_probation() {
+        let hearth = hearth_with(
+            Limits {
+                admission: admit::Limits { connections: 1, probation: 1, ..admit::Limits::default() },
+                media: media::Limits::default(),
+            },
+            Some("secret"),
+        );
+        let (addr, _stop) = serve(hearth.clone()).await;
+        let mut holder = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(status_line(&mut holder, HEALTH).await.contains("200"));
+        // The loop is now parked in `accept` holding a probation permit; free the general position.
+        drop(holder);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let line = status_line(&mut next, b"GET /reel/nope HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(line.contains("404"), "an ordinary connection was refused as overflow: {line}");
+    }
+
+    async fn head_status(addr: std::net::SocketAddr, pad: usize) -> String {
+        use tokio::io::AsyncWriteExt;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!("GET /health HTTP/1.1\r\nHost: x\r\nX-Pad: {}\r\n\r\n", "a".repeat(pad));
+        let _ = sock.write_all(head.as_bytes()).await;
+        let mut buf = [0u8; 256];
+        let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_request_head_past_the_read_buffer_is_refused_not_buffered() {
+        let hearth = hearth();
+        // Reel's port holds the 16 KiB ceiling; Scout's and the main port hold 32 KiB because a sealed
+        // config rides in the URL.
+        let (reel, _a) = serve_on(hearth.clone(), Some(Service::Reel)).await;
+        let (scout, _b) = serve_on(hearth.clone(), Some(Service::Scout)).await;
+        let (main, _c) = serve(hearth.clone()).await;
+
+        let over_reel = admit::CONNECTION_READ_BUFFER * 2;
+        assert!(!head_status(reel, over_reel).await.contains("200"), "an oversized head was served");
+        // A head between the two ceilings: refused where the buffer is 16 KiB, served where it is 32 KiB.
+        let between = admit::CONNECTION_READ_BUFFER + 4096;
+        assert!(!head_status(reel, between).await.contains("200"));
+        assert!(head_status(scout, between).await.contains("200"));
+        assert!(head_status(main, between).await.contains("200"));
+        let over_scout = admit::SCOUT_READ_BUFFER * 2;
+        assert!(!head_status(scout, over_scout).await.contains("200"));
+        assert!(!head_status(main, over_scout).await.contains("200"));
+
+        // A normal head still works on a fresh connection.
+        assert!(head_status(reel, 16).await.contains("200"));
     }
 
     #[tokio::test]

@@ -69,6 +69,29 @@ def b64url(obj):
 
 SUBS_CFG = b64url({"osKey": "bench-os-key", "autoSync": False})
 
+# Runs inside the hearth container (python3 is there for its HEALTHCHECK). Prints one load.py-shaped JSON object.
+LOOPBACK_PROBE = r"""
+import collections, json, sys, time, urllib.request
+seconds = float(sys.argv[1]); end = time.monotonic() + seconds
+lat, statuses, errors = [], collections.Counter(), collections.Counter()
+began = time.monotonic()
+while time.monotonic() < end:
+    started = time.perf_counter()
+    try:
+        r = urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)
+        r.read(); statuses[r.status] += 1; lat.append(time.perf_counter() - started)
+    except Exception as e:
+        errors[type(e).__name__ + ':' + str(e)[:60]] += 1
+    time.sleep(0.05)
+lat.sort()
+pick = lambda q: round(lat[min(len(lat) - 1, int(len(lat) * q))] * 1000, 3) if lat else 0
+elapsed = round(time.monotonic() - began, 3)
+print(json.dumps({"label": "loopback-health", "mode": "normal", "concurrency": 1, "elapsed_s": elapsed,
+    "requests": len(lat), "req_s": round(len(lat) / elapsed, 2), "payload_bytes": 0, "gib_s": 0.0,
+    "p50_ms": pick(0.5), "p95_ms": pick(0.95), "p99_ms": pick(0.99), "max_ms": round(max(lat, default=0) * 1000, 3),
+    "statuses": dict(statuses), "errors": sum(errors.values()), "error_outcomes": dict(errors), "refusal_codes": {}}))
+"""
+
 
 class Run:
     def __init__(self, out_dir):
@@ -184,6 +207,15 @@ class Run:
             raise RuntimeError(f"{script} failed: {result.stderr.strip()[-800:]}")
         return json.loads(result.stdout.strip().splitlines()[-1])
 
+    def loopback(self, seconds, timeout):
+        """What the container's own HEALTHCHECK (and den-update's probe from inside it) does: a fresh connection to
+        127.0.0.1 inside the hearth container, over and over, each one timed. Run in the container so it is loopback
+        for real, not a bridge address."""
+        result = engine("exec", HEARTH, "python3", "-c", LOOPBACK_PROBE, str(seconds), check=False, timeout=timeout)
+        if result.returncode:
+            raise RuntimeError(f"loopback probe failed: {result.stderr.strip()[-400:]}")
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
     # ---- cases -------------------------------------------------------------------------------------------------
     def run_case(self, case):
         name = case["name"]
@@ -227,9 +259,12 @@ class Run:
         parts, errors = [], []
 
         def one(part):
-            if part.get("script", "load.py") == "load.py":
+            if "loopback" not in part and part.get("script", "load.py") == "load.py":
                 part = {**part, "args": [*part["args"], "--procs", "1"]}
             try:
+                if "loopback" in part:
+                    parts.append(self.loopback(part["loopback"], case.get("timeout", 180)))
+                    return
                 parts.append(self.load(part.get("script", "load.py"), part["args"], timeout=case.get("timeout", 180)))
             except Exception as e:  # reported through the gate as a client error
                 errors.append(str(e))
@@ -273,7 +308,7 @@ def build_cases(base="http://hearth:8090", manifests="/tmp/manifests.paths", sco
     def spec(**kw):
         return kw
 
-    refusal_ok = {"429:rate_limited", "503:server_busy", "503:busy"}
+    refusal_ok = {"429:rate_limited", "503:server_busy", "503:media_busy", "503:busy"}
     cases = [
         {"name": "control-health", "spec": spec(allowed_statuses={200}, min_requests=100),
          **load("--path", "/health", "--duration", str(d), "--concurrency", str(c), "--expect-prefix", '{"services"')},
@@ -295,12 +330,15 @@ def build_cases(base="http://hearth:8090", manifests="/tmp/manifests.paths", sco
          **load("--path-template", f"/subs/{SUBS_CFG}/subtitle/{{n}}.srt", "--template-offset", "20000", "--duration", str(d), "--concurrency", str(c), "--min-200-bytes", "50000")},
         {"name": "subs-serve-slow-readers", "spec": spec(allowed_statuses={200}, min_requests=20, allow_max=True),
          **load("--path", f"/subs/{SUBS_CFG}/subtitle/101.srt", "--duration", str(d), "--concurrency", "24", "--mode", "slow-reader", "--slow-read-ms", "20", "--min-200-bytes", "50000")},
-        {"name": "remux-speed", "spec": spec(allowed_statuses={200}, allowed_refusals=refusal_ok, min_requests=50),
+        # Runs right after the cases that fill the cgroup with Subtitles' page cache, so the kernel may reclaim it
+        # (`max` moves) without hearth having written anything; `oom_kill` and the anon peak still bind.
+        {"name": "remux-speed", "spec": spec(allowed_statuses={200}, allowed_refusals=refusal_ok, min_requests=50, allow_max=True),
          **load("--path", "/remux/speed?bytes=2097152", "--duration", str(d), "--concurrency", str(c), "--rotate-ip", "--expect-200-bytes", "2097152")},
         {"name": "remux-session-flow", "script": "remux_flow.py", "timeout": 240,
          "spec": spec(allowed_statuses={200, 201, 204, 503}, required_statuses={200, 201, 204}, min_requests=20, allow_max=True),
          "args": ["--base", base, "--scout", scout, "--sessions", "2", "--duration", str(max(d, 15)), "--concurrency", "4"]},
-        {"name": "slow-readers-remux-speed", "spec": spec(allowed_statuses={200}, allowed_refusals=refusal_ok, min_requests=10),
+        # 24 slow readers against 16 Remux media permits: the 8 that cannot hold a permit are refused (503 media_busy).
+        {"name": "slow-readers-remux-speed", "spec": spec(allowed_statuses={200, 503}, required_statuses={200}, allowed_refusals=refusal_ok, min_requests=10),
          **load("--path", "/remux/speed?bytes=2097152", "--duration", str(d), "--concurrency", "24", "--mode", "slow-reader", "--slow-read-ms", "20", "--rotate-ip", "--expect-200-bytes", "2097152")},
         {"name": "cancellation-remux-speed", "spec": spec(cancel=True, min_requests=100),
          **load("--path", "/remux/speed?bytes=8388608", "--duration", str(d), "--concurrency", "32", "--mode", "cancel", "--rotate-ip")},
@@ -329,8 +367,54 @@ def build_cases(base="http://hearth:8090", manifests="/tmp/manifests.paths", sco
             {"script": "remux_flow.py", "args": ["--base", base, "--scout", scout, "--sessions", "2", "--duration", soak, "--concurrency", "2"]},
         ],
     })
+    # Offered load well past what the node admits, on the main port AND on the old per-service ports (the legacy
+    # listeners, which share the node's one budget): more media clients than media permits, slow readers holding
+    # permits, cold Reel and Scout work crowding the bulk lane. Small control requests ride along on every port.
+    # The node must refuse the excess with a stable 503 + Retry-After, stay inside its memory, and keep the control
+    # clients' latency flat; `components` carries each client group's own p50/p95/p99.
+    ov = str(max(d, 20))
+    legacy = lambda port: base.rsplit(":", 1)[0] + f":{port}"  # noqa: E731
+    flood = ["--check-retry-after", "--rotate-ip", "--duration", ov]
+    cases.append({
+        "name": "overload", "timeout": int(float(ov)) + 120,
+        "spec": spec(allowed_statuses={200, 400, 404, 429, 503}, required_statuses={200},
+                     allowed_refusals=refusal_ok | {"400:bad_config"}, min_requests=500),
+        "parallel": [
+            {"args": ["--base", base, "--path", "/remux/speed?bytes=2097152", "--concurrency", "64", "--label", "media-flood", *flood]},
+            {"args": ["--base", base, "--path", "/remux/speed?bytes=2097152", "--concurrency", "40", "--mode", "slow-reader", "--slow-read-ms", "20", "--label", "slow-readers", *flood]},
+            {"args": ["--base", legacy(8095), "--path", "/remux/speed?bytes=2097152", "--concurrency", "32", "--label", "media-flood-8095", *flood]},
+            {"args": ["--base", legacy(8092), "--path-template", "/meta/movie/tt{n:07d}.json?prewarm=0", "--template-offset", "300000", "--concurrency", "32", "--label", "reel-cold-8092", "--check-retry-after", "--duration", ov]},
+            {"args": ["--base", legacy(8080), "--path", "/zzz/stream/movie/tt0000001.json", "--concurrency", "8", "--label", "scout-bulk-8080", "--check-retry-after", "--duration", ov]},
+            {"args": ["--base", base, "--path", "/health", "--concurrency", "4", "--label", "control-health-8090", "--check-retry-after", "--duration", ov]},
+            {"args": ["--base", legacy(8095), "--path", "/remux/health", "--concurrency", "2", "--label", "control-remux-health-8095", "--duration", ov]},
+            {"args": ["--base", legacy(8080), "--path", "/health", "--concurrency", "2", "--label", "control-scout-health-8080", "--duration", ov]},
+            {"args": ["--base", legacy(8092), "--path", "/manifest.json", "--concurrency", "2", "--label", "control-reel-manifest-8092", "--duration", ov]},
+            {"args": ["--base", legacy(8093), "--path", "/manifest.json", "--concurrency", "2", "--label", "control-subs-manifest-8093", "--duration", ov]},
+        ],
+    })
+    # More PERSISTENT clients than the node's 256 connections, all busy so none idles out. Before the probation
+    # slots this kept every new connection waiting in the listen backlog for as long as the flood lasted, a
+    # `/health` probe included. A fresh connection per probe, from the driver (`slow-reader` is the driver's
+    # Connection: close mode) and from inside the container on loopback (what its HEALTHCHECK does), must still be
+    # answered quickly; the flood's own excess is refused with `503 server_busy`, not left hanging.
+    cf = str(max(d, 20))
+    cases.append({
+        "name": "connection-flood", "timeout": int(float(cf)) + 120,
+        "spec": spec(allowed_statuses={200, 503}, required_statuses={200}, allowed_refusals={"503:server_busy"}, min_requests=500),
+        "parallel": [
+            {"args": ["--base", base, "--path", "/reel/meta/movie/tt0000001.json?prewarm=0", "--concurrency", "320", "--label", "persistent-flood", "--check-retry-after", "--duration", cf]},
+            {"args": ["--base", base, "--path", "/health", "--concurrency", "4", "--mode", "slow-reader", "--slow-read-ms", "0", "--label", "health-fresh-connection", "--check-retry-after", "--duration", cf]},
+            {"loopback": float(cf)},
+        ],
+    })
     # Cases that ask an upstream leave idle keep-alive connections pooled (reqwest: 90 s). They declare how many.
     for case in cases:
+        if case["name"] == "connection-flood":
+            case["spec"]["pool_allowance"] = 128
+            case["spec"]["cache_fill_bytes"] = 16 * 1024 * 1024  # Reel's resolve cache
+        if case["name"] == "overload":
+            case["spec"]["pool_allowance"] = 128
+            case["spec"]["cache_fill_bytes"] = 16 * 1024 * 1024  # Reel's resolve cache
         if case["name"] in ("reel-meta-cold", "subs-search-cold", "subs-serve-warm", "subs-serve-cold",
                             "subs-serve-slow-readers", "remux-session-flow", "mixed-soak", "cancellation-subs-slow-upstream"):
             case["spec"]["pool_allowance"] = 128

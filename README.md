@@ -116,6 +116,7 @@ commits `VERSION`, waits for that commit's CI and tags it.
 | `/remux/...` | Remux | unchanged (Remux already serves everything under `/remux`) |
 | `/remux/metrics` | Remux | `/metrics` (its one route outside `/remux`) |
 | `/health` | hearth | all four side by side, below |
+| `/metrics` | hearth | its own admission counters (see Bounds); needs `HEARTH_METRICS_TOKEN` (or `METRICS_TOKEN`), else 404 |
 | anything else | hearth | 404 |
 
 `/health` answers 200 with `{"status": "ok"|"degraded", "services": {"scout": {...}, "reel": {...}, "subs": {...},
@@ -188,6 +189,55 @@ and hearth gives Scout `https://node.example/scout`, Reel `https://node.example/
 `https://node.example/subs` (an explicit `SCOUT_PUBLIC_BASE_URL`, `REEL_PUBLIC_BASE_URL` or `SUBS_PUBLIC_BASE_URL`
 wins; see Listeners for what a service's own listener does). `SCOUT_ORIGINS`, which Subtitles reads, begins with the
 Scout prefix and so also reaches Scout as `ORIGINS`, a name Scout does not read.
+
+## Bounds
+
+What the node may hold is fixed, so memory follows these limits rather than offered load (design and
+numbers: [oxyc/den-edge#120](https://github.com/oxyc/den-edge/issues/120), [oxyc/den#282](https://github.com/oxyc/den/issues/282)).
+They are constants (`admit.rs`, `media.rs`, `sock.rs`), not settings. **Every listener draws on the same
+budget**: the main port and the four service ports (Scout 8080, Reel 8092, Subtitles 8093, Remux 8095) share one
+connection cap, one pair of request lanes and one set of media permits, so opening a port adds no capacity.
+
+| Bound | Limit | When it is hit |
+|---|---|---|
+| Connections | 256 in all, taken before `accept`; 64 more on probation | past 256 the peer is accepted on probation: control routes only, one answer, then closed (`Connection: close`, 1 s head timeout); anything else gets `503 server_busy`. With no probation slot either, the peer waits in the kernel's listen backlog |
+| Hyper read buffer | 32 KiB on :8090 and Scout's port, 16 KiB on the others | an oversized request head is refused |
+| Requests | 64 live, 48 of them bulk | waits 25 ms, then `503 {"error":"server_busy"}` with `Retry-After: 1` |
+| Media bodies | 24 total; Remux 16, Reel 12 | no wait: `503 {"error":"media_busy"}` with `Retry-After: 1` |
+| Media idle / lifetime | Remux 10 s, Reel 30 s without a byte moved to the client / 15 min | the body ends with an error and its permit returns |
+| Idle non-media body | 30 s without a frame | the request position returns, and the body errors if it is polled again |
+| Socket queues | send 256 KiB (`HEARTH_SNDBUF`, bytes), receive 32 KiB requested | verified after `accept`; a connection the platform cannot bound is closed |
+
+A connection can have about its send queue in flight, so the send queue caps its throughput at roughly
+`queue / round-trip time`: 256 KiB allows ~42 Mbit/s at 50 ms and ~21 Mbit/s at 100 ms; LAN clients (about 1 ms) are
+nowhere near it. The default favours distant clients without letting a stalled reader hold much (the kernel counts
+twice the requested size, 512 KiB, against the cgroup; at most 24 media bodies stream at once). A node that serves
+4K remuxes over a long path can raise it with `HEARTH_SNDBUF` (and `net.core.wmem_max`, which clamps the request,
+208 KiB by default); a value below 16 KiB is refused with a log line and the default is used.
+
+The service's own 503s (Remux's `scratch_unavailable` and `scout_unconfigured`, Subtitles' `service_unavailable` and
+`translation_unavailable`) get `Retry-After: 5` from hearth when the service sent none.
+
+The 16 positions bulk cannot take are the control lane: `/health`, `/metrics`, the manifests and `/config-key`
+(Scout's and Reel's also `/` and `/configure`, their static page; every service's installed
+`/<config>/manifest.json`; Remux's bare `/health` on its own port), Remux's session keep-alive and end, and CORS preflights. It is
+an allowlist (`route::classify`); any route not named is bulk, which includes everything of Scout's that asks an
+indexer or a debrid service (`/<config>/stream`, `/play`, `/p/<ticket>`, `/account`, `/validate`). A media permit
+belongs to the response body and returns when the body finishes, the client goes away, the upstream fails or a
+deadline passes. Media is GET only: Reel's `/play` (also the bare `/play?v=<id>`), `/progressive`, `/hls/seg` and `/m/...`, and Remux's segments,
+`init.mp4` and `/speed`. Scout streams nothing (a play is a 302, a stream list a buffered JSON body), so it owns no
+media permit; its own deadlines are the 15 s request read and its upstream timeouts. Scout and Reel carry sealed
+configs in the URL, which is why :8090 and Scout's port keep a 32 KiB head.
+
+The idle clock runs only while the client is not reading, so a slow reader that keeps moving bytes holds its permit
+until it finishes (or the 15 min lifetime). Remux's is short because a player fetches a segment whole and pauses
+between segments; Reel's stays 30 s because a paused player stops reading a progressive file mid-body and asks again
+with a Range when it resumes.
+
+`/metrics` on :8090 (low cardinality: two lanes, two media classes) carries `den_hearth_request_admission_*` by
+`lane`, `den_hearth_connection_admission_*`, and `den_hearth_media_*` by `class`; on a service's own port `/metrics`
+is the service's. `bench/http/run.py` has an `overload` case that holds the node past these limits on every port and
+reports the cgroup's memory and `/health`'s latency (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ## Per-crate tools
 

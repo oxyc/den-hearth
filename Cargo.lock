@@ -427,11 +427,14 @@ dependencies = [
  "den-remux",
  "den-scout",
  "den-subtitles",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",
  "serde_json",
+ "socket2",
+ "subtle",
  "tokio",
 ]
 
