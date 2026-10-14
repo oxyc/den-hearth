@@ -114,9 +114,12 @@ async fn resolve_queued_add_promoted_to_a_torrent() {
 // release that is, correctly, always answered as "queued".
 //
 // Gated until package 3 lands `global_add_budget` and `budget_account` (addbudget.rs).
-#[cfg(any())]
-#[tokio::test]
-async fn add_magnet_queued_charge_is_not_refunded() {
+#[test]
+#[ignore = "needs global_add_budget and budget_account from package 3"]
+fn add_magnet_queued_charge_is_not_refunded() {
+    // Enable when package 3 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
     use crate::addbudget::{budget_account, global_add_budget};
 
     let account = format!("tb-queued-budget-{}", "x".repeat(8));
@@ -131,6 +134,8 @@ async fn add_magnet_queued_charge_is_not_refunded() {
     s.add_magnet(&"a".repeat(40), false, false).await.expect("add_magnet");
     let after = global_add_budget().remaining(&budget_key());
     assert_eq!(after, before - 1, "remaining budget after a queued add (charged, not refunded)");
+    }
+    todo!("pending: queued_test.go:103 TestAddMagnet_queuedChargeIsNotRefunded")
 }
 
 // createtorrent answering 400 DIFF_ISSUE "Download already queued." for a hash with no queued-id marker
@@ -214,9 +219,12 @@ async fn add_magnet_already_queued_but_hash_missing_from_listing_stays_a_dead_li
 // /play answers 202 for a release TorBox queued, never 404 — den#204.
 //
 // Gated until package 4 lands the handler (`NewHandler`, `do`, `cancelTorBoxHandler`).
-#[cfg(any())]
 #[test]
+#[ignore = "needs handler from package 4"]
 fn play_queued_add_answers_202() {
+    // Enable when package 4 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
     use crate::tests::handler::{do_req, valid_blob};
     let hash = "b".repeat(40);
     let (h, _) = crate::tests::cancel::cancel_torbox_handler(
@@ -233,6 +241,8 @@ fn play_queued_add_answers_202() {
         ..Default::default()
     })), None);
     assert_eq!(rr.status(), 202, "play on a queued add: {:?}", rr.body());
+    }
+    todo!("pending: queued_test.go:202 TestPlay_queuedAddAnswers202")
 }
 
 // StatusAnswer only ever asked mylist (the torrent listing), never TorBox's own queue — so a release
@@ -267,9 +277,12 @@ async fn status_answer_queued_release_with_no_marker_is_found_via_getqueued() {
 // release being gone.
 //
 // Gated until package 4 lands the handler (`NewHandler`, `do`, `cancelTorBoxHandler`).
-#[cfg(any())]
 #[test]
+#[ignore = "needs handler from package 4"]
 fn probe_queued_release_answers_202_not_not_queued() {
+    // Enable when package 4 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
     use crate::tests::handler::{do_req, valid_blob};
     let hash = "e".repeat(40);
     let queued_hash = hash.clone();
@@ -290,4 +303,6 @@ fn probe_queued_release_answers_202_not_not_queued() {
     let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("probe body did not decode");
     assert_eq!(body["state"], "queued", "probe state");
     assert_eq!(body["service"], "torbox", "probe service");
+    }
+    todo!("pending: queued_test.go:255 TestProbe_queuedReleaseAnswers202NotNotQueued")
 }

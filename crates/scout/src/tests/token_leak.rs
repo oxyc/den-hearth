@@ -56,9 +56,12 @@ async fn request_download_transport_error_never_carries_the_token() {
 // into a response BODY, and every error path here must redact that the same way addMagnet already does.
 //
 // Gated until package 2 lands `torrent_id_key` (refusal.rs, Go stores.go:786).
-#[cfg(any())]
-#[tokio::test]
-async fn cancel_never_leaks_the_token() {
+#[test]
+#[ignore = "needs torrent_id_key from refusal.rs (package 2)"]
+fn cancel_never_leaks_the_token() {
+    // Enable when package 2 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    async fn pending() {
     use std::time::Duration;
 
     use crate::cache::{Cache, MemoryCache};
@@ -100,15 +103,20 @@ async fn cancel_never_leaks_the_token() {
     let msg = format!("{err:?}");
     assert!(msg.contains("proxy_error"), "precondition failed: the refusal detail did not reach the error: {msg}");
     assert!(!msg.contains(LEAK_TOKEN), "the token leaked into the cancel error: {msg}");
+    }
+    todo!("pending: token_leak_test.go:55 TestCancel_neverLeaksTheToken")
 }
 
 // transportKind reports the cause without the address.
 //
 // Gated until package 2 lands `transport_kind` (refusal.rs, Go stores.go:1060). The Go fixtures are
 // *url.Error values; here they are the boxed transport errors reqwest hands back, built from the same text.
-#[cfg(any())]
 #[test]
+#[ignore = "needs transport_kind from refusal.rs (package 2)"]
 fn transport_kind() {
+    // Enable when package 2 lands: move this body up and delete the wrapper.
+    #[cfg(any())]
+    fn pending() {
     use crate::scrape::DoError;
     use crate::stores::refusal::transport_kind;
 
@@ -123,4 +131,6 @@ fn transport_kind() {
     let got = transport_kind(Some(cancelled.as_ref()));
     assert!(got == "cancelled" && !got.contains(LEAK_TOKEN), "cancellation: {got}");
     assert_eq!(transport_kind(None), "unknown");
+    }
+    todo!("pending: token_leak_test.go:84 TestTransportKind")
 }
