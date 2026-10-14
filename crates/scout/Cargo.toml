@@ -11,8 +11,9 @@ async-trait = "0.1"
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
 # `encoding/base64`). Not in the skeleton's modules yet; the owners of util.rs and seal.rs use it.
 base64 = "0.22"
-# Go's `json.Marshal` for string literals in config fixtures (`jsonString`), and the JSON text
-# `validate_config` takes.
+# Go's `encoding/json`: `json.Marshal` for string literals in config fixtures (`jsonString`), the JSON
+# text `validate_config` takes, the streamed TorBox account listing (`decodeListing`), and the response
+# bodies the handler tests decode.
 serde_json = "1"
 # XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`). The ticket owner uses it
 # in production; the tests build a legacy ticket with it.
