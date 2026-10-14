@@ -1,0 +1,155 @@
+# HELP scout_build_info The running den-scout version.
+# TYPE scout_build_info gauge
+scout_build_info{version="<version>"} 1
+# HELP scout_list_cache_total Stream-list cache lookups by outcome.
+# TYPE scout_list_cache_total counter
+scout_list_cache_total{result="hit"} 0
+scout_list_cache_total{result="stale"} 0
+scout_list_cache_total{result="miss"} 0
+# HELP scout_list_builds_total Stream-list builds by outcome.
+# TYPE scout_list_builds_total counter
+scout_list_builds_total{result="ok"} 0
+scout_list_builds_total{result="partial"} 0
+scout_list_builds_total{result="degraded"} 0
+# HELP scout_probe_cache_total Track-probe cache lookups by outcome.
+# TYPE scout_probe_cache_total counter
+scout_probe_cache_total{result="hit"} 0
+scout_probe_cache_total{result="miss"} 0
+# HELP scout_background_panics_total Panics recovered on a background goroutine (probe fan-out, stale list rebuild, account listing fetch).
+# TYPE scout_background_panics_total counter
+scout_background_panics_total 0
+# HELP scout_debrid_calls_total Debrid API calls by fixed endpoint and outcome.
+# TYPE scout_debrid_calls_total counter
+scout_debrid_calls_total{endpoint="checkcached",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="checkcached",outcome="error"} 0
+scout_debrid_calls_total{endpoint="mylist_account",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="mylist_account",outcome="error"} 0
+scout_debrid_calls_total{endpoint="mylist_id",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="mylist_id",outcome="error"} 0
+scout_debrid_calls_total{endpoint="requestdl",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="requestdl",outcome="error"} 0
+scout_debrid_calls_total{endpoint="createtorrent",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="createtorrent",outcome="error"} 0
+scout_debrid_calls_total{endpoint="user",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="user",outcome="error"} 0
+scout_debrid_calls_total{endpoint="controltorrent",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="controltorrent",outcome="error"} 0
+scout_debrid_calls_total{endpoint="controlqueued",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="controlqueued",outcome="error"} 0
+scout_debrid_calls_total{endpoint="getqueued",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="getqueued",outcome="error"} 0
+# HELP scout_debrid_calls_avoided_total Debrid API calls avoided by coordination or request policy.
+# TYPE scout_debrid_calls_avoided_total counter
+scout_debrid_calls_avoided_total{reason="availability_default"} 0
+scout_debrid_calls_avoided_total{reason="status_snapshot"} 0
+scout_debrid_calls_avoided_total{reason="checkcached_singleflight"} 0
+scout_debrid_calls_avoided_total{reason="checkcached_batch"} 0
+scout_debrid_calls_avoided_total{reason="probe_frontier"} 0
+# HELP scout_debrid_status_active Active shared status reads.
+# TYPE scout_debrid_status_active gauge
+scout_debrid_status_active 0
+# HELP scout_debrid_status_waiters Requests waiting on shared status reads.
+# TYPE scout_debrid_status_waiters gauge
+scout_debrid_status_waiters 0
+# HELP scout_indexer_requests_total Scrape attempts per indexer.
+# TYPE scout_indexer_requests_total counter
+scout_indexer_requests_total{indexer="torrentio"} 0
+scout_indexer_requests_total{indexer="comet"} 0
+scout_indexer_requests_total{indexer="mediafusion"} 0
+scout_indexer_requests_total{indexer="torz"} 0
+scout_indexer_requests_total{indexer="own"} 0
+# HELP scout_indexer_failures_total Scrape attempts that did not answer, per indexer.
+# TYPE scout_indexer_failures_total counter
+scout_indexer_failures_total{indexer="torrentio"} 0
+scout_indexer_failures_total{indexer="comet"} 0
+scout_indexer_failures_total{indexer="mediafusion"} 0
+scout_indexer_failures_total{indexer="torz"} 0
+scout_indexer_failures_total{indexer="own"} 0
+# HELP scout_indexer_releases_total Releases each indexer answered with, before dedupe.
+# TYPE scout_indexer_releases_total counter
+scout_indexer_releases_total{indexer="torrentio"} 0
+scout_indexer_releases_total{indexer="comet"} 0
+scout_indexer_releases_total{indexer="mediafusion"} 0
+scout_indexer_releases_total{indexer="torz"} 0
+scout_indexer_releases_total{indexer="own"} 0
+# HELP scout_source_coverage_total Configured sources in each list build's coverage, by outcome.
+# TYPE scout_source_coverage_total counter
+scout_source_coverage_total{indexer="torrentio",outcome="answered"} 0
+scout_source_coverage_total{indexer="torrentio",outcome="unreachable"} 0
+scout_source_coverage_total{indexer="torrentio",outcome="refused"} 0
+scout_source_coverage_total{indexer="torrentio",outcome="timeout"} 0
+scout_source_coverage_total{indexer="torrentio",outcome="skipped_misconfigured"} 0
+scout_source_coverage_total{indexer="torrentio",outcome="quarantined"} 0
+scout_source_coverage_total{indexer="comet",outcome="answered"} 0
+scout_source_coverage_total{indexer="comet",outcome="unreachable"} 0
+scout_source_coverage_total{indexer="comet",outcome="refused"} 0
+scout_source_coverage_total{indexer="comet",outcome="timeout"} 0
+scout_source_coverage_total{indexer="comet",outcome="skipped_misconfigured"} 0
+scout_source_coverage_total{indexer="comet",outcome="quarantined"} 0
+scout_source_coverage_total{indexer="mediafusion",outcome="answered"} 0
+scout_source_coverage_total{indexer="mediafusion",outcome="unreachable"} 0
+scout_source_coverage_total{indexer="mediafusion",outcome="refused"} 0
+scout_source_coverage_total{indexer="mediafusion",outcome="timeout"} 0
+scout_source_coverage_total{indexer="mediafusion",outcome="skipped_misconfigured"} 0
+scout_source_coverage_total{indexer="mediafusion",outcome="quarantined"} 0
+scout_source_coverage_total{indexer="torz",outcome="answered"} 0
+scout_source_coverage_total{indexer="torz",outcome="unreachable"} 0
+scout_source_coverage_total{indexer="torz",outcome="refused"} 0
+scout_source_coverage_total{indexer="torz",outcome="timeout"} 0
+scout_source_coverage_total{indexer="torz",outcome="skipped_misconfigured"} 0
+scout_source_coverage_total{indexer="torz",outcome="quarantined"} 0
+scout_source_coverage_total{indexer="own",outcome="answered"} 0
+scout_source_coverage_total{indexer="own",outcome="unreachable"} 0
+scout_source_coverage_total{indexer="own",outcome="refused"} 0
+scout_source_coverage_total{indexer="own",outcome="timeout"} 0
+scout_source_coverage_total{indexer="own",outcome="skipped_misconfigured"} 0
+scout_source_coverage_total{indexer="own",outcome="quarantined"} 0
+# HELP scout_released_streams_total Streams served to a client, the denominator for the shares below.
+# TYPE scout_released_streams_total counter
+scout_released_streams_total 0
+# HELP scout_released_video_codec_total Streams served, by video codec.
+# TYPE scout_released_video_codec_total counter
+scout_released_video_codec_total{codec="h264"} 0
+scout_released_video_codec_total{codec="hevc"} 0
+scout_released_video_codec_total{codec="av1"} 0
+scout_released_video_codec_total{codec="unknown"} 0
+# HELP scout_released_resolution_total Streams served, by resolution.
+# TYPE scout_released_resolution_total counter
+scout_released_resolution_total{resolution="2160p"} 0
+scout_released_resolution_total{resolution="1080p"} 0
+scout_released_resolution_total{resolution="720p"} 0
+scout_released_resolution_total{resolution="480p"} 0
+scout_released_resolution_total{resolution="unknown"} 0
+# HELP scout_released_audio_codec_total Streams served, by source audio codec.
+# TYPE scout_released_audio_codec_total counter
+scout_released_audio_codec_total{codec="eac3"} 0
+scout_released_audio_codec_total{codec="ac3"} 0
+scout_released_audio_codec_total{codec="truehd"} 0
+scout_released_audio_codec_total{codec="dts"} 0
+scout_released_audio_codec_total{codec="dtshd"} 0
+scout_released_audio_codec_total{codec="dtshdma"} 0
+scout_released_audio_codec_total{codec="dtsx"} 0
+scout_released_audio_codec_total{codec="flac"} 0
+scout_released_audio_codec_total{codec="aac"} 0
+scout_released_audio_codec_total{codec="opus"} 0
+scout_released_audio_codec_total{codec="mp3"} 0
+scout_released_audio_codec_total{codec="unknown"} 0
+# HELP scout_released_feature_total Streams served carrying a feature, as a share of scout_released_streams_total.
+# TYPE scout_released_feature_total counter
+scout_released_feature_total{feature="hdr"} 0
+scout_released_feature_total{feature="dolby_vision"} 0
+scout_released_feature_total{feature="cached"} 0
+# HELP scout_add_budget_remaining Smallest remaining hourly add allowance across accounts (-1 = none spent).
+# TYPE scout_add_budget_remaining gauge
+scout_add_budget_remaining -1
+# HELP scout_add_budget_remaining_by_intent Smallest remaining hourly add allowance across accounts, as a viewer waiting (play) and a prefetch see it (-1 = none spent).
+# TYPE scout_add_budget_remaining_by_intent gauge
+scout_add_budget_remaining_by_intent{intent="play"} -1
+scout_add_budget_remaining_by_intent{intent="prefetch"} -1
+# HELP scout_add_budget_refusals_total Adds scout's own hourly budget refused, by intent.
+# TYPE scout_add_budget_refusals_total counter
+scout_add_budget_refusals_total{intent="play"} 0
+scout_add_budget_refusals_total{intent="prefetch"} 0
+# HELP scout_cache_persistent Durable cache tier writing (1), disabled (0), not reported (-1).
+# TYPE scout_cache_persistent gauge
+scout_cache_persistent -1

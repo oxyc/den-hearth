@@ -456,3 +456,16 @@ async fn every_route_answers_as_it_did_before_the_rewrite() {
         );
     }
 }
+
+/// The whole /metrics exposition of a fresh process, every family and label in order, pinned the same way.
+#[test]
+fn the_metrics_text_is_what_it_was() {
+    let got = crate::metrics::metrics().render(-1);
+    let got = got.replace(crate::manifest::manifest_version(), "<version>");
+    if std::env::var_os("SCOUT_GOLDEN_WRITE").is_some() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/golden_metrics.txt");
+        std::fs::write(path, &got).expect("write the golden file");
+        return;
+    }
+    assert_eq!(got, include_str!("golden_metrics.txt"), "the /metrics text changed");
+}
