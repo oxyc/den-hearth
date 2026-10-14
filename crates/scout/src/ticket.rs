@@ -17,7 +17,7 @@ use sha2::Sha256;
 use crate::config::{Config, DebridAccount, DebridService, MAX_CONFIG_BLOB, SCOPE_AVAILABILITY};
 use crate::play::{is_info_hash, PlayTarget};
 use crate::seal::SealKeyring;
-use crate::util::{b64url_decode, b64url_encode, go_to_lower};
+use crate::util::{b64url_decode, b64url_encode, fold_json_keys, go_to_lower, Shape, LEAF};
 
 pub const PLAY_TICKET_INFO: &str = "den-scout/play/v1";
 /// The first path segment of a ticketed play URL. No config segment can be "p" — it does not decode.
@@ -178,7 +178,24 @@ impl TicketKeys {
             .iter()
             .find_map(|k| XChaCha20Poly1305::new(&(*k).into()).decrypt(nonce, ct).ok())
             .ok_or(TicketError::Bad)?;
-        let w: TicketWire = serde_json::from_slice(&pt).map_err(|_| TicketError::Bad)?;
+        // Go matches keys to fields case-insensitively, so a payload spelled "X" or "H" still opens there.
+        static SHAPE: Shape = Shape::Object(&[
+            ("h", &LEAF),
+            ("f", &LEAF),
+            ("s", &LEAF),
+            ("e", &LEAF),
+            ("d", &LEAF),
+            ("x", &LEAF),
+            ("i", &LEAF),
+            ("p", &LEAF),
+            ("scope", &LEAF),
+            ("z", &LEAF),
+            ("rt", &LEAF),
+            ("tt", &LEAF),
+        ]);
+        let mut value: serde_json::Value = serde_json::from_slice(&pt).map_err(|_| TicketError::Bad)?;
+        fold_json_keys(&mut value, &SHAPE);
+        let w: TicketWire = serde_json::from_value(value).map_err(|_| TicketError::Bad)?;
         if unix_secs(now) >= w.x {
             return Err(TicketError::Expired);
         }

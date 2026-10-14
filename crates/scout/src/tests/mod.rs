@@ -15,6 +15,7 @@ mod decisionlog;
 mod deps;
 mod diskcache;
 mod extra;
+mod go_wire_vectors;
 mod handler;
 mod hostlimit;
 mod indexerconfig;
