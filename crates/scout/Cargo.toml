@@ -36,7 +36,7 @@ serde = { version = "1", features = ["derive"] }
 http = "1"
 # Go `time.NewTicker` (`TieredCache::sweep_every`), `sync/singleflight` (indexerconfig.rs, cinemeta.rs),
 # and the name lookups household sources are guarded at (sources.rs).
-tokio = { version = "1", features = ["net", "sync", "time"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 # Go `regexp` (RE2 syntax, linear time): the release-title patterns in rank.go, attributes.go and label.go.
 regex = "1"
 # Go `regexp2`: the patterns that need lookaround, which RE2 lacks (rank.go's "upscaled" junk pattern,
