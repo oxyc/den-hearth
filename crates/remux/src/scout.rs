@@ -203,13 +203,32 @@ impl SourceGuard {
     /// `Ok` when `url` may be fetched: an IP literal must be public, a name must resolve and every address it
     /// resolves to must be public.
     async fn check(&self, url: &reqwest::Url) -> Result<(), String> {
+        let host = safe_host_fact(url);
         self.0.check(url).await.map_err(|refused| match refused {
-            GuardError::Unresolved(_) => "the play URL's host did not resolve".to_string(),
+            GuardError::Unresolved(_) => format!("the play URL's host did not resolve (host={host})"),
             GuardError::NotPublic | GuardError::Nothing => {
-                "the play URL led to a host that is not on the public internet".to_string()
+                format!("the play URL led to a host that is not on the public internet (host={host})")
             }
         })
     }
+}
+
+/// A bounded, non-secret host description for a guard refusal. A TorBox CDN suffix is operationally useful when
+/// its domains change; every other DNS name and every address literal stays deliberately opaque. Paths, queries,
+/// credentials and config segments never enter this function.
+fn safe_host_fact(url: &reqwest::Url) -> &str {
+    let Some(host) = url.host_str() else { return "missing" };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return "ip_literal";
+    }
+    host.find("tb-cdn.")
+        .map(|at| &host[at..])
+        .filter(|suffix| {
+            suffix.strip_prefix("tb-cdn.").is_some_and(|tld| {
+                (2..=10).contains(&tld.len()) && tld.bytes().all(|byte| byte.is_ascii_lowercase())
+            })
+        })
+        .unwrap_or("dns_name")
 }
 
 /// A scout base URL a browser handed over, accepted only as `<allowed origin>/<config>` for legacy Scout or
@@ -467,6 +486,23 @@ mod tests {
         ] {
             let err = resolve_through(location, SourceGuard::strict()).await.err().expect(location);
             assert!(err.contains("not on the public internet"), "{location}: {err}");
+        }
+    }
+
+    #[test]
+    fn guard_diagnostics_expose_only_a_safe_host_class_or_torbox_suffix() {
+        let signed = reqwest::Url::parse(
+            "https://node.tb-cdn.future/private/config/path?token=never-log-me&sig=also-secret",
+        )
+        .unwrap();
+        assert_eq!(safe_host_fact(&signed), "tb-cdn.future");
+        assert_eq!(safe_host_fact(&reqwest::Url::parse("http://10.0.0.5/private").unwrap()), "ip_literal");
+        assert_eq!(
+            safe_host_fact(&reqwest::Url::parse("https://private.example/secret").unwrap()),
+            "dns_name"
+        );
+        for secret in ["never-log-me", "also-secret", "private", "config", "path"] {
+            assert!(!safe_host_fact(&signed).contains(secret));
         }
     }
 

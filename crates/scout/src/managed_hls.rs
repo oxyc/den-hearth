@@ -25,6 +25,10 @@ const CREATE_STREAM_URL: &str = "https://api.torbox.app/v1/api/stream/createstre
 const CREATE_BODY_LIMIT: usize = 64 << 10;
 const PLAYLIST_BODY_LIMIT: usize = 256 << 10;
 const PLAYLIST_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// TorBox's published managed-stream CDN base domains. Keep this an explicit list: accepting an arbitrary
+/// `tb-cdn.*` suffix would turn TorBox's signed URL into an open redirect to a lookalike domain.
+const MANAGED_HLS_CDN_SUFFIXES: [&str; 7] =
+    [".tb-cdn.cx", ".tb-cdn.io", ".tb-cdn.pw", ".tb-cdn.sh", ".tb-cdn.st", ".tb-cdn.to", ".tb-cdn.earth"];
 
 /// The only distinctions Hearth needs while trying candidates and deciding whether to fall back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,21 +380,67 @@ fn parse_success(body: &[u8]) -> Result<reqwest::Url, ManagedHlsError> {
 }
 
 fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
-    let url = reqwest::Url::parse(raw).map_err(|_| ManagedHlsError::UnsafeResponse)?;
-    let host = url.host_str().ok_or(ManagedHlsError::UnsafeResponse)?;
-    let cdn_label = host.strip_suffix(".tb-cdn.io").filter(|label| !label.is_empty());
+    let url = reqwest::Url::parse(raw).map_err(|_| unsafe_hls_url("not_a_url", None))?;
+    let host = url.host_str().ok_or_else(|| unsafe_hls_url("no_host", Some(&url)))?;
+    let torbox_cdn = MANAGED_HLS_CDN_SUFFIXES
+        .iter()
+        .any(|suffix| host.strip_suffix(suffix).is_some_and(|label| !label.is_empty()));
     let mut scrobbling =
         url.query_pairs().filter_map(|(name, value)| (name == "scrobbling_enabled").then_some(value));
     let scrobbling_disabled =
         scrobbling.next().is_some_and(|value| value == "false") && scrobbling.next().is_none();
-    let safe = url.scheme() == "https"
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.fragment().is_none()
-        && url.port().is_none_or(|port| port == 443)
-        && cdn_label.is_some()
-        && scrobbling_disabled;
-    safe.then_some(url).ok_or(ManagedHlsError::UnsafeResponse)
+    let reason = if url.scheme() != "https" {
+        Some("not_https")
+    } else if !url.username().is_empty() || url.password().is_some() {
+        Some("credentials")
+    } else if url.fragment().is_some() {
+        Some("fragment")
+    } else if url.port().is_some_and(|port| port != 443) {
+        Some("nonstandard_port")
+    } else if !torbox_cdn {
+        Some("unrecognized_cdn")
+    } else if !scrobbling_disabled {
+        Some("scrobbling_flag")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(unsafe_hls_url(reason, Some(&url))),
+        None => Ok(url),
+    }
+}
+
+/// Record enough of a refused URL to diagnose a TorBox CDN contract change without ever recording its signed
+/// path or query. The suffix is deliberately restricted to a short DNS-shaped `tb-cdn.*` value; an arbitrary
+/// upstream hostname is reported only as `other`.
+fn unsafe_hls_url(reason: &'static str, url: Option<&reqwest::Url>) -> ManagedHlsError {
+    let scheme = match url.map(reqwest::Url::scheme) {
+        Some("https") => "https",
+        Some(_) => "other",
+        None => "unknown",
+    };
+    let port = match url.and_then(reqwest::Url::port) {
+        Some(443) => "443".to_owned(),
+        Some(port) => port.to_string(),
+        None => "default".to_owned(),
+    };
+    let cdn_suffix = url
+        .and_then(reqwest::Url::host_str)
+        .and_then(|host| host.find("tb-cdn.").map(|at| &host[at..]))
+        .filter(|suffix| {
+            suffix.strip_prefix("tb-cdn.").is_some_and(|tld| {
+                (2..=10).contains(&tld.len()) && tld.bytes().all(|byte| byte.is_ascii_lowercase())
+            })
+        })
+        .unwrap_or("other");
+    log_limited(
+        "torbox_unsafe_stream_url_detail",
+        &format!(
+            "event=managed_hls_url_validation outcome=refused reason={reason} scheme={scheme} \
+             cdn_suffix={cdn_suffix} port={port}"
+        ),
+    );
+    ManagedHlsError::UnsafeResponse
 }
 
 fn classify_failure(body: &[u8]) -> ManagedHlsError {
@@ -516,6 +566,49 @@ mod tests {
             parse_success(&serde_json::to_vec(&changed).unwrap()),
             Err(ManagedHlsError::MalformedResponse)
         );
+    }
+
+    #[test]
+    fn every_published_torbox_managed_stream_domain_is_accepted() {
+        for suffix in MANAGED_HLS_CDN_SUFFIXES {
+            let raw =
+                format!("https://flux-002.wnam{suffix}/playlist.m3u8?token=secret&scrobbling_enabled=false");
+            let url = validate_hls_url(&raw).unwrap_or_else(|error| panic!("{suffix}: {error:?}"));
+            assert_eq!(url.host_str(), Some(format!("flux-002.wnam{suffix}").as_str()));
+        }
+    }
+
+    #[test]
+    fn torbox_cdn_allow_list_does_not_accept_lookalikes_or_base_domains() {
+        for host in [
+            "tb-cdn.io",
+            "tb-cdn.earth",
+            "flux.tb-cdn.invalid",
+            "flux.tb-cdn.io.example.com",
+            "flux.tb-cdn.earth.example.com",
+            "flux.not-tb-cdn.io",
+        ] {
+            let raw = format!("https://{host}/playlist.m3u8?scrobbling_enabled=false");
+            assert_eq!(validate_hls_url(&raw), Err(ManagedHlsError::UnsafeResponse), "{host}");
+        }
+    }
+
+    #[test]
+    fn unsafe_url_log_names_the_stage_without_leaking_the_signed_url() {
+        let captured = crate::loglimit::capture(|| {
+            assert_eq!(
+                validate_hls_url(
+                    "https://flux.tb-cdn.future/secret/movie/path.m3u8?token=never-log-me&scrobbling_enabled=false"
+                ),
+                Err(ManagedHlsError::UnsafeResponse)
+            );
+        });
+        assert!(captured.contains("event=managed_hls_url_validation outcome=refused"), "{captured}");
+        assert!(captured.contains("reason=unrecognized_cdn"), "{captured}");
+        assert!(captured.contains("scheme=https cdn_suffix=tb-cdn.future port=default"), "{captured}");
+        for secret in ["never-log-me", "secret", "movie", "path.m3u8", "flux"] {
+            assert!(!captured.contains(secret), "log leaked {secret:?}: {captured}");
+        }
     }
 
     #[test]
