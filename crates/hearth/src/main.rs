@@ -17,6 +17,7 @@ mod admit;
 mod alloc;
 mod den;
 mod env;
+mod guest;
 mod inproc;
 mod media;
 mod playback;
@@ -260,6 +261,7 @@ where
             None => bad_path(),
         },
         den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
+        den::Route::Guest => guest::handle(hearth, req).await,
         den::Route::Migrate if hearth.legacy_migration => migrate_legacy(hearth, req).await,
         den::Route::Migrate => den_http::not_found(),
         own => hearth.den.answer(own, req.method(), req.headers()),

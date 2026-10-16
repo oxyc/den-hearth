@@ -45,6 +45,8 @@ pub enum Route {
     ConfigKey,
     /// `POST /den/migrate`: exchange validated legacy first-party config segments for one combined install.
     Migrate,
+    /// `POST /den/_guest`: Edge's authenticated guest overlay RPC.
+    Guest,
     /// `/den/<config>/manifest.json`, with the config segment.
     Installed(String),
     /// `/den/<config>/playback`, with the config segment. Hearth chooses the delivery path.
@@ -66,6 +68,7 @@ pub fn route(path: &str) -> Route {
         "/manifest.json" => return Route::Manifest,
         "/config-key" => return Route::ConfigKey,
         "/migrate" => return Route::Migrate,
+        "/_guest" => return Route::Guest,
         // The page's "Test token" button: a pasted token, no config.
         "/validate" => return Route::Scout(path.to_string()),
         _ => {}
@@ -270,6 +273,7 @@ impl Den {
                 }
             }
             Route::Migrate
+            | Route::Guest
             | Route::Playback(_)
             | Route::Scout(_)
             | Route::Subs(_)
@@ -505,6 +509,7 @@ mod tests {
         assert_eq!(route("/configure"), Route::Configure);
         assert_eq!(route("/configure/"), Route::Configure);
         assert_eq!(route("/migrate"), Route::Migrate);
+        assert_eq!(route("/_guest"), Route::Guest);
         assert_eq!(route("/manifest.json"), Route::Manifest);
         assert_eq!(route("/config-key"), Route::ConfigKey);
         assert_eq!(route("/CFG/manifest.json"), Route::Installed("CFG".into()));

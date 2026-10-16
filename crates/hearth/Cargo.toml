@@ -29,6 +29,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"]
 http-body-util = "0.1"
 bytes = "1"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 base64 = "0.23"
 # Bound the kernel's TCP queues as well as Rust's buffers (see sock.rs): Linux otherwise autotunes them
 # to megabytes per slow reader, charged to the container's cgroup and invisible in RSS.

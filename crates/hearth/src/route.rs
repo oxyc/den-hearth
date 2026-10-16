@@ -144,6 +144,7 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Subs(path) => classify(&Target::Subs(path.clone()), method),
             Route::Reel(path) => classify(&Target::Reel(path.clone()), method),
             Route::Playback(_) => bulk(None),
+            Route::Guest => bulk(None),
             Route::NotFound => bulk(None),
             // Up to three public-key decryptions: never consume the reserved control lane under abuse.
             Route::Migrate if *method == Method::OPTIONS => control,
@@ -295,6 +296,7 @@ mod tests {
             // A keep-alive verb on the wrong method is not the keep-alive.
             (Target::Remux("/remux/s/sid/sig/heartbeat".into()), Method::GET),
             (Target::Remux("/remux/admin/kill".into()), Method::POST),
+            (Target::Den(Route::Guest), Method::POST),
         ] {
             assert_eq!(class(target, method.clone()).0, Bulk, "{method}");
         }

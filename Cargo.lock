@@ -446,6 +446,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "serde",
  "serde_json",
  "socket2",
  "tikv-jemalloc-ctl",

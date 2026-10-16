@@ -90,11 +90,24 @@ pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
     // The playback facade gives Remux a combined install. This base is deliberately narrower than routing a
     // request through `/den`: only Scout and Subtitles resource paths are reachable. The Scout service key is
     // stripped before Subtitles, so it can never reach another member of the combined addon.
-    if hearth.scout.is_some() && hearth.reel.is_some() && hearth.subs.is_some() && hearth.remux.is_some() {
+    if hearth.scout.is_some() && hearth.remux.is_some() {
         let weak = Arc::downgrade(hearth);
         let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call_den_scout(weak.clone(), req)));
         if let Err(e) = local.add(crate::playback::DEN_ADDON_BASE, serve) {
             eprintln!("scout in process: skipping playback facade base: {e}");
+        }
+        let weak = Arc::downgrade(hearth);
+        let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call(weak.clone(), false, req)));
+        if let Err(e) = local.add(crate::playback::LEGACY_SCOUT_BASE, serve) {
+            eprintln!("scout in process: skipping guest fallback Scout base: {e}");
+        }
+    }
+    if hearth.subs.is_some() && hearth.remux.is_some() {
+        let weak = Arc::downgrade(hearth);
+        let serve: den_http::local::Serve =
+            Arc::new(move |req| Box::pin(call_legacy_subs(weak.clone(), req)));
+        if let Err(e) = local.add(crate::playback::LEGACY_SUBS_BASE, serve) {
+            eprintln!("scout in process: skipping guest fallback Subtitles base: {e}");
         }
     }
     let taken = local.bases().into_iter().map(str::to_string).collect();
@@ -105,6 +118,16 @@ pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
         let _ = subs.local_scout.set(local);
     }
     taken
+}
+
+async fn call_legacy_subs(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Response<crate::Body> {
+    let Some(hearth) = hearth.upgrade() else {
+        return crate::json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({"error": "shutting_down"}));
+    };
+    let Some(subs) = &hearth.subs else { return den_http::not_found() };
+    let (mut parts, body) = req.into_parts();
+    parts.headers.remove("x-den-remux-key");
+    den_subtitles::handle_request(subs.clone(), Request::from_parts(parts, Full::new(body))).await
 }
 
 async fn call_den_scout(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Response<crate::Body> {

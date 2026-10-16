@@ -26,6 +26,8 @@ static LOG: den_http::log::LimitedLog = den_http::log::LimitedLog::new();
 /// Subtitles resource slices used by Remux.
 pub const DEN_SCOUT_ORIGIN: &str = "http://den-hearth.invalid";
 pub const DEN_ADDON_BASE: &str = "http://den-hearth.invalid/den";
+pub const LEGACY_SCOUT_BASE: &str = "http://den-hearth.invalid/scout";
+pub const LEGACY_SUBS_BASE: &str = "http://den-hearth.invalid/subs";
 
 const MAX_BODY: usize = 16 * 1024;
 const MAX_KEY: usize = 128;
@@ -260,14 +262,14 @@ fn content_type_is_json(headers: &HeaderMap) -> bool {
     })
 }
 
-fn idempotency_key(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Option<String> {
     let value = headers.get("idempotency-key")?.to_str().ok()?;
     (!value.is_empty() && value.len() <= MAX_KEY && value.bytes().all(|b| b.is_ascii_graphic() && b != b','))
         .then(|| value.to_string())
 }
 
-fn trusted_edge(hearth: &Hearth, parts: &hyper::http::request::Parts) -> bool {
-    let remux = hearth.remux.as_ref().expect("playback requires Remux");
+pub(crate) fn trusted_edge(hearth: &Hearth, parts: &hyper::http::request::Parts) -> bool {
+    let Some(remux) = hearth.remux.as_ref() else { return false };
     let secret = parts.headers.get("x-den-edge-secret").map(HeaderValue::as_bytes);
     let secret_ok = den_remux::edge_secret_ok(remux.cfg.edge_secret.as_deref(), secret);
     let peer = parts.extensions.get::<den_remux::Peer>().map(|p| p.0);
@@ -445,10 +447,11 @@ fn with_prepare_timing(mut response: Response<Body>, elapsed: Duration) -> Respo
     response
 }
 
-fn log_direct_fallback(failure: DirectFailure, rid: Option<&str>) {
+fn log_direct_fallback(failure: DirectFailure, has_fallback: bool, rid: Option<&str>) {
     LOG.log(&format!("playback_direct_{}", failure.code), || {
+        let action = if has_fallback { "remux" } else { "unavailable" };
         let mut line =
-            format!("managed playback direct preparation failed reason={} action=remux", failure.code);
+            format!("managed playback direct preparation failed reason={} action={action}", failure.code);
         if let Some(wait) = failure.retry_after {
             let _ = write!(line, " retry_after_seconds={}", wait.as_secs());
         }
@@ -531,18 +534,17 @@ fn refuse(
 
 async fn remux(
     hearth: &Arc<Hearth>,
-    config: &str,
-    has_subtitles: bool,
+    scout_install: &str,
+    subtitles_install: Option<&str>,
     mut parts: hyper::http::request::Parts,
     mut request: Value,
 ) -> Response<Body> {
     let Some(object) = request.as_object_mut() else {
         return answer(StatusCode::BAD_REQUEST, "bad_request", None);
     };
-    let install = install_url(config);
-    object.insert("scout".to_string(), Value::String(install.clone()));
-    if has_subtitles {
-        object.insert("subtitles".to_string(), Value::String(install));
+    object.insert("scout".to_string(), Value::String(scout_install.to_string()));
+    if let Some(install) = subtitles_install {
+        object.insert("subtitles".to_string(), Value::String(install.to_string()));
     }
     let Ok(body) = serde_json::to_vec(&request) else {
         return answer(StatusCode::BAD_REQUEST, "bad_request", None);
@@ -643,6 +645,63 @@ where
     if !hearth.playback.enabled {
         return den_http::not_found();
     }
+    if req.method() == Method::OPTIONS {
+        return preflight();
+    }
+    // Opening and revocation checks deliberately happen before consulting replay state.
+    let install = match hearth.den.open(config) {
+        Ok(install) if install.members.contains(&"scout") => install,
+        _ => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                None,
+                den_http::log::request_id(req.headers()).as_deref(),
+            )
+        }
+    };
+
+    let combined = install_url(config);
+    let subtitles = install.members.contains(&"subs").then_some(combined.as_str());
+    handle_with_sources(hearth, Some(config), config, Some(&combined), subtitles, req).await
+}
+
+/// Serve Edge's authenticated guest overlay playback. The personal config can only supply managed direct
+/// playback and a subtitle override; Remux always receives the host's legacy Scout install.
+pub async fn handle_guest<B>(
+    hearth: &Arc<Hearth>,
+    direct_config: Option<&str>,
+    personal_scope: Option<&str>,
+    host_scout: Option<&str>,
+    host_subs: Option<&str>,
+    req: Request<B>,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let scope = personal_scope
+        .map(str::to_string)
+        .or_else(|| host_scout.map(|scout| format!("host:{scout}")))
+        .unwrap_or_else(|| "guest-without-scout".to_string());
+    handle_with_sources(hearth, direct_config, &scope, host_scout, host_subs, req).await
+}
+
+async fn handle_with_sources<B>(
+    hearth: &Arc<Hearth>,
+    direct_config: Option<&str>,
+    scope_config: &str,
+    remux_scout: Option<&str>,
+    remux_subtitles: Option<&str>,
+    req: Request<B>,
+) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if !hearth.playback.enabled {
+        return den_http::not_found();
+    }
     let rid = den_http::log::request_id(req.headers());
     if req.method() == Method::OPTIONS {
         return preflight();
@@ -658,11 +717,6 @@ where
     let Some(key) = idempotency_key(req.headers()) else {
         return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref());
     };
-    // Opening and revocation checks deliberately happen before consulting replay state.
-    let install = match hearth.den.open(config) {
-        Ok(install) if install.members.contains(&"scout") => install,
-        _ => return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref()),
-    };
     let (parts, body) = req.into_parts();
     let body = match http_body_util::Limited::new(body, MAX_BODY).collect().await {
         Ok(body) => body.to_bytes(),
@@ -675,7 +729,7 @@ where
     let (request, direct_failed) = parsed;
     let canonical =
         Bytes::from(serde_json::to_vec(&json!({"request": request, "directFailed": direct_failed})).unwrap());
-    let scope = (owner_scope(hearth, &parts), config.to_string(), key);
+    let scope = (owner_scope(hearth, &parts), scope_config.to_string(), key);
 
     let gate = {
         let mut records = hearth.playback.records.lock().await;
@@ -704,9 +758,9 @@ where
         return response;
     }
 
-    let has_subtitles = install.members.contains(&"subs");
     let managed = trusted_edge(hearth, &parts)
         && parts.headers.get("x-den-managed-playback").is_some_and(|value| value.as_bytes() == b"1")
+        && direct_config.is_some()
         && !direct_failed;
     let direct = managed_request(&request);
     // Kept outside the bounded future so a completed direct attempt is still available when Remux consumes the
@@ -719,7 +773,10 @@ where
                 let started = Instant::now();
                 match tokio::time::timeout(
                     MANAGED_PREPARE_TIMEOUT,
-                    hearth.scout.as_ref().expect("playback requires Scout").managed_hls(config, direct),
+                    hearth.scout.as_ref().expect("playback requires Scout").managed_hls(
+                        direct_config.expect("a managed direct request has a personal config"),
+                        direct,
+                    ),
                 )
                 .await
                 {
@@ -741,11 +798,15 @@ where
                 prepare_elapsed = Some(elapsed);
                 log_direct_fallback(
                     direct_failure.expect("a failed direct attempt has a reason"),
+                    remux_scout.is_some(),
                     rid.as_deref(),
                 );
             }
         }
-        let mut response = remux(hearth, config, has_subtitles, parts, request).await;
+        let mut response = match remux_scout {
+            Some(scout) => remux(hearth, scout, remux_subtitles, parts, request).await,
+            None => answer(StatusCode::BAD_GATEWAY, "playback_unavailable", None),
+        };
         if let Some(elapsed) = prepare_elapsed {
             response = with_prepare_timing(response, elapsed);
         }
