@@ -888,6 +888,22 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 impl Handler {
+    /// The validated full legacy config as a combined-addon's member. Credentials never leave this process: the
+    /// migration endpoint immediately seals this value under Hearth's key. A scoped availability config is not an
+    /// install and cannot be promoted.
+    pub fn migration_member(&self, blob: &str) -> Option<serde_json::Value> {
+        let config = self.inner.open_config(blob)?;
+        if !config.scope.is_empty() || self.inner.deps.config_slice.is_some() {
+            return None;
+        }
+        let opened = den_seal::open_segment(self.inner.deps.seal_keyring.as_deref(), blob).ok()?;
+        let mut value: serde_json::Value = serde_json::from_slice(&opened.json).ok()?;
+        let member = value.as_object_mut()?;
+        member.remove("iid");
+        member.remove("ep");
+        Some(value)
+    }
+
     /// Resolve one title to TorBox managed HLS without exposing a Scout route or provider identifiers.
     /// The config is opened with this handler's own combined-addon slice, keyring and revocation policy.
     pub async fn managed_hls(

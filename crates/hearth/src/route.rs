@@ -145,6 +145,9 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Reel(path) => classify(&Target::Reel(path.clone()), method),
             Route::Playback(_) => bulk(None),
             Route::NotFound => bulk(None),
+            // Up to three public-key decryptions: never consume the reserved control lane under abuse.
+            Route::Migrate if *method == Method::OPTIONS => control,
+            Route::Migrate => bulk(None),
             Route::Configure | Route::Manifest | Route::ConfigKey | Route::Installed(_) if read => control,
             _ => bulk(None),
         },
@@ -267,6 +270,7 @@ mod tests {
             (Target::Remux("/remux/s/sid/sig/heartbeat".into()), Method::POST),
             (Target::Remux("/remux/s/sid/sig/end".into()), Method::POST),
             (Target::Remux("/remux/s/sid/sig".into()), Method::DELETE),
+            (Target::Den(Route::Migrate), Method::OPTIONS),
             (Target::Reel("/play/x.mp4".into()), Method::OPTIONS),
         ] {
             assert_eq!(class(target, method.clone()).0, Control, "{method}");

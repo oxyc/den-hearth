@@ -35,7 +35,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use serde_json::Value;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
@@ -69,6 +70,8 @@ struct Hearth {
     metrics_token: Option<String>,
     /// The new unified playback API. Off unless explicitly enabled after deployment validation.
     playback: playback::Playback,
+    /// Legacy config exchange. Off until the matching Edge client and keyrings are deployed.
+    legacy_migration: bool,
 }
 
 /// Every bound the node enforces; `Default` is production, tests shrink it.
@@ -82,6 +85,7 @@ struct Limits {
 struct Options {
     metrics_token: Option<String>,
     managed_playback: bool,
+    legacy_migration: bool,
 }
 
 impl Hearth {
@@ -104,6 +108,7 @@ impl Hearth {
             media: media::MediaGate::new(limits.media),
             metrics_token: options.metrics_token,
             playback: playback::Playback::new(options.managed_playback),
+            legacy_migration: options.legacy_migration,
         })
     }
 }
@@ -255,8 +260,117 @@ where
             None => bad_path(),
         },
         den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
+        den::Route::Migrate if hearth.legacy_migration => migrate_legacy(hearth, req).await,
+        den::Route::Migrate => den_http::not_found(),
         own => hearth.den.answer(own, req.method(), req.headers()),
     }
+}
+
+/// Exchange legacy first-party bearer segments for one Hearth bearer segment. Possessing and passing validation of
+/// a legacy segment is the authority; all failures are deliberately the same response, so this is not a config
+/// oracle. No upstream is contacted and no plaintext credential is returned.
+async fn migrate_legacy<B>(hearth: &Hearth, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    use http_body_util::BodyExt;
+
+    const MAX: usize = 16 * 1024;
+    if !migration_authorized(hearth, &req) {
+        return den_http::not_found();
+    }
+    if req.method() == Method::OPTIONS {
+        let mut response = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("allow", "POST, OPTIONS")
+            .header("access-control-allow-methods", "POST, OPTIONS")
+            .header("access-control-allow-headers", "content-type")
+            .body(den_http::full(""))
+            .unwrap();
+        den_http::cors_stamp(response.headers_mut(), "");
+        return response;
+    }
+    if req.method() != Method::POST {
+        let mut response = migration_json(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+        response.headers_mut().insert("allow", hyper::header::HeaderValue::from_static("POST, OPTIONS"));
+        return response;
+    }
+    if !req.headers().get(hyper::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| {
+        v.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    }) {
+        return migration_json(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type");
+    }
+    let collected = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_body_util::Limited::new(req.into_body(), MAX).collect(),
+    )
+    .await;
+    let bytes = match collected {
+        Ok(Ok(body)) => body.to_bytes(),
+        Ok(Err(_)) | Err(_) => return migration_json(StatusCode::BAD_REQUEST, "migration_refused"),
+    };
+    let Ok(Value::Object(input)) = serde_json::from_slice::<Value>(&bytes) else {
+        return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
+    };
+    if input.is_empty() || input.keys().any(|key| !matches!(key.as_str(), "scout" | "subs" | "reel")) {
+        return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
+    }
+    let mut members = serde_json::Map::new();
+    for (name, value) in input {
+        let Some(segment) = value.as_str() else {
+            return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
+        };
+        let member = match name.as_str() {
+            "scout" => hearth.scout.as_ref().and_then(|state| state.migration_member(segment)),
+            "subs" => hearth
+                .subs
+                .as_deref()
+                .and_then(|state| den_subtitles::migration_member(state, segment)),
+            "reel" => hearth
+                .reel
+                .as_deref()
+                .and_then(|state| den_reel::migration_member(state, segment)),
+            _ => None,
+        };
+        let Some(member) = member else {
+            return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
+        };
+        members.insert(name, member);
+    }
+    let Ok(segment) = hearth.den.migrate_segment(members) else {
+        return migration_json(StatusCode::SERVICE_UNAVAILABLE, "migration_unavailable");
+    };
+    if hearth.den.open(&segment).is_err() {
+        return migration_json(StatusCode::SERVICE_UNAVAILABLE, "migration_unavailable");
+    }
+    let mut response = json(
+        StatusCode::OK,
+        &serde_json::json!({"manifestUrl": format!("/den/{segment}/manifest.json")}),
+    );
+    den_http::cors_stamp(response.headers_mut(), "");
+    response
+}
+
+/// Direct LAN callers prove authority by possessing each legacy bearer. Calls arriving from the configured public
+/// Edge proxy additionally need Edge's secret and the owner-only marker; a guest owner header always disqualifies
+/// the request. Internal headers from any other peer grant nothing.
+fn migration_authorized<B>(hearth: &Hearth, req: &Request<B>) -> bool {
+    let Some(remux) = hearth.remux.as_ref() else { return true };
+    let peer = req.extensions().get::<den_remux::Peer>().map(|peer| peer.0);
+    if peer.is_none() || peer != remux.cfg.public_session_proxy {
+        return true;
+    }
+    let secret = req.headers().get("x-den-edge-secret").map(hyper::header::HeaderValue::as_bytes);
+    den_remux::edge_secret_ok(remux.cfg.edge_secret.as_deref(), secret)
+        && req.headers().get("x-den-migration-owner").is_some_and(|value| value == "1")
+        && !req.headers().contains_key("x-den-owner")
+}
+
+fn migration_json(status: StatusCode, error: &'static str) -> Response<Body> {
+    let mut response = json(status, &serde_json::json!({"error": error}));
+    den_http::cors_stamp(response.headers_mut(), "");
+    response
 }
 
 /// Hearth's own `/metrics`: what admission is holding. The services keep theirs at `/scout/metrics`,
@@ -487,6 +601,7 @@ struct Configs {
     scout_bases: Vec<inproc::Base>,
     metrics_token: Option<String>,
     managed_playback: bool,
+    legacy_migration: bool,
     services: services::Services,
 }
 
@@ -513,7 +628,11 @@ async fn run(c: Configs) -> std::io::Result<()> {
         scout,
         c.den,
         Limits::default(),
-        Options { metrics_token: c.metrics_token, managed_playback: c.managed_playback },
+        Options {
+            metrics_token: c.metrics_token,
+            managed_playback: c.managed_playback,
+            legacy_migration: c.legacy_migration,
+        },
     );
     if let Some(scout) = &hearth.scout {
         scout.start_sweep();
@@ -559,6 +678,10 @@ async fn run(c: Configs) -> std::io::Result<()> {
         eprintln!("{}", hearth.den.summary());
     }
     eprintln!("managed playback: {}", hearth.playback.summary());
+    eprintln!(
+        "legacy install migration: {}",
+        if hearth.legacy_migration { "enabled" } else { "disabled" }
+    );
     eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
     // Each service's own startup line: operators read `transcode=` and the like from them.
     if let Some(reel) = &hearth.reel {
@@ -721,6 +844,9 @@ fn main() {
         && std::env::var("HEARTH_MANAGED_PLAYBACK")
             .ok()
             .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
+    let legacy_migration = std::env::var("HEARTH_LEGACY_MIGRATION")
+        .ok()
+        .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
@@ -739,6 +865,7 @@ fn main() {
         scout_bases,
         metrics_token,
         managed_playback,
+        legacy_migration,
         services,
     };
     if let Err(e) = rt.block_on(run(configs)) {
@@ -832,6 +959,43 @@ mod tests {
             .unwrap();
         let response = handle(hearth(), None, false, request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn migration_from_the_expected_edge_peer_requires_the_owner_marker_and_secret() {
+        let mut hearth = hearth();
+        let state = Arc::get_mut(&mut hearth).unwrap();
+        let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
+        remux.cfg.public_session_proxy = Some("10.0.0.2".parse().unwrap());
+        remux.cfg.edge_secret = Some("edge-secret".into());
+
+        let request = |peer: &str, headers: &[(&str, &str)]| {
+            let mut builder = Request::builder().extension(den_remux::Peer(peer.parse().unwrap()));
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            builder.body(()).unwrap()
+        };
+        assert!(migration_authorized(&hearth, &request("10.0.0.3", &[])));
+        assert!(migration_authorized(
+            &hearth,
+            &request(
+                "10.0.0.2",
+                &[("x-den-edge-secret", "edge-secret"), ("x-den-migration-owner", "1")],
+            ),
+        ));
+        for headers in [
+            vec![("x-den-migration-owner", "1")],
+            vec![("x-den-edge-secret", "wrong"), ("x-den-migration-owner", "1")],
+            vec![("x-den-edge-secret", "edge-secret"), ("x-den-migration-owner", "0")],
+            vec![
+                ("x-den-edge-secret", "edge-secret"),
+                ("x-den-migration-owner", "1"),
+                ("x-den-owner", "grant:deadbeef"),
+            ],
+        ] {
+            assert!(!migration_authorized(&hearth, &request("10.0.0.2", &headers)));
+        }
     }
 
     async fn get(path: &str) -> (StatusCode, serde_json::Value) {

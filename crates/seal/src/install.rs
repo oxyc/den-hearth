@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 use base64::Engine;
+use crypto_box::aead::{rand_core::RngCore, OsRng};
 
 /// An install id as /configure mints it: 16 random bytes, base64url, unpadded, 22 characters. Decoding is
 /// strict (no padding, no non-zero trailing bits), so each id has exactly one spelling and a
@@ -12,6 +13,13 @@ pub struct InstallId(String);
 impl InstallId {
     pub const BYTES: usize = 16;
     pub const LEN: usize = 22;
+
+    /// A fresh id for a server-minted install (the configure page uses the browser RNG for the same 16 bytes).
+    pub fn random() -> InstallId {
+        let mut bytes = [0u8; Self::BYTES];
+        OsRng.fill_bytes(&mut bytes);
+        InstallId(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    }
 
     pub fn parse(s: &str) -> Option<InstallId> {
         let ok = s.len() == Self::LEN
