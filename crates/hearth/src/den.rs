@@ -335,6 +335,24 @@ impl Den {
         };
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
+
+    /// Whether an existing combined config is still admitted and contains exactly these validated legacy
+    /// members. Only the combined install's own revocation identity is metadata; every service member and every
+    /// value inside it must match. This lets migration callers retry without minting another install.
+    pub fn migration_target_matches(&self, blob: &str, members: &serde_json::Map<String, Value>) -> bool {
+        if self.open(blob).is_err() {
+            return false;
+        }
+        let Ok(opened) = den_seal::open_segment(self.scout.keyring.as_ref(), blob) else {
+            return false;
+        };
+        let Ok(Value::Object(mut target)) = serde_json::from_slice::<Value>(&opened.json) else {
+            return false;
+        };
+        target.remove("iid");
+        target.remove("ep");
+        target == *members
+    }
 }
 
 /// A combined config as the manifest reads it.

@@ -276,7 +276,7 @@ where
 {
     use http_body_util::BodyExt;
 
-    const MAX: usize = 16 * 1024;
+    const MAX: usize = 32 * 1024;
     if !migration_authorized(hearth, &req) {
         return den_http::not_found();
     }
@@ -313,11 +313,21 @@ where
     let Ok(Value::Object(input)) = serde_json::from_slice::<Value>(&bytes) else {
         return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
     };
-    if input.is_empty() || input.keys().any(|key| !matches!(key.as_str(), "scout" | "subs" | "reel")) {
+    if input.is_empty()
+        || input.keys().any(|key| !matches!(key.as_str(), "scout" | "subs" | "reel" | "target"))
+    {
         return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
     }
+    let target = match input.get("target") {
+        Some(Value::String(target)) => Some(target.clone()),
+        Some(_) => return migration_json(StatusCode::BAD_REQUEST, "migration_refused"),
+        None => None,
+    };
     let mut members = serde_json::Map::new();
     for (name, value) in input {
+        if name == "target" {
+            continue;
+        }
         let Some(segment) = value.as_str() else {
             return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
         };
@@ -334,8 +344,18 @@ where
         };
         members.insert(name, member);
     }
-    let Ok(segment) = hearth.den.migrate_segment(members) else {
-        return migration_json(StatusCode::SERVICE_UNAVAILABLE, "migration_unavailable");
+    if members.is_empty() {
+        return migration_json(StatusCode::BAD_REQUEST, "migration_refused");
+    }
+    let segment = match target {
+        Some(target) if hearth.den.migration_target_matches(&target, &members) => target,
+        Some(_) => return migration_json(StatusCode::BAD_REQUEST, "migration_refused"),
+        None => {
+            let Ok(segment) = hearth.den.migrate_segment(members) else {
+                return migration_json(StatusCode::SERVICE_UNAVAILABLE, "migration_unavailable");
+            };
+            segment
+        }
     };
     if hearth.den.open(&segment).is_err() {
         return migration_json(StatusCode::SERVICE_UNAVAILABLE, "migration_unavailable");

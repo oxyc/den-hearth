@@ -177,7 +177,7 @@ async fn legacy_migration_is_concealed_by_default_and_has_a_bounded_http_contrac
     assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(wrong_type.headers()["cache-control"], "no-store");
     assert_eq!(wrong_type.headers()["access-control-allow-origin"], "*");
-    let too_large = " ".repeat(16 * 1024 + 1);
+    let too_large = " ".repeat(32 * 1024 + 1);
     assert_eq!(
         migration_request(&on, Method::POST, Some("application/json"), &too_large).await.status(),
         StatusCode::BAD_REQUEST
@@ -217,6 +217,109 @@ async fn migration_validates_legacy_members_and_returns_a_fresh_combined_install
     assert_eq!(install.members, vec!["scout", "subs", "reel"]);
     assert!(install.iid.as_deref().is_some_and(|iid| iid.len() == den_seal::InstallId::LEN));
     assert_ne!(segment, plain(&body), "a configured Hearth never returns legacy JSON in plaintext");
+}
+
+#[tokio::test]
+async fn migration_reuses_an_exact_admitted_target_idempotently() {
+    let den = den_with(Some(VEC_PRIV), "", "7", true);
+    let mut members = serde_json::Map::new();
+    members.insert("scout".into(), serde_json::json!({"debrid":[{"service":"torbox","token":"tb"}]}));
+    members.insert("subs".into(), serde_json::json!({"osKey":"os"}));
+    let target = den.migrate_segment(members).unwrap();
+    let hearth = hearth_den_with_options(
+        Limits::default(),
+        den,
+        Options { legacy_migration: true, ..Default::default() },
+    );
+    let body = serde_json::json!({
+        "scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#),
+        "subs": plain(r#"{"osKey":"os"}"#),
+        "target": target,
+    })
+    .to_string();
+    let expected = format!("/den/{target}/manifest.json");
+
+    for _ in 0..2 {
+        let response = migration_request(&hearth, Method::POST, Some("application/json"), &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(json_of(response).await["manifestUrl"], expected);
+    }
+}
+
+#[tokio::test]
+async fn migration_refuses_a_target_with_different_extra_or_missing_members() {
+    let den = den_with(Some(VEC_PRIV), "", "0", true);
+    let target = |members| den.migrate_segment(members).unwrap();
+    let member = |name: &str, value| {
+        let mut members = serde_json::Map::new();
+        members.insert(name.into(), value);
+        members
+    };
+    let scout = serde_json::json!({"debrid":[{"service":"torbox","token":"tb"}]});
+    let mut scout_and_subs = member("scout", scout.clone());
+    scout_and_subs.insert("subs".into(), serde_json::json!({"osKey":"os"}));
+    let cases = [
+        (
+            target(member("scout", serde_json::json!({"debrid":[{"service":"torbox","token":"different"}]}))),
+            serde_json::json!({"scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#)}),
+        ),
+        (
+            target(scout_and_subs.clone()),
+            serde_json::json!({"scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#)}),
+        ),
+        (
+            target(member("scout", scout)),
+            serde_json::json!({
+                "scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#),
+                "subs": plain(r#"{"osKey":"os"}"#),
+            }),
+        ),
+    ];
+    let hearth = hearth_den_with_options(
+        Limits::default(),
+        den,
+        Options { legacy_migration: true, ..Default::default() },
+    );
+
+    for (target, mut body) in cases {
+        body.as_object_mut().unwrap().insert("target".into(), serde_json::json!(target));
+        let response =
+            migration_request(&hearth, Method::POST, Some("application/json"), &body.to_string()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_of(response).await["error"], "migration_refused");
+    }
+}
+
+#[tokio::test]
+async fn migration_refuses_invalid_or_revoked_targets_and_target_without_legacy_members() {
+    let legacy = plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#);
+    let cases = [
+        (den_with(Some(VEC_PRIV), "", "0", true), "not-a-segment".to_owned()),
+        (den_with(Some(VEC_PRIV), IID, "0", true), sealed(VEC_PRIV, &config(0, &[SCOUT]))),
+    ];
+    for (den, target) in cases {
+        let hearth = hearth_den_with_options(
+            Limits::default(),
+            den,
+            Options { legacy_migration: true, ..Default::default() },
+        );
+        let body = serde_json::json!({"scout": legacy, "target": target}).to_string();
+        let response = migration_request(&hearth, Method::POST, Some("application/json"), &body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_of(response).await["error"], "migration_refused");
+    }
+
+    let hearth = hearth_den_with_options(
+        Limits::default(),
+        den_with(Some(VEC_PRIV), "", "0", true),
+        Options { legacy_migration: true, ..Default::default() },
+    );
+    let body = serde_json::json!({"target": sealed(VEC_PRIV, &config(0, &[SCOUT]))}).to_string();
+    assert_eq!(
+        migration_request(&hearth, Method::POST, Some("application/json"), &body).await.status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
