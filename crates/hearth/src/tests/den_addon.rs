@@ -2,6 +2,7 @@
 //! service with that service's member of the config, and every per-service route answering as before.
 
 use base64::Engine;
+use hyper::{HeaderMap, Method};
 
 use super::*;
 use crate::den::Den;
@@ -47,6 +48,44 @@ async fn get_from(hearth: &Arc<Hearth>, path: &str) -> (StatusCode, serde_json::
     (resp.status(), json_of(resp).await)
 }
 
+fn playback_hearth() -> Arc<Hearth> {
+    hearth_den_with_options(
+        Limits::default(),
+        den_with(None, "", "0", false),
+        Options { managed_playback: true, ..Default::default() },
+    )
+}
+
+async fn playback_request(
+    hearth: &Arc<Hearth>,
+    method: Method,
+    segment: &str,
+    key: Option<&str>,
+    content_type: Option<&str>,
+    body: &str,
+) -> Response<Body> {
+    let mut request = Request::builder().method(method).uri(format!("/den/{segment}/playback"));
+    if let Some(key) = key {
+        request = request.header("idempotency-key", key);
+    }
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    handle(
+        hearth.clone(),
+        None,
+        false,
+        request.body(http_body_util::Full::new(Bytes::copy_from_slice(body.as_bytes()))).unwrap(),
+    )
+    .await
+}
+
+async fn response_bytes(response: Response<Body>) -> (StatusCode, HeaderMap, Bytes) {
+    let (parts, body) = response.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    (parts.status, parts.headers, bytes)
+}
+
 fn resource_names(manifest: &serde_json::Value) -> Vec<&str> {
     manifest["resources"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect()
 }
@@ -83,6 +122,161 @@ async fn the_manifest_declares_only_what_the_install_configured() {
     assert_eq!(resource_names(&manifest), ["stream", "subtitles", "meta"]);
     assert_eq!(manifest["behaviorHints"]["configurationRequired"], true);
     assert!(manifest.get("denInstallId").is_none());
+}
+
+#[tokio::test]
+async fn playback_route_pins_its_http_contract_end_to_end() {
+    let hearth = playback_hearth();
+    let segment = plain(&config(0, &[SCOUT]));
+
+    let preflight = playback_request(&hearth, Method::OPTIONS, &segment, None, None, "").await;
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(preflight.headers()["access-control-allow-methods"], "POST, OPTIONS");
+    assert_eq!(preflight.headers()["access-control-allow-headers"], "content-type, idempotency-key");
+    assert_eq!(preflight.headers()["cache-control"], "no-store");
+
+    for (name, response, status, error) in [
+        (
+            "wrong method",
+            playback_request(&hearth, Method::GET, &segment, None, None, "").await,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "bad_request",
+        ),
+        (
+            "wrong media type",
+            playback_request(&hearth, Method::POST, &segment, Some("attempt-1"), Some("text/plain"), "{}")
+                .await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ),
+        (
+            "missing idempotency key",
+            playback_request(&hearth, Method::POST, &segment, None, Some("application/json"), "{}").await,
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            "unknown request field",
+            playback_request(
+                &hearth,
+                Method::POST,
+                &segment,
+                Some("attempt-2"),
+                Some("application/json"),
+                r#"{"imdb":"tt1","provider":"torbox"}"#,
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+    ] {
+        let (got, headers, body) = response_bytes(response).await;
+        assert_eq!(got, status, "{name}");
+        assert_eq!(headers["content-type"], "application/json", "{name}");
+        assert_eq!(headers["cache-control"], "no-store", "{name}");
+        assert!(!headers.contains_key("etag"), "{name}");
+        assert!(!headers.contains_key("last-modified"), "{name}");
+        assert!(!headers.contains_key("content-location"), "{name}");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], error, "{name}");
+    }
+
+    let oversized = format!(r#"{{"imdb":"tt1","filename":"{}"}}"#, "x".repeat(16 * 1024));
+    let response = playback_request(
+        &hearth,
+        Method::POST,
+        &segment,
+        Some("attempt-large"),
+        Some("application/json"),
+        &oversized,
+    )
+    .await;
+    let (status, headers, body) = response_bytes(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"], "bad_request");
+}
+
+#[tokio::test]
+async fn playback_idempotency_replays_one_result_and_conflicts_on_another_intent() {
+    let hearth = playback_hearth();
+    let segment = plain(&config(0, &[SCOUT]));
+    // An unknown replacement is refused by Remux before it asks Scout, making the complete facade path
+    // deterministic and hermetic while still exercising a side-effecting operation's replay record.
+    let original = r#"{"imdb":"tt1","replaces":"not-a-session"}"#;
+    let first = response_bytes(
+        playback_request(
+            &hearth,
+            Method::POST,
+            &segment,
+            Some("same-attempt"),
+            Some("application/json"),
+            original,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::BAD_REQUEST);
+
+    let replay = response_bytes(
+        playback_request(
+            &hearth,
+            Method::POST,
+            &segment,
+            Some("same-attempt"),
+            Some("application/json"),
+            original,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((replay.0, &replay.1, &replay.2), (first.0, &first.1, &first.2));
+
+    let conflict = playback_request(
+        &hearth,
+        Method::POST,
+        &segment,
+        Some("same-attempt"),
+        Some("application/json"),
+        r#"{"imdb":"tt2","replaces":"not-a-session"}"#,
+    )
+    .await;
+    let (status, headers, body) = response_bytes(conflict).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error": "idempotency_conflict"})
+    );
+}
+
+#[tokio::test]
+async fn revoked_install_admission_wins_over_a_saved_playback_answer() {
+    let den = den_with(None, IID, "0", false);
+    let hearth = hearth_den_with_options(
+        Limits::default(),
+        den,
+        Options { managed_playback: true, ..Default::default() },
+    );
+    let segment = plain(&config(0, &[SCOUT]));
+    hearth.playback.seed_completed_for_test("local", &segment, "revoked-attempt").await;
+
+    let response = playback_request(
+        &hearth,
+        Method::POST,
+        &segment,
+        Some("revoked-attempt"),
+        Some("application/json"),
+        r#"{"imdb":"tt1"}"#,
+    )
+    .await;
+    let (status, headers, body) = response_bytes(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error": "bad_request"})
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("should-not-replay"));
 }
 
 #[tokio::test]

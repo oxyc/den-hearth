@@ -54,6 +54,16 @@ struct Record {
     completed: Option<(Instant, Snapshot)>,
 }
 
+fn retain_live_records(records: &mut HashMap<(String, String, String), Record>, now: Instant) {
+    records.retain(|_, record| match &record.completed {
+        Some((at, _)) => now.duration_since(*at) <= REPLAY_FOR,
+        // The record itself owns one Arc. Any handler executing or waiting on this operation owns another.
+        // If none does, its request was cancelled before it could publish an answer; reclaim the reservation so
+        // disconnected clients cannot permanently fill the bounded replay table.
+        None => Arc::strong_count(&record.gate) > 1,
+    });
+}
+
 /// Bounded, process-local replay state. Signed URLs and idempotency keys are neither persisted nor logged.
 pub struct Playback {
     enabled: bool,
@@ -71,6 +81,25 @@ impl Playback {
         } else {
             "off"
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_completed_for_test(&self, owner: &str, config: &str, key: &str) {
+        self.records.lock().await.insert(
+            (owner.to_string(), config.to_string(), key.to_string()),
+            Record {
+                request: Bytes::new(),
+                gate: Arc::new(Mutex::new(())),
+                completed: Some((
+                    Instant::now(),
+                    Snapshot {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                        body: Bytes::from_static(br#"{"url":"should-not-replay"}"#),
+                    },
+                )),
+            },
+        );
     }
 }
 
@@ -423,9 +452,7 @@ where
     let gate = {
         let mut records = hearth.playback.records.lock().await;
         let now = Instant::now();
-        records.retain(|_, record| {
-            record.completed.as_ref().is_none_or(|(at, _)| now.duration_since(*at) <= REPLAY_FOR)
-        });
+        retain_live_records(&mut records, now);
         if let Some(record) = records.get(&scope) {
             if record.request != canonical {
                 return answer(StatusCode::CONFLICT, "idempotency_conflict", None);
@@ -515,6 +542,46 @@ mod tests {
         assert!(idempotency_key(&headers).is_none());
     }
 
+    #[test]
+    fn replay_table_reclaims_cancelled_and_expired_operations() {
+        let key = ("owner".to_string(), "install".to_string(), "attempt".to_string());
+        let gate = Arc::new(Mutex::new(()));
+        let active = gate.clone();
+        let mut records = HashMap::from([(
+            key.clone(),
+            Record { request: Bytes::from_static(b"request"), gate, completed: None },
+        )]);
+
+        retain_live_records(&mut records, Instant::now());
+        assert!(records.contains_key(&key), "an active handler keeps its reservation");
+
+        drop(active);
+        retain_live_records(&mut records, Instant::now());
+        assert!(records.is_empty(), "a cancelled handler cannot leak one of the bounded slots");
+
+        let response = Snapshot {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"answer"),
+        };
+        let gate = Arc::new(Mutex::new(()));
+        records.insert(
+            key.clone(),
+            Record {
+                request: Bytes::from_static(b"request"),
+                gate,
+                completed: Some((Instant::now(), response.clone())),
+            },
+        );
+        retain_live_records(&mut records, Instant::now());
+        assert!(records.contains_key(&key), "a fresh answer remains replayable");
+
+        records.get_mut(&key).unwrap().completed =
+            Some((Instant::now().checked_sub(REPLAY_FOR + Duration::from_secs(1)).unwrap(), response));
+        retain_live_records(&mut records, Instant::now());
+        assert!(records.is_empty(), "a stale signed answer is not retained");
+    }
+
     #[tokio::test]
     async fn remux_success_is_the_small_facade_contract_with_explicit_controls() {
         let response = den_http::json(
@@ -544,6 +611,49 @@ mod tests {
         assert_eq!(value["session"]["reportUrl"], "/remux/s/abc/sig/report");
         assert!(value.get("delivery").is_none());
         assert!(value.get("provider").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_waiter_observes_the_first_operation_s_snapshot() {
+        let scope = ("owner".to_string(), "install".to_string(), "attempt".to_string());
+        let gate = Arc::new(Mutex::new(()));
+        let playback = Arc::new(Playback::new(true));
+        playback.records.lock().await.insert(
+            scope.clone(),
+            Record { request: Bytes::from_static(b"same"), gate: gate.clone(), completed: None },
+        );
+
+        let first = gate.lock().await;
+        let waiting = {
+            let playback = playback.clone();
+            let scope = scope.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                let _one = gate.lock().await;
+                playback
+                    .records
+                    .lock()
+                    .await
+                    .get(&scope)
+                    .and_then(|record| record.completed.as_ref().map(|(_, response)| response.clone()))
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "a duplicate must wait rather than run beside the first request");
+
+        let expected = Snapshot {
+            status: StatusCode::BAD_GATEWAY,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(br#"{"error":"source_unavailable"}"#),
+        };
+        playback.records.lock().await.get_mut(&scope).unwrap().completed =
+            Some((Instant::now(), expected.clone()));
+        drop(first);
+
+        let observed = waiting.await.unwrap().expect("the first operation published an answer");
+        assert_eq!(observed.status, expected.status);
+        assert_eq!(observed.headers, expected.headers);
+        assert_eq!(observed.body, expected.body);
     }
 
     #[tokio::test]
