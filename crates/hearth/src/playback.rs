@@ -342,13 +342,10 @@ async fn translate_remux(response: Response<Body>) -> Response<Body> {
     let status = response.status();
     let retry_after = response.headers().get("retry-after").cloned();
     let server_timing = response.headers().get("server-timing").cloned();
-    let bytes = match response.into_body().collect().await {
+    let bytes = match http_body_util::Limited::new(response.into_body(), MAX_BODY).collect().await {
         Ok(body) => body.to_bytes(),
         Err(_) => return answer(StatusCode::BAD_GATEWAY, "source_unavailable", None),
     };
-    if bytes.len() > MAX_BODY {
-        return answer(StatusCode::BAD_GATEWAY, "source_unavailable", None);
-    }
     if status != StatusCode::CREATED {
         let (status, code, retry) = match status {
             StatusCode::BAD_REQUEST => (StatusCode::BAD_REQUEST, "bad_request", None),
@@ -403,8 +400,17 @@ async fn translate_remux(response: Response<Body>) -> Response<Body> {
 
 async fn snapshot(response: Response<Body>) -> Snapshot {
     let (parts, body) = response.into_parts();
-    let body = body.collect().await.map(|body| body.to_bytes()).unwrap_or_default();
-    Snapshot { status: parts.status, headers: parts.headers, body }
+    match http_body_util::Limited::new(body, MAX_BODY).collect().await {
+        Ok(body) => Snapshot { status: parts.status, headers: parts.headers, body: body.to_bytes() },
+        Err(_) => {
+            // Every ordinary facade answer is well below this ceiling. If release metadata from an untrusted
+            // indexer is not, do not retain it in the replay table: 256 individually bounded records must not
+            // turn a bounded upstream list into hundreds of MiB of duplicate response data.
+            let (parts, body) = answer(StatusCode::BAD_GATEWAY, "source_unavailable", None).into_parts();
+            let body = body.collect().await.map(|body| body.to_bytes()).unwrap_or_default();
+            Snapshot { status: parts.status, headers: parts.headers, body }
+        }
+    }
 }
 
 /// Serve `POST /den/<config>/playback`. The entire route is absent while its rollout switch is off.
@@ -664,6 +670,28 @@ mod tests {
             &[],
         );
         let response = translate_remux(response).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body(response).await, json!({"error": "source_unavailable"}));
+    }
+
+    #[tokio::test]
+    async fn remux_answer_is_bounded_while_it_is_read() {
+        let response = Response::builder()
+            .status(StatusCode::CREATED)
+            .body(den_http::full(vec![b'x'; MAX_BODY + 1]))
+            .unwrap();
+        let response = translate_remux(response).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body(response).await, json!({"error": "source_unavailable"}));
+    }
+
+    #[tokio::test]
+    async fn replay_snapshot_does_not_retain_oversized_release_metadata() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(den_http::full(vec![b'x'; MAX_BODY + 1]))
+            .unwrap();
+        let response = snapshot(response).await.response();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(body(response).await, json!({"error": "source_unavailable"}));
     }
