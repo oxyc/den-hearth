@@ -479,6 +479,8 @@ pub fn manifest(install: Option<&Install>) -> Value {
 
 /// The marker in `den_configure.html` the DenSeal bundle replaces.
 const SEAL_MARKER: &str = "<!-- DenSeal bundle -->";
+/// Edge replaces this exact, single JavaScript expression with the versioned guest bridge context.
+pub const GUEST_CONTEXT_MARKER: &str = "/*__DEN_HEARTH_GUEST_CONTEXT_V1__*/ null";
 
 /// The `<script>` element holding the DenSeal bundle (tweetnacl + blakejs, libsodium `crypto_box_seal`) in a
 /// service's configure page. All three carry the same one; it is taken from Scout's.
@@ -493,8 +495,13 @@ fn seal_bundle(page: &str) -> &str {
 /// The configure page, with the bundle put in once.
 fn configure_page() -> &'static str {
     static PAGE: LazyLock<String> = LazyLock::new(|| {
-        include_str!("den_configure.html")
-            .replace(SEAL_MARKER, seal_bundle(den_scout::configure::CONFIGURE_PAGE))
+        let template = include_str!("den_configure.html");
+        assert_eq!(
+            template.matches(GUEST_CONTEXT_MARKER).count(),
+            1,
+            "the guest bridge marker must occur exactly once"
+        );
+        template.replace(SEAL_MARKER, seal_bundle(den_scout::configure::CONFIGURE_PAGE))
     });
     PAGE.as_str()
 }
@@ -599,13 +606,28 @@ mod tests {
             "Object.assign({ iid: mintInstallId(), ep: configEpoch }, config)",
             "BASE + \"/config-key\"",
             "BASE + \"/validate\"",
-            "location.origin + BASE + \"/\" + toSegment(install) + \"/manifest.json\"",
+            "location.origin + BASE + \"/\" + segment + \"/manifest.json\"",
             "{ debrid: [{ service: $(\"service\").value, token: token }] }",
             "{ osKey: osKey, autoSync: $(\"autoSync\").checked }",
             "{ tmdbKey: tmdb }",
             SEAL_MARKER,
         ] {
             assert!(page.contains(needle), "the page no longer has: {needle}");
+        }
+        assert_eq!(
+            page.matches(GUEST_CONTEXT_MARKER).count(),
+            1,
+            "guest bridge marker must be exact and unique"
+        );
+        for needle in [
+            "DEN_GUEST_CONTEXT.v === 1",
+            "if (DEN_GUEST === false)",
+            "denFetch(DEN_GUEST.saveUrl",
+            "JSON.stringify({ install: segment })",
+            "location.origin + DEN_GUEST.base + \"/manifest.json\"",
+            "Could not save this guest install. Please try again.",
+        ] {
+            assert!(page.contains(needle), "the guest bridge no longer has: {needle}");
         }
         for slice in SLICES {
             assert!(page.contains(&format!("{slice}: collect")), "{slice}");
