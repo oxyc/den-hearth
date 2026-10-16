@@ -40,6 +40,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 // Match the shared outbound HTTP ceiling: an upstream cannot ask the browser to stop trying for a day.
 const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+const FINALIZE_HEADER: &str = "x-den-playback-finalize";
 
 #[derive(Clone)]
 struct Snapshot {
@@ -60,7 +61,7 @@ impl Snapshot {
 struct Record {
     request: Bytes,
     gate: Arc<Mutex<()>>,
-    completed: Option<(Instant, Snapshot)>,
+    completed: Option<(Instant, Snapshot, bool)>,
 }
 
 #[derive(Debug)]
@@ -92,7 +93,7 @@ fn reserve_record(
 
 fn retain_live_records(records: &mut HashMap<(String, String, String), Record>, now: Instant) {
     records.retain(|_, record| match &record.completed {
-        Some((at, _)) => now.duration_since(*at) <= REPLAY_FOR,
+        Some((at, _, _)) => now.duration_since(*at) <= REPLAY_FOR,
         // The record itself owns one Arc. Any handler executing or waiting on this operation owns another.
         // If none does, its request was cancelled before it could publish an answer; reclaim the reservation so
         // disconnected clients cannot permanently fill the bounded replay table.
@@ -223,6 +224,7 @@ impl Playback {
                         headers: HeaderMap::new(),
                         body: Bytes::from_static(br#"{"url":"should-not-replay"}"#),
                     },
+                    true,
                 )),
             },
         );
@@ -236,6 +238,14 @@ fn answer(status: StatusCode, error: &str, retry_after: Option<&'static str>) ->
     }
     stamp(&mut response);
     response
+}
+
+fn finalized() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("cache-control", "no-store")
+        .body(den_http::full(Bytes::new()))
+        .expect("static playback finalization response")
 }
 
 fn stamp(response: &mut Response<Body>) {
@@ -740,6 +750,46 @@ where
     let canonical =
         Bytes::from(serde_json::to_vec(&json!({"request": request, "directFailed": direct_failed})).unwrap());
     let scope = (owner_scope(hearth, &parts), scope_config.to_string(), key);
+    let finalize = parts.headers.get(FINALIZE_HEADER).and_then(|value| value.to_str().ok());
+
+    // A managed Remux answer is not safe to replay until Edge has opened the public media listener. Edge sends
+    // this authenticated outcome with the identical operation after that attempt. Keeping the decision here means
+    // Hearth owns its replay table while Edge owns only listener reachability; neither layer learns the other's
+    // implementation details.
+    if let Some(outcome) = finalize {
+        if !trusted_edge(hearth, &parts)
+            || !parts.headers.get("x-den-managed-playback").is_some_and(|value| value.as_bytes() == b"1")
+            || !matches!(outcome, "commit" | "abort")
+        {
+            return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref());
+        }
+        let gate = {
+            let records = hearth.playback.records.lock().await;
+            let Some(record) = records.get(&scope) else {
+                return if outcome == "abort" {
+                    finalized()
+                } else {
+                    answer(StatusCode::CONFLICT, "playback_pending", Some("1"))
+                };
+            };
+            if record.request != canonical {
+                return refuse(StatusCode::CONFLICT, "idempotency_conflict", None, rid.as_deref());
+            }
+            record.gate.clone()
+        };
+        let _one = gate.lock().await;
+        let mut records = hearth.playback.records.lock().await;
+        if outcome == "abort" {
+            records.remove(&scope);
+        } else if let Some((_, _, committed)) =
+            records.get_mut(&scope).and_then(|record| record.completed.as_mut())
+        {
+            *committed = true;
+        } else {
+            return answer(StatusCode::CONFLICT, "playback_pending", Some("1"));
+        }
+        return finalized();
+    }
 
     let gate = {
         let mut records = hearth.playback.records.lock().await;
@@ -756,22 +806,22 @@ where
         }
     };
     let _one = gate.lock().await;
-    if let Some(response) = hearth
-        .playback
-        .records
-        .lock()
-        .await
-        .get(&scope)
-        .and_then(|record| record.completed.as_ref().map(|(_, response)| response.response()))
-    {
+    if let Some(response) = hearth.playback.records.lock().await.get(&scope).and_then(|record| {
+        record.completed.as_ref().map(|(_, response, committed)| {
+            if *committed {
+                response.response()
+            } else {
+                answer(StatusCode::SERVICE_UNAVAILABLE, "playback_pending", Some("1"))
+            }
+        })
+    }) {
         hearth.playback.metrics.operation_replay.fetch_add(1, Relaxed);
         return response;
     }
 
-    let managed = trusted_edge(hearth, &parts)
-        && parts.headers.get("x-den-managed-playback").is_some_and(|value| value.as_bytes() == b"1")
-        && direct_config.is_some()
-        && !direct_failed;
+    let edge_managed = trusted_edge(hearth, &parts)
+        && parts.headers.get("x-den-managed-playback").is_some_and(|value| value.as_bytes() == b"1");
+    let managed = edge_managed && direct_config.is_some() && !direct_failed;
     let direct = managed_request(&request);
     // Kept outside the bounded future so a completed direct attempt is still available when Remux consumes the
     // rest of the overall deadline and the future is cancelled by the outer timeout.
@@ -841,7 +891,10 @@ where
         log_operation_failure(&saved, direct_failure, rid.as_deref());
     }
     if let Some(record) = hearth.playback.records.lock().await.get_mut(&scope) {
-        record.completed = Some((Instant::now(), saved.clone()));
+        // Direct provider URLs need no Edge listener. A managed Remux fallback does, so its replay stays
+        // provisional until Edge explicitly commits or aborts it after attempting that listener.
+        let committed = delivered_direct || !edge_managed || !saved.status.is_success();
+        record.completed = Some((Instant::now(), saved.clone(), committed));
     }
     saved.response()
 }
@@ -907,14 +960,14 @@ mod tests {
             Record {
                 request: Bytes::from_static(b"request"),
                 gate,
-                completed: Some((Instant::now(), response.clone())),
+                completed: Some((Instant::now(), response.clone(), true)),
             },
         );
         retain_live_records(&mut records, Instant::now());
         assert!(records.contains_key(&key), "a fresh answer remains replayable");
 
         records.get_mut(&key).unwrap().completed =
-            Some((Instant::now().checked_sub(REPLAY_FOR + Duration::from_secs(1)).unwrap(), response));
+            Some((Instant::now().checked_sub(REPLAY_FOR + Duration::from_secs(1)).unwrap(), response, true));
         retain_live_records(&mut records, Instant::now());
         assert!(records.is_empty(), "a stale signed answer is not retained");
     }
@@ -999,7 +1052,7 @@ mod tests {
                     .lock()
                     .await
                     .get(&scope)
-                    .and_then(|record| record.completed.as_ref().map(|(_, response)| response.clone()))
+                    .and_then(|record| record.completed.as_ref().map(|(_, response, _)| response.clone()))
             })
         };
         tokio::task::yield_now().await;
@@ -1011,13 +1064,44 @@ mod tests {
             body: Bytes::from_static(br#"{"error":"source_unavailable"}"#),
         };
         playback.records.lock().await.get_mut(&scope).unwrap().completed =
-            Some((Instant::now(), expected.clone()));
+            Some((Instant::now(), expected.clone(), true));
         drop(first);
 
         let observed = waiting.await.unwrap().expect("the first operation published an answer");
         assert_eq!(observed.status, expected.status);
         assert_eq!(observed.headers, expected.headers);
         assert_eq!(observed.body, expected.body);
+    }
+
+    #[tokio::test]
+    async fn managed_remux_replay_is_not_exposed_until_edge_commits_it() {
+        let scope = ("edge:owner".to_string(), "install".to_string(), "attempt".to_string());
+        let snapshot = Snapshot {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(br#"{"url":"/remux/s/id/sig/master.m3u8"}"#),
+        };
+        let mut records = HashMap::from([(
+            scope.clone(),
+            Record {
+                request: Bytes::from_static(b"same"),
+                gate: Arc::new(Mutex::new(())),
+                completed: Some((Instant::now(), snapshot.clone(), false)),
+            },
+        )]);
+
+        let (_, pending, committed) = records[&scope].completed.as_ref().unwrap();
+        assert!(!committed);
+        assert_eq!(pending.body, snapshot.body, "the provisional answer is retained for finalization");
+
+        let (_, _, committed) = records.get_mut(&scope).unwrap().completed.as_mut().unwrap();
+        *committed = true;
+        let (_, replay, committed) = records[&scope].completed.as_ref().unwrap();
+        assert!(*committed);
+        assert_eq!(replay.response().status(), StatusCode::OK);
+
+        records.remove(&scope);
+        assert!(!records.contains_key(&scope), "an Edge abort lets the same idempotency key start again");
     }
 
     #[tokio::test]
