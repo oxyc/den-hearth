@@ -137,7 +137,12 @@ fn migrated_members_get_one_fresh_identity_and_open_as_a_combined_install() {
     assert!(install.iid.as_deref().is_some_and(|iid| iid.len() == den_seal::InstallId::LEN));
 }
 
-async fn migration_request(hearth: &Arc<Hearth>, method: Method, content_type: Option<&str>, body: &str) -> Response<Body> {
+async fn migration_request(
+    hearth: &Arc<Hearth>,
+    method: Method,
+    content_type: Option<&str>,
+    body: &str,
+) -> Response<Body> {
     let mut request = Request::builder().method(method).uri("/den/migrate");
     if let Some(content_type) = content_type {
         request = request.header("content-type", content_type);
@@ -153,11 +158,7 @@ async fn migration_request(hearth: &Arc<Hearth>, method: Method, content_type: O
 
 #[tokio::test]
 async fn legacy_migration_is_concealed_by_default_and_has_a_bounded_http_contract_when_enabled() {
-    let off = hearth_den_with_options(
-        Limits::default(),
-        den_with(None, "", "0", false),
-        Options::default(),
-    );
+    let off = hearth_den_with_options(Limits::default(), den_with(None, "", "0", false), Options::default());
     assert_eq!(
         migration_request(&off, Method::POST, Some("application/json"), "{}").await.status(),
         StatusCode::NOT_FOUND

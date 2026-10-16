@@ -274,9 +274,7 @@ impl Den {
             | Route::Scout(_)
             | Route::Subs(_)
             | Route::Reel(_)
-            | Route::NotFound => {
-                den_http::not_found()
-            }
+            | Route::NotFound => den_http::not_found(),
         }
     }
 

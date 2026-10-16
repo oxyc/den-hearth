@@ -36,9 +36,9 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
-use serde_json::Value;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -323,14 +323,10 @@ where
         };
         let member = match name.as_str() {
             "scout" => hearth.scout.as_ref().and_then(|state| state.migration_member(segment)),
-            "subs" => hearth
-                .subs
-                .as_deref()
-                .and_then(|state| den_subtitles::migration_member(state, segment)),
-            "reel" => hearth
-                .reel
-                .as_deref()
-                .and_then(|state| den_reel::migration_member(state, segment)),
+            "subs" => {
+                hearth.subs.as_deref().and_then(|state| den_subtitles::migration_member(state, segment))
+            }
+            "reel" => hearth.reel.as_deref().and_then(|state| den_reel::migration_member(state, segment)),
             _ => None,
         };
         let Some(member) = member else {
@@ -344,10 +340,8 @@ where
     if hearth.den.open(&segment).is_err() {
         return migration_json(StatusCode::SERVICE_UNAVAILABLE, "migration_unavailable");
     }
-    let mut response = json(
-        StatusCode::OK,
-        &serde_json::json!({"manifestUrl": format!("/den/{segment}/manifest.json")}),
-    );
+    let mut response =
+        json(StatusCode::OK, &serde_json::json!({"manifestUrl": format!("/den/{segment}/manifest.json")}));
     den_http::cors_stamp(response.headers_mut(), "");
     response
 }
@@ -678,10 +672,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
         eprintln!("{}", hearth.den.summary());
     }
     eprintln!("managed playback: {}", hearth.playback.summary());
-    eprintln!(
-        "legacy install migration: {}",
-        if hearth.legacy_migration { "enabled" } else { "disabled" }
-    );
+    eprintln!("legacy install migration: {}", if hearth.legacy_migration { "enabled" } else { "disabled" });
     eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
     // Each service's own startup line: operators read `transcode=` and the like from them.
     if let Some(reel) = &hearth.reel {
@@ -979,10 +970,7 @@ mod tests {
         assert!(migration_authorized(&hearth, &request("10.0.0.3", &[])));
         assert!(migration_authorized(
             &hearth,
-            &request(
-                "10.0.0.2",
-                &[("x-den-edge-secret", "edge-secret"), ("x-den-migration-owner", "1")],
-            ),
+            &request("10.0.0.2", &[("x-den-edge-secret", "edge-secret"), ("x-den-migration-owner", "1")],),
         ));
         for headers in [
             vec![("x-den-migration-owner", "1")],
