@@ -58,7 +58,11 @@ impl Scout {
     /// agree on everything but `public_url`. `den` is the combined Den addon's terms for Scout's member.
     /// Call from inside the runtime.
     pub fn new(mount: Settings, legacy: Settings, den: &den_seal::Addon) -> Scout {
-        let cache = Arc::new(TieredCache::new(legacy.cache_bytes, std::path::Path::new(&legacy.cache_dir)));
+        let cache = Arc::new(TieredCache::new_with_disk_bytes(
+            legacy.cache_bytes,
+            legacy.disk_cache_bytes,
+            std::path::Path::new(&legacy.cache_dir),
+        ));
         let client = client();
         let deps = |settings: &Settings| {
             build_deps_shared(settings, client.clone(), cache.clone() as Arc<dyn Cache>)

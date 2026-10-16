@@ -3540,7 +3540,7 @@ function fillForm(s) {
   // built after the operator bumps it is not refused by it. no-cache so a just-bumped epoch isn't read
   // from a copy the browser kept; the 404 (sealing off) carries the epoch as well.
   var sealPublicKey = null, sealEpoch = null;
-  fetch("/config-key", { cache: "no-cache" })
+  fetch(addonBase() + "/config-key", { cache: "no-cache" })
     .then(function (r) { return r.ok || r.status === 404 ? r.json() : null; })
     .then(function (j) {
       if (j && j.key) sealPublicKey = j.key;
@@ -3610,11 +3610,18 @@ function fillForm(s) {
     setTimeout(function () { btn.textContent = label; }, 1500);
   }
 
+  // The same page is served at the legacy root and below Hearth's /scout mount. Keep whichever mount
+  // the browser used; dropping it makes a Compose install point at Hearth's 404 root.
+  function addonBase() {
+    var path = location.pathname.replace(/\/+$/, "");
+    return path.endsWith("/configure") ? path.slice(0, -10) : path;
+  }
+
   function build() {
     var config = collectConfig(); // page-specific; returns null (and focuses the bad field) if invalid
     if (!config) return;
     saveSettings(config);
-    $("url").value = location.origin + "/" + toSegment(config) + "/manifest.json";
+    $("url").value = location.origin + addonBase() + "/" + toSegment(config) + "/manifest.json";
     $("installId").textContent = lastInstallID;
     $("out").classList.remove("hidden");
     renderSecurityNote();
@@ -3630,7 +3637,7 @@ function fillForm(s) {
     if (!token) { out.textContent = "Paste a token first."; out.className = "note"; return; }
     out.textContent = "Checking…";
     out.className = "note";
-    fetch("/validate", {
+    fetch(addonBase() + "/validate", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ service: $("service").value, token: token })

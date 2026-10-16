@@ -23,6 +23,7 @@ mod playback;
 mod ports;
 mod route;
 mod scout;
+mod services;
 mod sock;
 
 use std::convert::Infallible;
@@ -54,10 +55,10 @@ const DRAIN_GRACE: Duration = Duration::from_secs(8);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Hearth {
-    reel: Arc<den_reel::AppState>,
-    subs: Arc<den_subtitles::AppState>,
-    remux: Arc<den_remux::AppState>,
-    scout: scout::Scout,
+    reel: Option<Arc<den_reel::AppState>>,
+    subs: Option<Arc<den_subtitles::AppState>>,
+    remux: Option<Arc<den_remux::AppState>>,
+    scout: Option<scout::Scout>,
     /// The combined Den addon's terms (`/den`).
     den: den::Den,
     /// One budget for the whole node: the main port and every service's own listener draw on it, so the
@@ -85,10 +86,10 @@ struct Options {
 
 impl Hearth {
     fn new(
-        reel: Arc<den_reel::AppState>,
-        subs: Arc<den_subtitles::AppState>,
-        remux: Arc<den_remux::AppState>,
-        scout: scout::Scout,
+        reel: Option<Arc<den_reel::AppState>>,
+        subs: Option<Arc<den_subtitles::AppState>>,
+        remux: Option<Arc<den_remux::AppState>>,
+        scout: Option<scout::Scout>,
         den: den::Den,
         limits: Limits,
         options: Options,
@@ -190,22 +191,37 @@ where
         Target::Metrics => metrics(hearth, req.headers()),
         Target::Health => json(StatusCode::OK, &health(hearth).await),
         Target::Scout(path) => match with_path(req, &path) {
-            Some(req) => hearth.scout.serve(own == Some(Service::Scout), req).await,
+            Some(req) => match &hearth.scout {
+                Some(scout) => scout.serve(own == Some(Service::Scout), req).await,
+                None => den_http::not_found(),
+            },
             None => bad_path(),
         },
         Target::Reel(path) => match with_path(req, &path) {
-            Some(req) => den_reel::handle_request(hearth.reel.clone(), req).await,
+            Some(req) => match &hearth.reel {
+                Some(reel) => den_reel::handle_request(reel.clone(), req).await,
+                None => den_http::not_found(),
+            },
             None => bad_path(),
         },
         Target::Subs(path) => match with_path(req, &path) {
-            Some(req) => den_subtitles::handle_request(hearth.subs.clone(), req).await,
+            Some(req) => match &hearth.subs {
+                Some(subs) => den_subtitles::handle_request(subs.clone(), req).await,
+                None => den_http::not_found(),
+            },
             None => bad_path(),
         },
         Target::Remux(path) => match with_path(req, &path) {
-            Some(req) => den_remux::handle_request(hearth.remux.clone(), req).await,
+            Some(req) => match &hearth.remux {
+                Some(remux) => den_remux::handle_request(remux.clone(), req).await,
+                None => den_http::not_found(),
+            },
             None => bad_path(),
         },
-        Target::Den(route) => den_dispatch(hearth, route, req).await,
+        Target::Den(route) if hearth.scout.is_some() && hearth.reel.is_some() && hearth.subs.is_some() => {
+            den_dispatch(hearth, route, req).await
+        }
+        Target::Den(_) => den_http::not_found(),
         Target::NotFound => json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"})),
     }
 }
@@ -225,15 +241,17 @@ where
     };
     match route {
         den::Route::Scout(path) => match with_path(req, &path) {
-            Some(req) => hearth.scout.serve_den(req).await,
+            Some(req) => hearth.scout.as_ref().expect("Den requires Scout").serve_den(req).await,
             None => bad_path(),
         },
         den::Route::Subs(path) => match with_terms(req, &path, &hearth.den.subs) {
-            Some(req) => den_subtitles::handle_request(hearth.subs.clone(), req).await,
+            Some(req) => {
+                den_subtitles::handle_request(hearth.subs.clone().expect("Den requires Subtitles"), req).await
+            }
             None => bad_path(),
         },
         den::Route::Reel(path) => match with_terms(req, &path, &hearth.den.reel) {
-            Some(req) => den_reel::handle_request(hearth.reel.clone(), req).await,
+            Some(req) => den_reel::handle_request(hearth.reel.clone().expect("Den requires Reel"), req).await,
             None => bad_path(),
         },
         den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
@@ -265,15 +283,21 @@ fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
 /// `ok`; the response is a 200 either way, as the services' are: it answers "is the process up".
 async fn health(hearth: &Hearth) -> serde_json::Value {
     let get = || Request::get("/health").body(Empty::<Bytes>::new()).expect("static request");
-    let reel = den_reel::handle_request(hearth.reel.clone(), get()).await;
-    let subs = den_subtitles::handle_request(hearth.subs.clone(), get()).await;
-    let remux = den_remux::handle_request(hearth.remux.clone(), get()).await;
-    let services = serde_json::json!({
-        "scout": report(hearth.scout.health().await).await,
-        "reel": report(reel).await,
-        "subs": report(subs).await,
-        "remux": report(remux).await,
-    });
+    let mut services = serde_json::Map::new();
+    if let Some(scout) = &hearth.scout {
+        services.insert("scout".into(), report(scout.health().await).await);
+    }
+    if let Some(reel) = &hearth.reel {
+        services.insert("reel".into(), report(den_reel::handle_request(reel.clone(), get()).await).await);
+    }
+    if let Some(subs) = &hearth.subs {
+        services
+            .insert("subs".into(), report(den_subtitles::handle_request(subs.clone(), get()).await).await);
+    }
+    if let Some(remux) = &hearth.remux {
+        services.insert("remux".into(), report(den_remux::handle_request(remux.clone(), get()).await).await);
+    }
+    let services = serde_json::Value::Object(services);
     let all_ok = services.as_object().is_some_and(|all| all.values().all(|s| s["status"] == "ok"));
     serde_json::json!({"status": if all_ok { "ok" } else { "degraded" }, "services": services})
 }
@@ -452,17 +476,18 @@ struct Configs {
     port: u16,
     /// The extra listeners: a service and the port its old container used.
     own: Vec<(Service, u16)>,
-    reel: den_reel::Config,
-    subs: den_subtitles::Config,
-    remux: den_remux::Config,
+    reel: Option<den_reel::Config>,
+    subs: Option<den_subtitles::Config>,
+    remux: Option<den_remux::Config>,
     /// Scout behind `/scout` and on its own listener: the same environment but for the public origin.
-    scout_mount: den_scout::deps::Settings,
-    scout_own: den_scout::deps::Settings,
+    scout_mount: Option<den_scout::deps::Settings>,
+    scout_own: Option<den_scout::deps::Settings>,
     den: den::Den,
     /// Where Remux and Subtitles reach Scout in process (`inproc`).
     scout_bases: Vec<inproc::Base>,
     metrics_token: Option<String>,
     managed_playback: bool,
+    services: services::Services,
 }
 
 async fn bind(port: u16) -> std::io::Result<TcpListener> {
@@ -473,16 +498,26 @@ async fn bind(port: u16) -> std::io::Result<TcpListener> {
 
 async fn run(c: Configs) -> std::io::Result<()> {
     let port = c.port;
+    let reel = c.reel.map(den_reel::init);
+    let subs = c.subs.map(den_subtitles::init);
+    let remux = match c.remux {
+        Some(config) => Some(den_remux::init(config).await),
+        None => None,
+    };
+    let scout =
+        c.scout_mount.zip(c.scout_own).map(|(mount, own)| scout::Scout::new(mount, own, &c.den.scout));
     let hearth = Hearth::new(
-        den_reel::init(c.reel),
-        den_subtitles::init(c.subs),
-        den_remux::init(c.remux).await,
-        scout::Scout::new(c.scout_mount, c.scout_own, &c.den.scout),
+        reel,
+        subs,
+        remux,
+        scout,
         c.den,
         Limits::default(),
         Options { metrics_token: c.metrics_token, managed_playback: c.managed_playback },
     );
-    hearth.scout.start_sweep();
+    if let Some(scout) = &hearth.scout {
+        scout.start_sweep();
+    }
     let in_process = inproc::install(&hearth, &c.scout_bases);
     let (stop, shutdown) = watch::channel(false);
     let signal = shutdown_signal();
@@ -494,28 +529,47 @@ async fn run(c: Configs) -> std::io::Result<()> {
     for (service, own_port) in &c.own {
         listeners.push((Some(*service), bind(*own_port).await?));
     }
-    eprintln!(
-        "den-hearth {} listening on :{port} — /scout (den-scout {}), /reel (den-reel {}), /subs (den-subtitles {}), /remux (den-remux {}); own listeners: {}",
-        env!("CARGO_PKG_VERSION"),
-        den_scout::release_version(),
-        den_reel::release_version(),
-        den_subtitles::release_version(),
-        den_remux::release_version(),
-        if c.own.is_empty() {
-            "none".to_string()
-        } else {
-            c.own.iter().map(|(s, p)| format!("{} :{p}", ports::name(*s))).collect::<Vec<_>>().join(", ")
-        },
-    );
+    let own_listeners = if c.own.is_empty() {
+        "none".to_string()
+    } else {
+        c.own.iter().map(|(s, p)| format!("{} :{p}", ports::name(*s))).collect::<Vec<_>>().join(", ")
+    };
+    if c.services == services::Services::ALL {
+        // Keep the established fleet line byte-for-byte compatible: the deploy probe reads the four versions.
+        eprintln!(
+            "den-hearth {} listening on :{port} — /scout (den-scout {}), /reel (den-reel {}), /subs (den-subtitles {}), /remux (den-remux {}); own listeners: {own_listeners}",
+            env!("CARGO_PKG_VERSION"),
+            den_scout::release_version(),
+            den_reel::release_version(),
+            den_subtitles::release_version(),
+            den_remux::release_version(),
+        );
+    } else {
+        eprintln!(
+            "den-hearth {} listening on :{port} — services={}; own listeners: {own_listeners}",
+            env!("CARGO_PKG_VERSION"),
+            c.services.names().join(","),
+        );
+    }
     eprintln!("{}", alloc::startup_line());
-    eprintln!("scout: {}", hearth.scout.summary());
-    eprintln!("{}", hearth.den.summary());
+    if let Some(scout) = &hearth.scout {
+        eprintln!("scout: {}", scout.summary());
+    }
+    if c.services.den() {
+        eprintln!("{}", hearth.den.summary());
+    }
     eprintln!("managed playback: {}", hearth.playback.summary());
     eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
     // Each service's own startup line: operators read `transcode=` and the like from them.
-    eprintln!("{}", den_reel::startup_line(&hearth.reel));
-    eprintln!("{}", den_remux::startup_line(&hearth.remux));
-    eprintln!("{}", den_subtitles::startup_line(&hearth.subs));
+    if let Some(reel) = &hearth.reel {
+        eprintln!("{}", den_reel::startup_line(reel));
+    }
+    if let Some(remux) = &hearth.remux {
+        eprintln!("{}", den_remux::startup_line(remux));
+    }
+    if let Some(subs) = &hearth.subs {
+        eprintln!("{}", den_subtitles::startup_line(subs));
+    }
     let (adm, media) = (admit::Limits::default(), media::Limits::default());
     eprintln!(
         "bounds (all listeners): connections={} requests={} (bulk {}) media={} (reel {}, remux {}) idle={}s lifetime={}s metrics={}",
@@ -541,8 +595,12 @@ async fn run(c: Configs) -> std::io::Result<()> {
         drained &= server.await.unwrap_or(false);
     }
 
-    den_reel::finish(&hearth.reel).await;
-    den_remux::finish(&hearth.remux).await;
+    if let Some(reel) = &hearth.reel {
+        den_reel::finish(reel).await;
+    }
+    if let Some(remux) = &hearth.remux {
+        den_remux::finish(remux).await;
+    }
     if drained {
         eprintln!("shut down cleanly");
     }
@@ -585,61 +643,84 @@ fn main() {
     // inside `from_env`, and `env::scoped` edits the environment to give each its own.
     let port = parsed_or("PORT", std::env::var("PORT").ok(), DEFAULT_PORT);
     let threads = parsed_or("HEARTH_WORKER_THREADS", std::env::var("HEARTH_WORKER_THREADS").ok(), 2);
-    let own = ports::legacy_ports(|name| std::env::var(name).ok(), port).unwrap_or_else(|e| {
+    let services = services::Services::parse(std::env::var("HEARTH_SERVICES").ok()).unwrap_or_else(|e| {
         eprintln!("fatal: {e}");
         std::process::exit(1);
     });
+    let own = ports::legacy_ports(|name| std::env::var(name).ok(), port, |service| services.has(service))
+        .unwrap_or_else(|e| {
+            eprintln!("fatal: {e}");
+            std::process::exit(1);
+        });
     // `HEARTH_PUBLIC_BASE_URL` gives a service the prefix it is mounted under. A service with a listener of
     // its own keeps the origin its own `PUBLIC_BASE_URL` names, as its old container did, so it gets none.
     let mount =
         |service: Service, name: &'static str| (!own.iter().any(|(s, _)| *s == service)).then_some(name);
     #[allow(unused_mut)]
-    let mut reel = env::scoped("REEL_", mount(Service::Reel, "reel"), den_reel::Config::from_env);
+    let mut reel = services
+        .has(Service::Reel)
+        .then(|| env::scoped("REEL_", mount(Service::Reel, "reel"), den_reel::Config::from_env));
     #[allow(unused_mut)]
-    let mut subs = env::scoped("SUBS_", mount(Service::Subs, "subs"), den_subtitles::Config::from_env);
-    let mut remux = env::scoped("REMUX_", None, den_remux::Config::from_env);
+    let mut subs = services
+        .has(Service::Subs)
+        .then(|| env::scoped("SUBS_", mount(Service::Subs, "subs"), den_subtitles::Config::from_env));
+    let mut remux =
+        services.has(Service::Remux).then(|| env::scoped("REMUX_", None, den_remux::Config::from_env));
     // This reserved origin never leaves the process. Remux still applies its ordinary origin SSRF guards, then
     // `inproc` serves only the combined addon's Scout and Subtitles resource slices for it.
-    if !remux.scout_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
-        remux.scout_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
-    }
-    if !remux.subtitle_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
-        remux.subtitle_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
+    if services.playback() {
+        let remux = remux.as_mut().expect("playback selection has remux");
+        if !remux.scout_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
+            remux.scout_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
+        }
+        if !remux.subtitle_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
+            remux.subtitle_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
+        }
     }
     #[cfg(feature = "stub-upstreams")]
-    stub_upstreams(&mut reel, &mut subs);
+    if let (Some(reel), Some(subs)) = (&mut reel, &mut subs) {
+        stub_upstreams(reel, subs);
+    }
     let scout_settings =
         || den_scout::deps::settings_from_env(|name| std::env::var(name).unwrap_or_default());
-    let scout_mount = env::scoped("SCOUT_", Some("scout"), scout_settings);
-    let mut scout_own = env::scoped("SCOUT_", None, scout_settings);
+    let scout_mount =
+        services.has(Service::Scout).then(|| env::scoped("SCOUT_", Some("scout"), scout_settings));
+    let mut scout_own = services.has(Service::Scout).then(|| env::scoped("SCOUT_", None, scout_settings));
     // The startup line names the port Scout answers on.
     let scout_port = own.iter().find(|(s, _)| *s == Service::Scout).map(|(_, p)| *p);
-    if let Some(p) = scout_port {
-        scout_own.port = p.to_string();
-    } else {
-        scout_own.port = format!("{port}/scout");
+    if let Some(scout_own) = scout_own.as_mut() {
+        if let Some(p) = scout_port {
+            scout_own.port = p.to_string();
+        } else {
+            scout_own.port = format!("{port}/scout");
+        }
     }
-    let scout_bases = inproc::scout_bases(
-        port,
-        scout_port,
-        std::env::var("HEARTH_PUBLIC_BASE_URL").ok().as_deref(),
-        &scout_own.public_url,
-    );
+    let scout_bases = if services.has(Service::Scout) {
+        inproc::scout_bases(
+            port,
+            scout_port,
+            std::env::var("HEARTH_PUBLIC_BASE_URL").ok().as_deref(),
+            &scout_own.as_ref().expect("selected Scout has settings").public_url,
+        )
+    } else {
+        Vec::new()
+    };
 
     // Scout's key as Scout reads it: the Den addon's ring is derived from it when it has none of its own.
     let den = den::Den::from_env(
         |name| std::env::var(name).unwrap_or_default(),
-        &scout_own.config_key,
-        &scout_own.config_keys_prev,
+        scout_own.as_ref().map_or("", |settings| settings.config_key.as_str()),
+        scout_own.as_ref().map_or("", |settings| settings.config_keys_prev.as_str()),
     );
 
     let metrics_token = std::env::var("HEARTH_METRICS_TOKEN")
         .or_else(|_| std::env::var("METRICS_TOKEN"))
         .ok()
         .filter(|token| !token.is_empty());
-    let managed_playback = std::env::var("HEARTH_MANAGED_PLAYBACK")
-        .ok()
-        .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
+    let managed_playback = services.playback()
+        && std::env::var("HEARTH_MANAGED_PLAYBACK")
+            .ok()
+            .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
@@ -658,6 +739,7 @@ fn main() {
         scout_bases,
         metrics_token,
         managed_playback,
+        services,
     };
     if let Err(e) = rt.block_on(run(configs)) {
         eprintln!("fatal: {e}");
@@ -691,10 +773,10 @@ mod tests {
             s
         };
         Hearth::new(
-            den_reel::AppState::new(den_reel::Config::from_env()),
-            den_subtitles::AppState::new(den_subtitles::Config::from_env()),
-            den_remux::AppState::new(den_remux::Config::from_env()),
-            scout::Scout::new(settings(), settings(), &den.scout),
+            Some(den_reel::AppState::new(den_reel::Config::from_env())),
+            Some(den_subtitles::AppState::new(den_subtitles::Config::from_env())),
+            Some(den_remux::AppState::new(den_remux::Config::from_env())),
+            Some(scout::Scout::new(settings(), settings(), &den.scout)),
             den,
             limits,
             options,
@@ -703,6 +785,24 @@ mod tests {
 
     fn hearth() -> Arc<Hearth> {
         hearth_with(Limits::default(), None)
+    }
+
+    fn scout_only() -> Arc<Hearth> {
+        let settings = || {
+            let mut settings = den_scout::deps::settings_from_env(|_| String::new());
+            settings.cache_dir = String::new();
+            settings
+        };
+        let den = den::Den::new(None, false, Default::default(), None, "none");
+        Hearth::new(
+            None,
+            None,
+            None,
+            Some(scout::Scout::new(settings(), settings(), &den.scout)),
+            den,
+            Limits::default(),
+            Options::default(),
+        )
     }
 
     async fn send_on(hearth: &Arc<Hearth>, own: Option<Service>, path: &str) -> Response<Body> {
@@ -744,6 +844,21 @@ mod tests {
         assert_eq!(parsed_or("PORT", Some("9000".into()), 8090u16), 9000);
         assert_eq!(parsed_or("PORT", Some("http".into()), 8090u16), 8090);
         assert_eq!(parsed_or("HEARTH_WORKER_THREADS", Some("-1".into()), 2usize), 2);
+    }
+
+    #[tokio::test]
+    async fn a_scout_only_node_hides_other_routes_and_reports_only_scout() {
+        let node = scout_only();
+        let health = send(&node, "/health").await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let health = json_of(health).await;
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["services"].as_object().unwrap().keys().collect::<Vec<_>>(), ["scout"]);
+
+        for path in ["/reel/health", "/subs/health", "/remux/health", "/den/manifest.json"] {
+            assert_eq!(send(&node, path).await.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(send(&node, "/scout/manifest.json").await.status(), StatusCode::OK);
     }
 
     /// Scout's header ceiling (Go's MaxHeaderBytes) holds under `/scout` too, not only on its own port.

@@ -47,7 +47,12 @@ impl TieredCache {
     /// Opening walks the directory once: that builds the index and reclaims what expired while the process was down
     /// (a redeploy is the likeliest moment for a backlog), so `sweep_every` does not repeat it at startup.
     pub fn new(max_bytes: usize, dir: &Path) -> TieredCache {
-        TieredCache::open(max_bytes, dir, None)
+        TieredCache::open(max_bytes, 256 << 20, dir, None)
+    }
+
+    /// Build the two tiers with independent memory and durable byte budgets.
+    pub fn new_with_disk_bytes(memory_bytes: usize, disk_bytes: usize, dir: &Path) -> TieredCache {
+        TieredCache::open(memory_bytes, disk_bytes, dir, None)
     }
 
     /// `new` reading time from `clock` in both tiers from the first walk on, so a replay can run days of traffic in
@@ -58,10 +63,15 @@ impl TieredCache {
         dir: &Path,
         clock: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
     ) -> TieredCache {
-        TieredCache::open(max_bytes, dir, Some(clock))
+        TieredCache::open(max_bytes, 256 << 20, dir, Some(clock))
     }
 
-    fn open(max_bytes: usize, dir: &Path, clock: Option<den_cache::Clock>) -> TieredCache {
+    fn open(
+        memory_bytes: usize,
+        disk_bytes: usize,
+        dir: &Path,
+        clock: Option<den_cache::Clock>,
+    ) -> TieredCache {
         // Files are `<expiry>\n<value>` from earlier releases and `<expiry> <len>\n<value>` from this one; both are read.
         let options = Options {
             dir: Some(dir.to_path_buf()),
@@ -70,7 +80,8 @@ impl TieredCache {
             accept_unframed: true,
             log: emit,
             clock,
-            ..Options::new(max_bytes)
+            disk_bytes: i64::try_from(disk_bytes).unwrap_or(i64::MAX),
+            ..Options::new(memory_bytes)
         };
         TieredCache { inner: den_cache::Cache::new(options) }
     }

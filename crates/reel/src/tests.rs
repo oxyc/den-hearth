@@ -1820,6 +1820,8 @@ async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
     assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
     assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
     assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
+    assert!(page.contains(r#"fetch(addonBase() + "/config-key""#), "the config key loses the Hearth mount");
+    assert!(page.contains("location.origin + addonBase()"), "the install URL loses the Hearth mount");
     assert!(page.contains(r#"<code id="iid"></code>"#), "the page has nowhere to show the install id");
     assert!(page.contains("iidEl.textContent = install.iid"), "the built link's install id is not shown");
     assert!(page.contains("REVOKED_INSTALLS</code> to revoke just this link"), "the id is not explained");

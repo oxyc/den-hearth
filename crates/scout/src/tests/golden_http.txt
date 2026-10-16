@@ -16,9 +16,9 @@
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: public, max-age=3600, stale-while-revalidate=600
 < content-type: text/html; charset=utf-8
-< etag: "3f92e2860fade9ef"
+< etag: "7c2a4dd26fbc60e4"
 < timing-allow-origin: *
-<html: 127400 bytes, FNV-1a-64 3f92e2860fade9ef>
+<html: 127783 bytes, FNV-1a-64 7c2a4dd26fbc60e4>
 
 == configure revalidated
 > GET /configure
@@ -957,9 +957,9 @@
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: public, max-age=3600, stale-while-revalidate=600
 < content-type: text/html; charset=utf-8
-< etag: "3f92e2860fade9ef"
+< etag: "7c2a4dd26fbc60e4"
 < timing-allow-origin: *
-<html: 127400 bytes, FNV-1a-64 3f92e2860fade9ef>
+<html: 127783 bytes, FNV-1a-64 7c2a4dd26fbc60e4>
 
 == bad key: manifest
 > GET /manifest.json

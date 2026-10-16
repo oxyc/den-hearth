@@ -37,6 +37,9 @@ starting it again: both listen on :8080, so only one runs at a time. Nothing ins
 
 ## Run
 
+For a ready-to-use Docker Compose deployment, selective services, persistent cache defaults, LAN HTTP Chromecast
+setup, HTTPS options, and Mac/Raspberry Pi notes, see **[Self-host den-hearth](selfhost/README.md)**.
+
 ```
 cargo run -p den-hearth        # listens on :8090, and on the four ports below
 ```
@@ -202,6 +205,10 @@ itself: a request to that host on Scout's port is answered in process and never 
 
 ## Configuration
 
+`HEARTH_SERVICES` is a comma-separated subset of `scout`, `reel`, `subs`, and `remux` (or `all`). It defaults to
+`all` for compatibility. Unselected services are not initialised or exposed and are omitted from `/health`.
+The combined `/den` addon requires Scout, Reel, and Subtitles; managed playback additionally requires Remux.
+
 The allocator is jemalloc with its purge tuning compiled in (`crates/hearth/src/alloc.rs`; the startup line
 `allocator: ...` shows what is in force); `_RJEM_MALLOC_CONF` (jemalloc's `MALLOC_CONF`, prefixed) overrides it.
 
@@ -215,12 +222,12 @@ SCOUT_CACHE_DIR=/cache/scout REEL_CACHE_DIR=/cache/reel   SUBS_CACHE_DIR=/cache/
 SCOUT_METRICS_TOKEN=...      REEL_METRICS_TOKEN=...       SUBS_METRICS_TOKEN=...
 ```
 
-The prefixes are `SCOUT_*`, `REEL_*`, `SUBS_*` and `REMUX_*`; `HEARTH_*` (`HEARTH_WORKER_THREADS`,
-`HEARTH_PUBLIC_BASE_URL`, `HEARTH_<SERVICE>_PORT`) is hearth's own, and `PORT` is hearth's alone. The image sets these,
+The prefixes are `SCOUT_*`, `REEL_*`, `SUBS_*` and `REMUX_*`; `HEARTH_*` (`HEARTH_SERVICES`,
+`HEARTH_WORKER_THREADS`, `HEARTH_PUBLIC_BASE_URL`, `HEARTH_<SERVICE>_PORT`) is hearth's own, and `PORT` is hearth's alone. The image sets these,
 which a deploy overrides as needed:
 
 ```
-SCOUT_CACHE_DIR=/cache/scout
+SCOUT_CACHE_DIR=/cache/scout  SCOUT_MEMORY_CACHE_BYTES=50331648  SCOUT_DISK_CACHE_BYTES=268435456
 REEL_CACHE_DIR=/cache/reel      REEL_FFMPEG_PATH=/usr/bin/ffmpeg  REEL_YTDLP_PATH=/usr/local/bin/yt-dlp
 REEL_YTDLP_WORKER=/app/resolve.py   REEL_MAX_HEIGHT=1080
 REEL_YOUTUBEI_WORKER=/app/youtubei/main.mjs   REEL_DENO_PATH=/usr/local/bin/deno

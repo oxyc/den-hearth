@@ -39,6 +39,8 @@ pub struct Settings {
     pub indexer_urls: HashMap<Indexer, String>,
     /// Byte budget for the in-memory cache.
     pub cache_bytes: usize,
+    /// Byte budget for the durable cache.
+    pub disk_cache_bytes: usize,
     /// Where the durable tier writes. Empty disables persistence.
     pub cache_dir: String,
     /// Metadata source for the year mistag filter (default: public Cinemeta).
@@ -139,6 +141,7 @@ pub fn settings_from_env(get: impl Fn(&str) -> String) -> Settings {
         public_url: get("PUBLIC_BASE_URL"),
         indexer_urls: urls,
         cache_bytes: int_env(&get("MEMORY_CACHE_BYTES"), 48 << 20), // 48 MiB
+        disk_cache_bytes: int_env(&get("DISK_CACHE_BYTES"), 256 << 20), // 256 MiB
         cache_dir: or_default(
             get("CACHE_DIR"),
             &std::env::temp_dir().join("den-scout-cache").to_string_lossy(),
