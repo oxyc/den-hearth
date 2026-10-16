@@ -212,8 +212,8 @@ impl SourceGuard {
     }
 }
 
-/// A scout base URL a browser handed over, accepted only as `<allowed origin>/<config>`: an origin in
-/// `SCOUT_ORIGINS`, exactly one path segment of base64url (den-scout's sealed config alphabet), and no
+/// A scout base URL a browser handed over, accepted only as `<allowed origin>/<config>` for legacy Scout or
+/// `<allowed origin>/den/<config>` for Hearth: an origin in `SCOUT_ORIGINS`, one base64url config segment, and no
 /// credentials, query or fragment. This is the SSRF guard — without it a logged-in browser could make
 /// this service fetch any URL on the LAN. Returns the normalised base.
 pub fn validate_scoped(url: &str, origins: &[String]) -> Result<String, &'static str> {
@@ -224,7 +224,7 @@ pub fn validate_scoped(url: &str, origins: &[String]) -> Result<String, &'static
         return Err("a query or fragment");
     }
     let (scheme, rest) = url.split_once("://").ok_or("not an absolute URL")?;
-    let (authority, config) = rest.split_once('/').ok_or("no config segment")?;
+    let (authority, path) = rest.split_once('/').ok_or("no config segment")?;
     if authority.contains('@') {
         return Err("credentials in the URL");
     }
@@ -232,11 +232,12 @@ pub fn validate_scoped(url: &str, origins: &[String]) -> Result<String, &'static
     if !origins.contains(&origin) {
         return Err("an origin not in SCOUT_ORIGINS");
     }
-    // One segment only: this also refuses a trailing slash and any further path.
+    let config = path.strip_prefix("den/").unwrap_or(path);
+    // One config segment only after the optional fixed Hearth mount: this also refuses a trailing slash/further path.
     if config.is_empty() || !config.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
         return Err("not a single base64url config segment");
     }
-    Ok(format!("{origin}/{config}"))
+    Ok(format!("{origin}/{path}"))
 }
 
 /// How scout is reached: in process when this service runs inside den-hearth beside the scout the URL names
@@ -598,6 +599,11 @@ mod tests {
             Ok("http://192.168.86.193:8080/abc".into()),
             "normalised"
         );
+        assert_eq!(
+            ok("http://192.168.86.193:8080/den/eyJ2IjoxfQ-_x"),
+            Ok("http://192.168.86.193:8080/den/eyJ2IjoxfQ-_x".into()),
+            "Hearth's one fixed mount preserves the same origin and segment boundary"
+        );
         for refused in [
             "http://192.168.86.193:8081/abc",          // another port
             "https://192.168.86.193:8080/abc",         // another scheme
@@ -607,6 +613,8 @@ mod tests {
             "http://192.168.86.193:8080/abc?x=1",      // query
             "http://192.168.86.193:8080/abc#f",        // fragment
             "http://192.168.86.193:8080/abc/stream",   // two segments
+            "http://192.168.86.193:8080/other/abc",    // only Hearth's fixed mount is admitted
+            "http://192.168.86.193:8080/den/abc/more", // Hearth plus more than one config segment
             "http://192.168.86.193:8080/abc/",         // trailing slash
             "http://192.168.86.193:8080/",             // no config
             "http://192.168.86.193:8080",              // no path at all
