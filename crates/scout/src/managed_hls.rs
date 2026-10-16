@@ -379,13 +379,18 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
     let url = reqwest::Url::parse(raw).map_err(|_| ManagedHlsError::UnsafeResponse)?;
     let host = url.host_str().ok_or(ManagedHlsError::UnsafeResponse)?;
     let cdn_label = host.strip_suffix(".tb-cdn.io").filter(|label| !label.is_empty());
+    let scrobbling: Vec<_> = url
+        .query_pairs()
+        .filter_map(|(name, value)| (name == "scrobbling_enabled").then_some(value))
+        .collect();
     let safe = url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
         && url.fragment().is_none()
         && url.port().is_none_or(|port| port == 443)
         && cdn_label.is_some()
-        && url.query_pairs().any(|(name, value)| name == "scrobbling_enabled" && value == "false");
+        && scrobbling.len() == 1
+        && scrobbling[0] == "false";
     safe.then_some(url).ok_or(ManagedHlsError::UnsafeResponse)
 }
 
@@ -649,7 +654,7 @@ mod tests {
 
     #[test]
     fn only_https_torbox_cdn_subdomains_are_accepted() {
-        let good = "https://a.tb-cdn.io/x.m3u8?token=x&scrobbling_enabled=false";
+        let good = "https://a.tb-cdn.io/x.m3u8?token=x&scrobbling_enabled=false&future=value";
         assert!(validate_hls_url(good).is_ok());
         for bad in [
             "http://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false",
@@ -660,6 +665,9 @@ mod tests {
             "https://a.tb-cdn.io:444/x.m3u8?scrobbling_enabled=false",
             "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false#fragment",
             "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true",
+            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false&scrobbling_enabled=false",
+            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true&scrobbling_enabled=false",
+            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false&scrobbling_enabled=true",
         ] {
             assert_eq!(validate_hls_url(bad), Err(ManagedHlsError::UnsafeResponse), "accepted {bad}");
         }
