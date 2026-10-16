@@ -379,18 +379,18 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
     let url = reqwest::Url::parse(raw).map_err(|_| ManagedHlsError::UnsafeResponse)?;
     let host = url.host_str().ok_or(ManagedHlsError::UnsafeResponse)?;
     let cdn_label = host.strip_suffix(".tb-cdn.io").filter(|label| !label.is_empty());
-    let scrobbling: Vec<_> = url
+    let mut scrobbling = url
         .query_pairs()
-        .filter_map(|(name, value)| (name == "scrobbling_enabled").then_some(value))
-        .collect();
+        .filter_map(|(name, value)| (name == "scrobbling_enabled").then_some(value));
+    let scrobbling_disabled =
+        scrobbling.next().is_some_and(|value| value == "false") && scrobbling.next().is_none();
     let safe = url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
         && url.fragment().is_none()
         && url.port().is_none_or(|port| port == 443)
         && cdn_label.is_some()
-        && scrobbling.len() == 1
-        && scrobbling[0] == "false";
+        && scrobbling_disabled;
     safe.then_some(url).ok_or(ManagedHlsError::UnsafeResponse)
 }
 
