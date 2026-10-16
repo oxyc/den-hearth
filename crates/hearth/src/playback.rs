@@ -30,6 +30,7 @@ pub const DEN_ADDON_BASE: &str = "http://den-hearth.invalid/den";
 const MAX_BODY: usize = 16 * 1024;
 const MAX_KEY: usize = 128;
 const MAX_RECORDS: usize = 256;
+const MAX_RECORDS_PER_OWNER: usize = 32;
 const REPLAY_FOR: Duration = Duration::from_secs(120);
 // Existing Remux may spend 60 s resolving, 30 s choosing and 20 s opening an already-started candidate. This
 // outer bound stops abandoned work without shortening that retained path.
@@ -58,6 +59,33 @@ struct Record {
     request: Bytes,
     gate: Arc<Mutex<()>>,
     completed: Option<(Instant, Snapshot)>,
+}
+
+#[derive(Debug)]
+enum ReservationError {
+    Conflict,
+    Busy,
+}
+
+fn reserve_record(
+    records: &mut HashMap<(String, String, String), Record>,
+    scope: &(String, String, String),
+    request: &Bytes,
+) -> Result<Arc<Mutex<()>>, ReservationError> {
+    if let Some(record) = records.get(scope) {
+        return if record.request == *request {
+            Ok(record.gate.clone())
+        } else {
+            Err(ReservationError::Conflict)
+        };
+    }
+    let owner_records = records.keys().filter(|(owner, _, _)| owner == &scope.0).count();
+    if owner_records >= MAX_RECORDS_PER_OWNER || records.len() >= MAX_RECORDS {
+        return Err(ReservationError::Busy);
+    }
+    let gate = Arc::new(Mutex::new(()));
+    records.insert(scope.clone(), Record { request: request.clone(), gate: gate.clone(), completed: None });
+    Ok(gate)
 }
 
 fn retain_live_records(records: &mut HashMap<(String, String, String), Record>, now: Instant) {
@@ -652,18 +680,14 @@ where
         let mut records = hearth.playback.records.lock().await;
         let now = Instant::now();
         retain_live_records(&mut records, now);
-        if let Some(record) = records.get(&scope) {
-            if record.request != canonical {
-                return refuse(StatusCode::CONFLICT, "idempotency_conflict", None, rid.as_deref());
+        match reserve_record(&mut records, &scope, &canonical) {
+            Ok(gate) => gate,
+            Err(ReservationError::Conflict) => {
+                return refuse(StatusCode::CONFLICT, "idempotency_conflict", None, rid.as_deref())
             }
-            record.gate.clone()
-        } else {
-            if records.len() >= MAX_RECORDS {
-                return refuse(StatusCode::TOO_MANY_REQUESTS, "playback_busy", Some("5"), rid.as_deref());
+            Err(ReservationError::Busy) => {
+                return refuse(StatusCode::TOO_MANY_REQUESTS, "playback_busy", Some("5"), rid.as_deref())
             }
-            let gate = Arc::new(Mutex::new(()));
-            records.insert(scope.clone(), Record { request: canonical, gate: gate.clone(), completed: None });
-            gate
         }
     };
     let _one = gate.lock().await;
@@ -818,6 +842,33 @@ mod tests {
             Some((Instant::now().checked_sub(REPLAY_FOR + Duration::from_secs(1)).unwrap(), response));
         retain_live_records(&mut records, Instant::now());
         assert!(records.is_empty(), "a stale signed answer is not retained");
+    }
+
+    #[test]
+    fn one_owner_cannot_consume_another_owner_s_replay_capacity() {
+        let mut records = HashMap::new();
+        let request = Bytes::from_static(b"same request");
+        for n in 0..MAX_RECORDS_PER_OWNER {
+            let scope = ("grant:one".to_string(), "install".to_string(), format!("attempt-{n}"));
+            assert!(reserve_record(&mut records, &scope, &request).is_ok());
+        }
+
+        let first = ("grant:one".to_string(), "install".to_string(), "attempt-0".to_string());
+        let replay =
+            reserve_record(&mut records, &first, &request).expect("an existing operation still replays");
+        assert!(Arc::ptr_eq(&replay, &records[&first].gate));
+        assert!(matches!(
+            reserve_record(
+                &mut records,
+                &("grant:one".to_string(), "install".to_string(), "one-too-many".to_string()),
+                &request,
+            ),
+            Err(ReservationError::Busy)
+        ));
+
+        let other = ("grant:two".to_string(), "install".to_string(), "attempt".to_string());
+        assert!(reserve_record(&mut records, &other, &request).is_ok());
+        assert!(records.contains_key(&other));
     }
 
     #[tokio::test]
