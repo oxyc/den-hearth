@@ -38,6 +38,8 @@ scout_debrid_calls_total{endpoint="controlqueued",outcome="ok"} 0
 scout_debrid_calls_total{endpoint="controlqueued",outcome="error"} 0
 scout_debrid_calls_total{endpoint="getqueued",outcome="ok"} 0
 scout_debrid_calls_total{endpoint="getqueued",outcome="error"} 0
+scout_debrid_calls_total{endpoint="createstream",outcome="ok"} 0
+scout_debrid_calls_total{endpoint="createstream",outcome="error"} 0
 # HELP scout_debrid_calls_avoided_total Debrid API calls avoided by coordination or request policy.
 # TYPE scout_debrid_calls_avoided_total counter
 scout_debrid_calls_avoided_total{reason="availability_default"} 0

@@ -252,6 +252,7 @@ fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
     let mut text = String::with_capacity(4096);
     hearth.admission.render(&mut text);
     hearth.media.render(&mut text);
+    hearth.playback.render(&mut text);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -905,6 +906,8 @@ mod tests {
             "den_hearth_connection_admission_waited_total",
             "den_hearth_media_active{class=\"remux\"}",
             "den_hearth_media_refused_total{class=\"reel\"}",
+            "den_hearth_playback_managed_prepare_total{outcome=\"timeout\"}",
+            "den_hearth_playback_operation_total{outcome=\"replay\"}",
         ] {
             assert!(text.contains(needle), "{needle}\n{text}");
         }
