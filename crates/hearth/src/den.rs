@@ -402,11 +402,9 @@ pub fn manifest(install: Option<&Install>) -> Value {
             let offered: Vec<&str> = install.members.iter().map(|slice| offers(slice)).collect();
             format!("Den Hearth: {} from your own node.", offered.join(", "))
         }
-        None => {
-            "Den Hearth: streams through your debrid account, subtitles and trailers — configure \
+        None => "Den Hearth: streams through your debrid account, subtitles and trailers — configure \
                  to choose which."
-                .to_owned()
-        }
+            .to_owned(),
     };
     let mut manifest = json!({
         "id": "com.den.hearth",
