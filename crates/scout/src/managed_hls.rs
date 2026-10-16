@@ -385,10 +385,15 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
     let torbox_cdn = MANAGED_HLS_CDN_SUFFIXES
         .iter()
         .any(|suffix| host.strip_suffix(suffix).is_some_and(|label| !label.is_empty()));
+    // `scrobbling_enabled` is an input to createstream and a field in its JSON response, both of which we
+    // require to be false. TorBox's signed HLS URL sometimes repeats it and sometimes omits it. Treat omission
+    // as safe, but never accept a URL that explicitly enables it or contains ambiguous duplicate values.
     let mut scrobbling =
         url.query_pairs().filter_map(|(name, value)| (name == "scrobbling_enabled").then_some(value));
-    let scrobbling_disabled =
-        scrobbling.next().is_some_and(|value| value == "false") && scrobbling.next().is_none();
+    let scrobbling_safe = match scrobbling.next() {
+        None => true,
+        Some(value) => value == "false" && scrobbling.next().is_none(),
+    };
     let reason = if url.scheme() != "https" {
         Some("not_https")
     } else if !url.username().is_empty() || url.password().is_some() {
@@ -399,7 +404,7 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
         Some("nonstandard_port")
     } else if !torbox_cdn {
         Some("unrecognized_cdn")
-    } else if !scrobbling_disabled {
+    } else if !scrobbling_safe {
         Some("scrobbling_flag")
     } else {
         None
@@ -555,6 +560,10 @@ mod tests {
         assert!(!format!("{wrapped:?}").contains("token="));
 
         let mut changed: serde_json::Value = serde_json::from_slice(SUCCESS).unwrap();
+        changed["data"]["hls_url"] =
+            serde_json::json!("https://flux-002.wnam.tb-cdn.io/opaque/index.m3u8?token=secret");
+        assert!(parse_success(&serde_json::to_vec(&changed).unwrap()).is_ok());
+
         changed["data"]["scrobbling_enabled"] = serde_json::Value::Bool(true);
         assert_eq!(
             parse_success(&serde_json::to_vec(&changed).unwrap()),
@@ -571,8 +580,7 @@ mod tests {
     #[test]
     fn every_published_torbox_managed_stream_domain_is_accepted() {
         for suffix in MANAGED_HLS_CDN_SUFFIXES {
-            let raw =
-                format!("https://flux-002.wnam{suffix}/playlist.m3u8?token=secret&scrobbling_enabled=false");
+            let raw = format!("https://flux-002.wnam{suffix}/playlist.m3u8?token=secret");
             let url = validate_hls_url(&raw).unwrap_or_else(|error| panic!("{suffix}: {error:?}"));
             assert_eq!(url.host_str(), Some(format!("flux-002.wnam{suffix}").as_str()));
         }
@@ -746,8 +754,12 @@ mod tests {
 
     #[test]
     fn only_https_torbox_cdn_subdomains_are_accepted() {
-        let good = "https://a.tb-cdn.io/x.m3u8?token=x&scrobbling_enabled=false&future=value";
-        assert!(validate_hls_url(good).is_ok());
+        for good in [
+            "https://a.tb-cdn.io/x.m3u8?token=x&future=value",
+            "https://a.tb-cdn.io/x.m3u8?token=x&scrobbling_enabled=false&future=value",
+        ] {
+            assert!(validate_hls_url(good).is_ok(), "refused {good}");
+        }
         for bad in [
             "http://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false",
             "https://tb-cdn.io/x.m3u8?scrobbling_enabled=false",
