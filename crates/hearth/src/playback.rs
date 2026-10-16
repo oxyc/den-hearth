@@ -84,10 +84,7 @@ fn reserve_record(
         return Err(ReservationError::Busy);
     }
     let gate = Arc::new(Mutex::new(()));
-    records.insert(
-        scope.clone(),
-        Record { request: request.clone(), gate: gate.clone(), completed: None },
-    );
+    records.insert(scope.clone(), Record { request: request.clone(), gate: gate.clone(), completed: None });
     Ok(gate)
 }
 
@@ -857,7 +854,8 @@ mod tests {
         }
 
         let first = ("grant:one".to_string(), "install".to_string(), "attempt-0".to_string());
-        let replay = reserve_record(&mut records, &first, &request).expect("an existing operation still replays");
+        let replay =
+            reserve_record(&mut records, &first, &request).expect("an existing operation still replays");
         assert!(Arc::ptr_eq(&replay, &records[&first].gate));
         assert!(matches!(
             reserve_record(
