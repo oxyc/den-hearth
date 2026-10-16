@@ -619,9 +619,22 @@ mod tests {
             1,
             "guest bridge marker must be exact and unique"
         );
+        let injected = page.replacen(
+            GUEST_CONTEXT_MARKER,
+            r#"{"v":2,"base":"/den/~deadbeef","saveUrl":"/den/~deadbeef/config"}"#,
+            1,
+        );
+        assert!(!injected.contains(GUEST_CONTEXT_MARKER));
+        assert!(injected.contains(
+            r#"var DEN_GUEST_CONTEXT = {"v":2,"base":"/den/~deadbeef","saveUrl":"/den/~deadbeef/config"};"#
+        ));
         for needle in [
-            "DEN_GUEST_CONTEXT.v === 1",
+            "DEN_GUEST_CONTEXT.v === 2",
             "if (DEN_GUEST === false)",
+            "if (DEN_GUEST !== null) $(\"go\").disabled = true",
+            "if (!sealPublicKey || !window.DenSeal)",
+            "if (DEN_GUEST && (!segment || !lastBuildSealed))",
+            "Nothing was saved.",
             "denFetch(DEN_GUEST.saveUrl",
             "JSON.stringify({ install: segment })",
             "location.origin + DEN_GUEST.base + \"/manifest.json\"",
@@ -629,8 +642,31 @@ mod tests {
         ] {
             assert!(page.contains(needle), "the guest bridge no longer has: {needle}");
         }
+        for forbidden in ["x-den-grant", "DEN_GUEST_CONTEXT.claim"] {
+            assert!(!page.contains(forbidden), "the cookie-authenticated page exposed {forbidden}");
+        }
         for slice in SLICES {
             assert!(page.contains(&format!("{slice}: collect")), "{slice}");
         }
+    }
+
+    #[test]
+    fn the_guest_bridge_requires_sealing_before_saving() {
+        let page = include_str!("den_configure.html");
+        let at =
+            |needle: &str| page.find(needle).unwrap_or_else(|| panic!("missing guest invariant: {needle}"));
+
+        assert!(
+            at("if (DEN_GUEST !== null) $(\"go\").disabled = true") < at("denFetch(BASE + \"/config-key\"")
+        );
+        assert!(at("if (!sealPublicKey || !window.DenSeal)") < at("$(\"go\").disabled = false"));
+        assert!(at("if (DEN_GUEST && (!segment || !lastBuildSealed))") < at("denFetch(DEN_GUEST.saveUrl"));
+        assert!(
+            at("if (!r.ok) throw new Error(\"save failed\")")
+                < at("location.origin + DEN_GUEST.base + \"/manifest.json\"")
+        );
+        assert!(
+            page.contains("if (DEN_GUEST !== null) {\n      lastBuildSealed = false;\n      return null;")
+        );
     }
 }

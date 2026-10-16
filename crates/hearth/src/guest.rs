@@ -213,7 +213,14 @@ fn operation_request(headers: &hyper::HeaderMap, operation: Operation) -> Option
     .ok()?;
     let body = operation.body.and_then(|value| serde_json::to_vec(&value).ok()).unwrap_or_default();
     let mut request = Request::builder().method(method).uri(uri);
-    for name in ["idempotency-key", "x-request-id", "x-forwarded-for", "x-den-public-session"] {
+    for name in [
+        "idempotency-key",
+        "x-request-id",
+        "x-forwarded-for",
+        "x-den-public-session",
+        "x-den-playback-finalize",
+        "x-den-playback-finalization",
+    ] {
         if let Some(value) = headers.get(name) {
             request = request.header(name, value);
         }
