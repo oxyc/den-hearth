@@ -3420,7 +3420,7 @@ function fillForm(s) {
   // epoch raised a minute ago is not read from a five-minute-old copy.
   var sealPublicKey = null;
   var configEpoch = 0;
-  fetch("/config-key", { cache: "no-cache" })
+  fetch(addonBase() + "/config-key", { cache: "no-cache" })
     .then(function (r) {
       return r.json().then(function (j) {
         if (r.ok && j.key) sealPublicKey = j.key;
@@ -3487,6 +3487,12 @@ function fillForm(s) {
     setTimeout(function () { btn.textContent = label; }, 1500);
   }
 
+  // The page may be served at the legacy root or below Hearth's /subs mount.
+  function addonBase() {
+    var path = location.pathname.replace(/\/+$/, "");
+    return path.endsWith("/configure") ? path.slice(0, -10) : path;
+  }
+
   function build() {
     var config = collectConfig(); // page-specific; returns null (and focuses the bad field) if invalid
     if (!config) return;
@@ -3494,7 +3500,7 @@ function fillForm(s) {
     // Stamped after saving, so every build is a new install: a rebuilt link never shares an id with
     // the one it replaces, and revoking either leaves the other alone.
     var install = Object.assign({}, config, { iid: mintInstallId(), ep: configEpoch });
-    $("url").value = location.origin + "/" + toSegment(install) + "/manifest.json";
+    $("url").value = location.origin + addonBase() + "/" + toSegment(install) + "/manifest.json";
     $("installId").textContent = install.iid;
     $("out").classList.remove("hidden");
     renderSecurityNote();

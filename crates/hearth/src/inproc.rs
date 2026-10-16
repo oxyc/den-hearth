@@ -75,6 +75,9 @@ pub fn scout_bases(
 
 /// Serve `bases` in process to Remux and Subtitles. Returns the bases that were taken, for the startup line.
 pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
+    if hearth.remux.is_none() && hearth.subs.is_none() {
+        return Vec::new();
+    }
     let mut local = den_http::Local::default();
     for base in bases {
         let weak = Arc::downgrade(hearth);
@@ -87,14 +90,20 @@ pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
     // The playback facade gives Remux a combined install. This base is deliberately narrower than routing a
     // request through `/den`: only Scout and Subtitles resource paths are reachable. The Scout service key is
     // stripped before Subtitles, so it can never reach another member of the combined addon.
-    let weak = Arc::downgrade(hearth);
-    let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call_den_scout(weak.clone(), req)));
-    if let Err(e) = local.add(crate::playback::DEN_ADDON_BASE, serve) {
-        eprintln!("scout in process: skipping playback facade base: {e}");
+    if hearth.scout.is_some() && hearth.reel.is_some() && hearth.subs.is_some() && hearth.remux.is_some() {
+        let weak = Arc::downgrade(hearth);
+        let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call_den_scout(weak.clone(), req)));
+        if let Err(e) = local.add(crate::playback::DEN_ADDON_BASE, serve) {
+            eprintln!("scout in process: skipping playback facade base: {e}");
+        }
     }
     let taken = local.bases().into_iter().map(str::to_string).collect();
-    let _ = hearth.remux.local_scout.set(local.clone());
-    let _ = hearth.subs.local_scout.set(local);
+    if let Some(remux) = &hearth.remux {
+        let _ = remux.local_scout.set(local.clone());
+    }
+    if let Some(subs) = &hearth.subs {
+        let _ = subs.local_scout.set(local);
+    }
     taken
 }
 
@@ -107,14 +116,18 @@ async fn call_den_scout(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Res
         let (mut parts, body) = req.into_parts();
         parts.headers.remove("x-den-remux-key");
         parts.extensions.insert(hearth.den.subs.clone());
-        return den_subtitles::handle_request(
-            hearth.subs.clone(),
-            Request::from_parts(parts, Full::new(body)),
-        )
-        .await;
+        return match &hearth.subs {
+            Some(subs) => {
+                den_subtitles::handle_request(subs.clone(), Request::from_parts(parts, Full::new(body))).await
+            }
+            None => den_http::not_found(),
+        };
     }
     if matches!(resource, Some("stream" | "play" | "account" | "availability")) {
-        return hearth.scout.serve_den(req.map(Full::new)).await;
+        return match &hearth.scout {
+            Some(scout) => scout.serve_den(req.map(Full::new)).await,
+            None => den_http::not_found(),
+        };
     }
     den_http::not_found()
 }
@@ -218,10 +231,10 @@ mod tests {
         };
         let den = crate::den::Den::new(None, false, Default::default(), None, "none");
         Hearth::new(
-            den_reel::AppState::new(den_reel::Config::from_env()),
-            den_subtitles::AppState::new(den_subtitles::Config::from_env()),
-            den_remux::AppState::new(den_remux::Config::from_env()),
-            crate::scout::Scout::new(settings(), settings(), &den.scout),
+            Some(den_reel::AppState::new(den_reel::Config::from_env())),
+            Some(den_subtitles::AppState::new(den_subtitles::Config::from_env())),
+            Some(den_remux::AppState::new(den_remux::Config::from_env())),
+            Some(crate::scout::Scout::new(settings(), settings(), &den.scout)),
             den,
             crate::Limits { admission, media: crate::media::Limits::default() },
             crate::Options::default(),
@@ -275,7 +288,7 @@ mod tests {
     }
 
     async fn in_process(hearth: &Arc<Hearth>, url: &str, key: Option<&str>) -> Answer {
-        let local = hearth.remux.local_scout.get().expect("installed");
+        let local = hearth.remux.as_ref().unwrap().local_scout.get().expect("installed");
         let resp = local.get(url, headers(key), 1 << 20).expect("served in process").await.unwrap();
         (resp.status().as_u16(), steady(resp.headers()), resp.into_body())
     }

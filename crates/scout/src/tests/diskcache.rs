@@ -361,6 +361,13 @@ fn tiered_cache_sweep_survives_a_write_failure() {
 // Measured before this: 429 KiB per entry with a max-size config, one build per second past the indexer
 // limiter, about 1.5 GB an hour. That mattered only once this tier had a writable volume to use.
 #[test]
+fn tiered_cache_accepts_an_independent_disk_budget() {
+    let dir = TempDir::new().unwrap();
+    let c = TieredCache::new_with_disk_bytes(1 << 20, 3 << 20, dir.path());
+    assert_eq!(c.max_bytes(), 3 << 20);
+}
+
+#[test]
 fn tiered_cache_sweep_enforces_a_byte_budget() {
     let dir = TempDir::new().unwrap();
     let c = TieredCache::new(1 << 20, dir.path());

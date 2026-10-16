@@ -775,6 +775,9 @@ async fn configure_page_shows_the_install_id() {
         "lastInstallID = config.iid;",
         r#"$("installId").textContent = lastInstallID;"#,
         "<code>REVOKED_INSTALLS</code> to revoke just this link",
+        r#"fetch(addonBase() + "/config-key""#,
+        r#"fetch(addonBase() + "/validate""#,
+        "location.origin + addonBase()",
     ] {
         assert!(page.contains(want), "configure page lacks {want:?}");
     }

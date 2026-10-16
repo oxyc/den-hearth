@@ -1,0 +1,28 @@
+# Portable, native-architecture image for a Scout-only node. The full Dockerfile intentionally carries the
+# amd64 media toolchain; Scout needs only the Rust binary and TLS roots.
+FROM rust:1-trixie AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p den-hearth
+
+FROM debian:trixie-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --user-group --create-home --home-dir /home/nonroot nonroot \
+    && install -d -o 65532 -g 65532 /cache/scout
+COPY --from=build /src/target/release/den-hearth /usr/local/bin/den-hearth
+
+ARG DEN_VERSION
+ENV DEN_VERSION=$DEN_VERSION \
+    HEARTH_SERVICES=scout \
+    SCOUT_CACHE_DIR=/cache/scout \
+    HEARTH_REEL_PORT=0 \
+    HEARTH_SUBS_PORT=0 \
+    HEARTH_REMUX_PORT=0
+VOLUME ["/cache"]
+EXPOSE 8090 8080
+HEALTHCHECK --interval=5m --timeout=5s --start-period=10s --retries=2 \
+  CMD ["python3", "-c", "import os,urllib.request as u; u.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8090')+'/health', timeout=4)"]
+USER 65532:65532
+ENTRYPOINT ["den-hearth"]

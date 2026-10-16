@@ -1,0 +1,6 @@
+services:
+  hearth:
+    devices:
+      - ${HEARTH_RENDER_DEVICE:-/dev/dri/renderD128}:${HEARTH_RENDER_DEVICE:-/dev/dri/renderD128}
+    group_add:
+      - ${HEARTH_RENDER_GID:?set HEARTH_RENDER_GID to the host render group id}

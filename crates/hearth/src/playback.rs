@@ -267,10 +267,11 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
 }
 
 fn trusted_edge(hearth: &Hearth, parts: &hyper::http::request::Parts) -> bool {
+    let remux = hearth.remux.as_ref().expect("playback requires Remux");
     let secret = parts.headers.get("x-den-edge-secret").map(HeaderValue::as_bytes);
-    let secret_ok = den_remux::edge_secret_ok(hearth.remux.cfg.edge_secret.as_deref(), secret);
+    let secret_ok = den_remux::edge_secret_ok(remux.cfg.edge_secret.as_deref(), secret);
     let peer = parts.extensions.get::<den_remux::Peer>().map(|p| p.0);
-    secret_ok && peer.is_some() && peer == hearth.remux.cfg.public_session_proxy
+    secret_ok && peer.is_some() && peer == remux.cfg.public_session_proxy
 }
 
 fn owner_scope(hearth: &Hearth, parts: &hyper::http::request::Parts) -> String {
@@ -551,7 +552,7 @@ async fn remux(
     parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     parts.headers.remove(CONTENT_LENGTH);
     let response = den_remux::handle_request(
-        hearth.remux.clone(),
+        hearth.remux.clone().expect("playback requires Remux"),
         Request::from_parts(parts, http_body_util::Full::new(Bytes::from(body))),
     )
     .await;
@@ -716,8 +717,11 @@ where
         if managed {
             if let Some(direct) = direct.as_ref() {
                 let started = Instant::now();
-                match tokio::time::timeout(MANAGED_PREPARE_TIMEOUT, hearth.scout.managed_hls(config, direct))
-                    .await
+                match tokio::time::timeout(
+                    MANAGED_PREPARE_TIMEOUT,
+                    hearth.scout.as_ref().expect("playback requires Scout").managed_hls(config, direct),
+                )
+                .await
                 {
                     Ok(Ok(result)) => {
                         hearth.playback.metrics.direct_ok.fetch_add(1, Relaxed);

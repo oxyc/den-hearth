@@ -747,6 +747,11 @@ mod tests {
         assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
         assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
         assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
+        assert!(
+            page.contains(r#"fetch(addonBase() + "/config-key""#),
+            "the config key loses the Hearth mount"
+        );
+        assert!(page.contains("location.origin + addonBase()"), "the install URL loses the Hearth mount");
     }
 
     /// The configured manifest names its install as `REVOKED_INSTALLS` spells it; a config without an

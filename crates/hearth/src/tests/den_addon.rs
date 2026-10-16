@@ -545,10 +545,10 @@ fn configured_hearth(den: Den, opensubtitles: &str) -> Arc<Hearth> {
     subs.os_api_base = opensubtitles.into();
     subs.public_base_url = Some("http://node.test/subs".into());
     Hearth::new(
-        den_reel::AppState::new(reel),
-        den_subtitles::AppState::new(subs),
-        den_remux::AppState::new(den_remux::Config::from_env()),
-        scout::Scout::new(settings(), settings(), &den.scout),
+        Some(den_reel::AppState::new(reel)),
+        Some(den_subtitles::AppState::new(subs)),
+        Some(den_remux::AppState::new(den_remux::Config::from_env())),
+        Some(scout::Scout::new(settings(), settings(), &den.scout)),
         den,
         Limits::default(),
         Options::default(),

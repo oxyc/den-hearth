@@ -1,0 +1,7 @@
+# Host-Caddy example: replace the hostname, set HEARTH_PUBLIC_BASE_URL to the same origin and HEARTH_BIND to
+# 127.0.0.1, point a DNS-only
+# record at this host, and forward 80/443. A LAN-only deployment should use DNS-01 plus split DNS instead; that
+# requires a Caddy build containing the DNS provider module for your provider.
+hearth.example.net {
+    reverse_proxy 127.0.0.1:8090
+}

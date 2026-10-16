@@ -1,0 +1,60 @@
+name: den-hearth
+
+services:
+  hearth:
+    image: ${HEARTH_IMAGE:-ghcr.io/oxyc/den-hearth:latest}
+    platform: ${HEARTH_PLATFORM:-linux/amd64}
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${HEARTH_BIND:-0.0.0.0}:${HEARTH_PORT:-8090}:8090"
+    env_file:
+      - ${HEARTH_ENV_FILE:-.env}
+    environment:
+      PORT: "8090"
+      HEARTH_SERVICES: ${HEARTH_SERVICES:-all}
+      # One public port is easier to proxy. Selected services live below /scout, /reel, /subs and /remux.
+      HEARTH_SCOUT_PORT: "0"
+      HEARTH_REEL_PORT: "0"
+      HEARTH_SUBS_PORT: "0"
+      HEARTH_REMUX_PORT: "0"
+      HEARTH_PUBLIC_BASE_URL: ${HEARTH_PUBLIC_BASE_URL:-}
+      HEARTH_WORKER_THREADS: ${HEARTH_WORKER_THREADS:-2}
+      SCOUT_CONFIG_KEY: ${SCOUT_CONFIG_KEY:-}
+      SCOUT_REMUX_KEY: ${SCOUT_REMUX_KEY:-}
+      SCOUT_MEMORY_CACHE_BYTES: ${SCOUT_MEMORY_CACHE_BYTES:-50331648}
+      SCOUT_DISK_CACHE_BYTES: ${SCOUT_DISK_CACHE_BYTES:-268435456}
+      SCOUT_METRICS_TOKEN: ${SCOUT_METRICS_TOKEN:-}
+      REEL_TMDB_KEY: ${REEL_TMDB_KEY:-}
+      REEL_CONFIG_KEY: ${REEL_CONFIG_KEY:-}
+      REEL_PLAY_SECRET: ${REEL_PLAY_SECRET:-}
+      REEL_CACHE_MAX_BYTES: ${REEL_CACHE_MAX_BYTES:-4294967296}
+      SUBS_CONFIG_KEY: ${SUBS_CONFIG_KEY:-}
+      SUBS_CACHE_MAX_BYTES: ${SUBS_CACHE_MAX_BYTES:-268435456}
+      REMUX_URL_KEY: ${REMUX_URL_KEY:-}
+      REMUX_SCOUT_KEY: ${SCOUT_REMUX_KEY:-}
+      REMUX_SCRATCH_MAX_BYTES: ${REMUX_SCRATCH_MAX_BYTES:-1073741824}
+      LOG_REQUESTS: ${LOG_REQUESTS:-1}
+      LOG_IDENTITY: ${LOG_IDENTITY:-0}
+    volumes:
+      - ${HEARTH_CACHE:-hearth-cache}:/cache
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /home/nonroot:size=64m,mode=0700,uid=65532,gid=65532
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request as u; u.urlopen('http://127.0.0.1:8090/health', timeout=4)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  hearth-cache:

@@ -33,6 +33,7 @@ fn settings_from_env() {
             && s.scrape_timeout == DEFAULT_TIMEOUT
             && s.list_ttl == DEFAULT_LIST_TTL
             && s.cache_bytes == 48 << 20
+            && s.disk_cache_bytes == 256 << 20
             && s.indexer_urls.is_empty(),
         "defaults: {s:?}"
     );
@@ -44,6 +45,7 @@ fn settings_from_env() {
         ("PUBLIC_BASE_URL", "https://scout.example"),
         ("MEDIAFUSION_URL", "https://mf.self/CONFIG/manifest.json"),
         ("MEMORY_CACHE_BYTES", "1048576"),
+        ("DISK_CACHE_BYTES", "2097152"),
         ("CACHE_DIR", "/cache"),
         ("CINEMETA_URL", "https://cinemeta.self"),
         ("CONFIG_KEY", "current-key"),
@@ -59,7 +61,8 @@ fn settings_from_env() {
             && s.public_url == "https://scout.example"
             && s.indexer_urls.get(&indexer("mediafusion")).map(String::as_str)
                 == Some("https://mf.self/CONFIG")
-            && s.cache_bytes == 1 << 20,
+            && s.cache_bytes == 1 << 20
+            && s.disk_cache_bytes == 2 << 20,
         "from env: {s:?}"
     );
     assert!(
