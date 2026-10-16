@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION};
@@ -14,10 +14,12 @@ use serde::Deserialize;
 use crate::cache::Cache;
 use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
+use crate::loglimit::log_limited;
+use crate::metrics::metrics;
 use crate::scrape::Doer;
 use crate::stores::refusal::{is_torrent_gone, refusal_is_about_the_account};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
-use crate::stores::ResolveTarget;
+use crate::stores::{ResolveTarget, StoreError};
 
 const CREATE_STREAM_URL: &str = "https://api.torbox.app/v1/api/stream/createstream";
 const CREATE_BODY_LIMIT: usize = 64 << 10;
@@ -31,8 +33,47 @@ pub enum ManagedHlsError {
     NotFound,
     /// The account was not authorized to create the stream.
     Refused,
+    /// TorBox rejected the API credential. Kept separate so the caller can tell the user to fix their key.
+    Authentication,
+    /// The account is valid but its plan does not permit managed streaming.
+    Entitlement,
+    /// TorBox asked this credential to wait. The shared transport also remembers and enforces the pause.
+    RateLimited { retry_after: Option<Duration> },
+    /// The request failed before TorBox returned an HTTP response.
+    Transport,
+    /// TorBox returned a response that did not match the documented/observed JSON contract.
+    MalformedResponse,
+    /// TorBox returned a URL outside the deliberately narrow HTTPS CDN allow-list.
+    UnsafeResponse,
+    /// The signed playlist could not be verified without following redirects or exceeding its strict bounds.
+    PlaylistUnavailable,
     /// TorBox, its answer, or the returned playlist was temporarily unusable.
     Unavailable,
+}
+
+impl ManagedHlsError {
+    /// Stable, non-secret detail suitable for an error response, metric label, or log line.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotFound => "torbox_item_not_found",
+            Self::Refused => "torbox_refused",
+            Self::Authentication => "torbox_authentication_failed",
+            Self::Entitlement => "torbox_managed_streaming_unavailable_for_plan",
+            Self::RateLimited { .. } => "torbox_rate_limited",
+            Self::Transport => "torbox_unreachable",
+            Self::MalformedResponse => "torbox_malformed_response",
+            Self::UnsafeResponse => "torbox_unsafe_stream_url",
+            Self::PlaylistUnavailable => "torbox_playlist_unavailable",
+            Self::Unavailable => "torbox_unavailable",
+        }
+    }
+
+    pub fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after } => retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Hearth's title-level managed-playback question. Provider identifiers deliberately do not appear here.
@@ -144,7 +185,11 @@ impl TorBoxManagedHls {
             cache: Some(self.cache.clone()),
             api: TORBOX_API.to_owned(),
         };
-        let (torrent_id, file_id) = store.prepare_managed_item(target).await.map_err(classify_store_error)?;
+        let (torrent_id, file_id) = store
+            .prepare_managed_item(target)
+            .await
+            .map_err(classify_store_error)
+            .map_err(report_resolution_failure)?;
 
         match self.create(token, torrent_id, file_id).await {
             Err(ManagedHlsError::NotFound) => {
@@ -161,23 +206,83 @@ impl TorBoxManagedHls {
         torrent_id: i64,
         file_id: Option<i64>,
     ) -> Result<ManagedHlsUrl, ManagedHlsError> {
-        let request = create_request(token, torrent_id, file_id)?;
-        let mut response =
-            self.create_client.do_request(request).await.map_err(|_| ManagedHlsError::Unavailable)?;
+        let request =
+            create_request(token, torrent_id, file_id).map_err(report_create_failure_without_status)?;
+        let mut response = match self.create_client.do_request(request).await {
+            Ok(response) => response,
+            Err(_) => {
+                metrics().torbox_call("createstream", false);
+                return Err(report_create_failure(ManagedHlsError::Transport, None));
+            }
+        };
         let status = response.status();
-        let body = read_capped(&mut response, CREATE_BODY_LIMIT).await?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ManagedHlsError::Refused);
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            metrics().torbox_call("createstream", false);
+            return Err(report_create_failure(ManagedHlsError::Authentication, Some(status)));
         }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            metrics().torbox_call("createstream", false);
+            return Err(report_create_failure(ManagedHlsError::Refused, Some(status)));
+        }
+        if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+            metrics().torbox_call("createstream", false);
+            return Err(report_create_failure(ManagedHlsError::Entitlement, Some(status)));
+        }
+        if let Some(throttle) = den_upstream::throttle(status, response.headers(), SystemTime::now()) {
+            let retry_after = match throttle {
+                den_upstream::Throttle::Stated(wait) => Some(wait),
+                den_upstream::Throttle::Unstated => None,
+            };
+            metrics().torbox_call("createstream", false);
+            return Err(report_create_failure(ManagedHlsError::RateLimited { retry_after }, Some(status)));
+        }
+        let body = read_capped(&mut response, CREATE_BODY_LIMIT).await.map_err(|_| {
+            metrics().torbox_call("createstream", false);
+            report_create_failure(ManagedHlsError::MalformedResponse, Some(status))
+        })?;
         if status != reqwest::StatusCode::OK {
-            return Err(classify_failure(&body));
+            metrics().torbox_call("createstream", false);
+            return Err(report_create_failure(classify_failure(&body), Some(status)));
         }
 
-        let url = parse_success(&body)?;
-        probe_playlist(&self.probe_client, &url).await?;
+        let url = parse_success(&body).map_err(|error| {
+            metrics().torbox_call("createstream", false);
+            report_create_failure(error, Some(status))
+        })?;
+        metrics().torbox_call("createstream", true);
+        probe_playlist(&self.probe_client, &url).await.map_err(report_probe_failure)?;
         Ok(ManagedHlsUrl(url))
     }
+}
+
+fn report_create_failure(error: ManagedHlsError, status: Option<reqwest::StatusCode>) -> ManagedHlsError {
+    let status = status.map_or_else(|| "none".to_owned(), |status| status.as_u16().to_string());
+    let retry = error.retry_after().map_or_else(|| "none".to_owned(), |wait| wait.as_secs().to_string());
+    log_limited(
+        error.code(),
+        &format!(
+            "managed HLS: TorBox createstream failed: cause={} http_status={status} retry_after_seconds={retry}",
+            error.code()
+        ),
+    );
+    error
+}
+
+fn report_create_failure_without_status(error: ManagedHlsError) -> ManagedHlsError {
+    report_create_failure(error, None)
+}
+
+fn report_probe_failure(error: ManagedHlsError) -> ManagedHlsError {
+    log_limited(error.code(), &format!("managed HLS: TorBox playlist probe failed: cause={}", error.code()));
+    error
+}
+
+fn report_resolution_failure(error: ManagedHlsError) -> ManagedHlsError {
+    log_limited(
+        error.code(),
+        &format!("managed HLS: TorBox item preparation failed: cause={}", error.code()),
+    );
+    error
 }
 
 #[async_trait]
@@ -194,8 +299,16 @@ impl ManagedHlsResolver for TorBoxManagedHls {
 fn classify_store_error(error: crate::stores::StoreError) -> ManagedHlsError {
     if is_torrent_gone(&error) {
         ManagedHlsError::NotFound
+    } else if matches!(
+        &error,
+        StoreError::Unavailable(unavailable) | StoreError::ScoutSide(unavailable)
+            if unavailable.status == 429
+    ) {
+        ManagedHlsError::RateLimited { retry_after: None }
     } else if refusal_is_about_the_account(&error) {
-        ManagedHlsError::Refused
+        ManagedHlsError::Authentication
+    } else if matches!(error, StoreError::Cancelled) {
+        ManagedHlsError::Transport
     } else {
         ManagedHlsError::Unavailable
     }
@@ -244,20 +357,27 @@ struct CreateData {
 fn parse_success(body: &[u8]) -> Result<reqwest::Url, ManagedHlsError> {
     // from_slice consumes exactly one complete JSON document. Unknown response fields remain additive, but
     // every field this adapter relies on must be present with the observed type and value.
-    let answer: CreateEnvelope = serde_json::from_slice(body).map_err(|_| ManagedHlsError::Unavailable)?;
+    let answer: CreateEnvelope =
+        serde_json::from_slice(body).map_err(|_| ManagedHlsError::MalformedResponse)?;
+    if !answer.success {
+        return Err(match answer.error.as_deref() {
+            Some("ITEM_NOT_FOUND") => ManagedHlsError::NotFound,
+            _ => ManagedHlsError::Unavailable,
+        });
+    }
     let data = answer
         .data
         .filter(|_| answer.success && answer.error.is_none())
-        .ok_or(ManagedHlsError::Unavailable)?;
+        .ok_or(ManagedHlsError::MalformedResponse)?;
     if data.audio_index != 0 || data.subtitle_index != "null" || data.scrobbling_enabled {
-        return Err(ManagedHlsError::Unavailable);
+        return Err(ManagedHlsError::MalformedResponse);
     }
     validate_hls_url(&data.hls_url)
 }
 
 fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
-    let url = reqwest::Url::parse(raw).map_err(|_| ManagedHlsError::Unavailable)?;
-    let host = url.host_str().ok_or(ManagedHlsError::Unavailable)?;
+    let url = reqwest::Url::parse(raw).map_err(|_| ManagedHlsError::UnsafeResponse)?;
+    let host = url.host_str().ok_or(ManagedHlsError::UnsafeResponse)?;
     let cdn_label = host.strip_suffix(".tb-cdn.io").filter(|label| !label.is_empty());
     let safe = url.scheme() == "https"
         && url.username().is_empty()
@@ -266,7 +386,7 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
         && url.port().is_none_or(|port| port == 443)
         && cdn_label.is_some()
         && url.query_pairs().any(|(name, value)| name == "scrobbling_enabled" && value == "false");
-    safe.then_some(url).ok_or(ManagedHlsError::Unavailable)
+    safe.then_some(url).ok_or(ManagedHlsError::UnsafeResponse)
 }
 
 fn classify_failure(body: &[u8]) -> ManagedHlsError {
@@ -288,22 +408,24 @@ async fn probe_playlist(client: &reqwest::Client, url: &reqwest::Url) -> Result<
             .get(url.clone())
             .header(ACCEPT, "application/vnd.apple.mpegurl, application/x-mpegURL")
             .build()
-            .map_err(|_| ManagedHlsError::Unavailable)?;
-        let mut response = client.execute(request).await.map_err(|_| ManagedHlsError::Unavailable)?;
+            .map_err(|_| ManagedHlsError::PlaylistUnavailable)?;
+        let mut response = client.execute(request).await.map_err(|_| ManagedHlsError::PlaylistUnavailable)?;
         // Redirects are deliberately not followed. Only a complete, successful playlist counts as ready.
         if response.status() != reqwest::StatusCode::OK {
-            return Err(ManagedHlsError::Unavailable);
+            return Err(ManagedHlsError::PlaylistUnavailable);
         }
-        let body = read_capped(&mut response, PLAYLIST_BODY_LIMIT).await?;
-        let text = std::str::from_utf8(&body).map_err(|_| ManagedHlsError::Unavailable)?;
+        let body = read_capped(&mut response, PLAYLIST_BODY_LIMIT)
+            .await
+            .map_err(|_| ManagedHlsError::PlaylistUnavailable)?;
+        let text = std::str::from_utf8(&body).map_err(|_| ManagedHlsError::PlaylistUnavailable)?;
         let first = text.lines().next().map(str::trim_end);
         if first != Some("#EXTM3U") {
-            return Err(ManagedHlsError::Unavailable);
+            return Err(ManagedHlsError::PlaylistUnavailable);
         }
         Ok(())
     })
     .await
-    .map_err(|_| ManagedHlsError::Unavailable)?
+    .map_err(|_| ManagedHlsError::PlaylistUnavailable)?
 }
 
 async fn read_capped(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>, ManagedHlsError> {
@@ -351,6 +473,21 @@ mod tests {
         reqwest::Response::from(http::Response::builder().status(status).body(body.to_owned()).unwrap())
     }
 
+    fn response_with_headers(status: u16, headers: &[(&str, &str)], body: &str) -> reqwest::Response {
+        let mut answer = http::Response::builder().status(status);
+        for (name, value) in headers {
+            answer = answer.header(*name, *value);
+        }
+        reqwest::Response::from(answer.body(body.to_owned()).unwrap())
+    }
+
+    fn adapter(
+        answer: impl Fn() -> Result<reqwest::Response, crate::scrape::DoError> + Send + Sync + 'static,
+    ) -> TorBoxManagedHls {
+        let doer = Arc::new(MockDoer(move |_| answer()));
+        TorBoxManagedHls::new(doer, Arc::new(MemoryCache::new(1 << 20))).unwrap()
+    }
+
     const SUCCESS: &[u8] = include_bytes!("../testdata/torbox-stream/create-success.json");
     const NOT_FOUND: &[u8] = include_bytes!("../testdata/torbox-stream/create-item-not-found.json");
     const PLAYLIST: &[u8] = include_bytes!("../testdata/torbox-stream/media-playlist.m3u8");
@@ -365,10 +502,16 @@ mod tests {
 
         let mut changed: serde_json::Value = serde_json::from_slice(SUCCESS).unwrap();
         changed["data"]["scrobbling_enabled"] = serde_json::Value::Bool(true);
-        assert_eq!(parse_success(&serde_json::to_vec(&changed).unwrap()), Err(ManagedHlsError::Unavailable));
+        assert_eq!(
+            parse_success(&serde_json::to_vec(&changed).unwrap()),
+            Err(ManagedHlsError::MalformedResponse)
+        );
         changed["data"]["scrobbling_enabled"] = serde_json::Value::Bool(false);
         changed["data"]["subtitle_index"] = serde_json::json!(0);
-        assert_eq!(parse_success(&serde_json::to_vec(&changed).unwrap()), Err(ManagedHlsError::Unavailable));
+        assert_eq!(
+            parse_success(&serde_json::to_vec(&changed).unwrap()),
+            Err(ManagedHlsError::MalformedResponse)
+        );
     }
 
     #[test]
@@ -395,6 +538,62 @@ mod tests {
         assert!(!pairs.contains_key("chosen_subtitle_index"));
         assert!(!request.url().as_str().contains("secret-token"));
         assert_eq!(request.headers()[AUTHORIZATION], "Bearer secret-token");
+    }
+
+    #[tokio::test]
+    async fn create_respects_rate_limits_without_retrying_and_preserves_safe_detail() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let managed = adapter(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(response_with_headers(429, &[("retry-after", "37")], "private provider detail"))
+        });
+        let captured = crate::loglimit::Capture::start();
+        assert_eq!(
+            managed.create("never-log-this-key", 123456, Some(789)).await,
+            Err(ManagedHlsError::RateLimited { retry_after: Some(Duration::from_secs(37)) })
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "a throttle must not be retried");
+        let log = captured.text();
+        assert!(log.contains("cause=torbox_rate_limited http_status=429 retry_after_seconds=37"), "{log}");
+        for secret in ["never-log-this-key", "123456", "789", "private provider detail"] {
+            assert!(!log.contains(secret), "log leaked {secret:?}: {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_accepts_retry_after_http_date_and_caps_the_wait() {
+        let managed = adapter(|| {
+            Ok(response_with_headers(503, &[("retry-after", "Sat, 06 Nov 2094 08:49:37 GMT")], "ignored"))
+        });
+        assert_eq!(
+            managed.create("key", 1, None).await,
+            Err(ManagedHlsError::RateLimited { retry_after: Some(den_upstream::MAX_RETRY_AFTER) })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_distinguishes_account_item_transport_and_shape_failures() {
+        let cases = [
+            (401, "{}", ManagedHlsError::Authentication),
+            (403, "{}", ManagedHlsError::Refused),
+            (402, "{}", ManagedHlsError::Entitlement),
+            (500, std::str::from_utf8(NOT_FOUND).unwrap(), ManagedHlsError::NotFound),
+            (200, "not json", ManagedHlsError::MalformedResponse),
+            (
+                200,
+                r#"{"success":false,"error":"ACTIVE_LIMIT","detail":"private"}"#,
+                ManagedHlsError::Unavailable,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let body = body.to_owned();
+            let managed = adapter(move || Ok(response(status, &body)));
+            assert_eq!(managed.create("key", 1, None).await, Err(expected), "http {status}");
+        }
+
+        let managed = adapter(|| Err(Box::new(std::io::Error::other("connection refused"))));
+        assert_eq!(managed.create("key", 1, None).await, Err(ManagedHlsError::Transport));
     }
 
     #[tokio::test]
@@ -462,7 +661,7 @@ mod tests {
             "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false#fragment",
             "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true",
         ] {
-            assert_eq!(validate_hls_url(bad), Err(ManagedHlsError::Unavailable), "accepted {bad}");
+            assert_eq!(validate_hls_url(bad), Err(ManagedHlsError::UnsafeResponse), "accepted {bad}");
         }
     }
 
@@ -490,14 +689,20 @@ mod tests {
         assert_eq!(probe_playlist(&client, &serve(ok).await).await, Ok(()));
 
         let redirect = b"HTTP/1.1 302 Found\r\nLocation: https://evil.example/x.m3u8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
-        assert_eq!(probe_playlist(&client, &serve(redirect).await).await, Err(ManagedHlsError::Unavailable));
+        assert_eq!(
+            probe_playlist(&client, &serve(redirect).await).await,
+            Err(ManagedHlsError::PlaylistUnavailable)
+        );
 
         let large = vec![b'x'; PLAYLIST_BODY_LIMIT + 1];
         let mut response =
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", large.len())
                 .into_bytes();
         response.extend_from_slice(&large);
-        assert_eq!(probe_playlist(&client, &serve(response).await).await, Err(ManagedHlsError::Unavailable));
+        assert_eq!(
+            probe_playlist(&client, &serve(response).await).await,
+            Err(ManagedHlsError::PlaylistUnavailable)
+        );
     }
 
     #[tokio::test]

@@ -759,7 +759,7 @@
 < cache-control: no-store
 < content-type: text/plain; version=0.0.4; charset=utf-8
 < timing-allow-origin: *
-<metrics: 155 lines, first "# HELP scout_build_info The running den-scout version.">
+<metrics: 157 lines, first "# HELP scout_build_info The running den-scout version.">
 
 == list with tickets
 > GET /<sealed config>/stream/movie/tt1234567.json

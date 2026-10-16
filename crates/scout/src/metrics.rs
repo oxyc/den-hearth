@@ -41,7 +41,7 @@ const METRIC_AUDIO_CODECS: [&str; 12] =
     ["eac3", "ac3", "truehd", "dts", "dtshd", "dtshdma", "dtsx", "flac", "aac", "opus", "mp3", "unknown"];
 
 /// Go `metricTorboxEndpoints`: the fixed debrid endpoints, one series per endpoint and outcome.
-pub const METRIC_TORBOX_ENDPOINTS: [&str; 9] = [
+pub const METRIC_TORBOX_ENDPOINTS: [&str; 10] = [
     "checkcached",
     "mylist_account",
     "mylist_id",
@@ -51,6 +51,7 @@ pub const METRIC_TORBOX_ENDPOINTS: [&str; 9] = [
     "controltorrent",
     "controlqueued",
     "getqueued",
+    "createstream",
 ];
 
 /// Go `metricTorboxOutcomes`.
