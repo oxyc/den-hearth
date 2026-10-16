@@ -25,6 +25,7 @@
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
+use base64::Engine;
 use hyper::{HeaderMap, Method, Response, StatusCode};
 use serde_json::{json, Value};
 
@@ -42,6 +43,8 @@ pub enum Route {
     Manifest,
     /// `/den/config-key`: the key the page seals to, and the epoch it stamps.
     ConfigKey,
+    /// `POST /den/migrate`: exchange validated legacy first-party config segments for one combined install.
+    Migrate,
     /// `/den/<config>/manifest.json`, with the config segment.
     Installed(String),
     /// `/den/<config>/playback`, with the config segment. Hearth chooses the delivery path.
@@ -62,6 +65,7 @@ pub fn route(path: &str) -> Route {
         "/" | "/configure" | "/configure/" => return Route::Configure,
         "/manifest.json" => return Route::Manifest,
         "/config-key" => return Route::ConfigKey,
+        "/migrate" => return Route::Migrate,
         // The page's "Test token" button: a pasted token, no config.
         "/validate" => return Route::Scout(path.to_string()),
         _ => {}
@@ -265,9 +269,12 @@ impl Den {
                     }
                 }
             }
-            Route::Playback(_) | Route::Scout(_) | Route::Subs(_) | Route::Reel(_) | Route::NotFound => {
-                den_http::not_found()
-            }
+            Route::Migrate
+            | Route::Playback(_)
+            | Route::Scout(_)
+            | Route::Subs(_)
+            | Route::Reel(_)
+            | Route::NotFound => den_http::not_found(),
         }
     }
 
@@ -307,6 +314,26 @@ impl Den {
             return Err(Rejected::Undecodable);
         }
         Ok(Install { iid, members })
+    }
+
+    /// Mint one combined config from already-opened, validated legacy members. The response is another bearer
+    /// credential, never plaintext: with sealing configured it is sealed before it leaves this process.
+    pub fn migrate_segment(&self, mut members: serde_json::Map<String, Value>) -> Result<String, ()> {
+        if self.scout.key_invalid || members.is_empty() {
+            return Err(());
+        }
+        members.insert("iid".into(), Value::String(InstallId::random().as_str().to_owned()));
+        members.insert("ep".into(), Value::from(self.scout.revocation.epoch()));
+        let json = serde_json::to_vec(&Value::Object(members)).map_err(|_| ())?;
+        let bytes = match &self.scout.keyring {
+            Some(keyring) => {
+                let mut framed = vec![den_seal::SEALED_VERSION];
+                framed.extend(den_seal::seal(&keyring.keys[0].pub_key, &json).map_err(|_| ())?);
+                framed
+            }
+            None => json,
+        };
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 
@@ -409,9 +436,9 @@ pub fn manifest(install: Option<&Install>) -> Value {
         }
     };
     let mut manifest = json!({
-        "id": "com.den.addon",
+        "id": "com.den.hearth",
         "version": version(),
-        "name": "Den",
+        "name": "Den Hearth",
         "description": description,
         "resources": resources,
         "types": types,
@@ -459,6 +486,7 @@ mod tests {
         assert_eq!(route("/"), Route::Configure);
         assert_eq!(route("/configure"), Route::Configure);
         assert_eq!(route("/configure/"), Route::Configure);
+        assert_eq!(route("/migrate"), Route::Migrate);
         assert_eq!(route("/manifest.json"), Route::Manifest);
         assert_eq!(route("/config-key"), Route::ConfigKey);
         assert_eq!(route("/CFG/manifest.json"), Route::Installed("CFG".into()));

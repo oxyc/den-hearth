@@ -48,6 +48,18 @@ pub use crate::config::Config;
 use crate::httputil::query_param;
 pub use crate::httputil::Body;
 pub use crate::state::AppState;
+
+/// Open and validate one legacy install for Hearth's migration endpoint, then drop the member's old revocation
+/// identity. The returned value is sealed immediately as a member of a fresh combined install.
+pub fn migration_member(state: &AppState, blob: &str) -> Option<serde_json::Value> {
+    userconfig::decode_checked(state.config_keyring.as_ref(), &state.cfg.revocation, blob).ok()?;
+    let opened = den_seal::open_segment(state.config_keyring.as_ref(), blob).ok()?;
+    let mut value: serde_json::Value = serde_json::from_slice(&opened.json).ok()?;
+    let member = value.as_object_mut()?;
+    member.remove("iid");
+    member.remove("ep");
+    Some(value)
+}
 pub use crate::userconfig::is_valid as is_valid_config;
 pub use crate::ytdlp::kill_live_groups;
 

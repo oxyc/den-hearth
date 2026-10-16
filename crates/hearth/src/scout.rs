@@ -54,6 +54,10 @@ fn client() -> Arc<dyn Doer> {
 }
 
 impl Scout {
+    pub fn migration_member(&self, blob: &str) -> Option<serde_json::Value> {
+        self.legacy.migration_member(blob)
+    }
+
     /// `mount` configures the handler behind `/scout`, `legacy` the one on Scout's own port. They must
     /// agree on everything but `public_url`. `den` is the combined Den addon's terms for Scout's member.
     /// Call from inside the runtime.
