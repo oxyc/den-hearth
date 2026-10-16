@@ -84,10 +84,39 @@ pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
             eprintln!("scout in process: skipping a base: {e}");
         }
     }
+    // The playback facade gives Remux a combined install. This base is deliberately narrower than routing a
+    // request through `/den`: only Scout and Subtitles resource paths are reachable. The Scout service key is
+    // stripped before Subtitles, so it can never reach another member of the combined addon.
+    let weak = Arc::downgrade(hearth);
+    let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call_den_scout(weak.clone(), req)));
+    if let Err(e) = local.add(crate::playback::DEN_ADDON_BASE, serve) {
+        eprintln!("scout in process: skipping playback facade base: {e}");
+    }
     let taken = local.bases().into_iter().map(str::to_string).collect();
     let _ = hearth.remux.local_scout.set(local.clone());
     let _ = hearth.subs.local_scout.set(local);
     taken
+}
+
+async fn call_den_scout(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Response<crate::Body> {
+    let Some(hearth) = hearth.upgrade() else {
+        return crate::json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({"error": "shutting_down"}));
+    };
+    let resource = req.uri().path().trim_start_matches('/').split('/').nth(1);
+    if matches!(resource, Some("subtitles" | "subtitle" | "translate")) {
+        let (mut parts, body) = req.into_parts();
+        parts.headers.remove("x-den-remux-key");
+        parts.extensions.insert(hearth.den.subs.clone());
+        return den_subtitles::handle_request(
+            hearth.subs.clone(),
+            Request::from_parts(parts, Full::new(body)),
+        )
+        .await;
+    }
+    if matches!(resource, Some("stream" | "play" | "account" | "availability")) {
+        return hearth.scout.serve_den(req.map(Full::new)).await;
+    }
+    den_http::not_found()
 }
 
 /// One request through hearth's own request path, as if it had arrived on Scout's listener (`own`) or on the main
@@ -195,7 +224,7 @@ mod tests {
             crate::scout::Scout::new(settings(), settings(), &den.scout),
             den,
             crate::Limits { admission, media: crate::media::Limits::default() },
-            None,
+            crate::Options::default(),
         )
     }
 

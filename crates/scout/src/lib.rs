@@ -21,6 +21,7 @@ pub mod label;
 pub mod linkcheck;
 pub mod linkmemo;
 pub mod loglimit;
+pub mod managed_hls;
 pub mod manifest;
 pub mod metrics;
 pub mod play;

@@ -1,0 +1,78 @@
+{
+  "success": true,
+  "error": null,
+  "detail": "Stream initialized successfully.",
+  "data": {
+    "audio_index": 0,
+    "auth_id": "<redacted>",
+    "domain": "flux-002.wnam.tb-cdn.io",
+    "file_id": 0,
+    "hash": "<redacted>",
+    "hls_url": "https://flux-002.wnam.tb-cdn.io/redacted/index.m3u8?token=redacted&scrobbling_enabled=false",
+    "id": 0,
+    "intro_information": {},
+    "is_transcoding": false,
+    "metadata": {
+      "audios": [
+        {
+          "channel_layout": "stereo",
+          "channels": 2,
+          "codec": "aac",
+          "codec_type": "audio",
+          "default": true,
+          "index": 0,
+          "language": "eng",
+          "language_full": "English",
+          "sample_rate": "48000",
+          "title": "<redacted>"
+        }
+      ],
+      "chapters": "<redacted>",
+      "subtitles": [
+        {
+          "codec": "subrip",
+          "codec_type": "subtitle",
+          "default": false,
+          "index": 0,
+          "language": "eng",
+          "language_full": "English",
+          "title": "<redacted>"
+        }
+      ],
+      "thumbnail": "<redacted>",
+      "video": {
+        "bitrate": "0",
+        "codec": "h264",
+        "codec_type": "video",
+        "duration": "0",
+        "file_name": "<redacted>",
+        "frame_rate": "0",
+        "height": 0,
+        "index": 0,
+        "opensubtitles_hash": "<redacted>",
+        "pixel_format": "yuv420p",
+        "size": 0,
+        "title": "<redacted>",
+        "title_data": {},
+        "total_chunks": 0,
+        "width": 0
+      }
+    },
+    "mimetype": "video/x-matroska",
+    "name": "<redacted>",
+    "needs_transcoding": true,
+    "open_subtitles_hash": "<redacted>",
+    "presigned_token": "<redacted>",
+    "region": "<redacted>",
+    "resolution_index": "null",
+    "s3_path": "<redacted>",
+    "scrobbling_enabled": false,
+    "search_metadata": null,
+    "short_name": "<redacted>",
+    "size": 0,
+    "subtitle_index": "null",
+    "type": "torrent",
+    "user_token": "<redacted>",
+    "webdav_url": "<redacted>"
+  }
+}

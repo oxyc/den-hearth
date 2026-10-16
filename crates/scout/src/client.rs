@@ -14,7 +14,7 @@ use crate::rank::RawStream;
 /// so 150 is 5.0), AV1 `seq_level_idx` (12 is 5.0). 0 means none.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub(crate) struct ClientPlayable {
+pub struct ClientPlayable {
     pub h264: i64,
     pub h264_high10: i64,
     pub hevc_main: i64,
@@ -38,7 +38,7 @@ pub(crate) struct ClientPlayable {
 /// The `dolbyVision` object of a `ClientPlayable`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub(crate) struct ClientDolbyVision {
+pub struct ClientDolbyVision {
     pub p5: bool,
     pub p8: bool,
 }

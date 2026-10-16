@@ -65,6 +65,8 @@ pub use crate::job::kill_live_groups;
 use crate::session::SubFile;
 use crate::state::unix_now;
 pub use crate::state::AppState;
+// Hearth's playback facade must apply these same checks before consulting idempotent replay state.
+pub use auth::{edge_secret_ok, is_grant_owner};
 
 /// The release the runtime image carries (`DEN_VERSION`, from the repository's `VERSION`). Keeping it out of
 /// Cargo.toml means a release does not invalidate the cached dependency and compile layers merely to change its

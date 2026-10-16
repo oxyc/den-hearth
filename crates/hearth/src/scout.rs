@@ -23,6 +23,7 @@ use den_scout::deps::{
 };
 use den_scout::diskcache::{TieredCache, SWEEP_INTERVAL};
 use den_scout::handler::{new_handler, Handler};
+use den_scout::managed_hls::{ManagedHlsError, ManagedHlsRequest, ManagedHlsResult};
 use den_scout::scrape::Doer;
 
 use crate::Body;
@@ -119,6 +120,16 @@ impl Scout {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         Self::bounded(&self.den, true, req).await
+    }
+
+    /// Resolve and prepare direct managed HLS through the combined addon's Scout member. This has no HTTP
+    /// route of its own: Hearth alone decides when the trusted request may attempt it and when to fall back.
+    pub async fn managed_hls(
+        &self,
+        config: &str,
+        request: &ManagedHlsRequest,
+    ) -> Result<ManagedHlsResult, ManagedHlsError> {
+        self.den.managed_hls(config, request).await
     }
 
     /// `handler` serving `req` after the head and body bounds. `shared_listener`: the connection is not

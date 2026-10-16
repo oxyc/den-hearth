@@ -44,6 +44,7 @@ use crate::label::binge_group;
 use crate::linkcheck::LinkVerdict;
 use crate::linkmemo::{link_memo_key, LinkMemo, LINK_MEMO_TTL};
 use crate::loglimit::{emit, log_limited};
+use crate::managed_hls::{ManagedHlsError, ManagedHlsRelease, ManagedHlsRequest, ManagedHlsResult};
 use crate::manifest::build_manifest;
 use crate::metrics::{cache_persistent_gauge, metrics};
 use crate::play::{decode_play_token, encode_play_token, PlayTarget};
@@ -887,6 +888,20 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 impl Handler {
+    /// Resolve one title to TorBox managed HLS without exposing a Scout route or provider identifiers.
+    /// The config is opened with this handler's own combined-addon slice, keyring and revocation policy.
+    pub async fn managed_hls(
+        &self,
+        config_blob: &str,
+        request: &ManagedHlsRequest,
+    ) -> Result<ManagedHlsResult, ManagedHlsError> {
+        let config = self.inner.open_config(config_blob).ok_or(ManagedHlsError::Refused)?;
+        if !config.scope.is_empty() {
+            return Err(ManagedHlsError::Refused);
+        }
+        self.inner.managed_hls(&config, request).await
+    }
+
     /// Serves one request. The request body is already read (hearth bounds it); the response body is whole.
     ///
     /// A cacheable answer carries its ETag, and a matching `If-None-Match` (weak or strong) collapses it to a 304
@@ -1177,6 +1192,71 @@ impl Inner {
     /// deadlinePassed's counterpart for the explicit clock: the deadline `d` from now.
     fn deadline_in(d: Duration) -> TokioInstant {
         TokioInstant::now() + d
+    }
+
+    async fn managed_hls(
+        self: &Arc<Self>,
+        config: &Config,
+        request: &ManagedHlsRequest,
+    ) -> Result<ManagedHlsResult, ManagedHlsError> {
+        let (kind, raw_id) = match (request.season, request.episode) {
+            (None, None) => ("movie", format!("{}.json", request.imdb)),
+            (Some(season), Some(episode)) => ("series", format!("{}:{season}:{episode}.json", request.imdb)),
+            _ => return Err(ManagedHlsError::NotFound),
+        };
+        let sid = parse_stream_id(kind, &raw_id).ok_or(ManagedHlsError::NotFound)?;
+        let resolver = self.deps.managed_hls.as_ref().ok_or(ManagedHlsError::Unavailable)?;
+        let deadline = Self::deadline_in(self.deps.scrape_timeout + LIST_BUILD_SLACK);
+        let list = self
+            .rank_list(
+                deadline,
+                config,
+                &sid,
+                None,
+                RankOpts { client: request.playable.as_ref(), check_cache: true, rid: "" },
+            )
+            .await;
+        let mut candidates: Vec<&RawStream> = list.ranked.iter().collect();
+        if let Some(filename) = request.filename.as_deref().filter(|name| !name.is_empty()) {
+            candidates.retain(|candidate| candidate.title == filename);
+        }
+        if candidates.is_empty() {
+            return Err(if list.degraded.is_empty() {
+                ManagedHlsError::NotFound
+            } else {
+                ManagedHlsError::Unavailable
+            });
+        }
+        for candidate in candidates {
+            let target = ResolveTarget {
+                info_hash: candidate.info_hash.clone(),
+                file_idx: candidate.file_idx,
+                season: season_ptr(&sid),
+                episode: episode_ptr(&sid),
+                release_size: candidate.size_bytes.unwrap_or_default(),
+                title: candidate.title.clone(),
+                imdb: sid.imdb.clone(),
+                ..Default::default()
+            };
+            match resolver.resolve(config, &target).await {
+                Ok(url) => {
+                    return Ok(ManagedHlsResult {
+                        url,
+                        release: ManagedHlsRelease {
+                            label: crate::label::clean_label_lower(
+                                &str::to_lowercase(&candidate.title),
+                                candidate,
+                            ),
+                            filename: candidate.title.clone(),
+                            size: candidate.size_bytes.filter(|size| *size > 0),
+                        },
+                    });
+                }
+                Err(ManagedHlsError::NotFound) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ManagedHlsError::NotFound)
     }
 
     // --- routing ----------------------------------------------------------------------------------------

@@ -413,21 +413,22 @@ async fn torbox_list_files_says_why_it_has_no_files() {
 // Fauda S1E3 hit errNoFileList repeatedly with nothing more specific anywhere in the log — every branch
 // behind it shares one identity by design, so a transport blip, a bad shape and a genuine id mismatch
 // were indistinguishable from the log alone. Each branch now writes its own line; this is what finds the
-// cause the NEXT time this happens, rather than only ever rediscovering it as "no usable answer" again.
+// cause the NEXT time this happens, rather than only ever rediscovering it as "no usable answer" again. The
+// diagnostic deliberately omits account-local torrent ids.
 #[tokio::test]
 async fn torbox_list_files_logs_which_branch_failed() {
     let _turn = LIST_FILES_LOG_TURN.lock().unwrap_or_else(|e| e.into_inner());
     // Each branch writes its own line, keyed by a name the test ages out of the log limiter first.
     let cases: Vec<(&str, &str, Route, &str)> = vec![
-        ("a transport blip", "mylist-transport", boom(), "torbox mylist 1: connection reset"),
-        ("a 400", "mylist-status", status(400), "torbox mylist 1: http 400"),
-        ("an unreadable body", "mylist-decode", ok("garbage"), "torbox mylist 1: unreadable body"),
-        ("a body with no data field", "mylist-empty", ok("{}"), "torbox mylist 1: no data field"),
+        ("a transport blip", "mylist-transport", boom(), "torbox mylist: connection reset"),
+        ("a 400", "mylist-status", status(400), "torbox mylist: http 400"),
+        ("an unreadable body", "mylist-decode", ok("garbage"), "torbox mylist: unreadable body"),
+        ("a body with no data field", "mylist-empty", ok("{}"), "torbox mylist: no data field"),
         (
             "an answer naming another torrent",
             "mylist-other-id",
             ok(r#"{"data":{"id":2}}"#),
-            "torbox mylist 1: answer named torrent 2",
+            "torbox mylist: answer named another torrent",
         ),
         (
             "neither an object nor an array",
@@ -439,7 +440,7 @@ async fn torbox_list_files_logs_which_branch_failed() {
             "an array with no matching entry",
             "mylist-no-match",
             ok(r#"{"data":[{"id":5}]}"#),
-            "torbox mylist 1: 1 entries, none named it",
+            "torbox mylist: 1 entries, none matched the requested torrent",
         ),
     ];
     for (name, key, f, want) in cases {

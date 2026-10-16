@@ -19,6 +19,7 @@ mod den;
 mod env;
 mod inproc;
 mod media;
+mod playback;
 mod ports;
 mod route;
 mod scout;
@@ -65,6 +66,8 @@ struct Hearth {
     media: Arc<media::MediaGate>,
     /// Bearer token for hearth's own `/metrics`; `None` turns it off (a 404, as in the services).
     metrics_token: Option<String>,
+    /// The new unified playback API. Off unless explicitly enabled after deployment validation.
+    playback: playback::Playback,
 }
 
 /// Every bound the node enforces; `Default` is production, tests shrink it.
@@ -72,6 +75,12 @@ struct Hearth {
 struct Limits {
     admission: admit::Limits,
     media: media::Limits,
+}
+
+#[derive(Default)]
+struct Options {
+    metrics_token: Option<String>,
+    managed_playback: bool,
 }
 
 impl Hearth {
@@ -82,7 +91,7 @@ impl Hearth {
         scout: scout::Scout,
         den: den::Den,
         limits: Limits,
-        metrics_token: Option<String>,
+        options: Options,
     ) -> Arc<Self> {
         Arc::new(Hearth {
             reel,
@@ -92,7 +101,8 @@ impl Hearth {
             den,
             admission: admit::Admission::new(limits.admission),
             media: media::MediaGate::new(limits.media),
-            metrics_token,
+            metrics_token: options.metrics_token,
+            playback: playback::Playback::new(options.managed_playback),
         })
     }
 }
@@ -226,6 +236,7 @@ where
             Some(req) => den_reel::handle_request(hearth.reel.clone(), req).await,
             None => bad_path(),
         },
+        den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
         own => hearth.den.answer(own, req.method(), req.headers()),
     }
 }
@@ -450,6 +461,7 @@ struct Configs {
     /// Where Remux and Subtitles reach Scout in process (`inproc`).
     scout_bases: Vec<inproc::Base>,
     metrics_token: Option<String>,
+    managed_playback: bool,
 }
 
 async fn bind(port: u16) -> std::io::Result<TcpListener> {
@@ -467,7 +479,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
         scout::Scout::new(c.scout_mount, c.scout_own, &c.den.scout),
         c.den,
         Limits::default(),
-        c.metrics_token,
+        Options { metrics_token: c.metrics_token, managed_playback: c.managed_playback },
     );
     hearth.scout.start_sweep();
     let in_process = inproc::install(&hearth, &c.scout_bases);
@@ -497,6 +509,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
     eprintln!("{}", alloc::startup_line());
     eprintln!("scout: {}", hearth.scout.summary());
     eprintln!("{}", hearth.den.summary());
+    eprintln!("managed playback: {}", hearth.playback.summary());
     eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
     // Each service's own startup line: operators read `transcode=` and the like from them.
     eprintln!("{}", den_reel::startup_line(&hearth.reel));
@@ -583,7 +596,15 @@ fn main() {
     let mut reel = env::scoped("REEL_", mount(Service::Reel, "reel"), den_reel::Config::from_env);
     #[allow(unused_mut)]
     let mut subs = env::scoped("SUBS_", mount(Service::Subs, "subs"), den_subtitles::Config::from_env);
-    let remux = env::scoped("REMUX_", None, den_remux::Config::from_env);
+    let mut remux = env::scoped("REMUX_", None, den_remux::Config::from_env);
+    // This reserved origin never leaves the process. Remux still applies its ordinary origin SSRF guards, then
+    // `inproc` serves only the combined addon's Scout and Subtitles resource slices for it.
+    if !remux.scout_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
+        remux.scout_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
+    }
+    if !remux.subtitle_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
+        remux.subtitle_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
+    }
     #[cfg(feature = "stub-upstreams")]
     stub_upstreams(&mut reel, &mut subs);
     let scout_settings =
@@ -615,14 +636,28 @@ fn main() {
         .or_else(|_| std::env::var("METRICS_TOKEN"))
         .ok()
         .filter(|token| !token.is_empty());
+    let managed_playback = std::env::var("HEARTH_MANAGED_PLAYBACK")
+        .ok()
+        .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let configs =
-        Configs { port, own, reel, subs, remux, scout_mount, scout_own, den, scout_bases, metrics_token };
+    let configs = Configs {
+        port,
+        own,
+        reel,
+        subs,
+        remux,
+        scout_mount,
+        scout_own,
+        den,
+        scout_bases,
+        metrics_token,
+        managed_playback,
+    };
     if let Err(e) = rt.block_on(run(configs)) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
@@ -653,7 +688,7 @@ mod tests {
             scout::Scout::new(settings(), settings(), &den.scout),
             den,
             limits,
-            token.map(str::to_string),
+            Options { metrics_token: token.map(str::to_string), ..Default::default() },
         )
     }
 
@@ -677,6 +712,17 @@ mod tests {
     async fn get_on(own: Option<Service>, path: &str) -> (StatusCode, serde_json::Value) {
         let resp = send_on(&hearth(), own, path).await;
         (resp.status(), json_of(resp).await)
+    }
+
+    #[tokio::test]
+    async fn unified_playback_is_a_concealed_404_by_default() {
+        let request = Request::post("/den/not-a-config/playback")
+            .header("content-type", "application/json")
+            .header("idempotency-key", "attempt-1")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = handle(hearth(), None, false, request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn get(path: &str) -> (StatusCode, serde_json::Value) {

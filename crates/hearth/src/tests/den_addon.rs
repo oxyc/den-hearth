@@ -357,7 +357,7 @@ fn configured_hearth(den: Den, opensubtitles: &str) -> Arc<Hearth> {
         scout::Scout::new(settings(), settings(), &den.scout),
         den,
         Limits::default(),
-        None,
+        Options::default(),
     )
 }
 

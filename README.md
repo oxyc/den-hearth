@@ -139,6 +139,7 @@ refused on the other's routes; every per-service route, key, revocation list and
 | `HEARTH_CONFIG_KEY`, `HEARTH_CONFIG_KEYS_PREV` | The addon's sealing key and prior keys. Unset: a ring derived from Scout's `CONFIG_KEY`/`CONFIG_KEYS_PREV` (HKDF), so a node that seals Scout seals this too and neither opens the other's configs or play tickets. Neither set: plaintext configs. A malformed key refuses every Den config (503 `config_key_invalid`). Play tickets are keyed with the addon's own HKDF info, so they stay apart from Scout's even if both keys are equal (hearth warns at startup when they are). |
 | `HEARTH_REVOKED_INSTALLS`, `HEARTH_CONFIG_EPOCH`, `HEARTH_REQUIRE_INSTALL_ID` | The addon's revocation, as each service's `*_REVOKED_INSTALLS` etc. |
 | `HEARTH_PUBLIC_BASE_URL` | The addon's links go under `<it>/den`; unset, under the request's origin and `/den`. |
+| `HEARTH_MANAGED_PLAYBACK` | Enables the new `POST /den/<config>/playback` coordinator. It is off by default (the route is a concealed 404) so the full Edge and Web path can ship and be validated before activation. |
 
 The startup line `den addon at /den — sealed=… key=…` shows what is in force.
 
@@ -151,6 +152,12 @@ while the Den addon derives from it rotates the Den key with it: put Scout's old
 
 `/den/_internal/validate/m/s/<blob>` is Reel's capability check for den-edge's LAN relay, on the Den addon's terms:
 it validates only capabilities Reel minted for a Den install, as Reel's own route validates only Reel's.
+
+When enabled, `/den/<config>/playback` accepts the current Remux play fields plus an `Idempotency-Key`. Hearth
+derives Scout and Subtitles from that same combined config, chooses direct managed HLS only for a trusted Edge
+request, and otherwise translates the existing Remux session into a response whose one required field is `url`.
+It does not create an outer session. Responses are JSON with `Cache-Control: no-store`; completed retries are
+held briefly in bounded memory so a lost response cannot create another Remux session.
 
 ## Listeners
 
