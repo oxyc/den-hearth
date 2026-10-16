@@ -37,8 +37,8 @@ starting it again: both listen on :8080, so only one runs at a time. Nothing ins
 
 ## Run
 
-For a ready-to-use Docker Compose deployment, selective services, persistent cache defaults, HTTPS/Chromecast
-caveats, and Mac/Raspberry Pi notes, see **[Self-host den-hearth](selfhost/README.md)**.
+For a ready-to-use Docker Compose deployment, selective services, persistent cache defaults, LAN HTTP Chromecast
+setup, HTTPS options, and Mac/Raspberry Pi notes, see **[Self-host den-hearth](selfhost/README.md)**.
 
 ```
 cargo run -p den-hearth        # listens on :8090, and on the four ports below

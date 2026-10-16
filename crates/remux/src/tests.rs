@@ -894,6 +894,14 @@ async fn end_to_end_via(
     assert_eq!(master.status, StatusCode::OK);
     assert_eq!(master.headers["content-type"], "application/vnd.apple.mpegurl");
     assert_eq!(master.headers["access-control-allow-origin"], "*");
+    assert_eq!(
+        master.headers["access-control-allow-headers"],
+        "Content-Type, Accept-Encoding, Range, If-Range, X-Request-Id"
+    );
+    assert_eq!(
+        master.headers["access-control-expose-headers"],
+        "Accept-Ranges, Content-Range, Content-Length, ETag"
+    );
     assert!(master.text().contains(codec_prefix) && master.text().contains("mp4a.40.2"), "{}", master.text());
 
     let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();

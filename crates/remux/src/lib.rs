@@ -240,13 +240,17 @@ fn metrics_body(state: &AppState) -> String {
 }
 
 /// The CORS a receiver needs on a session's files: any origin (a Cast receiver's is Google's), and
-/// `Range` allowed with `Content-Range` readable. POST is the player's error report.
+/// Cast's adaptive player may preflight `Content-Type`, `Accept-Encoding`, and `Range`; byte-range response headers
+/// remain readable. POST is the player's error report.
 fn add_cors(resp: &mut Response<Body>) {
     use hyper::header::HeaderValue;
     let h = resp.headers_mut();
-    den_http::cors_stamp(h, "Content-Range, Content-Length, ETag");
+    den_http::cors_stamp(h, "Accept-Ranges, Content-Range, Content-Length, ETag");
     h.insert("access-control-allow-methods", HeaderValue::from_static("GET, HEAD, POST, DELETE, OPTIONS"));
-    h.insert("access-control-allow-headers", HeaderValue::from_static("Range, If-Range, X-Request-Id"));
+    h.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("Content-Type, Accept-Encoding, Range, If-Range, X-Request-Id"),
+    );
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
 }
 

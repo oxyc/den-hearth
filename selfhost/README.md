@@ -9,7 +9,8 @@ or Docker Desktop on Apple Silicon. A Raspberry Pi can run the Scout-only image 
 From the repository root:
 
 ```sh
-sh selfhost/init.sh
+# Replace this with the stable address of the machine running Hearth.
+HEARTH_PUBLIC_BASE_URL=http://192.168.1.20:8090 sh selfhost/init.sh
 # Review selfhost/.env and add any optional provider settings you need.
 docker compose --env-file selfhost/.env -f selfhost/compose.yaml up -d
 curl http://localhost:8090/health
@@ -17,8 +18,10 @@ curl http://localhost:8090/health
 
 Open `http://<host>:8090/den/configure` on a machine that can reach the host. The page produces the combined addon
 URL to install in Den or another Stremio-compatible client. On a Scout-only node use `/scout/configure` instead.
-On a trusted home LAN, plain HTTP is enough for Den. Do not expose the port to the internet without HTTPS and
-access controls; installed URLs are bearer credentials even when their config payload is sealed.
+On a trusted home LAN, plain HTTP is enough for Den and for Chromecast media. Use a DHCP reservation or static
+address: changing the address breaks installed addon and in-flight media URLs. Do not expose the port to the
+internet without HTTPS and access controls; installed URLs are bearer credentials even when their config payload
+is sealed.
 
 The generated config keys are optional only for a disposable trusted-LAN setup. With them set, account tokens are
 sealed in addon URLs. Losing or changing one breaks that addon's installed URLs. The generated Reel signing secret
@@ -80,22 +83,30 @@ example is included in `Caddyfile.example`; it assumes Caddy runs on the host. S
 `127.0.0.1`. The hostname must resolve to an address the client can actually reach; `localhost` in an addon URL
 means the client itself, not the server.
 
-Chromecast splits this into two paths. A Web Sender page must use HTTPS, and a published custom receiver must use
-HTTPS, but Google permits the receiver to load media over HTTP from a private LAN address. Den's current Cast path
-is stricter and accepts only HTTPS media, so a plain-HTTP Hearth is not sufficient today. The media URL must be
-routable and resolvable **from the Chromecast**, not just from the sender; `localhost` means the Chromecast itself.
-Disable Wi-Fi client isolation and keep sender and receiver on a LAN where Cast discovery works.
+Chromecast splits this into two paths. Den's Web Sender remains on HTTPS, while the receiver may load a signed
+Remux playlist directly from a private-LAN HTTP address. Set, for example,
+`HEARTH_PUBLIC_BASE_URL=http://192.168.1.20:8090`; Den accepts HTTP Cast media only on an RFC 1918 address or
+`*.local` name and only for the exact signed Remux playlist shape. Public HTTP hosts, loopback, credentials, query
+parameters, and arbitrary paths remain refused. Managed CDN media remains HTTPS-only.
+
+The address must be routable and resolvable **from the Chromecast**, not just from the sender; `localhost` means
+the Chromecast itself. Keep Hearth, the sender, and the receiver on the same LAN, disable wireless client/AP
+isolation, allow the configured Hearth TCP port (8090 by default) between LAN clients, and allow multicast
+discovery. Prefer a reserved
+IPv4 address over an mDNS name when consumer routers handle `.local` inconsistently. Chrome may ask for Local
+Network Access when Den first contacts Hearth; allow it. Den does not proxy the video through Cloudflare or
+Tailscale in this mode: the receiver fetches it from Hearth over the LAN.
 
 If media does use HTTPS, use a publicly trusted certificate with the complete intermediate chain; a private CA is
-not a dependable Cast baseline. A public sender that probes a private Hearth address also encounters browser Local
-Network Access permission (Chrome 142+) and may encounter mixed-content rules, even though the receiver itself may
-load HTTP media. Split DNS plus the same trusted HTTPS hostname on the LAN is the least surprising arrangement.
+not a dependable Cast baseline. A public Den page contacting private Hearth control routes encounters browser Local
+Network Access permission (Chrome 142+), even though the receiver independently loads the media. Split DNS plus the
+same trusted HTTPS hostname on the LAN is the least surprising HTTPS arrangement.
 
 Every HLS playlist, init segment, media segment, and subtitle needs CORS; progressive media with tracks does too.
-Range requests must return correct `206`, `Content-Range`, and `Accept-Ranges` responses. This Compose file does not
-provision DNS, certificates, a sender/receiver application, or the separate Den Cast/Edge services. Hearth over
-plain HTTP is allowed by Google, but enabling it safely in Den needs a future Cast-only LAN path that never exposes
-an insecure remote URL or asks the HTTPS browser sender to probe mixed content.
+Remux supplies the Cast request headers and correct byte-range responses. The HTTPS sender does not probe a private
+HTTP media URL: it hands the capability to the receiver, while the parent Den page retains session heartbeat and
+cleanup. This Compose file does not provision DNS or certificates, and HTTP LAN casting is intentionally unavailable
+from a receiver outside that LAN.
 
 Remux emits fMP4 HLS. A Cast sender must mark both `hlsSegmentFormat` and `hlsVideoSegmentFormat` as `FMP4`; Cast
 otherwise assumes MPEG-TS. H.264/AAC is the broad compatibility fallback. HEVC, AV1, surround audio, and HDR support
@@ -103,6 +114,8 @@ vary by receiver generation, so passing a source codec through is not proof that
 
 Practical network choices:
 
+- **Simplest LAN-only:** set `HEARTH_PUBLIC_BASE_URL=http://<reserved-LAN-IP>:8090` and publish the Compose port.
+  No certificate, public DNS, Tunnel, or Funnel is needed. This is plaintext to devices already on that LAN.
 - **LAN-only:** use a real hostname and publicly trusted certificate on a LAN-bound Caddy. Obtain the certificate
   with DNS-01 so no inbound port is required, then use split DNS to resolve that name to the Hearth host. Caddy's
   private CA (`tls internal`) is not a dependable Chromecast trust path.
