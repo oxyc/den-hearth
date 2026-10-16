@@ -86,6 +86,31 @@ async fn response_bytes(response: Response<Body>) -> (StatusCode, HeaderMap, Byt
     (parts.status, parts.headers, bytes)
 }
 
+fn guest_hearth(den: Den) -> Arc<Hearth> {
+    let mut hearth = hearth_den_with_options(
+        Limits::default(),
+        den,
+        Options { managed_playback: true, ..Default::default() },
+    );
+    let state = Arc::get_mut(&mut hearth).unwrap();
+    let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
+    remux.cfg.public_session_proxy = Some("10.0.0.2".parse().unwrap());
+    remux.cfg.edge_secret = Some("edge-secret".into());
+    hearth
+}
+
+async fn guest_overlay(hearth: &Arc<Hearth>, body: Value, peer: &str, secret: &str) -> Response<Body> {
+    let request = Request::post("/den/_guest")
+        .header("content-type", "application/json")
+        .header("idempotency-key", "guest-attempt")
+        .header("x-den-edge-secret", secret)
+        .header("x-den-owner", "grant:deadbeef")
+        .extension(den_remux::Peer(peer.parse().unwrap()))
+        .body(http_body_util::Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+        .unwrap();
+    handle(hearth.clone(), None, false, request).await
+}
+
 fn resource_names(manifest: &serde_json::Value) -> Vec<&str> {
     manifest["resources"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect()
 }
@@ -123,6 +148,86 @@ async fn the_manifest_declares_only_what_the_install_configured() {
     assert_eq!(resource_names(&manifest), ["stream", "subtitles", "meta"]);
     assert_eq!(manifest["behaviorHints"]["configurationRequired"], true);
     assert!(manifest.get("denInstallId").is_none());
+}
+
+#[tokio::test]
+async fn guest_overlay_manifest_is_the_effective_union_and_never_names_an_install() {
+    let hearth = guest_hearth(den_with(None, "", "0", false));
+    let personal = plain(&config(0, &[SCOUT]));
+    let host_scout =
+        plain(r#"{"debrid":[{"service":"torbox","token":"host"}],"iid":"AAECAwQFBgcICQoLDA0ODw"}"#);
+    let host_subs = plain(r#"{"osKey":"host-os","iid":"AAECAwQFBgcICQoLDA0ODw"}"#);
+    let host_reel = plain(r#"{"tmdbKey":"host-tmdb","iid":"AAECAwQFBgcICQoLDA0ODw"}"#);
+    let response = guest_overlay(
+        &hearth,
+        serde_json::json!({
+            "personal": personal,
+            "host": {"scout": host_scout, "subs": host_subs, "reel": host_reel},
+            "request": {"method": "GET", "path": "/manifest.json"}
+        }),
+        "10.0.0.2",
+        "edge-secret",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let manifest = json_of(response).await;
+    assert_eq!(resource_names(&manifest), vec!["stream", "subtitles", "meta"]);
+    assert!(manifest.get("denInstallId").is_none(), "{manifest}");
+}
+
+#[tokio::test]
+async fn guest_overlay_is_concealed_from_everyone_but_the_configured_edge_peer() {
+    let hearth = guest_hearth(den_with(None, "", "0", false));
+    let body = serde_json::json!({
+        "host": {},
+        "request": {"method": "GET", "path": "/manifest.json"}
+    });
+    for (peer, secret) in [("10.0.0.3", "edge-secret"), ("10.0.0.2", "wrong")] {
+        let response = guest_overlay(&hearth, body.clone(), peer, secret).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{peer} {secret}");
+    }
+}
+
+#[tokio::test]
+async fn guest_overlay_revalidates_personal_revocation_before_answering() {
+    let hearth = guest_hearth(den_with(None, IID, "0", false));
+    let response = guest_overlay(
+        &hearth,
+        serde_json::json!({
+            "personal": plain(&config(0, &[SCOUT])),
+            "host": {},
+            "request": {"method": "GET", "path": "/manifest.json"}
+        }),
+        "10.0.0.2",
+        "edge-secret",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(response).await["error"], "guest_overlay_refused");
+}
+
+#[tokio::test]
+async fn a_personal_only_guest_has_no_hidden_host_fallback() {
+    let hearth = guest_hearth(den_with(None, "", "0", false));
+    let response = guest_overlay(
+        &hearth,
+        serde_json::json!({
+            "personal": plain(&config(0, &[SCOUT])),
+            "host": {},
+            "request": {
+                "method": "POST",
+                "path": "/playback",
+                "body": {"imdb": "tt1", "directFailed": true}
+            }
+        }),
+        "10.0.0.2",
+        "edge-secret",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(json_of(response).await["error"], "playback_unavailable");
 }
 
 #[test]

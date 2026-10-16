@@ -45,6 +45,8 @@ pub enum Route {
     ConfigKey,
     /// `POST /den/migrate`: exchange validated legacy first-party config segments for one combined install.
     Migrate,
+    /// `POST /den/_guest`: Edge's authenticated guest overlay RPC.
+    Guest,
     /// `/den/<config>/manifest.json`, with the config segment.
     Installed(String),
     /// `/den/<config>/playback`, with the config segment. Hearth chooses the delivery path.
@@ -66,6 +68,7 @@ pub fn route(path: &str) -> Route {
         "/manifest.json" => return Route::Manifest,
         "/config-key" => return Route::ConfigKey,
         "/migrate" => return Route::Migrate,
+        "/_guest" => return Route::Guest,
         // The page's "Test token" button: a pasted token, no config.
         "/validate" => return Route::Scout(path.to_string()),
         _ => {}
@@ -270,6 +273,7 @@ impl Den {
                 }
             }
             Route::Migrate
+            | Route::Guest
             | Route::Playback(_)
             | Route::Scout(_)
             | Route::Subs(_)
@@ -475,6 +479,8 @@ pub fn manifest(install: Option<&Install>) -> Value {
 
 /// The marker in `den_configure.html` the DenSeal bundle replaces.
 const SEAL_MARKER: &str = "<!-- DenSeal bundle -->";
+/// Edge replaces this exact, single JavaScript expression with the versioned guest bridge context.
+pub const GUEST_CONTEXT_MARKER: &str = "/*__DEN_HEARTH_GUEST_CONTEXT_V1__*/ null";
 
 /// The `<script>` element holding the DenSeal bundle (tweetnacl + blakejs, libsodium `crypto_box_seal`) in a
 /// service's configure page. All three carry the same one; it is taken from Scout's.
@@ -489,8 +495,13 @@ fn seal_bundle(page: &str) -> &str {
 /// The configure page, with the bundle put in once.
 fn configure_page() -> &'static str {
     static PAGE: LazyLock<String> = LazyLock::new(|| {
-        include_str!("den_configure.html")
-            .replace(SEAL_MARKER, seal_bundle(den_scout::configure::CONFIGURE_PAGE))
+        let template = include_str!("den_configure.html");
+        assert_eq!(
+            template.matches(GUEST_CONTEXT_MARKER).count(),
+            1,
+            "the guest bridge marker must occur exactly once"
+        );
+        template.replace(SEAL_MARKER, seal_bundle(den_scout::configure::CONFIGURE_PAGE))
     });
     PAGE.as_str()
 }
@@ -505,6 +516,7 @@ mod tests {
         assert_eq!(route("/configure"), Route::Configure);
         assert_eq!(route("/configure/"), Route::Configure);
         assert_eq!(route("/migrate"), Route::Migrate);
+        assert_eq!(route("/_guest"), Route::Guest);
         assert_eq!(route("/manifest.json"), Route::Manifest);
         assert_eq!(route("/config-key"), Route::ConfigKey);
         assert_eq!(route("/CFG/manifest.json"), Route::Installed("CFG".into()));
@@ -594,13 +606,28 @@ mod tests {
             "Object.assign({ iid: mintInstallId(), ep: configEpoch }, config)",
             "BASE + \"/config-key\"",
             "BASE + \"/validate\"",
-            "location.origin + BASE + \"/\" + toSegment(install) + \"/manifest.json\"",
+            "location.origin + BASE + \"/\" + segment + \"/manifest.json\"",
             "{ debrid: [{ service: $(\"service\").value, token: token }] }",
             "{ osKey: osKey, autoSync: $(\"autoSync\").checked }",
             "{ tmdbKey: tmdb }",
             SEAL_MARKER,
         ] {
             assert!(page.contains(needle), "the page no longer has: {needle}");
+        }
+        assert_eq!(
+            page.matches(GUEST_CONTEXT_MARKER).count(),
+            1,
+            "guest bridge marker must be exact and unique"
+        );
+        for needle in [
+            "DEN_GUEST_CONTEXT.v === 1",
+            "if (DEN_GUEST === false)",
+            "denFetch(DEN_GUEST.saveUrl",
+            "JSON.stringify({ install: segment })",
+            "location.origin + DEN_GUEST.base + \"/manifest.json\"",
+            "Could not save this guest install. Please try again.",
+        ] {
+            assert!(page.contains(needle), "the guest bridge no longer has: {needle}");
         }
         for slice in SLICES {
             assert!(page.contains(&format!("{slice}: collect")), "{slice}");

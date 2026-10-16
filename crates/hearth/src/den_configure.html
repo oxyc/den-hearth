@@ -180,9 +180,26 @@
 var PRODUCT = "Den";
 var STORE_KEY = "den-addon.configure";
 var $ = function (id) { return document.getElementById(id); };
+// Edge may replace this one stable marker with {v:1, base, saveUrl, claim}. Hearth owns every detail of the
+// provider UI and save behavior; a non-null context with any other shape fails closed below.
+var DEN_GUEST_CONTEXT = /*__DEN_HEARTH_GUEST_CONTEXT_V1__*/ null;
+var DEN_GUEST = DEN_GUEST_CONTEXT === null ? null :
+  (DEN_GUEST_CONTEXT.v === 1 && typeof DEN_GUEST_CONTEXT.base === "string" &&
+   typeof DEN_GUEST_CONTEXT.saveUrl === "string" && typeof DEN_GUEST_CONTEXT.claim === "string" ?
+   DEN_GUEST_CONTEXT : false);
 // Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
 // every link it builds sits beside it.
-var BASE = location.pathname.replace(/\/(configure\/?)?$/, "");
+var BASE = DEN_GUEST ? DEN_GUEST.base : location.pathname.replace(/\/(configure\/?)?$/, "");
+
+function denFetch(url, options) {
+  if (DEN_GUEST === false) return Promise.reject(new Error("invalid guest context"));
+  options = options || {};
+  if (DEN_GUEST) {
+    options.headers = new Headers(options.headers || {});
+    options.headers.set("x-den-grant", DEN_GUEST.claim);
+  }
+  return fetch(url, options);
+}
 
 // --- Streams (Scout) -------------------------------------------------------------------------------------
 var ALL_INDEXERS = ["torrentio", "comet", "mediafusion", "torz"];
@@ -412,7 +429,7 @@ function fillForm(s) {
   // addon only takes plaintext. Either answer carries the addon's config epoch, stamped into the link so it is
   // not born revoked. no-cache, so an epoch raised a minute ago is not read from a stale copy.
   var sealPublicKey = null, configEpoch = 0;
-  fetch(BASE + "/config-key", { cache: "no-cache" })
+  denFetch(BASE + "/config-key", { cache: "no-cache" })
     .then(function (r) {
       return r.json().then(function (j) {
         if (r.ok && j.key) sealPublicKey = j.key;
@@ -470,16 +487,41 @@ function fillForm(s) {
   }
 
   function build() {
+    if (DEN_GUEST === false) {
+      $("err").textContent = "This guest setup link is not valid. Open it again from Den.";
+      return;
+    }
     var config = collectConfig();
     if (!config) return;
     saveSettings(config);
     // Stamped after saving, so every build is a new install that can be revoked on its own.
     var install = Object.assign({ iid: mintInstallId(), ep: configEpoch }, config);
-    $("url").value = location.origin + BASE + "/" + toSegment(install) + "/manifest.json";
+    var segment = toSegment(install);
+    $("url").value = "";
     $("installId").textContent = install.iid;
     $("out").classList.remove("hidden");
     renderSecurityNote();
-    copyInstallURL();
+    if (DEN_GUEST === null) {
+      $("url").value = location.origin + BASE + "/" + segment + "/manifest.json";
+      copyInstallURL();
+      return;
+    }
+    denFetch(DEN_GUEST.saveUrl, {
+      method: "PUT",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ install: segment })
+    })
+      .then(function (r) {
+        if (!r.ok) throw new Error("save failed");
+        $("url").value = location.origin + DEN_GUEST.base + "/manifest.json";
+        copyInstallURL();
+      })
+      .catch(function () {
+        $("url").value = "";
+        $("sealNote").textContent = "Could not save this guest install. Please try again.";
+        $("sealNote").className = "note unsealed";
+      });
   }
 
   // The one request that sends the debrid token unsealed: only when this button is pressed, to check it now
@@ -489,7 +531,7 @@ function fillForm(s) {
     if (!token) { out.textContent = "Paste a token first."; out.className = "note"; return; }
     out.textContent = "Checking…";
     out.className = "note";
-    fetch(BASE + "/validate", {
+    denFetch(BASE + "/validate", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ service: $("service").value, token: token })
