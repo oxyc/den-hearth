@@ -219,6 +219,7 @@ fn operation_request(headers: &hyper::HeaderMap, operation: Operation) -> Option
         "x-forwarded-for",
         "x-den-public-session",
         "x-den-playback-finalize",
+        "x-den-playback-finalization",
     ] {
         if let Some(value) = headers.get(name) {
             request = request.header(name, value);
