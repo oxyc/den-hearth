@@ -475,16 +475,18 @@ fn error_code(snapshot: &Snapshot) -> &'static str {
     }
 }
 
-/// Add only the adapter's closed, non-secret error code after both delivery paths failed. The primary error
-/// remains Hearth's stable contract. This happens before the snapshot enters the replay table, so an ambiguous
-/// retry receives exactly the same body and headers as the first answer.
+/// Add only the adapter's closed, non-secret direct outcome. A successful Remux fallback is explicitly degraded;
+/// after both paths fail, the primary error remains Hearth's stable contract. This happens before the snapshot
+/// enters the replay table, so an ambiguous retry receives exactly the same body and headers as the first answer.
 fn annotate_direct_failure(snapshot: &mut Snapshot, failure: DirectFailure) {
-    if snapshot.status.is_success() {
-        return;
-    }
     let Ok(mut value) = serde_json::from_slice::<Value>(&snapshot.body) else { return };
     let Some(object) = value.as_object_mut() else { return };
-    object.insert("cause".to_string(), Value::String(failure.code.to_string()));
+    if snapshot.status.is_success() {
+        object.insert("degraded".to_string(), Value::Bool(true));
+        object.insert("directFailure".to_string(), Value::String(failure.code.to_string()));
+    } else {
+        object.insert("cause".to_string(), Value::String(failure.code.to_string()));
+    }
     let Ok(body) = serde_json::to_vec(&value) else { return };
     if body.len() > MAX_BODY {
         return;
@@ -493,7 +495,7 @@ fn annotate_direct_failure(snapshot: &mut Snapshot, failure: DirectFailure) {
     if let Ok(length) = HeaderValue::from_str(&snapshot.body.len().to_string()) {
         snapshot.headers.insert(CONTENT_LENGTH, length);
     }
-    if !snapshot.headers.contains_key("retry-after") {
+    if !snapshot.status.is_success() && !snapshot.headers.contains_key("retry-after") {
         if let Some(wait) = failure.retry_after {
             let seconds = wait.min(MAX_DIRECT_RETRY_AFTER).as_secs().max(1);
             if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
@@ -673,18 +675,26 @@ pub async fn handle_guest<B>(
     direct_config: Option<&str>,
     personal_scope: Option<&str>,
     host_scout: Option<&str>,
-    host_subs: Option<&str>,
+    effective_subtitles: Option<&str>,
     req: Request<B>,
 ) -> Response<Body>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let scope = personal_scope
-        .map(str::to_string)
-        .or_else(|| host_scout.map(|scout| format!("host:{scout}")))
-        .unwrap_or_else(|| "guest-without-scout".to_string());
-    handle_with_sources(hearth, direct_config, &scope, host_scout, host_subs, req).await
+    let scope = guest_scope(personal_scope, host_scout, effective_subtitles);
+    handle_with_sources(hearth, direct_config, &scope, host_scout, effective_subtitles, req).await
+}
+
+/// All sources that can change a guest playback answer belong to its replay scope. Keeping the tuple encoded
+/// rather than concatenated prevents one segment boundary from being confused for another.
+fn guest_scope(
+    personal: Option<&str>,
+    host_scout: Option<&str>,
+    effective_subtitles: Option<&str>,
+) -> String {
+    serde_json::to_string(&("guest", personal, host_scout, effective_subtitles))
+        .expect("a tuple of strings always serializes")
 }
 
 async fn handle_with_sources<B>(
@@ -1145,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_remux_fallback_never_exposes_the_direct_failure() {
+    fn a_successful_remux_fallback_exposes_only_the_stable_degraded_reason() {
         let original = br#"{"url":"/remux/s/id/signature/master.m3u8"}"#;
         let mut snapshot = Snapshot {
             status: StatusCode::OK,
@@ -1156,8 +1166,29 @@ mod tests {
             &mut snapshot,
             DirectFailure::from_managed(den_scout::managed_hls::ManagedHlsError::Authentication),
         );
-        assert_eq!(snapshot.body, Bytes::from_static(original));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&snapshot.body).unwrap(),
+            json!({
+                "url": "/remux/s/id/signature/master.m3u8",
+                "degraded": true,
+                "directFailure": "torbox_authentication_failed"
+            })
+        );
+        assert_eq!(snapshot.headers[CONTENT_LENGTH], snapshot.body.len().to_string());
         assert!(!snapshot.headers.contains_key("retry-after"));
+    }
+
+    #[test]
+    fn guest_replay_scope_changes_with_every_effective_config_source() {
+        let baseline = guest_scope(Some("personal"), Some("host-scout"), Some("host-subs"));
+        for changed in [
+            guest_scope(Some("personal-2"), Some("host-scout"), Some("host-subs")),
+            guest_scope(Some("personal"), Some("host-scout-2"), Some("host-subs")),
+            guest_scope(Some("personal"), Some("host-scout"), Some("host-subs-2")),
+            guest_scope(Some("personal"), Some("host-scout"), None),
+        ] {
+            assert_ne!(baseline, changed);
+        }
     }
 
     #[tokio::test]

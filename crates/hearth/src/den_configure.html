@@ -183,9 +183,13 @@ var $ = function (id) { return document.getElementById(id); };
 // Edge may replace this one stable marker with {v:1, base, saveUrl, claim}. Hearth owns every detail of the
 // provider UI and save behavior; a non-null context with any other shape fails closed below.
 var DEN_GUEST_CONTEXT = /*__DEN_HEARTH_GUEST_CONTEXT_V1__*/ null;
+function denGuestPath(value) {
+  return typeof value === "string" && value.charAt(0) === "/" && value.charAt(1) !== "/";
+}
 var DEN_GUEST = DEN_GUEST_CONTEXT === null ? null :
-  (DEN_GUEST_CONTEXT.v === 1 && typeof DEN_GUEST_CONTEXT.base === "string" &&
-   typeof DEN_GUEST_CONTEXT.saveUrl === "string" && typeof DEN_GUEST_CONTEXT.claim === "string" ?
+  (DEN_GUEST_CONTEXT.v === 1 && denGuestPath(DEN_GUEST_CONTEXT.base) &&
+   denGuestPath(DEN_GUEST_CONTEXT.saveUrl) && typeof DEN_GUEST_CONTEXT.claim === "string" &&
+   DEN_GUEST_CONTEXT.claim.length > 0 ?
    DEN_GUEST_CONTEXT : false);
 // Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
 // every link it builds sits beside it.
@@ -429,14 +433,27 @@ function fillForm(s) {
   // addon only takes plaintext. Either answer carries the addon's config epoch, stamped into the link so it is
   // not born revoked. no-cache, so an epoch raised a minute ago is not read from a stale copy.
   var sealPublicKey = null, configEpoch = 0;
+  if (DEN_GUEST !== null) $("go").disabled = true;
   denFetch(BASE + "/config-key", { cache: "no-cache" })
     .then(function (r) {
       return r.json().then(function (j) {
-        if (r.ok && j.key) sealPublicKey = j.key;
+        if (r.ok && typeof j.key === "string" && j.key) sealPublicKey = j.key;
         if (typeof j.epoch === "number") configEpoch = j.epoch;
+        if (DEN_GUEST) {
+          if (!sealPublicKey || !window.DenSeal) throw new Error("guest sealing unavailable");
+          $("go").disabled = false;
+        }
       });
     })
-    .catch(function () { /* offline / no key served → plaintext fallback below */ });
+    .catch(function () {
+      if (DEN_GUEST !== null) {
+        $("go").disabled = true;
+        $("err").textContent = DEN_GUEST === false ?
+          "This guest setup link is not valid. Open it again from Den." :
+          "Could not load encryption for this guest install. Please try again.";
+      }
+      // Standalone mode deliberately retains its previous plaintext fallback.
+    });
 
   // A fresh install id for every link: 16 random bytes, base64url without padding (22 characters).
   function mintInstallId() {
@@ -460,6 +477,10 @@ function fillForm(s) {
         lastBuildSealed = true;
         return segment;
       } catch (e) { /* fall through to plaintext */ }
+    }
+    if (DEN_GUEST !== null) {
+      lastBuildSealed = false;
+      return null;
     }
     lastBuildSealed = false;
     return encodePlain(config);
@@ -497,6 +518,11 @@ function fillForm(s) {
     // Stamped after saving, so every build is a new install that can be revoked on its own.
     var install = Object.assign({ iid: mintInstallId(), ep: configEpoch }, config);
     var segment = toSegment(install);
+    if (DEN_GUEST && (!segment || !lastBuildSealed)) {
+      $("err").textContent = "Could not encrypt this guest install. Nothing was saved.";
+      $("url").value = "";
+      return;
+    }
     $("url").value = "";
     $("installId").textContent = install.iid;
     $("out").classList.remove("hidden");

@@ -622,6 +622,10 @@ mod tests {
         for needle in [
             "DEN_GUEST_CONTEXT.v === 1",
             "if (DEN_GUEST === false)",
+            "if (DEN_GUEST !== null) $(\"go\").disabled = true",
+            "if (!sealPublicKey || !window.DenSeal)",
+            "if (DEN_GUEST && (!segment || !lastBuildSealed))",
+            "Nothing was saved.",
             "denFetch(DEN_GUEST.saveUrl",
             "JSON.stringify({ install: segment })",
             "location.origin + DEN_GUEST.base + \"/manifest.json\"",
@@ -632,5 +636,25 @@ mod tests {
         for slice in SLICES {
             assert!(page.contains(&format!("{slice}: collect")), "{slice}");
         }
+    }
+
+    #[test]
+    fn the_guest_bridge_requires_sealing_before_saving() {
+        let page = include_str!("den_configure.html");
+        let at =
+            |needle: &str| page.find(needle).unwrap_or_else(|| panic!("missing guest invariant: {needle}"));
+
+        assert!(
+            at("if (DEN_GUEST !== null) $(\"go\").disabled = true") < at("denFetch(BASE + \"/config-key\"")
+        );
+        assert!(at("if (!sealPublicKey || !window.DenSeal)") < at("$(\"go\").disabled = false"));
+        assert!(at("if (DEN_GUEST && (!segment || !lastBuildSealed))") < at("denFetch(DEN_GUEST.saveUrl"));
+        assert!(
+            at("if (!r.ok) throw new Error(\"save failed\")")
+                < at("location.origin + DEN_GUEST.base + \"/manifest.json\"")
+        );
+        assert!(
+            page.contains("if (DEN_GUEST !== null) {\n      lastBuildSealed = false;\n      return null;")
+        );
     }
 }
