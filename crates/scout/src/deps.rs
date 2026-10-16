@@ -19,6 +19,7 @@ use crate::decisionlog::{quote_go, set_log_identity};
 use crate::handler::{go_duration, DEFAULT_LIST_TTL, DEFAULT_TIMEOUT};
 use crate::indexerconfig::enable_indexer_config_minting;
 use crate::loglimit::emit;
+use crate::managed_hls::{ManagedHlsResolver, TorBoxManagedHls};
 use crate::manifest::manifest_version;
 use crate::scrape::{make_scrapers, new_source_doer, DoError, Doer, Scraper};
 use crate::seal::{parse_seal_keyring, SealKeyring};
@@ -347,6 +348,9 @@ pub struct Deps {
     pub public_url: String,
     pub make_scrapers: ScraperFactory,
     pub make_stores: StoreFactory,
+    /// Internal managed-HLS resolver. It is not reachable from Scout's HTTP routes; Hearth calls the Den
+    /// handler's title-level API while its rollout switch is enabled.
+    pub managed_hls: Option<Arc<dyn ManagedHlsResolver>>,
     /// Meta resolves an id → title + release year, for MOVIES only, so mistagged torrents can be dropped. Series are
     /// not looked up at all and get no mistag filter — cinemeta.rs records the two independent reasons, both of
     /// which were verified the hard way. Optional (None = no year/title filter); a lookup failure returns
@@ -437,6 +441,9 @@ fn build_deps_with(
     let indexer_urls = settings.indexer_urls.clone();
     let scraper_doer = doer.clone();
     let (store_doer, store_cache) = (doer.clone(), cache.clone());
+    let managed_hls = TorBoxManagedHls::new(doer.clone(), cache.clone())
+        .ok()
+        .map(|resolver| Arc::new(resolver) as Arc<dyn ManagedHlsResolver>);
     let (seal_keyring, config_key_invalid) = build_keyring(&settings.config_key, &settings.config_keys_prev);
     Deps {
         probe_doer: Some(doer.clone()),
@@ -450,6 +457,7 @@ fn build_deps_with(
             make_scrapers(c, scraper_doer.clone(), source_doer.clone(), &indexer_urls)
         }),
         make_stores: Arc::new(move |c| build_stores(c, store_doer.clone(), Some(store_cache.clone()))),
+        managed_hls,
         seal_keyring: seal_keyring.map(Arc::new),
         config_key_invalid,
         metrics_token: settings.metrics_token.clone(),

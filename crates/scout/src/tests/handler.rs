@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use crate::cache::{Cache, MemoryCache};
 use crate::config::{DebridService, Indexer};
 use crate::deps::Deps;
 use crate::handler::{new_handler, now_unix, Handler};
+use crate::managed_hls::{ManagedHlsError, ManagedHlsRequest, ManagedHlsResolver, ManagedHlsUrl};
 use crate::rank::RawStream;
 use crate::scrape::{DoError, ScrapeQuery, Scraper};
 use crate::seal::{parse_seal_keyring, SealKeyring};
@@ -126,6 +127,7 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
                 status_blocks: false,
             })]
         }),
+        managed_hls: None,
         seal_keyring: None,
         config_key_invalid: false,
         metrics_token: String::new(),
@@ -139,6 +141,53 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
     };
     over(&mut d);
     d
+}
+
+#[derive(Default)]
+struct FixedManagedHls {
+    targets: Mutex<Vec<ResolveTarget>>,
+}
+
+#[async_trait]
+impl ManagedHlsResolver for FixedManagedHls {
+    async fn resolve(
+        &self,
+        _config: &crate::config::Config,
+        target: &ResolveTarget,
+    ) -> Result<ManagedHlsUrl, ManagedHlsError> {
+        self.targets.lock().unwrap().push(target.clone());
+        Ok(ManagedHlsUrl::fixture(
+            "https://test.tb-cdn.io/opaque/index.m3u8?token=secret&scrobbling_enabled=false",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn managed_hls_is_title_level_and_keeps_provider_ids_inside_scout() {
+    let resolver = Arc::new(FixedManagedHls::default());
+    let inspect = resolver.clone();
+    let h = new_handler(test_deps(move |deps| deps.managed_hls = Some(resolver)));
+    let result = h
+        .managed_hls(
+            &valid_blob(),
+            &ManagedHlsRequest {
+                imdb: "tt0111161".to_owned(),
+                filename: Some("Movie 1080p WEB-DL".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("managed HLS");
+
+    assert_eq!(result.release.filename, "Movie 1080p WEB-DL");
+    assert_eq!(result.release.label, "1080p • WEB-DL • 8.0 GB");
+    assert_eq!(result.release.size, Some(8 * GIB));
+    assert_eq!(format!("{:?}", result.url), "ManagedHlsUrl([redacted])");
+    let targets = inspect.targets.lock().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].info_hash, "b".repeat(40));
+    assert_eq!(targets[0].file_idx, Some(0));
+    assert!(!targets[0].no_add, "managed playback must reuse the ordinary add-budgeted resolve path");
 }
 
 /// The future a `FakeScraper`'s behaviour returns, so a test can answer late, hang, or fail.

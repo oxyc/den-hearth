@@ -410,6 +410,7 @@ pub struct Release<'a> {
 /// two call sites.
 pub async fn fetch_list(
     http: &reqwest::Client,
+    local: Option<&den_http::Local>,
     source_http: &reqwest::Client,
     base: &str,
     release: &Release<'_>,
@@ -427,6 +428,13 @@ pub async fn fetch_list(
     let Some(url) = list_url(base, release.id, hash.as_deref(), release.size, release.filename) else {
         return Ok(Vec::new());
     };
+    if let Some(reply) = local.and_then(|local| local.get(&url, hyper::HeaderMap::new(), MAX_LIST as usize)) {
+        let resp = reply.await?;
+        if !resp.status().is_success() {
+            return Err(format!("den-subtitles answered {}", resp.status().as_u16()));
+        }
+        return Ok(parse_list(resp.body()));
+    }
     let resp = http.get(&url).send().await.map_err(|e| e.without_url().to_string())?;
     if !resp.status().is_success() {
         return Err(format!("den-subtitles answered {}", resp.status().as_u16()));

@@ -143,6 +143,7 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Scout(path) => classify(&Target::Scout(path.clone()), method),
             Route::Subs(path) => classify(&Target::Subs(path.clone()), method),
             Route::Reel(path) => classify(&Target::Reel(path.clone()), method),
+            Route::Playback(_) => bulk(None),
             Route::NotFound => bulk(None),
             Route::Configure | Route::Manifest | Route::ConfigKey | Route::Installed(_) if read => control,
             _ => bulk(None),
@@ -441,6 +442,7 @@ mod tests {
     fn the_den_addon_loses_its_mount() {
         assert_eq!(target("/den"), Target::Den(Route::Configure));
         assert_eq!(target("/den/CFG/manifest.json"), Target::Den(Route::Installed("CFG".into())));
+        assert_eq!(target("/den/CFG/playback"), Target::Den(Route::Playback("CFG".into())));
         assert_eq!(
             target("/den/CFG/stream/movie/tt1.json"),
             Target::Den(Route::Scout("/CFG/stream/movie/tt1.json".into()))

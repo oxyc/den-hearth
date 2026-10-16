@@ -1342,7 +1342,7 @@ impl Session {
             size: self.release.size,
             filename: &self.release.filename,
         };
-        subs::fetch_list(&st.scout_http, &st.source_http, &sb.base, &release)
+        subs::fetch_list(&st.scout_http, st.local_scout.get(), &st.source_http, &sb.base, &release)
             .await
             .inspect_err(|e| {
                 crate::log_limited("subtitles_list", || {
@@ -3415,7 +3415,7 @@ pub async fn create(
                 size,
                 filename: c.filename(),
             };
-            crate::subs::fetch_list(&st.scout_http, &st.source_http, base, &release)
+            crate::subs::fetch_list(&st.scout_http, st.local_scout.get(), &st.source_http, base, &release)
                 .await
                 .inspect_err(|e| {
                     crate::log_limited("subtitles_list", || {

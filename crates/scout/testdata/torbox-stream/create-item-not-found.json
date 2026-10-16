@@ -1,0 +1,7 @@
+{
+  "success": false,
+  "error": "ITEM_NOT_FOUND",
+  "detail": "Item not found. Please try again with a different ID.",
+  "data": null
+}
+

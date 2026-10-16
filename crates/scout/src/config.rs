@@ -81,8 +81,8 @@ pub const VALID_RESOLUTIONS: [&str; 4] = ["2160p", "1080p", "720p", "480p"];
 
 /// Ceiling on the base64 config path segment. See `decode_config`.
 pub const MAX_CONFIG_BLOB: usize = 16 << 10;
-/// Ceiling on accounts in one config. There are three services; more than a handful of accounts is
-/// not a configuration, it is a way to make one request retain a large slice for a whole scrape.
+/// Defensive ceiling on accounts in one config. Validation also permits only one account for each of the
+/// three services; the larger historical ceiling remains for compatibility with code sizing encoded forms.
 pub const MAX_DEBRID_ACCOUNTS: usize = 8;
 /// Ceiling on results in one response, down from 200.
 ///
@@ -240,10 +240,9 @@ pub fn decode_config_slice(kr: Option<&SealKeyring>, blob: &str, slice: Option<&
     // misses measured 207 MiB inside a 230 MiB GOMEMLIMIT.
     //
     // 16 KiB, and the margin is thinner than it looks: the largest config the FIELD caps admit —
-    // MAX_DEBRID_ACCOUNTS accounts each with a 512-character token, all four indexers, MAX_SOURCES household
-    // sources at MAX_SOURCE_URL, every filter, a 256-character regex — measures 14,718 bytes plain and 14,783
-    // sealed, so 90% of this is legitimately reachable. Those two numbers are computed by the test rather than
-    // trusted here. It was 8 KiB until household sources, whose links carry their own config segments. It
+    // one account for each provider, each with a 512-character token, all four indexers, MAX_SOURCES household
+    // sources at MAX_SOURCE_URL, every filter and a 256-character regex. The exact sizes are computed by the test
+    // rather than trusted here. It was 8 KiB until household sources, whose links carry their own config segments. It
     // cannot come down without lowering those caps too, which is why the response-side multiplier is bounded
     // by MAX_RESULT_CAP instead. A config from /configure is ~1 KB, and ~2 KB with one source.
     //
@@ -390,6 +389,7 @@ struct RawFilters {
 /// Go `validateConfig`: strict-whitelists and clamps an untrusted config (mirrors src/config.ts).
 fn validate(raw: RawConfig) -> Option<Config> {
     let mut debrid = Vec::new();
+    let mut debrid_services = HashSet::new();
     for d in raw.debrid.unwrap_or_default() {
         let d = d.unwrap_or(RawAccount { service: None, token: None });
         let Some(service) = DebridService::parse(&d.service.unwrap_or_default()) else {
@@ -398,6 +398,12 @@ fn validate(raw: RawConfig) -> Option<Config> {
         let token = d.token.unwrap_or_default();
         if token.is_empty() || token.len() > 512 {
             continue;
+        }
+        // A config has one account per provider. Store construction historically put these in a map and
+        // silently kept the last token, so the URL appeared valid while which account it used depended on
+        // ordering. Keep the Vec wire shape (and its preference order), but reject the ambiguous config.
+        if !debrid_services.insert(service) {
+            return None;
         }
         debrid.push(DebridAccount { service, token });
         // Stop at the ceiling rather than keeping every account named. With the blob capped this can no

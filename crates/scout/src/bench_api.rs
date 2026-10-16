@@ -172,6 +172,7 @@ pub async fn handler_bench(streams: Vec<RawStream>) -> HandlerBench {
         public_url: "https://scout.example".to_owned(),
         make_scrapers: Arc::new(move |_| vec![Box::new(FixedScraper(streams.to_vec())) as Box<dyn Scraper>]),
         make_stores: Arc::new(|_| vec![Box::new(HeldStore) as Box<dyn Store>]),
+        managed_hls: None,
         seal_keyring: Some(Arc::new(keyring)),
         config_key_invalid: false,
         metrics_token: String::new(),

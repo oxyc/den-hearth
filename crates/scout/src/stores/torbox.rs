@@ -46,8 +46,7 @@ use crate::util::{key_hash, Shape, LEAF};
 
 use super::{
     build_request, dead_link, encode_form, join_all, magnet_for, read_limited, read_store_error,
-    redact_token, short_hash, store_error_text, store_refused_us, torbox_fetch_state as fetch_state,
-    unavailable,
+    redact_token, store_error_text, store_refused_us, torbox_fetch_state as fetch_state, unavailable,
 };
 use crate::util::{scoped, DetachedFlight};
 pub(crate) use listing::{decode_listing, ListingFault, TruncationDetector};
@@ -655,10 +654,7 @@ impl TorBoxStore {
                     );
                     log_limited(
                         "torbox-already-queued",
-                        &format!(
-                            "torbox: {} already queued (queued_id {qid}) — reporting queued, not a dead link",
-                            short_hash(info_hash)
-                        ),
+                        "torbox: requested torrent already queued — reporting queued, not a dead link",
                     );
                     return Ok((0, qid));
                 }
@@ -1129,7 +1125,7 @@ impl TorBoxStore {
 
     /// Go `torBoxStore.forgetTorrentID` drops both remembered facts about a torrent the account turns out not to
     /// have, so the next resolve starts from nothing rather than from a stale id.
-    fn forget_torrent_id(&self, info_hash: &str) {
+    pub(crate) fn forget_torrent_id(&self, info_hash: &str) {
         let Some(cache) = &self.cache else { return };
         let identity = self.account_identity();
         cache.put(&torrent_id_key(&identity, info_hash), "", Duration::from_nanos(1));
@@ -1203,6 +1199,42 @@ impl TorBoxStore {
         // the result is sitting in the account listing.
         settle_add_attempt(self.cache(), DebridService::TorBox, &identity, info_hash);
         (id, true, true)
+    }
+
+    /// Resolve through the ordinary TorBox play path, including its add budget, in-flight markers, refusal
+    /// backoff and file selection, but return the account-local ids to Scout's managed-HLS adapter instead of
+    /// exposing them to Hearth. The ordinary download URL is minted and discarded for now; keeping this narrow
+    /// duplication-free boundary is safer than maintaining a second add state machine beside `Store::resolve`.
+    pub(crate) async fn prepare_managed_item(
+        &self,
+        target: &ResolveTarget,
+    ) -> Result<(i64, Option<i64>), StoreError> {
+        let resolved = <Self as Store>::resolve(self, target).await;
+        let (torrent_id, known) = self.known_torrent_id(&target.info_hash);
+        if !known {
+            return match resolved {
+                Err(error) => Err(error),
+                Ok(_) => Err(no_file_list()),
+            };
+        }
+
+        // Resolve caches the exact file list it used. Read that first so managed playback does not repeat a
+        // mylist call; the movie fast path intentionally caches an empty list and selects from file_idx.
+        let key = resolve_key(&self.account_identity(), &target.info_hash);
+        if let Some(entry) = self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.get(&key))
+            .and_then(|raw| serde_json::from_str::<ResolveEntry>(&raw).ok())
+            .filter(|entry| entry.torrent_id == torrent_id)
+        {
+            return Ok((torrent_id, select_file_id(&entry.files(), target)?));
+        }
+
+        // A link request can fail after the account has accepted and named the torrent. That should not hide
+        // the item from createstream; list it once and let the managed endpoint make its own readiness decision.
+        let files = self.list_files(torrent_id).await?;
+        Ok((torrent_id, select_file_id(&files, target)?))
     }
 
     /// Go `torBoxStore.findTorrentByHash` scans the account's torrent list for an infohash. TorBox reports hashes
@@ -1440,7 +1472,7 @@ impl TorBoxStore {
                 // more specific anywhere in the log; these lines are what distinguishes the branch next time.
                 log_limited(
                     "mylist-transport",
-                    &format!("torbox mylist {torrent_id}: {}", transport_kind(Some(e.as_ref()))),
+                    &format!("torbox mylist: {}", transport_kind(Some(e.as_ref()))),
                 );
                 return Err(no_file_list());
             }
@@ -1456,16 +1488,16 @@ impl TorBoxStore {
             return Err(unavailable(DebridService::TorBox, format!("mylist http {status}"), status));
         }
         if status != 200 {
-            log_limited("mylist-status", &format!("torbox mylist {torrent_id}: http {status}"));
+            log_limited("mylist-status", &format!("torbox mylist: http {status}"));
             return Err(no_file_list());
         }
         static SHAPE: Shape = Shape::Object(&[("success", &LEAF), ("data", &LEAF)]);
         let Some(body) = reply.json(&SHAPE).await.and_then(envelope) else {
-            log_limited("mylist-decode", &format!("torbox mylist {torrent_id}: unreadable body"));
+            log_limited("mylist-decode", "torbox mylist: unreadable body");
             return Err(no_file_list());
         };
         let Ok(success) = opt_bool(body.get("success")) else {
-            log_limited("mylist-decode", &format!("torbox mylist {torrent_id}: unreadable body"));
+            log_limited("mylist-decode", "torbox mylist: unreadable body");
             return Err(no_file_list());
         };
         // TorBox answers 200 with success:false / data:null for an id it no longer holds — the same shape
@@ -1482,7 +1514,7 @@ impl TorBoxStore {
         // `gone` paid an add to re-buy a torrent nobody said was missing. The two shapes that really do say
         // so are handled above, so nothing is lost by being careful here.
         let Some(data) = data else {
-            log_limited("mylist-empty", &format!("torbox mylist {torrent_id}: no data field"));
+            log_limited("mylist-empty", "torbox mylist: no data field");
             return Err(no_file_list());
         };
         let data = fold_entry_keys(data.clone(), &LIST_FILES_ENTRY, &LIST_FILES_ENTRIES);
@@ -1492,10 +1524,7 @@ impl TorBoxStore {
         let entry = match ListEntry::read(&data) {
             Some(e) => {
                 if e.id != 0 && e.id != torrent_id {
-                    log_limited(
-                        "mylist-other-id",
-                        &format!("torbox mylist {torrent_id}: answer named torrent {}", e.id),
-                    );
+                    log_limited("mylist-other-id", "torbox mylist: answer named another torrent");
                     return Err(no_file_list());
                 }
                 e
@@ -1513,10 +1542,7 @@ impl TorBoxStore {
                     _ => None,
                 };
                 let Some(arr) = arr else {
-                    log_limited(
-                        "mylist-shape",
-                        &format!("torbox mylist {torrent_id}: answer is neither an object nor an array"),
-                    );
+                    log_limited("mylist-shape", "torbox mylist: answer is neither an object nor an array");
                     return Err(no_file_list());
                 };
                 if arr.is_empty() {
@@ -1548,7 +1574,7 @@ impl TorBoxStore {
                 let Some(i) = m.or(unlabelled) else {
                     log_limited(
                         "mylist-no-match",
-                        &format!("torbox mylist {torrent_id}: {} entries, none named it", arr.len()),
+                        &format!("torbox mylist: {} entries, none matched the requested torrent", arr.len()),
                     );
                     return Err(no_file_list());
                 };
@@ -2747,10 +2773,7 @@ impl Store for TorBoxStore {
                         return Err(err);
                     }
                     self.forget_torrent_id(&t.info_hash);
-                    log_limited(
-                        "torbox-gone",
-                        &format!("torbox no longer has {} — re-adding", short_hash(&t.info_hash)),
-                    );
+                    log_limited("torbox-gone", "torbox no longer has the requested torrent — re-adding");
                 }
             }
         }
@@ -3054,8 +3077,7 @@ impl TorBoxStore {
             log_limited(
                 "torbox-stalled-cancel",
                 &format!(
-                    "cancelling a stalled torrent with no addedByUs marker ({}, state {}) — abandoned by the client's fallback",
-                    short_hash(info_hash),
+                    "cancelling a stalled torrent with no addedByUs marker (state {}) — abandoned by the client's fallback",
                     quote_go(state)
                 ),
             );

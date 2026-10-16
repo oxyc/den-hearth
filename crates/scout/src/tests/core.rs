@@ -627,11 +627,12 @@ fn decode_config_bounds_what_one_request_can_retain() {
     }
 
     // The margin that matters is against the largest LEGITIMATE config the field caps admit, not against
-    // a hand-picked typical one. maxDebridAccounts accounting each carrying a 512-character token (the
-    // per-token cap), all four indexers, maxSources household sources at the link cap, every filter set,
-    // and a 256-character excludeRegex.
-    let accts: Vec<String> = (0..MAX_DEBRID_ACCOUNTS)
-        .map(|_| format!(r#"{{"service":"torbox","token":"{}"}}"#, "t".repeat(512)))
+    // a hand-picked typical one. One account for each provider, each carrying a 512-character token (the
+    // per-token cap), all four indexers, maxSources household sources at the link cap, every filter set, and
+    // a 256-character excludeRegex.
+    let accts: Vec<String> = ["torbox", "realdebrid", "premiumize"]
+        .into_iter()
+        .map(|service| format!(r#"{{"service":"{service}","token":"{}"}}"#, "t".repeat(512)))
         .collect();
     let sources: Vec<String> = (0..MAX_SOURCES)
         .map(|i| {
@@ -665,8 +666,8 @@ fn decode_config_bounds_what_one_request_can_retain() {
         sealed_seg.len(),
         MAX_CONFIG_BLOB
     );
-    // Recorded rather than asserted loosely: 90% of the cap is reachable legitimately, so the cap cannot
-    // come down without lowering maxDebridAccounts or the per-token cap with it.
+    // Recorded rather than asserted loosely: the cap cannot come down without checking the actual maximal
+    // configuration and its sealed overhead.
     eprintln!(
         "largest legitimate segment: {} plain, {} sealed, against a {} cap",
         worst_legit.len(),
@@ -674,11 +675,12 @@ fn decode_config_bounds_what_one_request_can_retain() {
         MAX_CONFIG_BLOB
     );
 
-    // Accounts are capped, and repeated resolutions are deduped rather than retained — four valid values
-    // mean a repeat carries no information, and rankStreams scans that slice per release.
-    // Sized to fit under the blob cap, so this exercises the FIELD caps rather than being refused by the
-    // segment cap one layer up.
-    let accounts: Vec<&str> = (0..100).map(|_| r#"{"service":"torbox","token":"t"}"#).collect();
+    // Repeated provider accounts are rejected rather than silently choosing one token. Repeated resolutions
+    // are still deduped rather than retained — four valid values mean a repeat carries no information, and
+    // rankStreams scans that slice per release. Sized to fit under the blob cap, so this exercises validation
+    // rather than being refused by the segment cap one layer up.
+    let accounts: Vec<&str> = (0..100).map(|_| r#"{"service":"nope","token":"t"}"#).collect();
+    let accounts = std::iter::once(r#"{"service":"torbox","token":"t"}"#).chain(accounts).collect::<Vec<_>>();
     let resolutions: Vec<&str> = (0..100).map(|_| r#""1080p""#).collect();
     let cfg = crate::config::decode_config(
         None,
@@ -703,6 +705,25 @@ fn decode_config_bounds_what_one_request_can_retain() {
         "kept {} resolutions for one repeated value, want 1",
         cfg.filters.resolutions.len()
     );
+}
+
+#[test]
+fn decode_config_rejects_duplicate_provider_accounts() {
+    for duplicate in [
+        r#"{"debrid":[{"service":"torbox","token":"first"},{"service":"torbox","token":"second"}]}"#,
+        r#"{"debrid":[{"service":"realdebrid","token":"first"},{"service":"premiumize","token":"pm"},{"service":"realdebrid","token":"second"}]}"#,
+    ] {
+        assert!(
+            crate::config::decode_config(None, &blob(duplicate)).is_none(),
+            "duplicate provider config was accepted: {duplicate}"
+        );
+    }
+
+    // Invalid entries remain ignorable; they cannot make an otherwise valid provider look duplicated.
+    let valid = r#"{"debrid":[{"service":"torbox","token":""},{"service":"torbox","token":"kept"}]}"#;
+    let cfg = crate::config::decode_config(None, &blob(valid)).expect("one valid TorBox account");
+    assert_eq!(cfg.debrid.len(), 1);
+    assert_eq!(cfg.debrid[0].token, "kept");
 }
 
 // The account cap is a ceiling, not a target: a config naming several services keeps all of them.

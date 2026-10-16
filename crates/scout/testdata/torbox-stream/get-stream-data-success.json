@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "error": null,
+  "detail": "<redacted>",
+  "data": {
+    "audio_index": 0,
+    "domain": "flux-002.wnam.tb-cdn.io",
+    "file_token": "<redacted>",
+    "hls_url": "https://flux-002.wnam.tb-cdn.io/redacted/index.m3u8?token=redacted&scrobbling_enabled=false",
+    "intro_information": {},
+    "is_transcoding": false,
+    "metadata": {},
+    "needs_transcoding": true,
+    "presigned_token": "<redacted>",
+    "resolution_index": "null",
+    "search_metadata": null,
+    "subtitle_index": "null",
+    "token": "<redacted>",
+    "user_token": "<redacted>"
+  }
+}
