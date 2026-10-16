@@ -35,6 +35,8 @@ const REPLAY_FOR: Duration = Duration::from_secs(120);
 // outer bound stops abandoned work without shortening that retained path.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
+// Match the shared outbound HTTP ceiling: an upstream cannot ask the browser to stop trying for a day.
+const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 struct Snapshot {
@@ -441,6 +443,34 @@ fn error_code(snapshot: &Snapshot) -> &'static str {
     }
 }
 
+/// Add only the adapter's closed, non-secret error code after both delivery paths failed. The primary error
+/// remains Hearth's stable contract. This happens before the snapshot enters the replay table, so an ambiguous
+/// retry receives exactly the same body and headers as the first answer.
+fn annotate_direct_failure(snapshot: &mut Snapshot, failure: DirectFailure) {
+    if snapshot.status.is_success() {
+        return;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&snapshot.body) else { return };
+    let Some(object) = value.as_object_mut() else { return };
+    object.insert("cause".to_string(), Value::String(failure.code.to_string()));
+    let Ok(body) = serde_json::to_vec(&value) else { return };
+    if body.len() > MAX_BODY {
+        return;
+    }
+    snapshot.body = Bytes::from(body);
+    if let Ok(length) = HeaderValue::from_str(&snapshot.body.len().to_string()) {
+        snapshot.headers.insert(CONTENT_LENGTH, length);
+    }
+    if !snapshot.headers.contains_key("retry-after") {
+        if let Some(wait) = failure.retry_after {
+            let seconds = wait.min(MAX_DIRECT_RETRY_AFTER).as_secs().max(1);
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                snapshot.headers.insert("retry-after", value);
+            }
+        }
+    }
+}
+
 fn log_operation_failure(snapshot: &Snapshot, direct: Option<DirectFailure>, rid: Option<&str>) {
     if snapshot.status.is_success() {
         return;
@@ -654,9 +684,11 @@ where
         && parts.headers.get("x-den-managed-playback").is_some_and(|value| value.as_bytes() == b"1")
         && !direct_failed;
     let direct = managed_request(&request);
+    // Kept outside the bounded future so a completed direct attempt is still available when Remux consumes the
+    // rest of the overall deadline and the future is cancelled by the outer timeout.
+    let mut direct_failure = None;
+    let mut prepare_elapsed = None;
     let operation = async {
-        let mut direct_failure = None;
-        let mut prepare_elapsed = None;
         if managed {
             if let Some(direct) = direct.as_ref() {
                 let started = Instant::now();
@@ -665,7 +697,7 @@ where
                 {
                     Ok(Ok(result)) => {
                         hearth.playback.metrics.direct_ok.fetch_add(1, Relaxed);
-                        return (direct_response(result, started.elapsed().as_millis() as u64), None, true);
+                        return (direct_response(result, started.elapsed().as_millis() as u64), true);
                     }
                     Ok(Err(error)) => {
                         let failure = DirectFailure::from_managed(error);
@@ -689,14 +721,16 @@ where
         if let Some(elapsed) = prepare_elapsed {
             response = with_prepare_timing(response, elapsed);
         }
-        (response, direct_failure, false)
+        (response, false)
     };
-    let (response, direct_failure, delivered_direct) =
-        match tokio::time::timeout(OPERATION_TIMEOUT, operation).await {
-            Ok(result) => result,
-            Err(_) => (answer(StatusCode::GATEWAY_TIMEOUT, "playback_timeout", None), None, false),
-        };
-    let saved = snapshot(response).await;
+    let (response, delivered_direct) = match tokio::time::timeout(OPERATION_TIMEOUT, operation).await {
+        Ok(result) => result,
+        Err(_) => (answer(StatusCode::GATEWAY_TIMEOUT, "playback_timeout", None), false),
+    };
+    let mut saved = snapshot(response).await;
+    if let Some(failure) = direct_failure {
+        annotate_direct_failure(&mut saved, failure);
+    }
     if saved.status.is_success() {
         if delivered_direct {
             hearth.playback.metrics.operation_direct.fetch_add(1, Relaxed);
@@ -944,5 +978,93 @@ mod tests {
         assert_eq!(failure.code, "torbox_rate_limited");
         assert_eq!(failure.retry_after, Some(Duration::from_secs(17)));
         assert!(matches!(failure.class, DirectFailureClass::Unavailable));
+    }
+
+    fn error_snapshot(headers: HeaderMap) -> Snapshot {
+        Snapshot {
+            status: StatusCode::BAD_GATEWAY,
+            headers,
+            body: Bytes::from_static(br#"{"error":"source_unavailable"}"#),
+        }
+    }
+
+    #[test]
+    fn final_error_names_only_sanitized_auth_and_entitlement_causes() {
+        for (error, expected) in [
+            (den_scout::managed_hls::ManagedHlsError::Authentication, "torbox_authentication_failed"),
+            (
+                den_scout::managed_hls::ManagedHlsError::Entitlement,
+                "torbox_managed_streaming_unavailable_for_plan",
+            ),
+        ] {
+            let mut snapshot = error_snapshot(HeaderMap::new());
+            annotate_direct_failure(&mut snapshot, DirectFailure::from_managed(error));
+            let value: Value = serde_json::from_slice(&snapshot.body).unwrap();
+            assert_eq!(value["error"], "source_unavailable");
+            assert_eq!(value["cause"], expected);
+            assert_eq!(snapshot.headers[CONTENT_LENGTH], snapshot.body.len().to_string());
+            assert!(!snapshot.headers.contains_key("retry-after"));
+        }
+
+        let mut timed_out = error_snapshot(HeaderMap::new());
+        annotate_direct_failure(&mut timed_out, DirectFailure::TIMEOUT);
+        let value: Value = serde_json::from_slice(&timed_out.body).unwrap();
+        assert_eq!(value["cause"], "managed_prepare_timeout");
+    }
+
+    #[test]
+    fn direct_rate_limit_supplies_one_bounded_retry_after_without_overriding_remux() {
+        let failure = DirectFailure::from_managed(den_scout::managed_hls::ManagedHlsError::RateLimited {
+            retry_after: Some(Duration::from_secs(2 * 60 * 60)),
+        });
+        let mut snapshot = error_snapshot(HeaderMap::new());
+        annotate_direct_failure(&mut snapshot, failure);
+        assert_eq!(snapshot.headers["retry-after"], "3600");
+        let value: Value = serde_json::from_slice(&snapshot.body).unwrap();
+        assert_eq!(value["cause"], "torbox_rate_limited");
+
+        snapshot.headers.insert("retry-after", HeaderValue::from_static("7"));
+        annotate_direct_failure(&mut snapshot, failure);
+        assert_eq!(snapshot.headers["retry-after"], "7", "the final Remux answer takes precedence");
+    }
+
+    #[test]
+    fn a_successful_remux_fallback_never_exposes_the_direct_failure() {
+        let original = br#"{"url":"/remux/s/id/signature/master.m3u8"}"#;
+        let mut snapshot = Snapshot {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(original),
+        };
+        annotate_direct_failure(
+            &mut snapshot,
+            DirectFailure::from_managed(den_scout::managed_hls::ManagedHlsError::Authentication),
+        );
+        assert_eq!(snapshot.body, Bytes::from_static(original));
+        assert!(!snapshot.headers.contains_key("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn the_sanitized_final_failure_replays_exactly_without_private_detail() {
+        let mut snapshot = error_snapshot(HeaderMap::new());
+        annotate_direct_failure(
+            &mut snapshot,
+            DirectFailure::from_managed(den_scout::managed_hls::ManagedHlsError::Authentication),
+        );
+        let read = async |response: Response<Body>| {
+            let (parts, body) = response.into_parts();
+            (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
+        };
+        let first = read(snapshot.response()).await;
+        let replay = read(snapshot.response()).await;
+        assert_eq!(first, replay);
+        let text = String::from_utf8(first.2.to_vec()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            json!({"error": "source_unavailable", "cause": "torbox_authentication_failed"})
+        );
+        for private in ["token", "signed", "torrent", "file_id", "config", "grant", "idempotency"] {
+            assert!(!text.contains(private), "replayed final failure disclosed {private:?}: {text}");
+        }
     }
 }
