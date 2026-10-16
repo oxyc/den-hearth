@@ -675,6 +675,14 @@ mod tests {
     }
 
     fn hearth_den(limits: Limits, token: Option<&str>, den: den::Den) -> Arc<Hearth> {
+        hearth_den_with_options(
+            limits,
+            den,
+            Options { metrics_token: token.map(str::to_string), ..Default::default() },
+        )
+    }
+
+    fn hearth_den_with_options(limits: Limits, den: den::Den, options: Options) -> Arc<Hearth> {
         // No disk tier: a test must not write the temp dir.
         let settings = || {
             let mut s = den_scout::deps::settings_from_env(|_| String::new());
@@ -688,7 +696,7 @@ mod tests {
             scout::Scout::new(settings(), settings(), &den.scout),
             den,
             limits,
-            Options { metrics_token: token.map(str::to_string), ..Default::default() },
+            options,
         )
     }
 
