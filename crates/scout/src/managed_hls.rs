@@ -307,7 +307,14 @@ async fn probe_playlist(client: &reqwest::Client, url: &reqwest::Url) -> Result<
 }
 
 async fn read_capped(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>, ManagedHlsError> {
-    let mut body = Vec::new();
+    // Refuse an already-known oversize answer before reading it, and reserve only within our hard ceiling. This
+    // keeps the small create response to one allocation while an upstream cannot make us reserve arbitrary
+    // memory with a hostile Content-Length. A decoded/chunked answer still meets the streaming check below.
+    let declared = response.content_length().and_then(|length| usize::try_from(length).ok());
+    if declared.is_some_and(|length| length > limit) {
+        return Err(ManagedHlsError::Unavailable);
+    }
+    let mut body = Vec::with_capacity(declared.unwrap_or(0));
     while let Some(chunk) = response.chunk().await.map_err(|_| ManagedHlsError::Unavailable)? {
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(ManagedHlsError::Unavailable);
@@ -491,5 +498,26 @@ mod tests {
                 .into_bytes();
         response.extend_from_slice(&large);
         assert_eq!(probe_playlist(&client, &serve(response).await).await, Err(ManagedHlsError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn capped_read_rejects_a_declared_oversize_body_before_buffering() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n0123456789abcdefg",
+                )
+                .await
+                .unwrap();
+        });
+        let mut response = reqwest::get(format!("http://{addr}/body")).await.unwrap();
+        assert_eq!(read_capped(&mut response, 16).await, Err(ManagedHlsError::Unavailable));
     }
 }
