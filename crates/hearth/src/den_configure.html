@@ -180,16 +180,16 @@
 var PRODUCT = "Den";
 var STORE_KEY = "den-addon.configure";
 var $ = function (id) { return document.getElementById(id); };
-// Edge may replace this one stable marker with {v:1, base, saveUrl, claim}. Hearth owns every detail of the
-// provider UI and save behavior; a non-null context with any other shape fails closed below.
+// Edge may replace this one stable marker with {v:2, base, saveUrl}. Its short-lived HttpOnly cookie authorizes
+// the real page's same-origin requests, so no grant credential enters JavaScript. Hearth owns every detail of
+// the provider UI and save behavior; a non-null context with any other shape fails closed below.
 var DEN_GUEST_CONTEXT = /*__DEN_HEARTH_GUEST_CONTEXT_V1__*/ null;
 function denGuestPath(value) {
   return typeof value === "string" && value.charAt(0) === "/" && value.charAt(1) !== "/";
 }
 var DEN_GUEST = DEN_GUEST_CONTEXT === null ? null :
-  (DEN_GUEST_CONTEXT.v === 1 && denGuestPath(DEN_GUEST_CONTEXT.base) &&
-   denGuestPath(DEN_GUEST_CONTEXT.saveUrl) && typeof DEN_GUEST_CONTEXT.claim === "string" &&
-   DEN_GUEST_CONTEXT.claim.length > 0 ?
+  (DEN_GUEST_CONTEXT.v === 2 && denGuestPath(DEN_GUEST_CONTEXT.base) &&
+   denGuestPath(DEN_GUEST_CONTEXT.saveUrl) ?
    DEN_GUEST_CONTEXT : false);
 // Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
 // every link it builds sits beside it.
@@ -197,12 +197,7 @@ var BASE = DEN_GUEST ? DEN_GUEST.base : location.pathname.replace(/\/(configure\
 
 function denFetch(url, options) {
   if (DEN_GUEST === false) return Promise.reject(new Error("invalid guest context"));
-  options = options || {};
-  if (DEN_GUEST) {
-    options.headers = new Headers(options.headers || {});
-    options.headers.set("x-den-grant", DEN_GUEST.claim);
-  }
-  return fetch(url, options);
+  return fetch(url, options || {});
 }
 
 // --- Streams (Scout) -------------------------------------------------------------------------------------

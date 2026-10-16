@@ -619,8 +619,17 @@ mod tests {
             1,
             "guest bridge marker must be exact and unique"
         );
+        let injected = page.replacen(
+            GUEST_CONTEXT_MARKER,
+            r#"{"v":2,"base":"/den/~deadbeef","saveUrl":"/den/~deadbeef/config"}"#,
+            1,
+        );
+        assert!(!injected.contains(GUEST_CONTEXT_MARKER));
+        assert!(injected.contains(
+            r#"var DEN_GUEST_CONTEXT = {"v":2,"base":"/den/~deadbeef","saveUrl":"/den/~deadbeef/config"};"#
+        ));
         for needle in [
-            "DEN_GUEST_CONTEXT.v === 1",
+            "DEN_GUEST_CONTEXT.v === 2",
             "if (DEN_GUEST === false)",
             "if (DEN_GUEST !== null) $(\"go\").disabled = true",
             "if (!sealPublicKey || !window.DenSeal)",
@@ -632,6 +641,9 @@ mod tests {
             "Could not save this guest install. Please try again.",
         ] {
             assert!(page.contains(needle), "the guest bridge no longer has: {needle}");
+        }
+        for forbidden in ["x-den-grant", "DEN_GUEST_CONTEXT.claim"] {
+            assert!(!page.contains(forbidden), "the cookie-authenticated page exposed {forbidden}");
         }
         for slice in SLICES {
             assert!(page.contains(&format!("{slice}: collect")), "{slice}");
