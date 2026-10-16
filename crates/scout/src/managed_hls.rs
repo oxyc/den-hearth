@@ -385,15 +385,9 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
     let torbox_cdn = MANAGED_HLS_CDN_SUFFIXES
         .iter()
         .any(|suffix| host.strip_suffix(suffix).is_some_and(|label| !label.is_empty()));
-    // `scrobbling_enabled` is an input to createstream and a field in its JSON response, both of which we
-    // require to be false. TorBox's signed HLS URL sometimes repeats it and sometimes omits it. Treat omission
-    // as safe, but never accept a URL that explicitly enables it or contains ambiguous duplicate values.
-    let mut scrobbling =
-        url.query_pairs().filter_map(|(name, value)| (name == "scrobbling_enabled").then_some(value));
-    let scrobbling_safe = match scrobbling.next() {
-        None => true,
-        Some(value) => value == "false" && scrobbling.next().is_none(),
-    };
+    // The signed path and query are opaque TorBox output. Privacy is enforced by the false request parameter
+    // and the false response field checked above; interpreting a duplicate provider query here made harmless
+    // signing changes break playback. Keep this boundary about URL transport and ownership instead.
     let reason = if url.scheme() != "https" {
         Some("not_https")
     } else if !url.username().is_empty() || url.password().is_some() {
@@ -404,8 +398,6 @@ fn validate_hls_url(raw: &str) -> Result<reqwest::Url, ManagedHlsError> {
         Some("nonstandard_port")
     } else if !torbox_cdn {
         Some("unrecognized_cdn")
-    } else if !scrobbling_safe {
-        Some("scrobbling_flag")
     } else {
         None
     };
@@ -757,6 +749,9 @@ mod tests {
         for good in [
             "https://a.tb-cdn.io/x.m3u8?token=x&future=value",
             "https://a.tb-cdn.io/x.m3u8?token=x&scrobbling_enabled=false&future=value",
+            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false&scrobbling_enabled=false",
+            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true",
+            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true&scrobbling_enabled=false",
         ] {
             assert!(validate_hls_url(good).is_ok(), "refused {good}");
         }
@@ -768,10 +763,6 @@ mod tests {
             "https://user:pass@a.tb-cdn.io/x.m3u8?scrobbling_enabled=false",
             "https://a.tb-cdn.io:444/x.m3u8?scrobbling_enabled=false",
             "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false#fragment",
-            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true",
-            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false&scrobbling_enabled=false",
-            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=true&scrobbling_enabled=false",
-            "https://a.tb-cdn.io/x.m3u8?scrobbling_enabled=false&scrobbling_enabled=true",
         ] {
             assert_eq!(validate_hls_url(bad), Err(ManagedHlsError::UnsafeResponse), "accepted {bad}");
         }
