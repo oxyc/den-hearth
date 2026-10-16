@@ -400,18 +400,18 @@ pub fn manifest(install: Option<&Install>) -> Value {
     let description = match install {
         Some(install) => {
             let offered: Vec<&str> = install.members.iter().map(|slice| offers(slice)).collect();
-            format!("Den: {} from your own node.", offered.join(", "))
+            format!("Den Hearth: {} from your own node.", offered.join(", "))
         }
         None => {
-            "Den's self-hosted node: streams through your debrid account, subtitles and trailers — configure \
+            "Den Hearth: streams through your debrid account, subtitles and trailers — configure \
                  to choose which."
                 .to_owned()
         }
     };
     let mut manifest = json!({
-        "id": "com.den.addon",
+        "id": "com.den.hearth",
         "version": version(),
-        "name": "Den",
+        "name": "Den Hearth",
         "description": description,
         "resources": resources,
         "types": types,

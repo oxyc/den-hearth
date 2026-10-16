@@ -2,7 +2,7 @@
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Den — Configure</title>
+<title>Den Hearth — Configure</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -50,7 +50,7 @@
   #installId { color: #c9ccd3; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 </style></head><body>
 <main>
-<h1>Den</h1>
+<h1>Den Hearth</h1>
 <p class="sub">One addon for streams, subtitles and trailers. Fill in the parts you want — each is optional, and
   the addon offers only what you set up. Your keys stay in this link and are stored in the Den Keychain — treat
   the link like a password.</p>
@@ -177,8 +177,9 @@
 // Den (hearth's combined addon) — one config with a member per service: `scout` for streams, `subs` for
 // subtitles, `reel` for trailers. Each member is exactly what that service's own /configure page builds, so
 // the fields, defaults and checks below are theirs.
-var PRODUCT = "Den";
-var STORE_KEY = "den-addon.configure";
+var PRODUCT = "Den Hearth";
+var STORE_KEY = "den-hearth.configure";
+var LEGACY_STORE_KEY = "den-addon.configure";
 var $ = function (id) { return document.getElementById(id); };
 // Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
 // every link it builds sits beside it.
@@ -448,8 +449,19 @@ function fillForm(s) {
     return encodePlain(config);
   }
 
-  function saveSettings(config) { try { localStorage.setItem(STORE_KEY, JSON.stringify(config)); } catch (e) {} }
-  function loadSettings() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } }
+  function saveSettings(config) {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(config));
+      localStorage.removeItem(LEGACY_STORE_KEY);
+    } catch (e) {}
+  }
+  function loadSettings() {
+    try {
+      var current = localStorage.getItem(STORE_KEY);
+      var legacy = current === null ? localStorage.getItem(LEGACY_STORE_KEY) : null;
+      return JSON.parse(current || legacy || "null");
+    } catch (e) { return null; }
+  }
 
   function copyInstallURL() {
     var field = $("url");
@@ -542,7 +554,10 @@ function fillForm(s) {
   $("copy").addEventListener("click", copyInstallURL);
   $("forget").addEventListener("click", function (e) {
     e.preventDefault();
-    try { localStorage.removeItem(STORE_KEY); } catch (e2) {}
+    try {
+      localStorage.removeItem(STORE_KEY);
+      localStorage.removeItem(LEGACY_STORE_KEY);
+    } catch (e2) {}
     location.reload();
   });
 })();

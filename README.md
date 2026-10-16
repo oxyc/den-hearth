@@ -117,7 +117,7 @@ commits `VERSION`, waits for that commit's CI and tags it.
 | `/subs/...` | Subtitles | `/...` (prefix removed) |
 | `/remux/...` | Remux | unchanged (Remux already serves everything under `/remux`) |
 | `/remux/metrics` | Remux | `/metrics` (its one route outside `/remux`) |
-| `/den/...` | the Den addon: hearth, or the service a resource belongs to | see "The Den addon" |
+| `/den/...` | the Den Hearth addon: hearth, or the service a resource belongs to | see "The Den Hearth addon" |
 | `/health` | hearth | all four side by side, below |
 | `/metrics` | hearth | its own admission counters (see Bounds); needs `HEARTH_METRICS_TOKEN` (or `METRICS_TOKEN`), else 404 |
 | anything else | hearth | 404 |
@@ -126,9 +126,9 @@ commits `VERSION`, waits for that commit's CI and tags it.
 "remux": {...}}}`, each entry being that service's own `/health` body. It is `degraded` when any service
 says anything but `ok`. Each service's own `/health` and `/metrics` stay reachable under its prefix.
 
-## The Den addon
+## The Den Hearth addon
 
-One Stremio addon for what were three installs ([oxyc/den#286](https://github.com/oxyc/den/issues/286)): one
+One Stremio addon, **Den Hearth**, for what were three installs ([oxyc/den#286](https://github.com/oxyc/den/issues/286)): one
 manifest, one `/den/configure` and one sealed config holding a member per service — `scout` (streams), `subs`
 (subtitles), `reel` (trailers), each exactly the config that service's own `/configure` builds — with one install
 id (`iid`) and epoch (`ep`) at the top. The manifest at `/den/<config>/manifest.json` declares only the members the

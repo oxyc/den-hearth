@@ -106,7 +106,8 @@ async fn the_manifest_declares_only_what_the_install_configured() {
             get_from(&hearth, &format!("/den/{}/manifest.json", plain(&config(0, &members)))).await;
         assert_eq!(status, StatusCode::OK, "{members:?}");
         assert_eq!(resource_names(&manifest), want, "{members:?}");
-        assert_eq!(manifest["id"], "com.den.addon");
+        assert_eq!(manifest["id"], "com.den.hearth");
+        assert_eq!(manifest["name"], "Den Hearth");
         assert_eq!(manifest["denInstallId"], IID);
         assert_eq!(manifest["behaviorHints"]["configurationRequired"], false);
         // Trailers take tmdb ids too, and only a Reel member brings that prefix.
