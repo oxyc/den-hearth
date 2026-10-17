@@ -848,8 +848,8 @@ where
     // implementation details.
     if parts.headers.contains_key(FINALIZE_HEADER) {
         if !trusted_edge(hearth, &parts)
-            || !parts.headers.get("x-den-managed-playback").is_some_and(|value| value.as_bytes() == b"1")
-            || !parts.headers.get(FINALIZATION_PROTOCOL_HEADER).is_some_and(|value| value.as_bytes() == b"1")
+            || parts.headers.get("x-den-managed-playback").is_none_or(|value| value.as_bytes() != b"1")
+            || parts.headers.get(FINALIZATION_PROTOCOL_HEADER).is_none_or(|value| value.as_bytes() != b"1")
             || finalize.is_none()
         {
             return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref());
