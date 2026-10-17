@@ -222,7 +222,7 @@ it optional (`.env.example` lists the same):
 | `SCOUT_ORIGINS` | unset (Tier 2 off) | Comma-separated den-scout origins (`http://192.168.86.193:8080`) a `?resync=` target may be at — the origin of the stream URLs scout hands the app. |
 | `SCOUT_ALIASES` | unset | `<public origin>=<LAN origin>` pairs (`https://d-play.oxy.fi=http://192.168.86.193:8080`): a resync target on scout's public name is fetched at its LAN address, so two services on one box never go through the WAN and the tunnel. Both sides must also be in `SCOUT_ORIGINS`. |
 | `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-1 reference and Tier-2 audio sync. |
-| `FFMPEG_PATH` | `ffmpeg` (image: `/usr/bin/ffmpeg`) | The `ffmpeg` binary used to extract Tier-2's bounded partial-audio sample. |
+| `FFMPEG_PATH` | `ffmpeg` (image: `/usr/local/bin/ffmpeg`) | The purpose-built software `ffmpeg` binary used to extract Tier-2's bounded partial-audio sample. |
 
 On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host` header is fine —
 leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients (i.e. exposed

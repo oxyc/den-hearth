@@ -377,8 +377,8 @@ Low resource use comes first, and the design follows from it:
 - **Image** — a static musl `den-remux` and an ffmpeg configured with `--disable-everything` plus only what
   a session uses, on Alpine: **67.3 MB**. Until the GPU transcode it was 13.4 MB on `distroless/static`;
   libva has to load Intel's driver at run time, which a fully static binary cannot, and that driver is
-  most of the image now. Disk only: nothing loads it until a transcode starts. den-reel's image on the box is 693 MB
-  (Debian ffmpeg, yt-dlp, deno, MP4Box).
+  most of the image now. Disk only: nothing loads it until a transcode starts. The combined Hearth image also carries
+  Reel's yt-dlp, deno and MP4Box plus a separate purpose-built software ffmpeg shared by Reel and Subtitles.
 - **Idle is zero work.** No timers, sweeps or polling without sessions: scratch is swept at start — keeping the
   sessions a shutdown suspended, to resume (`ARCHITECTURE.md`), and removing those not resumed within
   `SESSION_IDLE_SECS` — and a session's directory is removed when it ends. Each session has one task, which ticks every 500 ms only
