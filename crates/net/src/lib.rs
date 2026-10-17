@@ -3,9 +3,13 @@
 //! This is the union of them, so a range added here is refused everywhere.
 //!
 //! It also holds the one reading of a config path segment's base64url, so Scout, Reel and Subtitles open the same
-//! links.
+//! links, and the one guarded signal to a child's process group (`kill_group`), so Reel and Remux refuse the same
+//! process group ids, and the one `Playable` report Remux and Reel read a browser's capabilities with.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+mod playable;
+pub use playable::{DolbyVisionPlay, Playable};
 
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
@@ -84,6 +88,27 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || (a == 192 && b == 88 && c == 99) // deprecated 6to4 relay anycast 192.88.99/24
         || (a == 198 && b & 0xfe == 18) // benchmarking 198.18/15
         || a >= 240) // reserved 240/4 (and the broadcast address)
+}
+
+/// SIGKILL a child's process group: the child and whatever it forked (yt-dlp's ffmpeg, ffmpeg's own children),
+/// which `kill_on_drop` alone leaves running. Nothing off unix.
+pub fn kill_group(pgid: u32) {
+    #[cfg(unix)]
+    signal_group(pgid, libc::SIGKILL);
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
+/// Send `sig` to a process group. Already-exited is ESRCH, which nobody cares about.
+#[cfg(unix)]
+pub fn signal_group(pgid: u32, sig: libc::c_int) {
+    // 0 is our own group and 1 would make kill(-1) "every process we may signal" — the whole container; above
+    // i32::MAX the negation is a single unrelated pid (`-(u32::MAX - 7) as i32` is 8). None of them is reachable
+    // from child.id(), which is exactly why none of them may be a live signal.
+    if pgid > 1 && pgid <= i32::MAX as u32 {
+        // Negative pid = the whole group.
+        unsafe { libc::kill(-(pgid as i32), sig) };
+    }
 }
 
 #[cfg(test)]

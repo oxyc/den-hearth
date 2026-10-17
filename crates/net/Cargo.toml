@@ -2,10 +2,16 @@
 name = "den-net"
 version = "0.0.0"
 edition = "2021"
-description = "Small rules every addon must read the same way: is this address on the public internet, and how is a config path segment decoded"
+description = "Small rules every addon must read the same way: is this address on the public internet, how is a config path segment decoded, which process group ids may be signalled, and what a browser's playable report says"
 publish = false
 license = "MIT"
 
 [dependencies]
 # The lenient base64url the config segment is read with (`b64url_decode`).
 base64 = "0.23"
+# The browser's `playable` report (`Playable`), read by Remux and Reel and sent on by Remux.
+serde = { version = "1", features = ["derive"] }
+
+# kill(2) on a child's process group (`signal_group`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
