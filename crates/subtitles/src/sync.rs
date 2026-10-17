@@ -670,7 +670,26 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn work_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("den-subs-synctest-{tag}"))
+        // A fixed name made separate cargo invocations (and a prior interrupted run) share fake
+        // binaries and append-only call counters. That turned the Tier-2 assertions into a test of
+        // whatever happened to be left in /tmp. Keep the directory after this helper returns, but
+        // give every invocation an OS-created unique name; each test removes it on success and a
+        // failed run cannot affect the next one.
+        tempfile::Builder::new()
+            .prefix(&format!("den-subs-synctest-{tag}-"))
+            .tempdir()
+            .expect("create unique sync test directory")
+            .keep()
+    }
+
+    #[test]
+    fn work_dirs_are_isolated_across_invocations() {
+        let first = work_dir("isolation");
+        let second = work_dir("isolation");
+
+        assert_ne!(first, second);
+        std::fs::remove_dir_all(first).ok();
+        std::fs::remove_dir_all(second).ok();
     }
 
     // Write an executable `#!/bin/sh` script into `dir` and return its path.
