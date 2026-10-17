@@ -666,7 +666,7 @@ async fn translate_remux(response: Response<Body>) -> Response<Body> {
             StatusCode::BAD_GATEWAY => (StatusCode::BAD_GATEWAY, "source_unavailable", None),
             _ => (StatusCode::SERVICE_UNAVAILABLE, "playback_unavailable", Some("5")),
         };
-        let formats = (status == StatusCode::NOT_FOUND).then(|| skipped_formats(&bytes)).unwrap_or_default();
+        let formats = if status == StatusCode::NOT_FOUND { skipped_formats(&bytes) } else { Vec::new() };
         let mut out = if formats.is_empty() {
             answer(status, code, retry)
         } else {
