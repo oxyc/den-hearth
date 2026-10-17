@@ -606,6 +606,7 @@ async fn origin_handle<B>(
             "tt0000009" => "slow/h264.mkv",
             "tt0000030" => "hold/h264.mkv",
             "tt0000011" => "av1.mkv",
+            "tt0000018" => "av1-sdr.mkv",
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
             "tt0000040" => "resume40/h264.mkv",
@@ -909,6 +910,21 @@ fn extinfs(media: &str) -> Vec<f64> {
         .collect()
 }
 
+/// With `REMUX_E2E_DUMP` set to a directory, a session's master, media playlist, init and segments are written into
+/// `<dir>/<fixture stem>/` exactly as the session served them, so a browser test can play Remux's own output
+/// (den-edge's `web/e2e/remux-av1.spec.mjs`). The playlists name everything relatively, so the files play as they are.
+fn dump_session(fixture_name: &str, master: &str, media: &str, init: &[u8], segs: &[Bytes]) {
+    let Some(root) = std::env::var_os("REMUX_E2E_DUMP") else { return };
+    let dir = Path::new(&root).join(Path::new(fixture_name).file_stem().unwrap());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("master.m3u8"), master).unwrap();
+    std::fs::write(dir.join("media.m3u8"), media).unwrap();
+    std::fs::write(dir.join("init.mp4"), init).unwrap();
+    for (i, seg) in segs.iter().enumerate() {
+        std::fs::write(dir.join(format!("seg{i}.m4s")), seg).unwrap();
+    }
+}
+
 /// The whole path for one fixture: log in, create a session against the fake scout, fetch the
 /// playlists, then fetch segments out of order so the job has to restart — first mid-file, then
 /// behind itself, then at zero — and check every segment with ffprobe. `extra` goes into the request
@@ -1063,6 +1079,7 @@ async fn end_to_end_with(
         state.jobs_started.load(Relaxed) > jobs_before_segments,
         "an out-of-order fetch should have restarted the job"
     );
+    dump_session(fixture_name, &master.text(), &media, &init.body, &segs);
 
     let frame = 1.0 / 24.0 + 0.002;
     let mut shifted = vec![false; n];
@@ -1360,6 +1377,24 @@ async fn av1_matroska_end_to_end() {
         &file,
     );
     assert_eq!(stream.trim(), "av1,smpte2084", "the init alone describes AV1 in PQ");
+}
+
+/// 8-bit SDR AV1 copied for a player that decodes only 8-bit AV1: the short Main 8 codec string and no VIDEO-RANGE,
+/// which a player reads as SDR.
+#[tokio::test]
+#[ignore]
+async fn av1_sdr_matroska_end_to_end() {
+    let playable = r#","playable":{"h264":51,"av1":13}"#;
+    let (master, init, _) = end_to_end("tt0000018", "av1-sdr.mkv", "av01.0.", true, playable).await;
+    assert!(master.contains("CODECS=\"av01.0.") && master.contains("M.08"), "{master}");
+    assert!(!master.contains("VIDEO-RANGE"), "{master}");
+    let file = temp_dir().join("init.mp4");
+    std::fs::write(&file, &init).unwrap();
+    let stream = ffprobe(
+        &["-select_streams", "v:0", "-show_entries", "stream=codec_name,color_transfer", "-of", "csv=p=0"],
+        &file,
+    );
+    assert_eq!(stream.trim(), "av1,bt709", "the init alone describes AV1 in BT.709");
 }
 
 /// 5.1 for a player that plays multichannel AAC: surround.mkv's 5.1 track, and its 7.1 one folded down, come out as
