@@ -477,6 +477,8 @@ name = "den-net"
 version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
+ "libc",
+ "serde",
 ]
 
 [[package]]
@@ -488,6 +490,7 @@ dependencies = [
  "blake2",
  "bytes",
  "den-http",
+ "den-net",
  "den-seal",
  "den-upstream",
  "divan",
@@ -514,6 +517,7 @@ dependencies = [
  "chacha20poly1305",
  "den-http",
  "den-media",
+ "den-net",
  "den-upstream",
  "divan",
  "dolby_vision",

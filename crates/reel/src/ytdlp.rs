@@ -615,18 +615,8 @@ pub fn kill_live_groups() -> usize {
     taken.len()
 }
 
-#[cfg(unix)]
 pub(crate) fn kill_group(pgid: Option<u32>) {
-    // A pgid above i32::MAX negates into a POSITIVE number — i.e. a single unrelated pid, not a
-    // group. `-(u32::MAX - 7) as i32` is 8. Nothing should produce such a value, which is exactly
-    // why it must not be a SIGKILL aimed at whatever pid 8 happens to be.
-    // 0 is our own group and 1 makes kill(-1) "every process we may signal" — the whole container.
-    // Neither is reachable from child.id(), which is exactly why neither should be a live SIGKILL.
-    if let Some(pgid) = pgid.filter(|&p| p > 1 && p <= i32::MAX as u32) {
-        // Negative pid = the whole group. Already-exited is ESRCH, which we don't care about.
-        unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+    if let Some(pgid) = pgid {
+        den_net::kill_group(pgid);
     }
 }
-
-#[cfg(not(unix))]
-pub(crate) fn kill_group(_pgid: Option<u32>) {}

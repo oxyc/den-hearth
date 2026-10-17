@@ -28,6 +28,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::client::TakesVariant as _;
+
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;

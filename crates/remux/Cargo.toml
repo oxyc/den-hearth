@@ -13,6 +13,8 @@ den-upstream = { path = "../upstream" }
 den-http = { path = "../http" }
 # The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file with, shared with Scout.
 den-media = { path = "../media" }
+# The guarded signal to ffmpeg's process group, shared with Reel.
+den-net = { path = "../net" }
 # Single-threaded async runtime: the process only routes requests and watches ffmpeg, which does the
 # actual work in its own process. current_thread keeps the resident thread count (and RAM) minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
@@ -44,7 +46,7 @@ dolby_vision = { version = "3.4", default-features = false }
 # libchromaprint and ffmpeg needs no chromaprint muxer.
 rusty-chromaprint = "0.3"
 
-# killpg / SIGSTOP / SIGCONT on the ffmpeg process group.
+# SIGSTOP / SIGCONT for the ffmpeg process group, and the encoder's setpriority.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

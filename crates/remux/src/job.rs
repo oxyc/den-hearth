@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use den_net::{kill_group, signal_group};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
@@ -723,18 +724,6 @@ pub fn kill_live_groups() -> usize {
 
 pub fn live_groups() -> usize {
     LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len())
-}
-
-fn kill_group(pgid: u32) {
-    signal_group(pgid, libc::SIGKILL);
-}
-
-fn signal_group(pgid: u32, sig: libc::c_int) {
-    // 0 is our own group and 1 would make kill(-1) "every process we may signal"; above i32::MAX the
-    // negation is a single unrelated pid. None of them is reachable from child.id().
-    if pgid > 1 && pgid <= i32::MAX as u32 {
-        unsafe { libc::kill(-(pgid as i32), sig) };
-    }
 }
 
 #[cfg(test)]

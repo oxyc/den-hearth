@@ -15,6 +15,9 @@ den-seal = { path = "../seal" }
 den-http = { path = "../http" }
 # Client profiles, Retry-After and the per-credential pause, shared with Subtitles, Remux and Scout.
 den-upstream = { path = "../upstream" }
+# The guarded SIGKILL to a download's process group, shared with Remux: kill_on_drop reaps only the direct child,
+# and yt-dlp forks ffmpeg to do the merge.
+den-net = { path = "../net" }
 # Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
 # minimal on a homelab box.
@@ -59,6 +62,6 @@ tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io
 # Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
 divan = "0.1"
 
-# killpg: kill_on_drop reaps only the direct child, and yt-dlp forks ffmpeg to do the merge.
-[target.'cfg(unix)'.dependencies]
+# The tests' liveness probe, kill(pid, 0).
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
