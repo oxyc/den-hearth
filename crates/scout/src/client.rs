@@ -65,6 +65,11 @@ impl ClientPlayable {
         if a.three_d || !remux_opens(&s) {
             return NEVER_PLAYS_COST;
         }
+        // An MPEG-TS or AVI is transcoded whatever its codec, MPEG-4 Part 2 and MPEG-2 among them, and its audio
+        // converted with it.
+        if remux_converts(&s) {
+            return VIDEO_CONVERTED_COST + AUDIO_CONVERTED_COST;
+        }
         let mut cost = 0;
         // Most Profile 5 has no base layer, but a malformed class has a P5 container record over a regular HDR base.
         // Keep proven P5 near the end so den-remux can inspect the HEVC VUI/RPU and either refuse genuine P5 or strip
@@ -130,7 +135,7 @@ impl ClientPlayable {
                 }
             }
             "" => cost += VIDEO_UNNAMED_COST,
-            // MPEG-4 Part 2, VC-1, MPEG-2: den-remux converts none of them.
+            // MPEG-4 Part 2, VC-1, MPEG-2 in Matroska or MP4: den-remux converts none of them.
             _ => return NEVER_PLAYS_COST,
         }
         match a.audio_codec.as_deref().unwrap_or("") {
@@ -151,17 +156,23 @@ impl ClientPlayable {
     }
 }
 
-/// Go `remuxRefusedExt`: den-remux opens Matroska and MP4 only, and refuses these by name.
-const REMUX_REFUSED_EXT: [&str; 9] =
-    [".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"];
+/// Go `remuxRefusedExt`: den-remux opens Matroska, MP4, MPEG-TS and AVI, and refuses these by name (den-remux's
+/// `scout::left_out_by_name`).
+const REMUX_REFUSED_EXT: [&str; 7] = [".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"];
 
 /// Go `remuxOpens`.
 fn remux_opens(s: &RawStream) -> bool {
-    if matches!(container_of(s.clone()).as_str(), "avi" | "webm") {
+    if container_of(s.clone()) == "webm" {
         return false;
     }
     let name = str::to_lowercase(&s.title);
     !REMUX_REFUSED_EXT.iter().any(|ext| name.ends_with(ext))
+}
+
+/// Whether den-remux transcodes the release for its container: an MPEG-TS or AVI has no index to cut a copy on.
+fn remux_converts(s: &RawStream) -> bool {
+    let name = str::to_lowercase(&s.title);
+    container_of(s.clone()) == "avi" || name.ends_with(".ts") || name.ends_with(".avi")
 }
 
 /// Go `webReady`: whether a browser can play the release as it is served (an https MP4).

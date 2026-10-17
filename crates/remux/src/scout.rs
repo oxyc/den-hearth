@@ -107,26 +107,40 @@ pub fn parse(body: &[u8]) -> Result<Vec<Stream>, String> {
 }
 
 /// The extension of a release whose name says it is in a container left out by name: one the probe can't open
-/// (it reads Matroska and MP4 only), or WebM. `None` for any other name, which the probe decides.
+/// (it reads Matroska, MP4, MPEG-TS and AVI only), or WebM. `None` for any other name, which the probe decides.
+/// Blu-ray's M2TS is an MPEG-TS of 192-byte packets, which the probe doesn't read.
 pub fn left_out_by_name(s: &Stream) -> Option<&'static str> {
     let name = s.filename().to_ascii_lowercase();
     [
-        ".avi", ".ts", ".m2ts", ".mts", ".m2t", ".iso", ".img", ".wmv", ".asf", ".mpg", ".mpeg", ".vob",
-        ".flv", ".rm", ".rmvb", ".divx", ".ogm", ".ogv", ".webm",
+        ".m2ts", ".mts", ".m2t", ".iso", ".img", ".wmv", ".asf", ".mpg", ".mpeg", ".vob", ".flv", ".rm",
+        ".rmvb", ".divx", ".ogm", ".ogv", ".webm",
     ]
     .into_iter()
     .find(|ext| name.ends_with(ext))
 }
 
-/// Could the browser take this release with only the audio re-encoded? Cached — an uncached one would
-/// start a debrid download and play nothing — and H.264 or HEVC, AV1 or VP9 for a player that decodes it
-/// (`av1`, `vp9`), or a codec the title does not name (the probe decides those). AV1 or VP9 for any other
-/// player, MPEG-4 Part 2 and VC-1 need the video re-encoded, which this service does not do. Containers
-/// other than Matroska and MP4 are left out by name (`left_out_by_name`).
+/// Whether the release's name says MPEG-TS or AVI: transcoded whatever its codec (`MediaInfo::grid`), so the MPEG-4
+/// Part 2 that scout's probe names in an AVI is tried too.
+pub(crate) fn grid_by_name(s: &Stream) -> bool {
+    let name = s.filename().to_ascii_lowercase();
+    name.ends_with(".ts") || name.ends_with(".avi")
+}
+
+/// Could the browser take this release? Cached — an uncached one would start a debrid download and play nothing —
+/// and H.264 or HEVC, AV1 or VP9 for a player that decodes it (`av1`, `vp9`), or a codec the title does not name (the
+/// probe decides those), or MPEG-4 Part 2 in an MPEG-TS or AVI, which is transcoded. AV1 or VP9 for any other
+/// player, and VC-1, need the video re-encoded from a container this service copies. Some containers are left out by
+/// name (`left_out_by_name`).
 fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
     let codec_ok = match s.attributes.codec.as_deref().map(str::to_ascii_lowercase) {
         None => true,
-        Some(c) => c == "h264" || c == "hevc" || (av1 && c == "av1") || (vp9 && c == "vp9"),
+        Some(c) => {
+            c == "h264"
+                || c == "hevc"
+                || (av1 && c == "av1")
+                || (vp9 && c == "vp9")
+                || (c == "mpeg4" && grid_by_name(s))
+        }
     };
     s.attributes.cached == Some(true) && codec_ok && left_out_by_name(s).is_none() && !s.attributes.three_d
 }
@@ -569,17 +583,45 @@ mod tests {
             [
                 "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
                 "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
+                "Film.2019.720p.BluRay.XviD.avi",
                 "Film.2019.1080p.BluRay.mkv",
             ],
-            "scout's order, minus uncached, cache-unknown, AV1, VP9, XviD, AVI and 3D"
+            "scout's order, minus uncached, cache-unknown, AV1, VP9 and 3D"
         );
+    }
+
+    #[test]
+    fn mpegts_and_avi_are_candidates_with_mpeg4_and_m2ts_is_left_out() {
+        let stream = |filename: &str, codec: Option<&str>| Stream {
+            title: String::new(),
+            url: String::new(),
+            hints: Hints { filename: Some(filename.into()) },
+            attributes: Attributes {
+                cached: Some(true),
+                codec: codec.map(String::from),
+                ..Default::default()
+            },
+        };
+        for s in [
+            stream("Film.2026.TELESYNC.ts", None),
+            stream("Film.2005.DVDRip.XviD.avi", Some("mpeg4")),
+            stream("Film.1999.DVB.ts", Some("h264")),
+        ] {
+            assert_eq!(left_out_by_name(&s), None, "{}", s.filename());
+            assert!(remuxable(&s, false, false), "{}", s.filename());
+        }
+        assert!(
+            !remuxable(&stream("Film.2005.DVDRip.XviD.mkv", Some("mpeg4")), false, false),
+            "a copy's container"
+        );
+        assert_eq!(left_out_by_name(&stream("Film.BluRay.m2ts", None)), Some(".m2ts"));
     }
 
     #[test]
     fn a_named_release_goes_first_when_it_is_playable() {
         let pick = candidates(&fixture(), Some("Film.2019.1080p.BluRay.mkv"), false, false);
         assert_eq!(pick[0].filename(), "Film.2019.1080p.BluRay.mkv");
-        assert_eq!(pick.len(), 3, "the others stay as fallbacks");
+        assert_eq!(pick.len(), 4, "the others stay as fallbacks");
         // Named but uncached: scout's first cached one instead.
         let pick = candidates(&fixture(), Some("Film.2019.1080p.WEB.x264-UNCACHED.mkv"), false, false);
         assert_eq!(pick[0].filename(), "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv");
@@ -616,6 +658,7 @@ mod tests {
                 "Film.2019.2160p.UHD.BluRay.REMUX.HEVC.TrueHD.7.1.mkv",
                 "Film.2019.2160p.WEB-DL.AV1.mkv",
                 "Film.2019.1080p.WEB-DL.DDP5.1.H.264.mkv",
+                "Film.2019.720p.BluRay.XviD.avi",
                 "Film.2019.1080p.BluRay.mkv",
             ],
             "in scout's order"

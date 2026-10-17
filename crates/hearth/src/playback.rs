@@ -1271,13 +1271,13 @@ mod tests {
             &json!({
                 "error": "no_playable_release",
                 "detail": "torrent 123",
-                "formats": [".ts", ".avi", "../secret", ".toolongext", 7],
+                "formats": [".m2ts", ".wmv", "../secret", ".toolongext", 7],
             }),
             &[],
         );
         let response = translate_remux(response).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(body(response).await, json!({"error": "no_release", "formats": [".ts", ".avi"]}));
+        assert_eq!(body(response).await, json!({"error": "no_release", "formats": [".m2ts", ".wmv"]}));
 
         let plain = den_http::json(StatusCode::NOT_FOUND, &json!({"error": "no_release"}), &[]);
         assert_eq!(body(translate_remux(plain).await).await, json!({"error": "no_release"}));

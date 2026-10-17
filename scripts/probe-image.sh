@@ -101,6 +101,24 @@ if [ -e "$node" ]; then
         -frames:v 6 -f mp4 -movflags frag_keyframe+empty_moov pipe:1 <"$clip" >/dev/null \
         || { echo "::error::the rate-controlled h264_vaapi encode failed on $node (see above)"; exit 1; }
     echo "gpu: rate-controlled h264_vaapi encode ok on $node"
+    # An MPEG-TS or AVI run as a session makes one from its second grid keyframe (job.rs, `Keyframes::Grid`): times
+    # rounded to frame ticks, cut back to the keyframe, the next one forced. H.264 is decoded on the GPU; MPEG-2 and
+    # XviD on the CPU and uploaded (`hwupload`) — the filters and decoders this image adds for them.
+    grid="setpts='if(gt(FR,0),round(PTS*TB*FR)/(FR*TB),PTS)',trim=start=5.98"
+    for clip in h264.ts mpeg2.ts xvid.avi; do
+        case "$clip" in
+            h264.ts) decode=(-hwaccel vaapi -hwaccel_device "$node" -hwaccel_output_format vaapi); upload="" ;;
+            *) decode=(-init_hw_device "vaapi=va:$node" -filter_hw_device va); upload="format=nv12,hwupload," ;;
+        esac
+        docker run --rm -i --device "$node" --group-add "$gid" --entrypoint ffmpeg-remux "$image" \
+            -hide_banner -loglevel error "${decode[@]}" -i pipe:0 -map 0:V:0 \
+            -vf "$grid,${upload}scale_vaapi=w=256:h=144:format=nv12" \
+            -c:v h264_vaapi -profile:v high -level:v 4.1 -b:v 4000000 -maxrate 6000000 -bufsize 8000000 \
+            -force_key_frames 11.98 -g 1000 -frames:v 24 -f mp4 -movflags frag_keyframe+empty_moov pipe:1 \
+            <"$(dirname "$0")/../crates/remux/testdata/$clip" >/dev/null \
+            || { echo "::error::the grid transcode of $clip failed on $node (see above)"; exit 1; }
+        echo "gpu: grid transcode of $clip ok on $node"
+    done
 else
     echo "gpu: skipped, no $node on this host (the transcode path is not proven here)"
 fi

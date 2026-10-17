@@ -1,4 +1,4 @@
-//! Golden outputs of the probe over every Matroska and MP4 fixture of both crates (remux's and scout's `testdata`),
+//! Golden outputs of the probe over every Matroska, MP4, MPEG-TS and AVI fixture of both crates (remux's and scout's `testdata`),
 //! with the whole head and with a short one (which sends the probe to the SeekHead and the `moov` through
 //! `Source`), so a change to the parsing code underneath shows up as a diff in `testdata/probe-golden.txt`.
 //! Regenerate with `UPDATE_GOLDEN=1 cargo test -p den-remux probe::golden`.
@@ -22,7 +22,7 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
             .expect("testdata")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".mkv") || n.ends_with(".mp4"))
+            .filter(|n| [".mkv", ".mp4", ".ts", ".avi"].iter().any(|ext| n.ends_with(ext)))
             .collect();
         names.sort();
         for name in names {

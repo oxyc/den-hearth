@@ -52,10 +52,11 @@ fn rank_streams_for_the_browser_that_asked() {
     assert_eq!(tv[0], remux.title, "the TV's list starts {:?}, want the 4K remux", tv[0]);
 
     let cases: Vec<(&str, Option<ClientPlayable>, Vec<String>)> = vec![
+        // The XviD AVI is transcoded, which ranks it above a profile 5 this browser most likely can't show at all.
         (
             "4K HDR HEVC: the remux only needs its audio converted",
             Some(a_browser(|_| {})),
-            vec![remux.title.clone(), web.title.clone(), dv5.title.clone(), xvid.title.clone()],
+            vec![remux.title.clone(), web.title.clone(), xvid.title.clone(), dv5.title.clone()],
         ),
         (
             "no HEVC: the remux has to be transcoded, so the 1080p H.264 plays first",
@@ -63,12 +64,12 @@ fn rank_streams_for_the_browser_that_asked() {
                 p.hevc_main = 0;
                 p.hevc_main10 = 0;
             })),
-            vec![web.title.clone(), remux.title.clone(), dv5.title.clone(), xvid.title.clone()],
+            vec![web.title.clone(), remux.title.clone(), xvid.title.clone(), dv5.title.clone()],
         ),
         (
             "no HDR: the same",
             Some(a_browser(|p| p.hdr = false)),
-            vec![web.title.clone(), remux.title.clone(), dv5.title.clone(), xvid.title.clone()],
+            vec![web.title.clone(), remux.title.clone(), xvid.title.clone(), dv5.title.clone()],
         ),
         (
             "Dolby Vision 5 shown: the 4K web release copies whole, ahead of the remux whose TrueHD is converted",
@@ -96,6 +97,9 @@ fn client_playable_cost() {
         ("Film.1080p.WEB-DL.AV1.AAC.webm", NEVER_PLAYS_COST),
         ("Film.1080p.BluRay.H.264.AAC.3D.HSBS.mkv", NEVER_PLAYS_COST),
         ("Film.1080p.BluRay.H.264.AAC.m2ts", NEVER_PLAYS_COST),
+        // Transcoded for their container whatever the codec, the audio with them.
+        ("Film.2005.DVDRip.XviD.MP3.avi", VIDEO_CONVERTED_COST + AUDIO_CONVERTED_COST),
+        ("Film.2026.1080p.HDTS.H.264.AAC.ts", VIDEO_CONVERTED_COST + AUDIO_CONVERTED_COST),
     ];
     for (title, want) in cases {
         let got = p.cost(bare(title), stream_attributes(bare(title)));

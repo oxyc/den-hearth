@@ -19,7 +19,11 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `subs.mkv` | `h264.mkv` with three text subtitle tracks: SRT English, ASS Finnish (an italic override) and a forced SRT Swedish. Cues sit inside a segment (1, 9, 26 s), across a cut at 13 s (12–14) and after it (14.5), so the segments 0–8, 8–13, 13–19.5, 19.5–24, 24–30 each hold a known set | as `h264.mkv` | 30.021 |
 | `open-gop.mkv` | Open GOPs: x265's own keyframes every 3 s are CRAs, each with three RASL leading pictures that reference the GOP before (`closed_gops` false, no `EXT-X-INDEPENDENT-SEGMENTS`) | 0, 3, 6, 9 | 12.0 |
 | `open-gop.mp4` | `open-gop.mkv` copied into MP4: the leading pictures seen in `ctts` | as `open-gop.mkv` | 12.0 |
-| `scout-streams.json` | A den-scout stream list: uncached, AV1, VP9, XviD/AVI, 3D and cache-unknown releases to skip | — | — |
+| `h264.ts` | MPEG-TS: H.264 with 10 s GOPs, so a run started between them has no source keyframe there; AAC eng. Its clock starts at 1.462 s (the audio), the video at 1.483 s | 0, 10, 20 (from the video's start) | 30.021 |
+| `mpeg2.ts` | MPEG-TS: MPEG-2 (160 × 90, 12-frame GOPs), decoded on the CPU for a transcode; AC-3 5.1 fin | every 0.5 s | 30.005 |
+| `xvid.avi` | AVI with `idx1`: XviD (MPEG-4 Part 2, no B-frames) and MP3, decoded on the CPU for a transcode. libxvid's one frame of delay leaves the index's second chunk empty, a drop frame, which a transcode shows as the first | 0, 10.042, 20.042 | 30.042 |
+| `noindex.avi` | The first 4 s of `xvid.avi`, cut just before its `idx1`: an AVI with no index, refused | — | — |
+| `scout-streams.json` | A den-scout stream list: uncached, AV1, VP9, an XviD AVI to try, 3D and cache-unknown releases | — | — |
 
 ## Regenerating
 
@@ -89,6 +93,20 @@ ffmpeg -y -i h264.mkv \
   -f lavfi -i "aevalsrc=sin(440*2*PI*t)|sin(495*2*PI*t)|sin(550*2*PI*t)|0.3*sin(55*2*PI*t)|sin(660*2*PI*t)|sin(770*2*PI*t)|sin(880*2*PI*t)|sin(990*2*PI*t):c=7.1:s=48000:d=30" \
   -map 0:v -map 1:a -map 2:a -c:v copy -c:a aac -b:a:0 40k -b:a:1 40k \
   -metadata:s:a:0 language=eng -metadata:s:a:1 language=swe surround.mkv
+
+# MPEG-TS and AVI (ffmpeg 8.0, nixpkgs, with libx264, libxvid and libmp3lame). The XviD has no B-frames: ffmpeg's AVI
+# muxer stores libxvid's with timestamps four frames late, which is ffmpeg's muxing and not what an XviD release holds.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine=frequency=440:duration=30:sample_rate=48000 \
+  -map 0:v -map 1:a -c:v libx264 -preset veryfast -crf 36 -bf 3 -g 240 -keyint_min 240 -sc_threshold 0 -pix_fmt yuv420p \
+  -c:a aac -b:a 64k -ac 2 -metadata:s:a:0 language=eng h264.ts
+ffmpeg -y -f lavfi -i testsrc2=size=160x90:rate=24:duration=30 \
+  -f lavfi -i "aevalsrc=sin(440*2*PI*t)|sin(550*2*PI*t)|sin(660*2*PI*t)|0.3*sin(55*2*PI*t)|sin(770*2*PI*t)|sin(880*2*PI*t):c=5.1:s=48000:d=30" \
+  -map 0:v -map 1:a -c:v mpeg2video -q:v 31 -bf 2 -g 12 -pix_fmt yuv420p -c:a ac3 -b:a 96k \
+  -metadata:s:a:0 language=fin mpeg2.ts
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine=frequency=550:duration=30:sample_rate=48000 \
+  -map 0:v -map 1:a -c:v libxvid -q:v 25 -g 240 -bf 0 -c:a libmp3lame -b:a 32k -ac 2 xvid.avi
+# noindex.avi: 4 s of it, cut where its idx1 starts (69030 here: the offset of the chunk named idx1 after LIST movi).
+ffmpeg -y -i xvid.avi -t 4 -c copy short.avi && head -c 69030 short.avi > noindex.avi && rm short.avi
 ```
 
 Three subtitle files, muxed with `h264.mkv`'s streams copied (`-c copy`, so the keyframes are `h264.mkv`'s):
@@ -148,7 +166,9 @@ The expected keyframe lists come from:
 ffprobe -v error -select_streams V:0 -skip_frame nokey -show_entries frame=pts_time -of csv=p=0 <file>
 ```
 
-A regenerated file must reproduce those lists exactly; `src/tests.rs` asserts them.
+A regenerated file must reproduce those lists exactly; `src/tests.rs` asserts them. The MPEG-TS and AVI fixtures are
+the exception: their keyframes are the probe's 6 s grid, and `src/tests.rs` holds them to ffprobe's duration, size and
+tracks instead.
 
 ## segments-a.mkv, segments-b.mkv
 

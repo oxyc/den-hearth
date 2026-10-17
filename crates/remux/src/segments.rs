@@ -681,14 +681,15 @@ async fn save(st: &AppState, ep: &Episode, p: &Prints, found: Found, cost: &Cost
     );
 }
 
-/// The releases to read, cheapest first: cached, in a container the probe opens, not 3D; anything up to 1080p before
-/// a 4K copy, then by size.
+/// The releases to read, cheapest first: cached, in a container the probe opens with an index of its own — Matroska or
+/// MP4, not an MPEG-TS or AVI — not 3D; anything up to 1080p before a 4K copy, then by size.
 fn cheapest(list: &[crate::scout::Stream]) -> Vec<&crate::scout::Stream> {
     let mut out: Vec<_> = list
         .iter()
         .filter(|s| {
             s.attributes.cached == Some(true)
                 && crate::scout::left_out_by_name(s).is_none()
+                && !crate::scout::grid_by_name(s)
                 && !s.attributes.three_d
         })
         .collect();
@@ -771,7 +772,7 @@ async fn open(
     let info = match key.as_deref().and_then(|k| st.probe(k)) {
         Some(info) => info,
         None => {
-            let source = crate::probe::Source::Http { client: &st.source_http, url: &r.url };
+            let source = crate::probe::Source::Http { client: &st.source_http, url: &r.url, size: r.size };
             let info = crate::probe::probe(&source, &r.head).await.map_err(|e| e.to_string())?;
             if let Some(k) = key {
                 st.remember_probe(k, &info);
