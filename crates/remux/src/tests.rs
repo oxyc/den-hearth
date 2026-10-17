@@ -523,6 +523,20 @@ async fn origin_handle<B>(
             ]});
             return origin_full(200, body.to_string());
         }
+        if imdb == "tt0000017" {
+            // Only containers left out by name: a telesync .ts twice and an XviD .avi.
+            let release = |filename: &str| {
+                serde_json::json!({"url": format!("http://{addr}/{p}/never/{filename}"),
+                                   "attributes": {"cached": true, "label": filename},
+                                   "behaviorHints": {"filename": filename}})
+            };
+            let body = serde_json::json!({"streams": [
+                release("Film.2026.TS.ts"),
+                release("Film.2026.TELESYNC.ts"),
+                release("Film.2005.DVDRip.XviD.avi"),
+            ]});
+            return origin_full(200, body.to_string());
+        }
         if imdb == "tt0000008" {
             // Four releases that won't open, ahead of one that does.
             let release = |url: String, filename: String| {
@@ -1281,6 +1295,26 @@ async fn surround_matroska_end_to_end() {
         // its number, and AAC-LC is profile 1 (`AV_PROFILE_AAC_LOW`). Either says the same thing.
         assert!(matches!(profile.trim(), "LC" | "1"), "track {track}: AAC-LC, got {profile}");
     }
+}
+
+/// A title whose only cached releases are in containers left out by name answers `no_release` naming those
+/// containers once each, so a player can say why; a plain empty answer names none.
+#[tokio::test]
+async fn nothing_to_play_names_the_containers_it_left_out() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let body = |imdb: &str| format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body("tt0000017")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        (j["error"].as_str(), j["formats"].clone()),
+        (Some("no_release"), serde_json::json!([".ts", ".avi"]))
+    );
+
+    let r = call(&state, "POST", "/remux/session", None, &body("tt0000099")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert!(r.json().get("formats").is_none(), "{}", r.text());
 }
 
 /// An AV1 release plays for a player whose report says it decodes it — its level, its 10 bits, its PQ — named so in
