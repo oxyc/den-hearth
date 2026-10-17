@@ -30,6 +30,9 @@ pub const LEGACY_SCOUT_BASE: &str = "http://den-hearth.invalid/scout";
 pub const LEGACY_SUBS_BASE: &str = "http://den-hearth.invalid/subs";
 
 const MAX_BODY: usize = 16 * 1024;
+// Remux's session answer names every segment as `[start, bytes]`, about 20 bytes each, so it grows with the film:
+// a 2.6-hour film's 1,224 segments came to ~25 KiB and broke the old 16 KiB ceiling. This one holds ~6 hours.
+const MAX_ANSWER: usize = 256 * 1024;
 const MAX_KEY: usize = 128;
 const MAX_RECORDS: usize = 256;
 const MAX_RECORDS_PER_OWNER: usize = 32;
@@ -554,7 +557,7 @@ fn annotate_direct_failure(snapshot: &mut Snapshot, failure: DirectFailure) {
         object.insert("cause".to_string(), Value::String(failure.code.to_string()));
     }
     let Ok(body) = serde_json::to_vec(&value) else { return };
-    if body.len() > MAX_BODY {
+    if body.len() > MAX_ANSWER {
         return;
     }
     snapshot.body = Bytes::from(body);
@@ -633,7 +636,7 @@ async fn translate_remux(response: Response<Body>) -> Response<Body> {
     let status = response.status();
     let retry_after = response.headers().get("retry-after").cloned();
     let server_timing = response.headers().get("server-timing").cloned();
-    let bytes = match http_body_util::Limited::new(response.into_body(), MAX_BODY).collect().await {
+    let bytes = match http_body_util::Limited::new(response.into_body(), MAX_ANSWER).collect().await {
         Ok(body) => body.to_bytes(),
         Err(_) => return answer(StatusCode::BAD_GATEWAY, "source_unavailable", None),
     };
@@ -691,7 +694,7 @@ async fn translate_remux(response: Response<Body>) -> Response<Body> {
 
 async fn snapshot(response: Response<Body>) -> Snapshot {
     let (parts, body) = response.into_parts();
-    match http_body_util::Limited::new(body, MAX_BODY).collect().await {
+    match http_body_util::Limited::new(body, MAX_ANSWER).collect().await {
         Ok(body) => Snapshot { status: parts.status, headers: parts.headers, body: body.to_bytes() },
         Err(_) => {
             // Every ordinary facade answer is well below this ceiling. If release metadata from an untrusted
@@ -1238,18 +1241,34 @@ mod tests {
     async fn remux_answer_is_bounded_while_it_is_read() {
         let response = Response::builder()
             .status(StatusCode::CREATED)
-            .body(den_http::full(vec![b'x'; MAX_BODY + 1]))
+            .body(den_http::full(vec![b'x'; MAX_ANSWER + 1]))
             .unwrap();
         let response = translate_remux(response).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(body(response).await, json!({"error": "source_unavailable"}));
     }
 
+    /// A long film's answer lists every segment; 1,224 of them (a 2.6-hour film) failed the old 16 KiB ceiling.
+    #[tokio::test]
+    async fn a_long_films_session_answer_is_translated_and_replayed_whole() {
+        let segments: Vec<Value> = (0..1_224).map(|i| json!([f64::from(i) * 7.697, 2_345_678 + i])).collect();
+        let created = den_http::json(
+            StatusCode::CREATED,
+            &json!({"sid": "sid", "playlist": "/remux/s/sid/sig/master.m3u8", "segments": segments}),
+            &[],
+        );
+        let response = snapshot(translate_remux(created).await).await.response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body(response).await;
+        assert_eq!(value["url"], "/remux/s/sid/sig/master.m3u8");
+        assert_eq!(value["session"]["segments"].as_array().map(Vec::len), Some(1_224));
+    }
+
     #[tokio::test]
     async fn replay_snapshot_does_not_retain_oversized_release_metadata() {
         let response = Response::builder()
             .status(StatusCode::OK)
-            .body(den_http::full(vec![b'x'; MAX_BODY + 1]))
+            .body(den_http::full(vec![b'x'; MAX_ANSWER + 1]))
             .unwrap();
         let response = snapshot(response).await.response();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
