@@ -114,7 +114,10 @@ CI (`.github/workflows/`): `ci.yml` formats, lints and tests the workspace, runs
 probes (`scripts/probe-image.sh`) and scans an immutable candidate. `docker-publish.yml` promotes that digest on a
 `v*` tag (cosign keyless signature, `:latest` last) and rebuilds the newest tag weekly without cache for Debian
 security fixes. `ytdlp-update.yml` and `deno-update.yml` bump the checksummed downloads. `scripts/release.sh X.Y.Z`
-commits `VERSION`, waits for that commit's CI and tags it.
+publishes an already-merged version commit: it waits for that exact `main` commit's CI and only then tags it. When
+`VERSION` needs to change, first run `scripts/release.sh --prepare X.Y.Z`; it opens the required version-only pull
+request and stops. After that PR merges, update the checkout to `main` and run the publish command. Preparation never
+tags or publishes a release, and publishing never writes or pushes directly to protected `main`.
 
 ## Routing
 

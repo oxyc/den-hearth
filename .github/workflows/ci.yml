@@ -33,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all --check
+      - name: Release helper
+        run: scripts/release-test.sh
       - name: Clippy
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - uses: taiki-e/install-action@v2

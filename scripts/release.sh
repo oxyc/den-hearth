@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Publish a release without rebuilding or retesting it.
 #
-#   scripts/release.sh 0.2.0
+#   scripts/release.sh --prepare 0.2.0  # open the VERSION pull request
+#   scripts/release.sh 0.2.0            # after that pull request is merged
 #
 # Main CI has already built, behavior-probed and scanned an immutable candidate image for its exact SHA, and the
-# vX.Y.Z workflow only verifies and promotes that digest. So this script's job is to make the release commit
-# (the VERSION file, nothing else), wait for that commit's own main CI, and tag only once it is green.
+# vX.Y.Z workflow only verifies and promotes that digest. Protected main means the VERSION commit must pass through
+# a pull request. Preparation creates that version-only PR; publishing waits for its merged commit's main CI and
+# tags only once it is green.
 #
 # That ordering is the point. A tag on a red commit produces NO image, and `den-update` then reports "already at
 # <digest>" — which means "the registry is unchanged" and reads as "nothing to deploy". The tag exists, the deploy
@@ -15,8 +17,16 @@
 # so a release changes no dependency layer.
 set -euo pipefail
 
+mode=publish
+if [ "${1:-}" = --prepare ]; then
+    mode=prepare
+    shift
+fi
 version="${1:-}"
-[ -n "$version" ] || { echo "usage: scripts/release.sh <version>   e.g. 0.2.0" >&2; exit 1; }
+[ -n "$version" ] && [ "$#" -eq 1 ] || {
+    echo "usage: scripts/release.sh [--prepare] <version>   e.g. 0.2.0" >&2
+    exit 1
+}
 case "$version" in
     v*) echo "error: give the version without the leading v ($version -> ${version#v})" >&2; exit 1 ;;
     *.*.*) ;;
@@ -40,6 +50,36 @@ git rev-parse "v$version" >/dev/null 2>&1 && { echo "error: tag v$version alread
 command -v gh >/dev/null 2>&1 || {
     echo "error: gh is required to prove exact-main CI before tagging" >&2; exit 1; }
 
+current="$(cat VERSION)"
+if [ "$mode" = publish ] && [ "$current" != "$version" ]; then
+    echo "error: VERSION is $current; protected $main requires a version pull request first" >&2
+    echo "       run: scripts/release.sh --prepare $version" >&2
+    echo "       after it merges, update $main and rerun: scripts/release.sh $version" >&2
+    exit 1
+fi
+
+if [ "$mode" = prepare ]; then
+    [ "$current" != "$version" ] || {
+        echo "error: VERSION is already $version; update $main after the version PR merges, then run:" >&2
+        echo "       scripts/release.sh $version" >&2
+        exit 1
+    }
+    branch="release/$version"
+    existing_pr="$(gh pr list --repo "$slug" --head "$branch" --state open --limit 1 --json url --jq '.[0].url // empty')"
+    if [ -n "$existing_pr" ]; then
+        echo "release preparation already exists: $existing_pr"
+        exit 0
+    fi
+    git show-ref --verify --quiet "refs/heads/$branch" && {
+        echo "error: local branch $branch already exists; inspect or remove it before retrying" >&2
+        exit 1
+    }
+    git show-ref --verify --quiet "refs/remotes/origin/$branch" && {
+        echo "error: origin/$branch exists without an open PR; inspect it before retrying" >&2
+        exit 1
+    }
+fi
+
 # The checks CI runs on this exact commit, so a failure is found here rather than after the push. Formatting
 # goes through nix when this machine has no rustfmt: `cargo fmt` failing with "no such command" reads as "not
 # applicable", and that reading is what cost earlier releases.
@@ -53,14 +93,26 @@ run_rustfmt() {
 echo "==> formatting";  run_rustfmt
 echo "==> tests";       cargo test --workspace --quiet
 
-current="$(cat VERSION)"
-if [ "$current" != "$version" ]; then
+if [ "$mode" = prepare ]; then
     echo "==> version $current -> $version"
+    git switch --quiet -c "$branch"
     printf '%s\n' "$version" > VERSION
     [ "$(cat VERSION)" = "$version" ] || { echo "error: the version bump did not apply" >&2; exit 1; }
     git add VERSION
     git commit --quiet -m "${slug#*/} $version"
-    git push --quiet origin "HEAD:$main"
+    git push --quiet --set-upstream origin "$branch"
+    body="$(printf '%s\n\n%s\n' \
+        "Prepare ${slug#*/} $version." \
+        "After this merges and exact-main CI passes, publish it with \`scripts/release.sh $version\`.")"
+    if ! pr_url="$(gh pr create --repo "$slug" --base "$main" --head "$branch" \
+        --title "Release $version" --body "$body")"; then
+        echo "error: $branch was pushed, but its pull request could not be created" >&2
+        echo "       retry: gh pr create --repo $slug --base $main --head $branch" >&2
+        exit 1
+    fi
+    echo "release preparation opened: $pr_url"
+    echo "after it merges, update $main and run: scripts/release.sh $version"
+    exit 0
 fi
 sha="$(git rev-parse HEAD)"
 
