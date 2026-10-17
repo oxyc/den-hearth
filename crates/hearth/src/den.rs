@@ -664,7 +664,9 @@ mod tests {
         assert!(at("if (!sealPublicKey || !window.DenSeal)") < at("$(\"go\").disabled = false"));
         assert!(at("if (DEN_GUEST && (!segment || !lastBuildSealed))") < at("denFetch(DEN_GUEST.saveUrl"));
         let saved = page[at("if (!r.ok) throw new Error(\"save failed\")")..].to_owned();
-        assert!(saved.find("throw").unwrap() < saved.find("$(\"out\").classList.remove(\"hidden\")").unwrap());
+        assert!(
+            saved.find("throw").unwrap() < saved.find("$(\"out\").classList.remove(\"hidden\")").unwrap()
+        );
         assert!(
             page.contains("if (DEN_GUEST !== null) {\n      lastBuildSealed = false;\n      return null;")
         );
