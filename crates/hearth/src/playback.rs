@@ -632,6 +632,22 @@ async fn remux(
     translate_remux(response).await
 }
 
+/// The containers Remux left out unopened, from its 404 body. Only short `.ext` names pass: the rest of that body
+/// is Remux's own detail, which the facade never repeats.
+fn skipped_formats(body: &[u8]) -> Vec<String> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else { return Vec::new() };
+    let Some(formats) = value.get("formats").and_then(Value::as_array) else { return Vec::new() };
+    formats
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|ext| {
+            ext.len() <= 6 && ext.starts_with('.') && ext[1..].bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        .take(20)
+        .map(str::to_string)
+        .collect()
+}
+
 async fn translate_remux(response: Response<Body>) -> Response<Body> {
     let status = response.status();
     let retry_after = response.headers().get("retry-after").cloned();
@@ -650,7 +666,18 @@ async fn translate_remux(response: Response<Body>) -> Response<Body> {
             StatusCode::BAD_GATEWAY => (StatusCode::BAD_GATEWAY, "source_unavailable", None),
             _ => (StatusCode::SERVICE_UNAVAILABLE, "playback_unavailable", Some("5")),
         };
-        let mut out = answer(status, code, retry);
+        let formats = (status == StatusCode::NOT_FOUND).then(|| skipped_formats(&bytes)).unwrap_or_default();
+        let mut out = if formats.is_empty() {
+            answer(status, code, retry)
+        } else {
+            let mut out = den_http::json(
+                status,
+                &json!({"error": code, "formats": formats}),
+                &[("cache-control", "no-store")],
+            );
+            stamp(&mut out);
+            out
+        };
         if let Some(value) = retry_after {
             out.headers_mut().insert("retry-after", value);
         }
@@ -1235,6 +1262,25 @@ mod tests {
         let response = translate_remux(response).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(body(response).await, json!({"error": "source_unavailable"}));
+    }
+
+    #[tokio::test]
+    async fn a_no_release_answer_names_only_the_skipped_formats() {
+        let response = den_http::json(
+            StatusCode::NOT_FOUND,
+            &json!({
+                "error": "no_playable_release",
+                "detail": "torrent 123",
+                "formats": [".ts", ".avi", "../secret", ".toolongext", 7],
+            }),
+            &[],
+        );
+        let response = translate_remux(response).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body(response).await, json!({"error": "no_release", "formats": [".ts", ".avi"]}));
+
+        let plain = den_http::json(StatusCode::NOT_FOUND, &json!({"error": "no_release"}), &[]);
+        assert_eq!(body(translate_remux(plain).await).await, json!({"error": "no_release"}));
     }
 
     #[tokio::test]

@@ -696,8 +696,20 @@ where
             }),
             &[],
         ),
-        Err(e) => httputil::error(e.status, e.code, &e.detail),
+        Err(e) => api_error(&e),
     }
+}
+
+/// The JSON error a session or release request ends in; `formats` appears only when some release was left out by name.
+fn api_error(e: &session::ApiError) -> Response<Body> {
+    if e.formats.is_empty() {
+        return httputil::error(e.status, e.code, &e.detail);
+    }
+    httputil::json(
+        e.status,
+        &serde_json::json!({"error": e.code, "detail": e.detail, "formats": e.formats}),
+        &[],
+    )
 }
 
 async fn create_session<B>(
@@ -903,7 +915,7 @@ where
                 &[("server-timing", server_timing.as_str()), ("x-den-session-id", s.short())],
             )
         }
-        Err(e) => httputil::error(e.status, e.code, &e.detail),
+        Err(e) => api_error(&e),
     }
 }
 

@@ -294,10 +294,13 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub detail: String,
+    /// The extensions of cached releases left out unopened by their names (`scout::left_out_by_name`), on an
+    /// answer that found nothing to play: what lets a player say "only .ts releases are ready" instead of "none".
+    pub formats: Vec<&'static str>,
 }
 
 fn api(status: StatusCode, code: &'static str, detail: impl Into<String>) -> ApiError {
-    ApiError { status, code, detail: detail.into() }
+    ApiError { status, code, detail: detail.into(), formats: Vec::new() }
 }
 
 /// The nearest keyframe to `t` when there is one within `SNAP`, else `t`. Keeps a job's running sum of
@@ -3019,16 +3022,10 @@ pub async fn create(
         want.playable.is_some_and(Playable::takes_av1),
         want.playable.is_some_and(Playable::takes_vp9),
     );
-    if candidates.is_empty() {
-        return Err(api(
-            StatusCode::NOT_FOUND,
-            "no_release",
-            "No cached release in a codec this service can remux.",
-        ));
-    }
-    let takes_hevc = player_takes_hevc(want.playable, want.video_codecs);
     // Why the release the player named was passed over, where it was: `release.requested` in the answer.
     let mut requested_why: Option<String> = None;
+    // The containers of what was left out by name, for an answer that ends with nothing to play.
+    let mut formats: Vec<&'static str> = Vec::new();
     // Left out of `candidates` by their names, which a person reading the log should see was on purpose.
     for s in list.iter().filter(|s| s.attributes.cached == Some(true) && !s.attributes.three_d) {
         if let Some(ext) = scout::left_out_by_name(s) {
@@ -3036,11 +3033,21 @@ pub async fn create(
                 "session {short}: {imdb} skipped \"{}\" unopened: {ext} is not a container this service opens{rid_suffix}",
                 s.attributes.label
             );
+            if !formats.contains(&ext) {
+                formats.push(ext);
+            }
             if want.filename == Some(s.filename()) {
                 requested_why = Some(format!("{ext} files can't be played here"));
             }
         }
     }
+    if candidates.is_empty() {
+        return Err(ApiError {
+            formats,
+            ..api(StatusCode::NOT_FOUND, "no_release", "No cached release in a codec this service can remux.")
+        });
+    }
+    let takes_hevc = player_takes_hevc(want.playable, want.video_codecs);
     // What scout says of each release decides, before any is opened, which are tried first — those that play as
     // they are, then those that play only converted, scout's ranking holding within each — and which aren't
     // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
@@ -3314,7 +3321,10 @@ pub async fn create(
                  converted now.",
             ));
         }
-        return Err(api(StatusCode::NOT_FOUND, "no_playable_release", "No cached release could be opened."));
+        return Err(ApiError {
+            formats,
+            ..api(StatusCode::NOT_FOUND, "no_playable_release", "No cached release could be opened.")
+        });
     };
     let (audio, audio_reason) = match want.audio_track {
         Some(n) if n < info.audio.len() => (n, crate::lang::AudioReason::Explicit),
