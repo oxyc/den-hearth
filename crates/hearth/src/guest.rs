@@ -35,6 +35,7 @@ struct Input {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Host {
+    den: Option<String>,
     scout: Option<String>,
     subs: Option<String>,
     reel: Option<String>,
@@ -51,7 +52,15 @@ struct Operation {
 
 struct Opened {
     personal: Option<(String, den::Install)>,
-    host: Host,
+    host: OpenedHost,
+}
+
+#[derive(Default)]
+struct OpenedHost {
+    den: Option<(String, den::Install)>,
+    scout: Option<String>,
+    subs: Option<String>,
+    reel: Option<String>,
 }
 
 struct PlaybackSources<'a> {
@@ -137,11 +146,31 @@ fn playback_sources(opened: &Opened) -> PlaybackSources<'_> {
         direct,
         remux_scout: opened
             .host
-            .scout
-            .as_deref()
-            .map(|segment| format!("{}/{segment}", playback::LEGACY_SCOUT_BASE)),
+            .den
+            .as_ref()
+            .filter(|(_, install)| install.members.contains(&"scout"))
+            .map(|(segment, _)| format!("{}/{segment}", playback::DEN_ADDON_BASE))
+            .or_else(|| {
+                opened
+                    .host
+                    .scout
+                    .as_deref()
+                    .map(|segment| format!("{}/{segment}", playback::LEGACY_SCOUT_BASE))
+            }),
         subtitles: personal_subs.or_else(|| {
-            opened.host.subs.as_deref().map(|segment| format!("{}/{segment}", playback::LEGACY_SUBS_BASE))
+            opened
+                .host
+                .den
+                .as_ref()
+                .filter(|(_, install)| install.members.contains(&"subs"))
+                .map(|(segment, _)| format!("{}/{segment}", playback::DEN_ADDON_BASE))
+                .or_else(|| {
+                    opened
+                        .host
+                        .subs
+                        .as_deref()
+                        .map(|segment| format!("{}/{segment}", playback::LEGACY_SUBS_BASE))
+                })
         }),
     }
 }
@@ -168,6 +197,10 @@ fn open(hearth: &Hearth, personal: Option<String>, host: Host) -> Option<Opened>
         }
         None => None,
     };
+    let den = match host.den {
+        Some(segment) => Some((segment.clone(), hearth.den.open(&segment).ok()?)),
+        None => None,
+    };
     if host.scout.as_deref().is_some_and(|segment| {
         hearth.scout.as_ref().and_then(|scout| scout.migration_member(segment)).is_none()
     }) || host.subs.as_deref().is_some_and(|segment| {
@@ -177,7 +210,7 @@ fn open(hearth: &Hearth, personal: Option<String>, host: Host) -> Option<Opened>
     }) {
         return None;
     }
-    Some(Opened { personal, host })
+    Some(Opened { personal, host: OpenedHost { den, scout: host.scout, subs: host.subs, reel: host.reel } })
 }
 
 fn operation_request(headers: &hyper::HeaderMap, operation: Operation) -> Option<Request<Full<Bytes>>> {
@@ -237,14 +270,21 @@ fn operation_request(headers: &hyper::HeaderMap, operation: Operation) -> Option
 
 fn manifest(opened: &Opened, method: &Method) -> Response<Body> {
     let personal = opened.personal.as_ref().map(|(_, install)| &install.members);
+    let host_den = opened.host.den.as_ref().map(|(_, install)| &install.members);
     let mut members = Vec::new();
-    if opened.host.scout.is_some() || personal.is_some_and(|members| members.contains(&"scout")) {
+    if opened.host.scout.is_some()
+        || personal.is_some_and(|members| members.contains(&"scout"))
+        || host_den.is_some_and(|members| members.contains(&"scout"))
+    {
         members.push("scout");
     }
-    if opened.host.subs.is_some() || personal.is_some_and(|members| members.contains(&"subs")) {
+    if opened.host.subs.is_some()
+        || personal.is_some_and(|members| members.contains(&"subs"))
+        || host_den.is_some_and(|members| members.contains(&"subs"))
+    {
         members.push("subs");
     }
-    if opened.host.reel.is_some() {
+    if opened.host.reel.is_some() || host_den.is_some_and(|members| members.contains(&"reel")) {
         members.push("reel");
     }
     if members.is_empty() {
@@ -287,7 +327,22 @@ async fn resource(hearth: &Arc<Hearth>, opened: &Opened, req: Request<Full<Bytes
                 .await;
             }
         }
-        let Some(host) = opened.host.subs.as_deref() else { return den_http::not_found() };
+        if let Some((host, install)) = &opened.host.den {
+            if install.members.contains(&"subs") {
+                let Some(mut req) = crate::with_path(req, &format!("/{host}{path}")) else {
+                    return refused(StatusCode::BAD_REQUEST);
+                };
+                req.extensions_mut().insert(hearth.den.subs.clone());
+                return den_subtitles::handle_request(
+                    hearth.subs.clone().expect("guest overlay requires Subtitles"),
+                    req,
+                )
+                .await;
+            }
+        }
+        let Some(host) = opened.host.subs.as_deref() else {
+            return den_http::not_found();
+        };
         let Some(req) = crate::with_path(req, &format!("/{host}{path}")) else {
             return refused(StatusCode::BAD_REQUEST);
         };
@@ -298,7 +353,22 @@ async fn resource(hearth: &Arc<Hearth>, opened: &Opened, req: Request<Full<Bytes
         .await;
     }
     if path.starts_with("/meta/") {
-        let Some(host) = opened.host.reel.as_deref() else { return den_http::not_found() };
+        if let Some((host, install)) = &opened.host.den {
+            if install.members.contains(&"reel") {
+                let Some(mut req) = crate::with_path(req, &format!("/{host}{path}")) else {
+                    return refused(StatusCode::BAD_REQUEST);
+                };
+                req.extensions_mut().insert(hearth.den.reel.clone());
+                return den_reel::handle_request(
+                    hearth.reel.clone().expect("guest overlay requires Reel"),
+                    req,
+                )
+                .await;
+            }
+        }
+        let Some(host) = opened.host.reel.as_deref() else {
+            return den_http::not_found();
+        };
         let Some(req) = crate::with_path(req, &format!("/{host}{path}")) else {
             return refused(StatusCode::BAD_REQUEST);
         };
@@ -338,6 +408,7 @@ async fn scrub(response: Response<Body>, owner: &str, opened: &Opened) -> Respon
     };
     for segment in [
         opened.personal.as_ref().map(|(segment, _)| segment.as_str()),
+        opened.host.den.as_ref().map(|(segment, _)| segment.as_str()),
         opened.host.scout.as_deref(),
         opened.host.subs.as_deref(),
         opened.host.reel.as_deref(),
@@ -370,7 +441,8 @@ mod tests {
     fn opened(members: Vec<&'static str>) -> Opened {
         Opened {
             personal: Some(("personal".into(), den::Install { iid: None, members })),
-            host: Host {
+            host: OpenedHost {
+                den: None,
                 scout: Some("host-scout".into()),
                 subs: Some("host-subs".into()),
                 reel: Some("host-reel".into()),
@@ -394,6 +466,27 @@ mod tests {
         let opened = opened(vec!["scout"]);
         let sources = playback_sources(&opened);
         assert_eq!(sources.subtitles.as_deref(), Some("http://den-hearth.invalid/subs/host-subs"));
+    }
+
+    #[test]
+    fn a_migrated_host_hearth_install_is_the_remux_and_subtitle_fallback() {
+        let mut opened = opened(vec!["scout", "subs"]);
+        opened.host.den =
+            Some(("host-hearth".into(), den::Install { iid: None, members: vec!["scout", "subs", "reel"] }));
+        let sources = playback_sources(&opened);
+        assert_eq!(sources.direct, Some("personal"), "the guest's personal Scout stays preferred");
+        assert_eq!(sources.remux_scout.as_deref(), Some("http://den-hearth.invalid/den/host-hearth"));
+        assert_eq!(
+            sources.subtitles.as_deref(),
+            Some("http://den-hearth.invalid/den/personal"),
+            "the personal subtitle member overrides the host"
+        );
+
+        opened.personal = None;
+        let sources = playback_sources(&opened);
+        assert_eq!(sources.direct, None);
+        assert_eq!(sources.remux_scout.as_deref(), Some("http://den-hearth.invalid/den/host-hearth"));
+        assert_eq!(sources.subtitles.as_deref(), Some("http://den-hearth.invalid/den/host-hearth"));
     }
 
     #[test]

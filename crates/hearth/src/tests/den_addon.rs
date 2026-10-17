@@ -208,6 +208,46 @@ async fn guest_overlay_revalidates_personal_revocation_before_answering() {
 }
 
 #[tokio::test]
+async fn guest_overlay_opens_a_migrated_host_hearth_without_returning_its_bearer() {
+    let hearth = guest_hearth(den_with(None, "", "0", false));
+    let host = plain(&config(0, &[SCOUT, SUBS, REEL]));
+    let response = guest_overlay(
+        &hearth,
+        serde_json::json!({
+            "host": {"den": host},
+            "request": {"method": "GET", "path": "/manifest.json"}
+        }),
+        "10.0.0.2",
+        "edge-secret",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains(&host), "the host bearer left the overlay: {text}");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(resource_names(&manifest), vec!["stream", "subtitles", "meta"]);
+}
+
+#[tokio::test]
+async fn guest_overlay_revalidates_a_revoked_host_hearth_before_answering() {
+    let host = sealed(VEC_PRIV, &config(0, &[SCOUT]));
+    let hearth = guest_hearth(den_with(Some(VEC_PRIV), IID, "0", false));
+    let response = guest_overlay(
+        &hearth,
+        serde_json::json!({
+            "host": {"den": host},
+            "request": {"method": "GET", "path": "/manifest.json"}
+        }),
+        "10.0.0.2",
+        "edge-secret",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(response).await["error"], "guest_overlay_refused");
+}
+
+#[tokio::test]
 async fn a_personal_only_guest_has_no_hidden_host_fallback() {
     let hearth = guest_hearth(den_with(None, "", "0", false));
     let response = guest_overlay(
