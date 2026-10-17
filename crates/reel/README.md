@@ -190,7 +190,10 @@ and is the final fallback. Its sealed media form is `d`; the internal capability
 
 The v2 prepare envelope keeps only descriptive discovery fields (`name`, `category`, `provider`) in
 `meta.links` and adds a complete `planUrl` to every candidate. `primary` is `{ id, planUrl }`; alternates
-can therefore be fetched lazily without deriving a route. The embedded `primaryPlan` is `null` when
+can therefore be fetched lazily without deriving a route. A `planUrl` is relative to the prepare URL the
+client asked (`../../sources/<id>.json?…`, one `../` more under `/<config>/`), so an answer relayed to a
+public visitor never names the origin Reel itself was reached at; resolve it with
+`new URL(planUrl, prepareUrl)`. Older releases answered an absolute URL. The embedded `primaryPlan` is `null` when
 there is no valid primary or its preparation failed, so no downloaded capability is emitted for an
 invalid candidate.
 

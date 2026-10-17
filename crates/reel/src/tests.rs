@@ -4308,6 +4308,78 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
     assert!(empty.get("sources").is_none(), "an invalid primary emitted fallback capabilities");
 }
 
+/// A v2 prepare answer reaches public visitors through Den Edge's relay, so it names no origin of Reel's
+/// own — not `PUBLIC_BASE_URL`, not the Host it was asked at. Every plan URL is relative to the request,
+/// and resolved against the relay's URL for that request it lands on a `/sources` Reel serves and verifies.
+#[tokio::test]
+async fn prepare_v2_names_its_plans_relative_to_the_request_and_no_origin_of_its_own() {
+    use base64::Engine as _;
+
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-prepare-relative",
+        "printf '1280 720\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\n'",
+    );
+    let mut cfg = test_cfg(dir);
+    cfg.ytdlp = yt;
+    cfg.play_secret = Some("s3cret".into());
+    cfg.public_base_url = Some("http://10.20.30.40:8092".into());
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ", "alternate01"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let segment = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(r#"{"tmdbKey":"byok","iid":"AAAAAAAAAAAAAAAAAAAAAA","ep":9}"#);
+    let query = "v=2&surface=audible&player=native&intent=play";
+    for path in [
+        format!("/prepare/movie/tt0111161.json?{query}"),
+        format!("/{segment}/prepare/movie/tt0111161.json?{query}"),
+    ] {
+        let request = hyper::Request::builder()
+            .uri(&path)
+            .header("host", "10.20.30.40:8092")
+            .header("x-forwarded-host", "10.20.30.40:8092")
+            .body(())
+            .unwrap();
+        let response = crate::handle_request(state.clone(), request).await;
+        assert_eq!(response.status(), 200, "{path}");
+        let body = direct_body(response).await;
+        let text = body.to_string();
+        assert!(!text.contains("http://"), "{path}: {text}");
+        assert!(!text.contains("10.20.30.40") && !text.contains(":8092"), "{path}: {text}");
+
+        // What the browser asked, through the relay that mounts Reel at `/reel`.
+        let asked = reqwest::Url::parse(&format!("https://edge.example/reel{path}")).unwrap();
+        let mut plans = vec![body["primary"]["planUrl"].as_str().unwrap().to_owned()];
+        plans.extend(body["meta"]["links"].as_array().unwrap().iter().map(|l| l["planUrl"].to_string()));
+        for plan in &plans {
+            let plan = plan.trim_matches('"');
+            assert!(!plan.starts_with('/') && !plan.contains("://"), "{path}: not relative: {plan}");
+            let resolved = asked.join(plan).unwrap();
+            assert_eq!(resolved.origin(), asked.origin(), "{path}: {plan}");
+            assert!(resolved.path().starts_with("/reel/sources/"), "{path}: {resolved}");
+        }
+
+        // The primary's resolved URL, past the relay's prefix, is a `/sources` whose signature verifies and
+        // whose answer is the plan prepare embedded.
+        let resolved = asked.join(&plans[0]).unwrap();
+        let reel_path = resolved.path().strip_prefix("/reel").unwrap();
+        let request = hyper::Request::builder()
+            .uri(format!("{reel_path}?{}", resolved.query().unwrap()))
+            .header("host", "10.20.30.40:8092")
+            .body(())
+            .unwrap();
+        let sources = crate::handle_request(state.clone(), request).await;
+        assert_eq!(sources.status(), 200, "{path}: {resolved}");
+        assert_eq!(direct_body(sources).await, body["primaryPlan"], "{path}");
+    }
+}
+
 #[tokio::test]
 async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() {
     let dir = temp_dir();

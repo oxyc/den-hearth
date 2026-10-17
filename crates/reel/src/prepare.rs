@@ -41,10 +41,19 @@ pub async fn handle_prepare(
         Some(c) => crate::sign::Binding::install(c.iid.as_deref(), c.ep, den.is_some()),
         None => crate::sign::Binding::Unbound,
     };
+    // A v2 answer names its plans relative to this request. It reaches public visitors through Den Edge's
+    // relay, so the origin Reel was reached at (its LAN address, or `PUBLIC_BASE_URL`) must not appear in
+    // it; the client resolves the reference against the URL it asked. `/prepare/<type>/<id>.json` sits two
+    // segments below Reel's root and `/<config>/prepare/…` three, under whatever prefix Reel is mounted at.
+    // A v1 answer keeps the absolute base: its embedded `../m/…` URLs resolve against `sourcesBase`.
+    let base = match contract {
+        crate::sources::Contract::V1 => discovered.base.clone(),
+        crate::sources::Contract::V2 => if cfg.is_some() { "../../.." } else { "../.." }.to_owned(),
+    };
     let mut meta = crate::addon::build_meta(
         ty,
         &discovered.id,
-        &discovered.base,
+        &base,
         &discovered.yt_ids,
         state.cfg.play_secret.as_deref(),
         binding,
