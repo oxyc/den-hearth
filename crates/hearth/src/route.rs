@@ -45,7 +45,9 @@ pub fn legacy(service: Service, path: &str) -> Target {
 }
 
 pub fn target(path: &str) -> Target {
-    if path == "/health" {
+    // Routes v1 probes `<entry.url>/health`. The combined addon's entries end in `/den`, so its health address
+    // is `/den/health`; answer it with Hearth's same aggregate report rather than parsing `health` as a config.
+    if matches!(path, "/health" | "/den/health") {
         return Target::Health;
     }
     if path == "/metrics" {
@@ -380,6 +382,7 @@ mod tests {
     #[test]
     fn health_is_hearths_own() {
         assert_eq!(target("/health"), Target::Health);
+        assert_eq!(target("/den/health"), Target::Health);
     }
 
     #[test]
