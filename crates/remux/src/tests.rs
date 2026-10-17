@@ -193,8 +193,59 @@ async fn open_gops_are_told_from_closed_ones() {
 
 #[tokio::test]
 async fn neither_container_is_refused() {
-    let err = probe::probe(&Source::Mem(b"RIFF....AVI "), b"RIFF....AVI ").await.unwrap_err();
+    let err =
+        probe::probe(&Source::Mem(b"OggS\0\x02\0\0\0\0\0\0"), b"OggS\0\x02\0\0\0\0\0\0").await.unwrap_err();
     assert!(matches!(err, probe::ProbeError::Unsupported(_)), "{err}");
+}
+
+/// MPEG-TS and AVI keep no index a copy could be cut on: their keyframes are a 6 s grid from the first picture, which
+/// a transcode forces, and the rest is what ffprobe reads of them (testdata/README.md): the codec, the picture's size,
+/// the duration within 0.1 s, and each audio track's codec, channels and language. The TS's timeline starts at its
+/// first timestamp — the audio's, 1.462 s and 1.436 s into the 90 kHz clock — as ffmpeg's does under `-start_at_zero`.
+#[tokio::test]
+async fn mpegts_and_avi_read_as_ffprobe_reads_them() {
+    let mpeg2 = VideoCodec::Other("mpeg2video".into());
+    let mpeg4 = VideoCodec::Other("mpeg4".into());
+    #[rustfmt::skip]
+    let cases = [
+        // (file, head, container, video, size, duration, first picture, audio codec, channels, language)
+        ("h264.ts", crate::scout::HEAD_BYTES as usize, "mpegts", VideoCodec::H264, (320, 180), 30.021, 1.483_333 - 1.462, "aac", 2, Some("eng")),
+        ("mpeg2.ts", crate::scout::HEAD_BYTES as usize, "mpegts", mpeg2, (160, 90), 30.005, 1.441_667 - 1.436_333, "ac3", 6, Some("fin")),
+        ("xvid.avi", crate::scout::HEAD_BYTES as usize, "avi", mpeg4.clone(), (320, 180), 30.042, 0.0, "mp3", 2, None),
+        // A head short of the AVI's header list: the probe reads the rest of it.
+        ("xvid.avi", 4096, "avi", mpeg4, (320, 180), 30.042, 0.0, "mp3", 2, None),
+    ];
+    for (name, head, container, video, size, duration, first, audio, channels, language) in cases {
+        let info = probe_with_head(&fixture(name), head).await;
+        assert_eq!(
+            (info.container, &info.video, (info.width, info.height)),
+            (container, &video, size),
+            "{name}"
+        );
+        assert!((info.duration - duration).abs() < 0.1, "{name}: {} vs ffprobe's {duration}", info.duration);
+        assert!(info.grid() && info.closed_gops && info.byte_index.is_empty(), "{name}");
+        let grid: Vec<f64> = (0..5).map(|n| first + 6.0 * n as f64).collect();
+        assert_keyframes(&info.keyframes, &grid);
+        let tracks: Vec<_> =
+            info.audio.iter().map(|a| (a.codec.as_str(), a.channels, a.language.as_deref())).collect();
+        assert_eq!(tracks, [(audio, channels, language)], "{name}");
+        // The tracks' names are ffmpeg's, never Matroska's or MP4's: a session re-encodes them, cut to the grid.
+        let eac3 = crate::session::Playable { eac3: true, flac: true, ..Default::default() };
+        let plan = crate::session::audio_plan(&info.audio[0].codec, channels, Some(&eac3));
+        assert_eq!(plan.0, None, "{name}: copied as {:?}", plan.0);
+    }
+    let h264 = probe_with_head(&fixture("h264.ts"), crate::scout::HEAD_BYTES as usize).await;
+    assert!(h264.codecs.as_deref().is_some_and(|c| c.starts_with("avc1.64")), "{:?}", h264.codecs);
+    assert_eq!(h264.frame_rate.map(|f| f.round()), Some(24.0));
+}
+
+/// An AVI with no index — here a download cut off before its `idx1` — is refused rather than handed to ffmpeg, which
+/// would read the whole file to index it before it could seek.
+#[tokio::test]
+async fn an_avi_with_no_index_is_refused() {
+    let bytes = fixture("noindex.avi");
+    let err = probe::probe(&Source::Mem(&bytes), &bytes).await.unwrap_err();
+    assert!(matches!(&err, probe::ProbeError::Unsupported(w) if w == probe::avi::NO_INDEX), "{err}");
 }
 
 #[tokio::test]
@@ -507,8 +558,8 @@ async fn origin_handle<B>(
             return origin_full(200, body.to_string());
         }
         if imdb == "tt0000016" {
-            // Ahead of one that plays: a release named .m2ts, one whose bytes are MPEG-TS, and one whose debrid
-            // answers with an error page.
+            // Ahead of one that plays: a release named .m2ts, one whose bytes are MPEG-TS sync bytes with no program
+            // in them, and one whose debrid answers with an error page.
             let release = |path: &str, filename: &str| {
                 serde_json::json!({"url": format!("http://{addr}/{p}/{path}"),
                                    "attributes": {"cached": true, "codec": "h264", "sizeBytes": 307_200,
@@ -524,16 +575,16 @@ async fn origin_handle<B>(
             return origin_full(200, body.to_string());
         }
         if imdb == "tt0000017" {
-            // Only containers left out by name: a telesync .ts twice and an XviD .avi.
+            // Only containers left out by name: a Blu-ray's .m2ts twice and a .wmv.
             let release = |filename: &str| {
                 serde_json::json!({"url": format!("http://{addr}/{p}/never/{filename}"),
                                    "attributes": {"cached": true, "label": filename},
                                    "behaviorHints": {"filename": filename}})
             };
             let body = serde_json::json!({"streams": [
-                release("Film.2026.TS.ts"),
-                release("Film.2026.TELESYNC.ts"),
-                release("Film.2005.DVDRip.XviD.avi"),
+                release("Film.2026.BluRay.m2ts"),
+                release("Film.2026.BluRay.Part2.m2ts"),
+                release("Film.2005.DVDRip.wmv"),
             ]});
             return origin_full(200, body.to_string());
         }
@@ -564,6 +615,9 @@ async fn origin_handle<B>(
             "tt0000044" => "resume44/slow/h264.mkv",
             "tt0000045" => "resume45/h264.mkv",
             "tt0000046" => "resume46/h264.mkv",
+            "tt0000050" => "h264.ts",
+            "tt0000051" => "xvid.avi",
+            "tt0000052" => "mpeg2.ts",
             "tt0000004:1:2" if path.contains("/stream/series/") => "h264.mkv",
             // Two episodes sharing an intro and end credits (testdata/README.md); there is no episode 3.
             "tt0000020:1:1" if path.contains("/stream/series/") => "segments-a.mkv",
@@ -634,7 +688,7 @@ async fn origin_handle<B>(
     if name == "errorpage" {
         return origin_full(200, "<html><body>Service temporarily unavailable</body></html>");
     }
-    // MPEG-TS sync bytes: a file that is neither Matroska nor MP4.
+    // MPEG-TS sync bytes and nothing else: no program a probe could read.
     let data = match name {
         "mpegts" => vec![0x47; 300 * 1024],
         _ => match std::fs::read(testdata(name)) {
@@ -879,10 +933,35 @@ async fn end_to_end_via(
     extra: &str,
     in_process: bool,
 ) -> (String, Bytes, PathBuf) {
+    end_to_end_with(imdb, fixture_name, codec_prefix, scoped, extra, in_process, None).await
+}
+
+/// `end_to_end_via`, transcoding: with `transcode`'s ffmpeg and VAAPI device (`grid_transcoder`), and transcoding on.
+async fn end_to_end_with(
+    imdb: &str,
+    fixture_name: &str,
+    codec_prefix: &str,
+    scoped: bool,
+    extra: &str,
+    in_process: bool,
+    transcode: Option<(String, PathBuf)>,
+) -> (String, Bytes, PathBuf) {
     let ffmpeg8 = ffmpeg_major() == Some(8);
     let fake = origin_counting().await;
     let origin = fake.url.clone();
-    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let grid = transcode.is_some();
+    let state = match transcode {
+        Some((ffmpeg, vaapi_device)) => {
+            let state = state_from(Config {
+                ffmpeg,
+                vaapi_device,
+                ..test_config(&origin, 2, Duration::from_secs(600), Some(SCOUT_KEY))
+            });
+            state.transcode_ok.store(true, Relaxed);
+            state
+        }
+        None => test_state(&origin, 2, Duration::from_secs(600)),
+    };
     if in_process {
         fake.serve_in_process(&state);
     }
@@ -1044,8 +1123,18 @@ async fn end_to_end_via(
         )
     };
     let got_count: usize = count(&whole).trim().parse().unwrap();
-    let source_count: usize = count(&testdata(fixture_name)).trim().parse().unwrap();
-    if ffmpeg8 && shifted.iter().any(|shifted| *shifted) {
+    // An MPEG-TS's stream is listed twice, under its program and on its own, each line ending in a comma.
+    let source_count: usize =
+        count(&testdata(fixture_name)).lines().next().unwrap().trim_end_matches(',').parse().unwrap();
+    if grid {
+        // A transcode is constant-rate: a picture every 1/24 s from the first to the last, none twice and none
+        // missing — an AVI's drop frame (a chunk with no picture) shown as the one before it, as a player would.
+        let mut pts: Vec<f64> = video_packets(&whole).iter().map(|p| p.0).collect();
+        pts.sort_by(f64::total_cmp);
+        let uneven: Vec<_> = pts.windows(2).filter(|w| (w[1] - w[0] - 1.0 / 24.0).abs() > 0.002).collect();
+        assert!(uneven.is_empty(), "{got_count} pictures, not one every frame: {uneven:?}");
+        assert!(got_count >= source_count, "{got_count} pictures of {source_count}");
+    } else if ffmpeg8 && shifted.iter().any(|shifted| *shifted) {
         let duplicate_bound: usize = shifted
             .iter()
             .enumerate()
@@ -1297,6 +1386,142 @@ async fn surround_matroska_end_to_end() {
     }
 }
 
+/// The ffmpeg and render node a grid session's transcode runs on: where there is a GPU (`VAAPI_DEVICE`, default
+/// renderD128), `FFMPEG_PATH`'s own VAAPI; else, where that ffmpeg has libx264, a stand-in that runs it with the VAAPI
+/// flags swapped for libx264's and the software scaler's — the same seek, cuts, forced keyframes and audio, encoded on
+/// the CPU. `None` where neither is here: the image's e2e stage, whose ffmpeg encodes H.264 only over VAAPI, on a
+/// runner with no GPU.
+fn grid_transcoder() -> Option<(String, PathBuf)> {
+    let ffmpeg = tool("FFMPEG_PATH", "ffmpeg");
+    let device = PathBuf::from(tool("VAAPI_DEVICE", "/dev/dri/renderD128"));
+    if device.exists() {
+        return Some((ffmpeg, device));
+    }
+    let encoders = std::process::Command::new(&ffmpeg).args(["-hide_banner", "-encoders"]).output().ok()?;
+    if !String::from_utf8_lossy(&encoders.stdout).contains("libx264") {
+        return None;
+    }
+    // `for a do … set -- "$@" "$a"` rebuilds the arguments one by one, dropping each VAAPI device flag with its value.
+    let shim = fake_ffmpeg(&format!(
+        r#"skip=0
+for a do
+  shift
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -hwaccel|-hwaccel_device|-hwaccel_output_format|-init_hw_device|-filter_hw_device) skip=1; continue ;;
+    h264_vaapi) a=libx264 ;;
+    *scale_vaapi=*) a=$(printf '%s' "$a" | sed -e 's/,hwupload//' -e 's/scale_vaapi=\([^:]*\):\([^:]*\):format=nv12/scale=\1:\2,format=yuv420p/') ;;
+  esac
+  set -- "$@" "$a"
+done
+exec '{ffmpeg}' "$@""#
+    ));
+    Some((shim, device))
+}
+
+/// An MPEG-TS or AVI release, the title's only one, played through the harness above: transcoded with its keyframes
+/// forced onto the probe's 6 s grid, every segment fetched — 3, then 1 and 0 behind it, each a restart — and each
+/// starting on a keyframe at its playlist time with audio in it, the whole joined back with every picture once.
+async fn grid_end_to_end(imdb: &str, fixture_name: &str) {
+    let Some(transcoder) = grid_transcoder() else {
+        eprintln!("skipped: no GPU here, and no libx264 to stand in for it");
+        return;
+    };
+    let (master, _, whole) =
+        end_to_end_with(imdb, fixture_name, "avc1.640029", true, "", false, Some(transcoder.clone())).await;
+    assert!(master.contains("CODECS=\"avc1.640029,mp4a.40.2\""), "{master}");
+    let video =
+        ffprobe(&["-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"], &whole);
+    assert_eq!(video.trim(), "h264");
+    // Every segment is one GOP of the grid: a keyframe every 6 s and none between.
+    let keys: Vec<f64> = video_packets(&whole).into_iter().filter(|p| p.1).map(|p| p.0).collect();
+    assert!(keys.windows(2).all(|w| (w[1] - w[0] - 6.0).abs() < 0.05), "{keys:?}");
+
+    // A fresh session asked for its last segment first — a run from that keyframe, read from 12 s before it — then
+    // its first, then the one before the last: each is the same 6 s of pictures, from a keyframe at its playlist time,
+    // that a run from the start makes there.
+    let fake = origin_counting().await;
+    let (ffmpeg, vaapi_device) = transcoder;
+    let state = state_from(Config {
+        ffmpeg,
+        vaapi_device,
+        ..test_config(&fake.url, 2, Duration::from_secs(600), Some(SCOUT_KEY))
+    });
+    state.transcode_ok.store(true, Relaxed);
+    let body = format!(r#"{{"imdb":"{imdb}","scout":"{}/{SCOPED}"}}"#, fake.url);
+    let r = call(&state, "POST", "/remux/session", Some(&login(&state, "phone-key").await), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let base = r.json()["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let durs = extinfs(&call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text());
+    let last = durs.len() - 1;
+    let out = temp_dir();
+    let mut init = None;
+    for n in [last, 0, last - 1] {
+        let seg = call(&state, "GET", &format!("{base}seg{n}.m4s"), None, "").await;
+        assert_eq!(seg.status, StatusCode::OK, "seg{n}: {}", seg.text());
+        // Asked for after the first segment, so the session's first run is that segment's.
+        if init.is_none() {
+            init = Some(call(&state, "GET", &format!("{base}init.mp4"), None, "").await.body);
+        }
+        let init = init.as_ref().unwrap();
+        let f = out.join(format!("seg{n}.mp4"));
+        std::fs::write(&f, [init.as_ref(), seg.body.as_ref()].concat()).unwrap();
+        let pkts = video_packets(&f);
+        let start: f64 = durs[..n].iter().sum();
+        assert!(pkts.first().is_some_and(|p| p.1), "seg{n} starts on a keyframe: {pkts:?}");
+        assert!(
+            (pkts[0].0 - start).abs() <= 1.0 / 24.0 + 0.002,
+            "seg{n} starts at {}, not {start}",
+            pkts[0].0
+        );
+        assert_eq!(pkts.iter().filter(|p| p.1).count(), 1, "seg{n} is one GOP");
+        let from_zero =
+            video_packets(&whole).into_iter().filter(|p| p.0 >= start - 0.01 && p.0 < start + durs[n] - 0.01);
+        assert_eq!(
+            pkts.len(),
+            from_zero.count(),
+            "seg{n} holds the pictures a run from the start puts there"
+        );
+        let audio = ffprobe(
+            &[
+                "-select_streams",
+                "a:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+            ],
+            &f,
+        );
+        assert!(audio.trim().parse::<u32>().unwrap() > 0, "seg{n} has no audio");
+    }
+    assert!(state.jobs_started.load(Relaxed) >= 2, "the first segment asked for after the last is a restart");
+    state.end_all("test").await;
+}
+
+/// H.264 and AAC in an MPEG-TS with 10 s GOPs, so a restart at 18 s has no keyframe of the source there: it reads
+/// from 6 s and is cut back. Its timeline starts 1.46 s into the stream's clock.
+#[tokio::test]
+#[ignore = "needs ffmpeg with libx264, or VAAPI and a GPU"]
+async fn mpegts_end_to_end() {
+    grid_end_to_end("tt0000050", "h264.ts").await;
+}
+
+/// MPEG-2 and AC-3 5.1 in an MPEG-TS: the MPEG-2 decoded on the CPU, the AC-3 converted to AAC stereo.
+#[tokio::test]
+#[ignore = "needs ffmpeg with libx264, or VAAPI and a GPU"]
+async fn mpeg2_mpegts_end_to_end() {
+    grid_end_to_end("tt0000052", "mpeg2.ts").await;
+}
+
+/// XviD and MP3 in an AVI with its `idx1`: the MPEG-4 Part 2 decoded on the CPU and uploaded for the encode.
+#[tokio::test]
+#[ignore = "needs ffmpeg with libx264, or VAAPI and a GPU"]
+async fn avi_end_to_end() {
+    grid_end_to_end("tt0000051", "xvid.avi").await;
+}
+
 /// A title whose only cached releases are in containers left out by name answers `no_release` naming those
 /// containers once each, so a player can say why; a plain empty answer names none.
 #[tokio::test]
@@ -1309,7 +1534,7 @@ async fn nothing_to_play_names_the_containers_it_left_out() {
     let j = r.json();
     assert_eq!(
         (j["error"].as_str(), j["formats"].clone()),
-        (Some("no_release"), serde_json::json!([".ts", ".avi"]))
+        (Some("no_release"), serde_json::json!([".m2ts", ".wmv"]))
     );
 
     let r = call(&state, "POST", "/remux/session", None, &body("tt0000099")).await;
@@ -1929,7 +2154,7 @@ async fn the_search_goes_past_three_releases_that_wont_open() {
     state.end_all("test").await;
 }
 
-/// A release whose file is in neither container is opened once: the next session skips it unopened, and so does the
+/// A release whose file is in no container the probe reads is opened once: the next session skips it unopened, and so does the
 /// next process, which reads the verdict back from scratch. A release named .m2ts is never opened, and one whose
 /// debrid sent an error page in its place is tried again. No ffmpeg needed.
 #[tokio::test]

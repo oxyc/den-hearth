@@ -540,23 +540,30 @@ impl Session {
             let k = self.segments[m].start;
             let next = kfs.iter().copied().find(|x| *x > k + 1e-6).unwrap_or(self.info.duration);
             if next - k >= job::MIN_SEEK_GAP {
-                return (k, job::seek_for(k));
+                let seek = if self.info.grid() { job::grid_seek(k) } else { job::seek_for(k) };
+                return (k, seek);
             }
         }
         (kfs.first().copied().unwrap_or(0.0), None)
     }
 
-    /// What a job does with the video: a copy, or this session's transcode.
-    fn video(&self, st: &AppState) -> job::Video {
+    /// What a job starting on the keyframe at `start` does with the video: a copy, or this session's transcode.
+    fn video(&self, st: &AppState, start: f64) -> job::Video {
         match self.transcoded {
             true => {
                 let (width, height) = transcode_size(self.info.width, self.info.height, self.preset);
+                let keyframes = match self.info.grid() {
+                    true => job::Keyframes::Grid { times: self.info.keyframes.clone(), start },
+                    false => job::Keyframes::Source,
+                };
                 job::Video::Transcode {
                     device: st.cfg.vaapi_device.to_string_lossy().into_owned(),
                     width,
                     height,
                     tonemap: tonemaps(&self.info),
                     preset: self.preset,
+                    software_decode: !matches!(self.info.video, VideoCodec::H264 | VideoCodec::Hevc),
+                    keyframes,
                 }
             }
             false => {
@@ -677,7 +684,7 @@ impl Session {
         let spec = Spec {
             input: &input,
             seek,
-            video: self.video(st),
+            video: self.video(st, start),
             audio: self.audio,
             audio_out: self.audio_out,
             text: &self.text_tracks,
@@ -2059,19 +2066,25 @@ async fn open(
     let from_cache = cached.is_some();
     let info = match cached {
         Some(info) => info,
-        None => match crate::probe::probe(&Source::Http { client: &st.source_http, url: &r.url }, &r.head)
-            .await
-        {
-            Ok(info) => info,
-            Err(e) => {
-                let neither =
-                    matches!(&e, crate::probe::ProbeError::Unsupported(w) if w == crate::probe::NEITHER);
-                return Err(OpenFailure { why: e.to_string(), lasting: neither && the_files_own_head(&r) });
+        None => {
+            let src = Source::Http { client: &st.source_http, url: &r.url, size: r.size };
+            match crate::probe::probe(&src, &r.head).await {
+                Ok(info) => info,
+                Err(e) => {
+                    // What the file is, not how the read went: an AVI without an index stays one.
+                    let lasting = matches!(&e, crate::probe::ProbeError::Unsupported(w)
+                        if w == crate::probe::NEITHER || w == crate::probe::avi::NO_INDEX);
+                    return Err(OpenFailure {
+                        why: e.to_string(),
+                        lasting: lasting && the_files_own_head(&r),
+                    });
+                }
             }
-        },
+        }
     };
     st.known().put(known_key(title, s), &info);
-    if let VideoCodec::Other(c) = &info.video {
+    // An MPEG-TS's or AVI's MPEG-2 or MPEG-4 Part 2 is decoded on the CPU for its transcode; nothing else decodes them.
+    if let (VideoCodec::Other(c), false) = (&info.video, info.grid()) {
         return Err(OpenFailure { why: format!("video is {c}, which needs a re-encode"), lasting: true });
     }
     if info.audio.is_empty() {
@@ -2384,6 +2397,12 @@ pub(crate) fn tonemaps(info: &crate::probe::MediaInfo) -> bool {
     info.hdr || info.dolby_vision.is_some_and(|dv| dv.compat != 2)
 }
 
+/// Whether a release plays only converted on the GPU: an MPEG-TS or AVI, whose keyframes are the probe's grid
+/// (`MediaInfo::grid`), or HEVC the player can't take as it is.
+fn converts_only(playable: Option<&Playable>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
+    info.grid() || (info.video == VideoCodec::Hevc && !plays(playable, takes_hevc, info))
+}
+
 /// Whether the player takes the release's video as it is: by `playable`, else by `videoCodecs`, which can only say
 /// that it takes no HEVC — and never that it takes AV1 or VP9, which only `playable` reports.
 fn plays(playable: Option<&Playable>, takes_hevc: bool, info: &crate::probe::MediaInfo) -> bool {
@@ -2463,6 +2482,8 @@ pub(crate) fn fit(a: &scout::Attributes, playable: Option<&Playable>, takes_hevc
             }
         }
         (Some("hevc"), None) if !takes_hevc => Fit::Convert,
+        // MPEG-4 Part 2, which only an AVI or MPEG-TS gets this far with (`scout::candidates`): always transcoded.
+        (Some("mpeg4"), _) => Fit::Convert,
         _ => Fit::Copy,
     }
 }
@@ -2776,6 +2797,10 @@ fn probed_verdict(
             Plays::No,
             Some(format!("Dolby Vision profile {profile}{record} — this browser can't show it")),
         );
+    }
+    if info.grid() {
+        let container = if info.container == "avi" { "AVI" } else { "MPEG-TS" };
+        return (Plays::Convert, Some(format!("{container} is converted on the server")));
     }
     if plays(playable, takes_hevc, info) {
         return (Plays::Yes, None);
@@ -3137,16 +3162,19 @@ pub async fn create(
                         requested_why = probed_verdict(&info, want.playable, takes_hevc).1;
                     }
                 }
-                // HEVC the player can't take as it is plays only converted on the GPU: kept as the last resort
-                // while the rest are looked through for one that plays untouched — unless the player named this
-                // release (another audio track of it), which it keeps.
-                Ok((r, info))
-                    if info.video == VideoCodec::Hevc && !plays(want.playable, takes_hevc, &info) =>
-                {
+                // HEVC the player can't take as it is, and every MPEG-TS and AVI, plays only converted on the GPU: kept
+                // as the last resort while the rest are looked through for one that plays untouched — unless the
+                // player named this release (another audio track of it), which it keeps.
+                Ok((r, info)) if converts_only(want.playable, takes_hevc, &info) => {
                     eprintln!(
-                        "session {short}: {imdb} \"{}\" ({}) plays here only converted{rid_suffix}",
+                        "session {short}: {imdb} \"{}\" ({} {}) plays here only converted{rid_suffix}",
                         c.attributes.label,
-                        info.codecs.as_deref().unwrap_or("HEVC")
+                        info.container,
+                        info.codecs.as_deref().unwrap_or(match &info.video {
+                            VideoCodec::Other(c) => c,
+                            VideoCodec::H264 => "H.264",
+                            _ => "HEVC",
+                        })
                     );
                     let named = want.filename == Some(c.filename());
                     if named {

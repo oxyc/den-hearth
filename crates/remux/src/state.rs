@@ -194,7 +194,7 @@ impl StoredMediaInfo {
         let byte_index = self.byte_index.len() <= PROBE_KEYFRAMES_MAX
             && self.byte_index.iter().all(|(time, _)| finite_time(*time))
             && self.byte_index.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1);
-        matches!(self.container.as_str(), "matroska" | "mp4")
+        matches!(self.container.as_str(), "matroska" | "mp4" | "mpegts" | "avi")
             && self.duration.is_finite()
             && (0.0..=7.0 * 24.0 * 60.0 * 60.0).contains(&self.duration)
             && self.width <= 65_535
@@ -214,6 +214,8 @@ impl StoredMediaInfo {
         let container = match self.container.as_str() {
             "matroska" => "matroska",
             "mp4" => "mp4",
+            "mpegts" => "mpegts",
+            "avi" => "avi",
             _ => return None,
         };
         Some(MediaInfo {

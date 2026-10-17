@@ -18,7 +18,8 @@
 //!   them the mp4 muxer rebases each run to zero and records the offset in that run's `init.mp4` edit
 //!   list, so GOPs from two runs cannot share one init. With them `tfdt` is absolute and every run
 //!   writes a byte-identical init. `skip_sidx` also keeps a per-GOP `sidx` out of the joined segment.
-//! - `-ss K+0.135 -noaccurate_seek`: see [`seek_for`].
+//! - `-ss K+0.135 -noaccurate_seek`: see [`seek_for`]. A file with no index (MPEG-TS, AVI) is transcoded and read
+//!   from `-ss K-12` instead, cut back to K: see [`grid_seek`].
 //! - `-hls_flags temp_file`: a GOP file appears under its final name only once it is complete.
 
 use std::path::{Path, PathBuf};
@@ -43,6 +44,25 @@ pub fn seek_for(k: f64) -> Option<f64> {
     (k > 0.0).then_some(k + SEEK_PAST)
 }
 
+/// How far before a grid keyframe a run's `-ss` aims (`grid_seek`). An MPEG-TS has no index, so ffmpeg's seek into
+/// one lands on the next keyframe AT OR AFTER the time asked: a plain `-ss 36` into a stream with 10 s GOPs gave
+/// pictures only from 40.04. Aimed this far back, the decoder has a keyframe of the source at or before the grid's
+/// in hand for any GOP up to this long, and the run is then cut to the grid's (`Keyframes::Grid`).
+pub const GRID_SEEK_PAD: f64 = 12.0;
+/// How far before a grid time its keyframe is forced and its run cut. A picture's time is rounded to its frame rate's
+/// ticks (`GRID_TICKS`), up to half a frame either way, so the picture at a grid time can come out a little before it:
+/// it still starts the GOP, and at 24 or 25 fps the one before it never does.
+const GRID_EARLY: f64 = 0.02;
+/// Each picture's time rounded to a tick of its frame rate, as the encoder's time base rounds it anyway, before the
+/// cut: the cut and the forced keyframes then compare the same times, in every run. Left alone where no frame rate is
+/// known.
+const GRID_TICKS: &str = "setpts='if(gt(FR,0),round(PTS*TB*FR)/(FR*TB),PTS)'";
+
+/// `-ss` for a run starting on the grid keyframe at `k`: `GRID_SEEK_PAD` before it, or `None` to read from the start.
+pub fn grid_seek(k: f64) -> Option<f64> {
+    (k > GRID_SEEK_PAD).then_some(k - GRID_SEEK_PAD)
+}
+
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const STDERR_TAIL: usize = 2048;
 
@@ -56,8 +76,7 @@ pub enum Video {
         dovi: Dovi,
     },
     /// Decoded, scaled (and tone-mapped, for HDR) on the GPU and encoded to H.264 there, over VAAPI — for
-    /// a player that cannot take the release's HEVC. `-force_key_frames source` puts an output keyframe on
-    /// every source keyframe, so the GOPs, and the playlist cut on them, are the ones a copy would make.
+    /// a player that cannot take the release's HEVC, and for every MPEG-TS and AVI. Its keyframes are `keyframes`.
     Transcode {
         device: String,
         /// The output size, inside the preset's; 0 × 0 when the source's is unknown, which leaves ffmpeg to scale it
@@ -66,7 +85,35 @@ pub enum Video {
         height: u32,
         tonemap: bool,
         preset: Preset,
+        /// Decoded by ffmpeg on the CPU and uploaded to the GPU for the scaler and encoder: MPEG-4 Part 2 (XviD, DivX)
+        /// and MPEG-2, which the GPU's decoder isn't asked for.
+        software_decode: bool,
+        keyframes: Keyframes,
     },
+}
+
+/// Where a transcode puts its keyframes.
+pub enum Keyframes {
+    /// On every source keyframe (`-force_key_frames source`), so the GOPs, and the playlist cut on them, are the ones
+    /// a copy would make.
+    Source,
+    /// On the probe's grid (`probe::grid`) of a file with no index: forced at each time after the run's start keyframe
+    /// `start`, so every run cuts at the same pictures whatever its start. A run that begins past the first is read
+    /// from `grid_seek`'s padded point and cut back to `start` (`trim`/`atrim`); its first picture, the grid's
+    /// keyframe there, is a keyframe as every encode's first is.
+    Grid { times: Vec<f64>, start: f64 },
+}
+
+impl Keyframes {
+    /// Where a grid run is cut to: its start, where that is past the grid's first keyframe.
+    fn trim(&self) -> Option<f64> {
+        match self {
+            Keyframes::Grid { times, start } if times.first().is_some_and(|f| *start > f + 1e-6) => {
+                Some(start - GRID_EARLY)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What a copy does with the video's Dolby Vision.
@@ -216,9 +263,20 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     // One thread for the audio decoder, the filter graph and the AAC encoder: the video is copied, and
     // AAC — stereo or 5.1 — keeps one core far from busy.
     a.extend(s(&["-threads", "1", "-copyts", "-start_at_zero", "-noaccurate_seek"]));
-    if let Video::Transcode { device, .. } = &spec.video {
+    let trim = match &spec.video {
+        Video::Transcode { keyframes, .. } => keyframes.trim(),
+        Video::Copy { .. } => None,
+    };
+    match &spec.video {
         // Decoded frames stay on the GPU for the scaler and encoder.
-        a.extend(s(&["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]));
+        Video::Transcode { device, software_decode: false, .. } => {
+            a.extend(s(&["-hwaccel", "vaapi", "-hwaccel_device", device, "-hwaccel_output_format", "vaapi"]));
+        }
+        // Decoded on the CPU, then uploaded (`hwupload`) to the device the filter graph is given.
+        Video::Transcode { device, software_decode: true, .. } => {
+            a.extend(s(&["-init_hw_device", &format!("vaapi=va:{device}"), "-filter_hw_device", "va"]));
+        }
+        Video::Copy { .. } => {}
     }
     if let Some(ss) = spec.seek {
         a.extend(["-ss".to_string(), format!("{ss:.6}")]);
@@ -240,25 +298,45 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
                 Dovi::Absent => {}
             }
         }
-        Video::Transcode { width, height, tonemap, preset, .. } => {
+        Video::Transcode { width, height, tonemap, preset, software_decode, keyframes, .. } => {
             let size = match width {
                 0 => format!("w=-2:h={}", preset.height),
                 w => format!("w={w}:h={height}"),
             };
-            let scale = format!("scale_vaapi={size}:format=nv12");
-            let vf = match tonemap {
-                true => format!("tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709,{scale}"),
-                false => scale,
-            };
-            a.extend(["-vf".to_string(), vf]);
+            let mut vf: Vec<String> = Vec::new();
+            if let Keyframes::Grid { .. } = keyframes {
+                vf.push(GRID_TICKS.into());
+            }
+            vf.extend(trim.map(|t| format!("trim=start={t:.6}")));
+            if *software_decode {
+                vf.push("format=nv12,hwupload".into());
+            }
+            if *tonemap {
+                vf.push("tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709".into());
+            }
+            vf.push(format!("scale_vaapi={size}:format=nv12"));
+            a.extend(["-vf".to_string(), vf.join(",")]);
             // The output says it is SDR because `tonemap_vaapi` says so on every frame it makes. Naming the
             // colours here as well (`-colorspace bt709` and its two) instead breaks the graph — "Error
             // reinitializing filters!", and the encoder never opens.
             a.extend(s(&["-c:v", "h264_vaapi", "-profile:v", "high", "-level:v", "4.1"]));
             let [rate, peak, buffer] = [preset.bitrate, preset.peak, preset.buffer].map(|b| b.to_string());
             a.extend(s(&["-b:v", &rate, "-maxrate", &peak, "-bufsize", &buffer]));
-            // Keyframes where the source has them, and no others the encoder would add on its own.
-            a.extend(s(&["-force_key_frames", "source", "-g", "1000"]));
+            // Keyframes where the source has them, or on the grid, and no others the encoder would add on its own.
+            let forced = match keyframes {
+                Keyframes::Source => "source".to_string(),
+                Keyframes::Grid { times, start } => times
+                    .iter()
+                    .filter(|t| **t > start + 1e-6)
+                    .map(|t| format!("{:.3}", t - GRID_EARLY))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            };
+            // A run from the grid's last keyframe has none to force: its first picture is one.
+            if !forced.is_empty() {
+                a.extend(s(&["-force_key_frames", &forced]));
+            }
+            a.extend(s(&["-g", "1000"]));
         }
     }
     // No encoder priming to account for with a copy: the packets keep the source's timestamps, as the copied video's do.
@@ -270,6 +348,10 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     };
     match (channels, spec.audio_out.aac_bitrate()) {
         (Some(ac), Some(rate)) => {
+            // Cut where the pictures are: the padded seek read the audio from as far back.
+            if let Some(t) = trim {
+                a.extend(["-af".to_string(), format!("atrim=start={t:.6}")]);
+            }
             a.extend(s(&["-c:a", "aac", "-ac", ac, "-b:a", &format!("{}k", rate / 1000)]));
         }
         _ => a.extend(s(&["-c:a", "copy"])),
@@ -719,6 +801,8 @@ mod tests {
                 height: 800,
                 tonemap: true,
                 preset: HD1080,
+                software_decode: false,
+                keyframes: Keyframes::Source,
             },
             audio: 0,
             audio_out: AudioOut::Stereo,
@@ -744,6 +828,8 @@ mod tests {
                 height: 720,
                 tonemap: false,
                 preset: HD720,
+                software_decode: false,
+                keyframes: Keyframes::Source,
             },
             ..spec
         };
@@ -757,10 +843,77 @@ mod tests {
                 height: 0,
                 tonemap: false,
                 preset: HD1080,
+                software_decode: false,
+                keyframes: Keyframes::Source,
             },
             ..sdr
         };
         assert!(args(&unknown, None).join(" ").contains("-vf scale_vaapi=w=-2:h=1080:format=nv12 "));
+    }
+
+    /// An MPEG-TS's or AVI's grid: keyframes forced at its times from the run's start on, the run read from 12 s before
+    /// its start and cut back to it, picture and sound alike — and MPEG-4 Part 2 decoded on the CPU and uploaded.
+    #[test]
+    fn a_grid_transcode_forces_the_grid_and_cuts_a_padded_seek_back_to_its_start() {
+        let grid = |start: f64| Keyframes::Grid { times: vec![0.021, 6.021, 12.021, 18.021, 24.021], start };
+        let video = |software_decode, start| Video::Transcode {
+            device: "/dev/dri/renderD128".into(),
+            width: 320,
+            height: 180,
+            tonemap: false,
+            preset: HD1080,
+            software_decode,
+            keyframes: grid(start),
+        };
+        let spec = Spec {
+            input: "/f.ts",
+            seek: grid_seek(18.021),
+            video: video(false, 18.021),
+            audio: 0,
+            audio_out: AudioOut::Stereo,
+            text: &[],
+            dir: Path::new("/d"),
+        };
+        let joined = args(&spec, None).join(" ");
+        let ticks = "setpts='if(gt(FR,0),round(PTS*TB*FR)/(FR*TB),PTS)'";
+        for want in [
+            "-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -ss 6.021000 -i /f.ts",
+            &format!("-vf {ticks},trim=start=18.001000,scale_vaapi=w=320:h=180:format=nv12 -c:v h264_vaapi"),
+            "-force_key_frames 24.001 -g 1000",
+            "-af atrim=start=18.001000 -c:a aac -ac 2",
+        ] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        assert!(!joined.contains("source") && !joined.contains("init_hw_device"), "{joined}");
+
+        // Within the pad of the start, it reads from the start of the file, and is still cut back.
+        assert_eq!(grid_seek(6.021), None);
+        let near = Spec { seek: grid_seek(6.021), video: video(false, 6.021), ..spec };
+        let joined = args(&near, None).join(" ");
+        assert!(!joined.contains("-ss "), "{joined}");
+        assert!(
+            joined.contains(",trim=start=6.001000,")
+                && joined.contains("-force_key_frames 12.001,18.001,24.001 ")
+        );
+
+        // From the first keyframe there is nothing to cut, and the encode's first picture is a keyframe of its own.
+        let first = Spec { seek: None, video: video(false, 0.021), ..near };
+        let joined = args(&first, None).join(" ");
+        assert!(!joined.contains("trim") && joined.contains("-force_key_frames 6.001,12.001,18.001,24.001 "));
+        // From the last, there is none to force.
+        let last = Spec { seek: grid_seek(24.021), video: video(false, 24.021), ..first };
+        assert!(!args(&last, None).join(" ").contains("-force_key_frames"));
+
+        // XviD: decoded in software, uploaded to the device the filter graph is given.
+        let xvid = Spec { input: "/f.avi", seek: grid_seek(18.021), video: video(true, 18.021), ..last };
+        let joined = args(&xvid, None).join(" ");
+        for want in [
+            "-init_hw_device vaapi=va:/dev/dri/renderD128 -filter_hw_device va -ss 6.021000 -i /f.avi",
+            &format!("-vf {ticks},trim=start=18.001000,format=nv12,hwupload,scale_vaapi=w=320:h=180:format=nv12 -c:v"),
+        ] {
+            assert!(joined.contains(want), "missing `{want}` in: {joined}");
+        }
+        assert!(!joined.contains("-hwaccel"), "{joined}");
     }
 
     /// A fragmented init as ffmpeg writes it, cut down: ftyp, then moov with a video and an audio trak.

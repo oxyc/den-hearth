@@ -151,22 +151,27 @@ RUN ./configure \
 
 FROM ffmpeg-source AS ffmpeg
 # What each group is for:
-#   demuxers   matroska, mov                  — the containers scout's releases come in
+#   demuxers   matroska, mov                  — the containers scout's releases come in; mpegts and avi, which have no
+#              index a copy is cut on, so they are only ever transcoded
 #   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output; pcm_s16le (`-f s16le` at run time), raw PCM on a
 #              pipe for the intro/credits fingerprint (`segments`)
 #   decoders   every audio codec a release carries: AC-3/E-AC-3, DTS (core of DTS-HD), TrueHD, FLAC,
 #              Opus, AAC, MP3/MP2, Vorbis, LPCM. And h264/hevc: a copy needs them for stream probing
 #              (to learn the B-frame reorder delay — without them ffmpeg guesses every copied packet's
-#              DTS), and a transcode decodes through them with the VAAPI hwaccels below.
+#              DTS), and a transcode decodes through them with the VAAPI hwaccels below. mpeg4 (XviD, DivX) and
+#              mpeg2video, an AVI's and an MPEG-TS's, decoded on the CPU for a transcode.
 #              and the text subtitles a release carries — SRT, ASS/SSA, WebVTT, mov_text — which are written as WebVTT
 #              beside the video in the same run (bitmap subtitles have no decoder here: nothing maps them)
 #   encoders   aac (ffmpeg's native, stereo 192k); h264_vaapi for a transcode; webvtt for the subtitles; pcm_s16le
 #              for the fingerprint's PCM
 #   parsers    for the codecs the demuxers hand over unparsed. av1: Matroska asks for AV1's headers parsed, and
 #              the parser reads the pixel format and colours from the sequence header. A copy of AV1 needs no
-#              decoder: its packets are never reordered, so there is no delay to learn by probing
+#              decoder: its packets are never reordered, so there is no delay to learn by probing. mpegvideo and
+#              mpeg4video for MPEG-2 in an MPEG-TS and MPEG-4 Part 2 in an AVI
 #   filters    the audio graph -ac 2 builds (resample/downmix, format negotiation, the buffer
-#              endpoints every graph has); scale_vaapi and tonemap_vaapi for a transcode
+#              endpoints every graph has); scale_vaapi and tonemap_vaapi for a transcode; for a transcode of an
+#              MPEG-TS or AVI, setpts and trim/atrim to cut a run to its keyframe, and hwupload (with format, and the
+#              scale that converts to nv12 — swscale) to hand CPU-decoded pictures to the GPU
 #   bsfs       dovi_rpu and filter_units: a copied Dolby Vision stream loses its RPU and enhancement layer
 #              and its configuration record, leaving the HDR10 base layer a browser can play
 #   protocols  file, pipe (the fingerprint's PCM on stdout), and http(s) over tcp/tls (OpenSSL); --enable-version3 is
@@ -176,18 +181,18 @@ RUN ./configure \
       --prefix=/opt/ffmpeg \
       --enable-static --disable-shared --enable-small \
       --disable-everything --disable-autodetect --disable-doc --disable-debug \
-      --disable-ffplay --disable-avdevice --disable-swscale \
+      --disable-ffplay --disable-avdevice \
       --enable-version3 --enable-openssl --enable-zlib --enable-vaapi \
       --enable-protocol=file,pipe,http,https,tcp,tls \
-      --enable-demuxer=matroska,mov \
+      --enable-demuxer=matroska,mov,mpegts,avi \
       --enable-muxer=hls,mp4,webvtt,pcm_s16le \
-      --enable-decoder=h264,hevc,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be,subrip,ass,ssa,webvtt,movtext \
+      --enable-decoder=h264,hevc,mpeg4,mpeg2video,aac,ac3,eac3,dca,truehd,mlp,flac,opus,mp3,mp2,vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_s16be,pcm_s24be,subrip,ass,ssa,webvtt,movtext \
       --enable-hwaccel=h264_vaapi,hevc_vaapi \
       --enable-encoder=aac,h264_vaapi,webvtt,pcm_s16le \
-      --enable-parser=av1,h264,hevc,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
-      --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,buffer,buffersink,format,scale_vaapi,tonemap_vaapi \
+      --enable-parser=av1,h264,hevc,mpegvideo,mpeg4video,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
+      --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,setpts,buffer,buffersink,format,scale,hwupload,scale_vaapi,tonemap_vaapi \
       --enable-bsf=dovi_rpu,filter_units \
-      --enable-swresample \
+      --enable-swresample --enable-swscale \
     && make -j"$(nproc)" && make install
 
 # ---- test: Reel/Subtitles' ffmpeg against generated and checked-in media -----------------------------

@@ -6,14 +6,19 @@
 //! keeps it in `stss` plus `stts`/`ctts`, inside a `moov` that is at the front or, without faststart,
 //! after the media data.
 //!
+//! MPEG-TS and AVI keep no index a copy could be cut on, so their keyframes are a grid the probe makes up
+//! (`grid`), which a transcode makes true by forcing its keyframes there (`MediaInfo::grid`).
+//!
 //! Hand-written parsers rather than ffprobe, for the same reasons den-scout gives: the structures
 //! needed are small, and ffprobe would be another binary parsing untrusted bytes before we have
 //! decided to trust the file at all.
 
+pub mod avi;
 #[cfg(test)]
 mod golden;
 pub mod mkv;
 pub mod mp4;
+pub mod ts;
 
 use std::fmt;
 
@@ -112,6 +117,31 @@ pub struct MediaInfo {
     /// The video track's bytes over the whole file, where the file says (as `AudioTrack::bytes`): with the audio
     /// track a session plays, what it delivers of the file, which the byte index is scaled to.
     pub video_bytes: Option<u64>,
+}
+
+impl MediaInfo {
+    /// MPEG-TS or AVI: `keyframes` is the probe's grid, not the file's, so the release plays only transcoded, its
+    /// keyframes forced onto the grid (`job::Keyframes::Grid`).
+    pub fn grid(&self) -> bool {
+        matches!(self.container, "mpegts" | "avi")
+    }
+}
+
+/// How far apart a grid's keyframes are: the playlist's target, so each segment is one GOP.
+pub const GRID_SECS: f64 = crate::playlist::TARGET_SECS;
+
+/// The longest a file with no index may say it lasts: a week, as long as a stored probe may (`StoredMediaInfo::valid`).
+/// A header claiming more is broken or hostile, and its grid would not fit in memory.
+pub const GRID_MAX_DURATION: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+
+/// The keyframes of a file with no index: every `GRID_SECS` from its first frame at `first`, but none in the last
+/// half of one before `duration`, which would end the film on a segment of a few frames.
+pub fn grid(first: f64, duration: f64) -> Vec<f64> {
+    let duration = duration.min(GRID_MAX_DURATION);
+    (0u32..)
+        .map(|n| first + n as f64 * GRID_SECS)
+        .take_while(|t| *t == first || t + GRID_SECS / 2.0 < duration)
+        .collect()
 }
 
 #[derive(Debug)]
@@ -773,12 +803,22 @@ pub enum Source<'a> {
     Http {
         client: &'a reqwest::Client,
         url: &'a str,
+        /// The file's size, where the server named it: what an MPEG-TS's last timestamps are read back from.
+        size: Option<u64>,
     },
     #[cfg(any(test, feature = "bench"))]
     Mem(&'a [u8]),
 }
 
 impl Source<'_> {
+    pub fn size(&self) -> Option<u64> {
+        match self {
+            #[cfg(any(test, feature = "bench"))]
+            Source::Mem(b) => Some(b.len() as u64),
+            Source::Http { size, .. } => *size,
+        }
+    }
+
     /// `len` bytes from `start`, or fewer at the end of the file.
     pub async fn read(&self, start: u64, len: u64) -> Result<Vec<u8>, ProbeError> {
         match self {
@@ -788,7 +828,7 @@ impl Source<'_> {
                 let e = start.saturating_add(len).min(b.len() as u64) as usize;
                 Ok(b[s..e].to_vec())
             }
-            Source::Http { client, url } => {
+            Source::Http { client, url, .. } => {
                 read_range(client, url, start, len).await.map_err(ProbeError::Fetch)
             }
         }
@@ -832,8 +872,8 @@ pub async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<Vec<u8
     Ok(out)
 }
 
-/// Why `probe` refuses a head that starts neither container.
-pub const NEITHER: &str = "neither Matroska nor MP4";
+/// Why `probe` refuses a head that starts no container it reads, or an MPEG-TS that carries no program.
+pub const NEITHER: &str = "not Matroska, MP4, MPEG-TS or AVI";
 
 /// Probe a file whose first bytes are `head`, dispatching on its magic rather than its name.
 pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeError> {
@@ -842,6 +882,12 @@ pub async fn probe(src: &Source<'_>, head: &[u8]) -> Result<MediaInfo, ProbeErro
     }
     if head.len() >= 8 && matches!(&head[4..8], b"ftyp" | b"moov" | b"free" | b"mdat" | b"wide" | b"skip") {
         return mp4::probe(src, head).await;
+    }
+    if ts::starts(head) {
+        return ts::probe(src, head).await;
+    }
+    if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"AVI " {
+        return avi::probe(src, head).await;
     }
     Err(ProbeError::Unsupported(NEITHER.into()))
 }

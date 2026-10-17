@@ -461,9 +461,13 @@ dependabot cannot bump it, so bump both lines by hand.
 ## Limits
 
 - **Cached releases only** (an uncached one would start a debrid download).
-- **H.264, HEVC, AV1 and VP9 sources only.** AV1 and VP9 play only as a copy, for a player whose `playable` says it
-  decodes them (10-bit VP9 through hls.js alone); there is no conversion to fall back on. MPEG-4 Part 2/XviD and VC-1 are
-  skipped. Files without a keyframe index (Matroska with no Cues) are skipped.
+- **H.264, HEVC, AV1 and VP9 sources only** in Matroska and MP4. AV1 and VP9 play only as a copy, for a player whose
+  `playable` says it decodes them (10-bit VP9 through hls.js alone); there is no conversion to fall back on. MPEG-4
+  Part 2/XviD and VC-1 there are skipped. Files without a keyframe index (Matroska with no Cues) are skipped.
+- **MPEG-TS and AVI are always transcoded** (MPEG-TS and AVI, below): H.264, HEVC or MPEG-2 in an MPEG-TS (not an M2TS's
+  192-byte packets), MPEG-4 Part 2 (XviD, DivX), H.264 or HEVC in an AVI with an index. Each holds the one transcode slot;
+  their subtitles are not carried, the session plays one audio track converted to AAC, interlaced MPEG-2 shows combing
+  (nothing deinterlaces), and a transport stream whose timestamps jump may drift.
 - **Audio is AAC**, one track per session: 7.1 for a player that reports `aac71`, 5.1 for one that reports
   `aacMultichannel` (a 7.1 track folds down to it), stereo for every other — or, for a player that plays them,
   E-AC-3/AC-3 or FLAC copied with no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for
@@ -518,6 +522,20 @@ audio and subtitles are unchanged.
   producer gives the GPU back at once while its logical session remains resumable.
 - **Tested** by the flags (`job.rs`) and the slot (`tests.rs`) here, and on the box's GPU by hand: CI has no
   GPU.
+
+### MPEG-TS and AVI
+
+Neither has a keyframe index a copy could be cut on, so the probe (`probe/ts.rs`, `probe/avi.rs`) reads only the
+streams, the picture's size and the duration — a TS's from its PAT/PMT and first timestamps in the head and its last
+ones in the file's final 4 MiB, an AVI's from `avih`/`strh` — and makes the keyframes a 6 s grid from the first frame.
+An AVI with neither an `idx1` nor OpenDML's `indx` is refused: ffmpeg would read the whole file to index it. Every
+session of one is a transcode with its keyframes forced on the grid, so the fixed playlist, resume and pruning work as
+they do for a copy. A run starting at grid keyframe K is read from `-ss K-12` and cut back to K (`trim`/`atrim`, after
+a `setpts` that rounds each picture to its frame's tick as the encoder would): a transport stream has no index, so
+ffmpeg's seek lands on the next keyframe after the time asked, and a plain `-ss 36` into 10 s GOPs gave pictures only
+from 40.04. H.264 and HEVC are decoded on the GPU; MPEG-2 and MPEG-4 Part 2 on the CPU, then `hwupload`ed to the same
+scaler and encoder. The audio is always converted to AAC, cut with the picture. `scripts/probe-image.sh` runs all
+three on the GPU; locally the `#[ignore]`d e2e tests stand libx264 in for VAAPI.
 
 ## Run
 

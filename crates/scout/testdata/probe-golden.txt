@@ -43,6 +43,9 @@ remux/hevc.mkv @1000: err: no track information in the file head
 remux/moov-at-end.mp4 @1048576: {"container":"mp4","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":10,"width":160,"height":90,"frameRate":24.0,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
 remux/moov-at-end.mp4 @4096: err: no track information in the file head
 remux/moov-at-end.mp4 @1000: err: no track information in the file head
+remux/noindex.avi @1048576: {"container":"avi","videoCodec":"mpeg4","audioChannels":"2.0","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/noindex.avi @4096: {"container":"avi","videoCodec":"mpeg4","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/noindex.avi @1000: {"container":"avi","videoCodec":"mpeg4","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/open-gop.mkv @1048576: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/open-gop.mkv @4096: {"container":"matroska","videoCodec":"hevc","audioChannels":"2.0","bitDepth":8,"videoProfile":1,"videoLevel":60,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/open-gop.mkv @1000: err: no track information in the file head
@@ -61,4 +64,7 @@ remux/subs.mkv @1000: err: no track information in the file head
 remux/surround.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"7.1","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/surround.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"7.1","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/surround.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"7.1","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/xvid.avi @1048576: {"container":"avi","videoCodec":"mpeg4","audioChannels":"2.0","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":1,"untaggedSubtitleTracks":0}
+remux/xvid.avi @4096: {"container":"avi","videoCodec":"mpeg4","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/xvid.avi @1000: {"container":"avi","videoCodec":"mpeg4","audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 codec records: 90f5e2434b1db5a3
