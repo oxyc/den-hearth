@@ -208,8 +208,9 @@ if (DEN_GUEST) {
   $("trailersHelp").textContent = "Use your own TMDB key, or leave it blank to use shared trailer settings.";
   $("go").textContent = "Save settings";
   $("outTitle").textContent = "Settings saved";
-  $("installMeta").style.display = "none";
-  $("installDirections").textContent = "Saved for this shared access.";
+  // A guest's settings are saved to their shared access, not handed over as a link, so nothing about a link shows.
+  ["url", "copy", "installMeta", "sealNote", "sealDisclaimer"].forEach(function (id) { $(id).hidden = true; });
+  $("installDirections").textContent = "Den uses them from now on.";
 }
 
 function denFetch(url, options) {
@@ -539,13 +540,15 @@ function fillForm(s) {
     }
     $("url").value = "";
     $("installId").textContent = install.iid;
-    $("out").classList.remove("hidden");
-    renderSecurityNote();
     if (DEN_GUEST === null) {
+      $("out").classList.remove("hidden");
+      renderSecurityNote();
       $("url").value = location.origin + BASE + "/" + segment + "/manifest.json";
       copyInstallURL();
       return;
     }
+    // A guest is told "saved" only once Edge has kept the install; until then the result stays hidden.
+    $("out").classList.add("hidden");
     denFetch(DEN_GUEST.saveUrl, {
       method: "PUT",
       cache: "no-store",
@@ -554,13 +557,10 @@ function fillForm(s) {
     })
       .then(function (r) {
         if (!r.ok) throw new Error("save failed");
-        $("url").value = location.origin + DEN_GUEST.base + "/manifest.json";
-        copyInstallURL();
+        $("out").classList.remove("hidden");
       })
       .catch(function () {
-        $("url").value = "";
-        $("sealNote").textContent = "Could not save this guest install. Please try again.";
-        $("sealNote").className = "note unsealed";
+        $("err").textContent = "Could not save these settings. Please try again.";
       });
   }
 
