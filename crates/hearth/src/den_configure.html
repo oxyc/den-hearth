@@ -51,12 +51,12 @@
 </style></head><body>
 <main>
 <h1>Den</h1>
-<p class="sub">One addon for streams, subtitles and trailers. Fill in the parts you want — each is optional, and
+<p class="sub" id="mainIntro">One addon for streams, subtitles and trailers. Fill in the parts you want — each is optional, and
   the addon offers only what you set up. Your keys stay in this link and are stored in the Den Keychain — treat
   the link like a password.</p>
 
 <h3>Streams</h3>
-<p class="optional">Resolved through your own debrid account. Leave the token blank for no streams.</p>
+<p class="optional" id="streamsHelp">Resolved through your own debrid account. Leave the token blank for no streams.</p>
 <h2>Debrid</h2>
 <label for="service">Service</label>
 <select id="service">
@@ -121,7 +121,7 @@
 </div>
 
 <h3>Subtitles</h3>
-<p class="optional">Hash-matched OpenSubtitles, auto-sync, and your-own-key AI translation. Leave the
+<p class="optional" id="subtitlesHelp">Hash-matched OpenSubtitles, auto-sync, and your-own-key AI translation. Leave the
   OpenSubtitles key blank for no subtitles.</p>
 <label for="osKey">OpenSubtitles API key</label>
 <input id="osKey" type="password" autocomplete="off" placeholder="your opensubtitles.com consumer key">
@@ -149,7 +149,7 @@
 </div>
 
 <h3>Trailers</h3>
-<p class="optional">Inline trailers resolved from your own TMDB key. Leave it blank for no trailers.</p>
+<p class="optional" id="trailersHelp">Inline trailers resolved from your own TMDB key. Leave it blank for no trailers.</p>
 <label for="tmdbKey">TMDB API key</label>
 <input id="tmdbKey" type="password" autocomplete="off" placeholder="your themoviedb.org API key (v3) or read token (v4)">
 <div class="hint">Free from <a href="https://www.themoviedb.org/settings/api">themoviedb.org/settings/api</a>.
@@ -162,13 +162,13 @@
 <button id="go" class="primary">Build install link</button>
 <div class="err" id="err"></div>
 <div id="out" class="hidden">
-  <h2>Your install link</h2>
+  <h2 id="outTitle">Your install link</h2>
   <textarea id="url" readonly rows="3" aria-label="Install URL"></textarea>
   <div class="row"><button id="copy" type="button">Copy link</button></div>
-  <p class="foot">Install id: <code id="installId"></code> — put this in <code>HEARTH_REVOKED_INSTALLS</code> to revoke just this link.</p>
+  <p class="foot" id="installMeta">Install id: <code id="installId"></code> — put this in <code>HEARTH_REVOKED_INSTALLS</code> to revoke just this link.</p>
   <p class="note" id="sealNote"></p>
   <p class="disclaimer" id="sealDisclaimer"></p>
-  <p class="foot">In Den: Settings → Plugins → Add, paste this link. &nbsp;·&nbsp;
+  <p class="foot"><span id="installDirections">In Den: Settings → Plugins → Add, paste this link.</span> &nbsp;·&nbsp;
      <a href="#" id="forget">Forget saved settings on this browser</a></p>
 </div>
 </main>
@@ -194,6 +194,17 @@ var DEN_GUEST = DEN_GUEST_CONTEXT === null ? null :
 // Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
 // every link it builds sits beside it.
 var BASE = DEN_GUEST ? DEN_GUEST.base : location.pathname.replace(/\/(configure\/?)?$/, "");
+STORE_KEY = DEN_GUEST ? STORE_KEY + ":" + DEN_GUEST.base : DEN_GUEST === null ? STORE_KEY : null;
+if (DEN_GUEST) {
+  $("mainIntro").textContent = "Your settings override shared sections. Leave a section blank to keep using its shared settings.";
+  $("streamsHelp").textContent = "Use your own debrid account, or leave the token blank to use shared stream settings.";
+  $("subtitlesHelp").textContent = "Use your own OpenSubtitles settings, or leave the key blank to use shared subtitle settings.";
+  $("trailersHelp").textContent = "Use your own TMDB key, or leave it blank to use shared trailer settings.";
+  $("go").textContent = "Save settings";
+  $("outTitle").textContent = "Settings saved";
+  $("installMeta").style.display = "none";
+  $("installDirections").textContent = "Saved for this shared access.";
+}
 
 function denFetch(url, options) {
   if (DEN_GUEST === false) return Promise.reject(new Error("invalid guest context"));
@@ -481,8 +492,8 @@ function fillForm(s) {
     return encodePlain(config);
   }
 
-  function saveSettings(config) { try { localStorage.setItem(STORE_KEY, JSON.stringify(config)); } catch (e) {} }
-  function loadSettings() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } }
+  function saveSettings(config) { if (!STORE_KEY) return; try { localStorage.setItem(STORE_KEY, JSON.stringify(config)); } catch (e) {} }
+  function loadSettings() { if (!STORE_KEY) return null; try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } }
 
   function copyInstallURL() {
     var field = $("url");
@@ -605,7 +616,7 @@ function fillForm(s) {
   $("copy").addEventListener("click", copyInstallURL);
   $("forget").addEventListener("click", function (e) {
     e.preventDefault();
-    try { localStorage.removeItem(STORE_KEY); } catch (e2) {}
+    if (STORE_KEY) try { localStorage.removeItem(STORE_KEY); } catch (e2) {}
     location.reload();
   });
 })();

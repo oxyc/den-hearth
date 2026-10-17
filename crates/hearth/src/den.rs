@@ -610,6 +610,9 @@ mod tests {
             "{ debrid: [{ service: $(\"service\").value, token: token }] }",
             "{ osKey: osKey, autoSync: $(\"autoSync\").checked }",
             "{ tmdbKey: tmdb }",
+            "Leave a section blank to keep using its shared settings.",
+            "$(\"go\").textContent = \"Save settings\"",
+            "STORE_KEY + \":\" + DEN_GUEST.base",
             SEAL_MARKER,
         ] {
             assert!(page.contains(needle), "the page no longer has: {needle}");
