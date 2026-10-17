@@ -5,9 +5,9 @@
 # compile or test the same commit again.
 #
 # Every Monday, and on a manual run, the NEWEST v* tag is rebuilt instead: released code only, never main,
-# with the base images re-pulled, no build cache and apt run again, so a Debian security fix (ffmpeg parses
-# every trailer, subtitle track and release this node handles) reaches the box between releases — through den-update's probe and
-# rollback, like any release.
+# with the base images re-pulled, no build cache and apt run again, so Debian runtime security fixes reach the box
+# between releases — through den-update's probe and rollback, like any release. FFmpeg itself is source-pinned in
+# the Dockerfile; one deliberate version/checksum bump updates both builds and runs both compatibility gates.
 name: docker-publish
 
 on:

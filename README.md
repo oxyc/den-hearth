@@ -56,12 +56,19 @@ Debian trixie-slim (Reel's yt-dlp needs Python, while deno and MP4Box are glibc 
 | Tool | For | Source |
 |---|---|---|
 | `den-hearth` | the binary, built with cargo-chef so dependencies are a cached layer | this workspace |
-| `ffmpeg` (Debian) | Reel (mux, cropdetect) and Subtitles (audio decode for sync) | apt |
+| `ffmpeg` | Reel (mux, cropdetect) and Subtitles (audio decode for sync): broad software input support, only the output/filter/protocol surface they use | checksummed source, `FFMPEG_VERSION` / `FFMPEG_SHA256` |
 | `ffmpeg-remux` | Remux: minimal source build, VAAPI, checksummed tarball | `FFMPEG_VERSION` / `FFMPEG_SHA256` |
 | `intel-media-va-driver-non-free` | Remux's GPU transcode (UHD 630, driver `iHD`), amd64 only. The free package has no bitrate-controlled encode (CQP only) and no `scale_vaapi` kernels, so the non-free component is enabled for this one install | apt |
 | `yt-dlp` zipapp, `deno`, `python3` | Reel's extractor and its resident resolver | pinned versions, SHA-256 checked |
 | `MP4Box` + `libgpac` | Reel's `clap` box | GPAC pinned to a commit |
 | `alass` | Subtitles' aligner | `cargo install --locked`, pinned |
+
+Both ffmpegs are built from the same pinned source and updated by changing one version/checksum pair. Do not narrow
+the software build's decoders or parsers from a sample of current releases: Subtitles may meet any audio codec a
+guest's release carries. Its container list covers normal video releases while deliberately excluding playlist and
+network-aware demuxers; only Reel/Subtitles' required muxers, encoders, filters and protocols are enabled. The e2e
+target is the compatibility gate for changes to that line, including alass's otherwise easy-to-miss raw `s16le`
+subprocess call.
 
 It runs as uid/gid 65532 (`nonroot`) with `/cache/{scout,reel,subs,remux}` owned by it and `VOLUME /cache`. It
 exposes 8090 (`PORT`) and the four legacy ports 8080, 8092, 8093 and 8095 (see Listeners). `HEALTHCHECK` polls `/health` every 5 minutes. The release number is `VERSION`, passed
@@ -83,7 +90,8 @@ docker run --rm --entrypoint ffmpeg-remux den-hearth:local -hwaccels
 ```
 
 `docker buildx bake` builds the same image from `docker-bake.hcl`; `docker buildx bake e2e` runs Remux's `#[ignore]`d
-end-to-end tests against the image's own `ffmpeg-remux`. A transcode needs the GPU: pass `--device /dev/dri` and add
+end-to-end tests against the image's own `ffmpeg-remux`, plus Reel/Subtitles' crop, merge, HTTP relay, raw-sync and
+14-codec decode matrix against the image's own software `ffmpeg`. A transcode needs the GPU: pass `--device /dev/dri` and add
 the host's `render` gid with `--group-add` (the old `den-remux` quadlet did the same).
 
 On a host with a GPU, `scripts/probe-image.sh` also runs Remux's real encode (`h264_vaapi` with `-b:v/-maxrate/-bufsize`,
@@ -228,10 +236,10 @@ which a deploy overrides as needed:
 
 ```
 SCOUT_CACHE_DIR=/cache/scout  SCOUT_MEMORY_CACHE_BYTES=50331648  SCOUT_DISK_CACHE_BYTES=268435456
-REEL_CACHE_DIR=/cache/reel      REEL_FFMPEG_PATH=/usr/bin/ffmpeg  REEL_YTDLP_PATH=/usr/local/bin/yt-dlp
+REEL_CACHE_DIR=/cache/reel      REEL_FFMPEG_PATH=/usr/local/bin/ffmpeg  REEL_YTDLP_PATH=/usr/local/bin/yt-dlp
 REEL_YTDLP_WORKER=/app/resolve.py   REEL_MAX_HEIGHT=1080
 REEL_YOUTUBEI_WORKER=/app/youtubei/main.mjs   REEL_DENO_PATH=/usr/local/bin/deno
-SUBS_CACHE_DIR=/cache/subs      SUBS_FFMPEG_PATH=/usr/bin/ffmpeg  SUBS_ALASS_PATH=/usr/local/bin/alass
+SUBS_CACHE_DIR=/cache/subs      SUBS_FFMPEG_PATH=/usr/local/bin/ffmpeg  SUBS_ALASS_PATH=/usr/local/bin/alass
 REMUX_SCRATCH_DIR=/cache/remux  REMUX_FFMPEG_PATH=/usr/local/bin/ffmpeg-remux
 LIBVA_DRIVER_NAME=iHD           DEN_VERSION=<VERSION>
 ```

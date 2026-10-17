@@ -6,10 +6,10 @@
 #   Subtitles  alass, ffmpeg
 #   Remux      a minimal, source-built ffmpeg with VAAPI, and Intel's media driver for a GPU transcode
 #
-# Two ffmpegs, on purpose. Remux's is built from source with everything switched off but what a session
-# uses (its segment alignment depends on exactly how that build seeks, and its tests only count against
-# it); Reel and Subtitles decode arbitrary media (cropdetect, any audio codec yt-dlp or a subtitle sync
-# meets), which that build cannot. Debian's package serves those two. Remux's lives at
+# Two purpose-built ffmpegs, on purpose. Remux's has a narrow protocol/container/codec allowlist because
+# segment alignment depends on exactly how that build seeks. Reel and Subtitles share a software build
+# with broad built-in demuxer/decoder/parser support, but without hardware, UI, capture or general encoding
+# stacks. Their crop/decode/merge contract is exercised in the e2e image target. Remux's lives at
 # /usr/local/bin/ffmpeg-remux and is the only one that is ever given the GPU.
 #
 # Runtime is debian-slim, not Alpine: the old Remux image was Alpine/musl, but Reel's MP4Box and deno
@@ -111,12 +111,11 @@ ARG ALASS_VERSION=2.0.0
 RUN cargo install alass-cli --version ${ALASS_VERSION} --root /alass --locked
 
 # ---- build Remux's ffmpeg ---------------------------------------------------------------------------
-# Debian's ffmpeg package brings a few hundred MB of codecs, filters and X libraries Remux never
-# touches. This one is built from source with everything disabled, then only what a session uses
-# switched back on: the Matroska and MP4 demuxers, the hls/mp4 muxers, the audio decoders a release can
-# carry, the native AAC encoder, HTTP(S), and the VAAPI pieces of a GPU transcode. VAAPI is why the
-# runtime carries libva and Intel's driver: libva loads the GPU's driver at run time.
-FROM debian:trixie-slim AS ffmpeg
+# Debian's ffmpeg package brings a few hundred MB of codecs, filters and X libraries these jobs never
+# touch. Both runtime ffmpegs come from this one checksummed source. The first keeps broad software input
+# compatibility for Reel/Subtitles; the second switches on only what a Remux session uses. VAAPI is why
+# the runtime still carries libva and Intel's driver: libva loads the GPU's driver at run time.
+FROM debian:trixie-slim AS ffmpeg-source
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential nasm pkgconf libssl-dev zlib1g-dev libva-dev xz-utils wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -128,6 +127,29 @@ RUN wget -q -O /tmp/ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_V
     && echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
 WORKDIR /tmp/ffmpeg-${FFMPEG_VERSION}
+
+FROM ffmpeg-source AS ffmpeg-general
+# Reel needs local DASH merging plus H.264 crop detection. Subtitles needs to decode the audio
+# codecs found in arbitrary releases, resample them to mono PCM, and concatenate bounded WAV
+# samples. Keep common release containers plus all software decoders/parsers for input compatibility;
+# exclude playlist/network demuxers, hardware, UI, capture and general encoding stacks.
+RUN ./configure \
+      --prefix=/opt/ffmpeg-general \
+      --enable-static --disable-shared --enable-small --enable-gpl \
+      --disable-everything --disable-autodetect --disable-doc --disable-debug \
+      --disable-ffplay --disable-avdevice \
+      --enable-ffmpeg --enable-ffprobe \
+      --enable-protocol=file,pipe,http,tcp \
+      --enable-demuxer=matroska,mov,avi,mpegts,mpegps,ogg,flac,mp3,wav,asf,flv \
+      --enable-decoders --enable-parsers \
+      --enable-muxer=mp4,wav,null,pcm_s16le \
+      --enable-encoder=pcm_s16le,wrapped_avframe \
+      --enable-filter=cropdetect,concat,aresample,aformat,anull,abuffer,abuffersink,null,buffer,buffersink,format \
+      --enable-bsf=aac_adtstoasc \
+      --enable-swresample --enable-swscale \
+    && make -j"$(nproc)" && make install
+
+FROM ffmpeg-source AS ffmpeg
 # What each group is for:
 #   demuxers   matroska, mov                  — the containers scout's releases come in
 #   muxers     hls (+ mp4, which it drives)   — fMP4 HLS output; pcm_s16le (`-f s16le` at run time), raw PCM on a
@@ -168,6 +190,22 @@ RUN ./configure \
       --enable-swresample \
     && make -j"$(nproc)" && make install
 
+# ---- test: Reel/Subtitles' ffmpeg against generated and checked-in media -----------------------------
+# Debian ffmpeg exists only in this stage to generate deterministic fixtures. Keeping it separate from
+# the Rust e2e stage makes the two proofs independent and prevents test-only packages changing Remux's
+# process environment. The marker copied below makes this gate mandatory whenever CI builds `e2e`.
+FROM debian:trixie-slim AS general-e2e
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY --from=ffmpeg-general /opt/ffmpeg-general/bin/ffmpeg /usr/local/bin/ffmpeg-general
+COPY --from=ffmpeg-general /opt/ffmpeg-general/bin/ffprobe /usr/local/bin/ffprobe-general
+COPY crates/remux/testdata/ crates/remux/testdata/
+COPY crates/scout/testdata/ crates/scout/testdata/
+COPY scripts/probe-general-ffmpeg.sh scripts/probe-general-ffmpeg.sh
+RUN sh scripts/probe-general-ffmpeg.sh /usr/local/bin/ffmpeg-general /usr/local/bin/ffprobe-general /usr/bin/ffmpeg \
+    && touch /general-e2e-passed
+
 # ---- test: Remux's #[ignore]d end-to-end tests against its own ffmpeg ---------------------------------
 # `docker build --target e2e .` (CI runs it; the default build skips it). The segment alignment depends on
 # exactly how ffmpeg seeks, so these tests only count with the ffmpeg the image ships. ffprobe is built for
@@ -175,6 +213,7 @@ RUN ./configure \
 FROM chef AS e2e
 RUN apt-get update && apt-get install -y --no-install-recommends libssl3t64 zlib1g libva2 libva-drm2 \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=general-e2e /general-e2e-passed /general-e2e-passed
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
 COPY . .
 RUN cargo test --locked -p den-remux -- --include-ignored
@@ -191,8 +230,7 @@ RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 # ---- runtime ------------------------------------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
 
-# ffmpeg (Reel and Subtitles) + ca-certificates (TLS roots) + python3 (Reel's resident resolver:
-# spawning yt-dlp pays interpreter and import startup for every trailer). The libraries
+# ca-certificates (TLS roots) + python3 (Reel's resident resolver and yt-dlp zipapp CLI fallback). The libraries
 # Remux's ffmpeg links are named here rather than left to ffmpeg's own dependencies. On amd64 — the box,
 # with its UHD 630 — Intel's VAAPI driver (iHD) comes too, the non-free build (non-free component enabled for
 # that install only): the free `intel-media-va-driver` exposes only the low-power encode entrypoint, which
@@ -203,7 +241,7 @@ FROM debian:trixie-slim AS runtime
 # weekly patch rebuild runs without cache and so always takes the current ones.
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
-         ffmpeg ca-certificates python3 libssl3t64 zlib1g libva2 libva-drm2 \
+         ca-certificates python3 libssl3t64 zlib1g libva2 libva-drm2 \
     && if [ "$(dpkg --print-architecture)" = amd64 ]; then \
          sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
          && apt-get update \
@@ -231,6 +269,7 @@ COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box
 COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
 RUN ldconfig
 COPY --from=alass /alass/bin/alass-cli /usr/local/bin/alass
+COPY --from=ffmpeg-general /opt/ffmpeg-general/bin/ffmpeg /opt/ffmpeg-general/bin/ffprobe /usr/local/bin/
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg-remux
 COPY --from=build /src/target/release/den-hearth /usr/local/bin/den-hearth
 
@@ -260,14 +299,14 @@ WORKDIR /app
 # ffmpeg ever opens a VAAPI device.
 ENV SCOUT_CACHE_DIR=/cache/scout \
     REEL_CACHE_DIR=/cache/reel \
-    REEL_FFMPEG_PATH=/usr/bin/ffmpeg \
+    REEL_FFMPEG_PATH=/usr/local/bin/ffmpeg \
     REEL_YTDLP_PATH=/usr/local/bin/yt-dlp \
     REEL_YTDLP_WORKER=/app/resolve.py \
     REEL_YOUTUBEI_WORKER=/app/youtubei/main.mjs \
     REEL_DENO_PATH=/usr/local/bin/deno \
     REEL_MAX_HEIGHT=1080 \
     SUBS_CACHE_DIR=/cache/subs \
-    SUBS_FFMPEG_PATH=/usr/bin/ffmpeg \
+    SUBS_FFMPEG_PATH=/usr/local/bin/ffmpeg \
     SUBS_ALASS_PATH=/usr/local/bin/alass \
     REMUX_SCRATCH_DIR=/cache/remux \
     REMUX_FFMPEG_PATH=/usr/local/bin/ffmpeg-remux \
