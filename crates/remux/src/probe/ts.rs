@@ -50,7 +50,7 @@ fn packet(p: &[u8]) -> Option<Packet<'_>> {
 
 /// The packets of `b` from its first, which is a sync byte.
 fn packets(b: &[u8]) -> impl Iterator<Item = Packet<'_>> {
-    b.chunks_exact(PACKET).filter_map(packet)
+    b.as_chunks::<PACKET>().0.iter().filter_map(|p| packet(p))
 }
 
 /// The PSI section `pid` carries, gathered from the packet that starts it and the ones after: its body after the
@@ -131,7 +131,7 @@ fn kind(stream_type: u8, descriptors: &[(u8, &[u8])]) -> Kind {
 fn program(head: &[u8]) -> Option<Vec<Stream>> {
     let pat = section(head, 0, 0x00)?;
     // After the transport stream id, version and section numbers: four bytes a program, number 0 the network's.
-    let pmt_pid = pat.get(5..)?.chunks_exact(4).find_map(|e| {
+    let pmt_pid = pat.get(5..)?.as_chunks::<4>().0.iter().find_map(|e| {
         let number = u16::from_be_bytes([e[0], e[1]]);
         (number != 0).then(|| u16::from_be_bytes([e[2] & 0x1f, e[3]]))
     })?;
