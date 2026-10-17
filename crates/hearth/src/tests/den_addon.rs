@@ -99,16 +99,19 @@ fn guest_hearth(den: Den) -> Arc<Hearth> {
     hearth
 }
 
-async fn guest_overlay(hearth: &Arc<Hearth>, body: Value, peer: &str, secret: &str) -> Response<Body> {
-    let request = Request::post("/den/_guest")
+fn guest_request(body: Value, peer: &str, secret: &str) -> Request<http_body_util::Full<Bytes>> {
+    Request::post("/den/_guest")
         .header("content-type", "application/json")
         .header("idempotency-key", "guest-attempt")
         .header("x-den-edge-secret", secret)
         .header("x-den-owner", "grant:deadbeef")
         .extension(den_remux::Peer(peer.parse().unwrap()))
         .body(http_body_util::Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
-        .unwrap();
-    handle(hearth.clone(), None, false, request).await
+        .unwrap()
+}
+
+async fn guest_overlay(hearth: &Arc<Hearth>, body: Value, peer: &str, secret: &str) -> Response<Body> {
+    handle(hearth.clone(), None, false, guest_request(body, peer, secret)).await
 }
 
 fn resource_names(manifest: &serde_json::Value) -> Vec<&str> {
@@ -245,6 +248,31 @@ async fn guest_overlay_revalidates_a_revoked_host_hearth_before_answering() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_of(response).await["error"], "guest_overlay_refused");
+}
+
+#[tokio::test]
+async fn guest_overlay_refuses_host_hearth_members_missing_from_this_runtime() {
+    for missing in ["scout", "subs", "reel"] {
+        let mut hearth = guest_hearth(den_with(None, "", "0", false));
+        let state = Arc::get_mut(&mut hearth).unwrap();
+        match missing {
+            "scout" => state.scout = None,
+            "subs" => state.subs = None,
+            "reel" => state.reel = None,
+            _ => unreachable!(),
+        }
+        let host = plain(&config(0, &[SCOUT, SUBS, REEL]));
+        let body = serde_json::json!({
+            "host": {"den": host},
+            "request": {"method": "GET", "path": "/manifest.json"}
+        });
+        // The router already unmounts /den without every component; the overlay must refuse on its own too.
+        let routed = guest_overlay(&hearth, body.clone(), "10.0.0.2", "edge-secret").await;
+        assert_eq!(routed.status(), StatusCode::NOT_FOUND, "missing {missing}");
+        let response = crate::guest::handle(&hearth, guest_request(body, "10.0.0.2", "edge-secret")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "missing {missing}");
+        assert_eq!(json_of(response).await["error"], "guest_overlay_refused", "missing {missing}");
+    }
 }
 
 #[tokio::test]

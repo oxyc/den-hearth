@@ -185,12 +185,7 @@ fn open(hearth: &Hearth, personal: Option<String>, host: Host) -> Option<Opened>
     let personal = match personal {
         Some(segment) => {
             let install = hearth.den.open(&segment).ok()?;
-            if install.members.iter().any(|member| match *member {
-                "scout" => hearth.scout.is_none(),
-                "subs" => hearth.subs.is_none(),
-                "reel" => hearth.reel.is_none(),
-                _ => true,
-            }) {
+            if !has_components(hearth, &install) {
                 return None;
             }
             Some((segment.clone(), install))
@@ -198,7 +193,13 @@ fn open(hearth: &Hearth, personal: Option<String>, host: Host) -> Option<Opened>
         None => None,
     };
     let den = match host.den {
-        Some(segment) => Some((segment.clone(), hearth.den.open(&segment).ok()?)),
+        Some(segment) => {
+            let install = hearth.den.open(&segment).ok()?;
+            if !has_components(hearth, &install) {
+                return None;
+            }
+            Some((segment.clone(), install))
+        }
         None => None,
     };
     if host.scout.as_deref().is_some_and(|segment| {
@@ -211,6 +212,15 @@ fn open(hearth: &Hearth, personal: Option<String>, host: Host) -> Option<Opened>
         return None;
     }
     Some(Opened { personal, host: OpenedHost { den, scout: host.scout, subs: host.subs, reel: host.reel } })
+}
+
+fn has_components(hearth: &Hearth, install: &den::Install) -> bool {
+    install.members.iter().all(|member| match *member {
+        "scout" => hearth.scout.is_some(),
+        "subs" => hearth.subs.is_some(),
+        "reel" => hearth.reel.is_some(),
+        _ => false,
+    })
 }
 
 fn operation_request(headers: &hyper::HeaderMap, operation: Operation) -> Option<Request<Full<Bytes>>> {
