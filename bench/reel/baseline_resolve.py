@@ -25,7 +25,7 @@ import sys
 
 # The zipapp is a zip of the package; importing from it is what lets the pinned artifact be reused.
 # `YTDLP_ZIP` overrides where it is, so this can be run outside the image it is built for.
-sys.path.insert(0, os.environ.get("YTDLP_ZIP", "/usr/local/lib/yt-dlp.zip"))
+sys.path.insert(0, os.environ.get("YTDLP_ZIP", "/usr/local/bin/yt-dlp"))
 
 from yt_dlp import YoutubeDL  # noqa: E402  (only importable once the path above is set)
 from yt_dlp.utils import DownloadError  # noqa: E402

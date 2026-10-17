@@ -49,6 +49,17 @@ for port in 18080 18092 18093; do
     curl -fsS "http://127.0.0.1:$port/health" | jq -e '.status' >/dev/null
 done
 curl -fsS http://127.0.0.1:18095/remux/health | jq -e '.status' >/dev/null
+
+# Reel's one SHA-pinned yt-dlp zipapp serves both paths. Prove system Python can execute it as the
+# CLI fallback and import it for the resident resolver; this catches a future artifact-format change
+# before promotion. A malformed id is rejected without depending on YouTube or runner egress.
+ytdlp_version=$(docker run --rm --entrypoint yt-dlp "$image" --version)
+[ -n "$ytdlp_version" ] || { echo "::error::yt-dlp zipapp did not run under system Python"; exit 1; }
+reply=$(printf '%s\n' '{"id":"x","format":"best","rungs":[]}' | \
+    docker run --rm -i --entrypoint python3 "$image" /app/resolve.py)
+jq -e '.ok == false and (.error | type == "string" and length > 0)' <<<"$reply" >/dev/null \
+    || { echo "::error::Reel's resident yt-dlp worker did not report its malformed-id failure: $reply"; exit 1; }
+echo "yt-dlp: zipapp $ytdlp_version executes as the CLI fallback and imports in the resident worker"
 # Scout's installer page is served at its root too. Read the whole body before matching: `grep -q` stops at the
 # first match and closes the pipe, which fails curl (23) under pipefail on a page that is fine.
 configure="$(curl -fsS http://127.0.0.1:18080/configure)"

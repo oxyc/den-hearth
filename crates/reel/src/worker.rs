@@ -1,9 +1,8 @@
 //! A resident yt-dlp, so a resolve costs the extraction and not the interpreter.
 //!
-//! Spawning the standalone binary spends about 840ms before it has looked at anything — Python
-//! starting and yt-dlp importing itself — measured on the box against a 2162ms resolve. That is two
-//! fifths of every one, and it is paid again for every trailer. This keeps one process alive and
-//! talks to it over a pipe: one JSON object per line each way (`worker/resolve.py`).
+//! Spawning the yt-dlp CLI spends time before it has looked at anything — Python starting and yt-dlp
+//! importing itself — and pays that again for every trailer. This keeps one process alive and talks
+//! to it over a pipe: one JSON object per line each way (`worker/resolve.py`).
 //!
 //! **Everything here is optional.** No worker configured, one that will not start, one that dies
 //! mid-answer, one that takes too long — every path returns `None`, and the caller spawns the binary
