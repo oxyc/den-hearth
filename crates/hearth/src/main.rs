@@ -621,6 +621,37 @@ struct Configs {
     services: services::Services,
 }
 
+/// The handed-over sockets, each as the listener on its port. One on a port this node does not serve is an error:
+/// left unserved, it would accept connections that nothing ever answers.
+fn adopt_inherited(
+    inherited: Vec<std::net::TcpListener>,
+    main: u16,
+    own: &[(Service, u16)],
+) -> std::io::Result<Vec<(Option<Service>, TcpListener)>> {
+    inherited
+        .into_iter()
+        .map(|socket| {
+            let at = socket.local_addr()?;
+            let Some(service) = listener_for(at.port(), main, own) else {
+                return Err(std::io::Error::other(format!(
+                    "an inherited socket on {at} is none of this node's ports"
+                )));
+            };
+            eprintln!("serving on an inherited socket, {at}");
+            Ok((service, TcpListener::from_std(socket)?))
+        })
+        .collect()
+}
+
+/// Which listener a socket on `port` stands for: `Some(None)` the main one, `Some(Some(service))` that service's
+/// own, `None` neither.
+fn listener_for(port: u16, main: u16, own: &[(Service, u16)]) -> Option<Option<Service>> {
+    if port == main {
+        return Some(None);
+    }
+    own.iter().find(|(_, p)| *p == port).map(|(service, _)| Some(*service))
+}
+
 async fn bind(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind(("0.0.0.0", port))
         .await
@@ -660,10 +691,14 @@ async fn run(c: Configs) -> std::io::Result<()> {
         signal.await;
         let _ = stop.send(true);
     });
+    // Every port is bound here: it is the address containers on the same network reach this one by. A socket the
+    // supervisor handed over is served as well, as the listener with its port, and is the one that stays open while
+    // this process is replaced.
     let mut listeners = vec![(None, bind(port).await?)];
     for (service, own_port) in &c.own {
         listeners.push((Some(*service), bind(*own_port).await?));
     }
+    listeners.extend(adopt_inherited(sock::inherited_listeners()?, port, &c.own)?);
     let own_listeners = if c.own.is_empty() {
         "none".to_string()
     } else {
@@ -1242,6 +1277,44 @@ mod tests {
         let (stop, stopped) = watch::channel(false);
         let server = tokio::spawn(serve_until(listener, None, hearth(), stopped, grace));
         (addr, stop, server)
+    }
+
+    /// A handed-over socket is served as the listener with its port; one on a port the node does not serve is
+    /// refused rather than left accepting connections nothing answers.
+    #[test]
+    fn an_inherited_socket_stands_for_the_listener_on_its_port() {
+        let own = [(Service::Scout, 8080), (Service::Reel, 8092), (Service::Remux, 8095)];
+        assert_eq!(listener_for(8090, 8090, &own), Some(None));
+        assert_eq!(listener_for(8080, 8090, &own), Some(Some(Service::Scout)));
+        assert_eq!(listener_for(8095, 8090, &own), Some(Some(Service::Remux)));
+        assert_eq!(listener_for(8094, 8090, &own), None);
+    }
+
+    /// The point of the handed-over socket: a connection made while no process is serving (a restart) waits in
+    /// the kernel queue, and the next process adopts the socket as that service's listener and answers it.
+    #[tokio::test]
+    async fn a_connection_queued_on_an_inherited_socket_is_answered_by_the_next_process() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let supervisor = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = supervisor.local_addr().unwrap();
+        let mut early = tokio::net::TcpStream::connect(addr).await.unwrap();
+        early.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        supervisor.set_nonblocking(true).unwrap();
+        let stray = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(adopt_inherited(vec![stray], 1, &[]).is_err(), "a socket on a port nobody serves");
+        let mut adopted = adopt_inherited(vec![supervisor], 1, &[(Service::Scout, addr.port())]).unwrap();
+        let (own, listener) = adopted.pop().unwrap();
+        assert_eq!(own, Some(Service::Scout));
+        let (stop, stopped) = watch::channel(false);
+        let server = tokio::spawn(serve_until(listener, own, hearth(), stopped, Duration::from_secs(1)));
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), early.read_to_string(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        stop.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), server).await.unwrap().unwrap());
     }
 
     #[tokio::test]
