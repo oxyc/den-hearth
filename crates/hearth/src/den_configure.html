@@ -28,6 +28,8 @@
          color: #c9ccd3; font-weight: 400; }
   .chk input { width: auto; }
   .optional { font-weight: 400; color: #8b919b; }
+  details#advancedSources { margin-top: .6rem; }
+  details#advancedSources > summary { cursor: pointer; color: #7fb0ff; margin-bottom: .7rem; }
   button.primary { width: 100%; margin-top: 1.75rem; padding: .8rem; border: 0; border-radius: 10px;
     background: #3b82f6; color: #fff; font-weight: 600; font-size: 1rem; cursor: pointer; }
   #out { margin-top: 1.5rem; }
@@ -79,11 +81,14 @@
   with your token.</p>
 <p class="note" id="sourcesResult"></p>
 <h2>Sources</h2>
-<label class="chk"><input type="checkbox" id="useDefaults" checked> Use the server's defaults</label>
-<p class="optional" id="defaultsNote">Your link carries only your debrid account, so everything else
-  follows this server — change the defaults here later and every link built this way follows, with no
-  re-configuring. Untick to see them and pin your own.</p>
-<div id="tunables">
+<p class="optional">Streams use the recommended indexers and filters, and pick up improvements to them
+  automatically — nothing to fill in.</p>
+<details id="advancedSources">
+<summary>Advanced: choose your own indexers and filters</summary>
+<label class="chk"><input type="checkbox" id="useDefaults" checked> Use the recommended defaults</label>
+<p class="optional" id="defaultsNote">Your link carries only your debrid account, so these follow the server
+  as its defaults change. Untick only if you need to pin your own.</p>
+<div id="tunables" hidden>
 <h2>Indexers <span class="optional">(all if none)</span></h2>
 <label class="chk"><input type="checkbox" name="indexer" value="torrentio" checked> Torrentio</label>
 <label class="chk"><input type="checkbox" name="indexer" value="comet" checked> Comet</label>
@@ -119,6 +124,7 @@
 <div class="field"><label for="resultCap">Max results</label>
   <input id="resultCap" type="number" min="1" max="50" value="20"></div>
 </div>
+</details>
 
 <h3>Subtitles</h3>
 <p class="optional" id="subtitlesHelp">Hash-matched OpenSubtitles, auto-sync, and your-own-key AI translation. Leave the
@@ -310,7 +316,7 @@ function setChecks(name, values) {
 
 function syncDefaults() {
   var useDefaults = $("useDefaults").checked;
-  $("tunables").style.display = useDefaults ? "none" : "";
+  $("tunables").hidden = useDefaults;
   $("defaultsNote").style.display = useDefaults ? "" : "none";
 }
 
@@ -323,6 +329,8 @@ function fillScout(s) {
   setChecks("indexer", s.indexers && s.indexers.length ? s.indexers : ALL_INDEXERS);
   var pinned = !!s.filters || typeof s.cachedOnly === "boolean" || !!s.indexers || s.resultCap != null;
   $("useDefaults").checked = !pinned;
+  // A link that already pins its own sources opens on them, so what it carries is never out of sight.
+  $("advancedSources").open = pinned;
   syncDefaults();
   var f = s.filters || {};
   if ("excludeCam" in f) $("excludeCam").checked = !!f.excludeCam;
