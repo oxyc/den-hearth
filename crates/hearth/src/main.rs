@@ -5,7 +5,7 @@
 //!   /subs/...   → den-subtitles (`/subs/<config>/manifest.json` is Subtitles' `/<config>/manifest.json`)
 //!   /remux/...  → den-remux     (unchanged: Remux already serves everything under `/remux`)
 //!   /den/...    → the combined Den addon: one manifest and config for Scout, Subtitles and Reel (`den`)
-//!   /health     → all four, each as its own service reports it
+//!   /health, /den/health → all four, each as its own service reports it
 //!
 //! Each service also has a listener of its own on the port its old container used (`ports`), where every
 //! request goes to that service with the path unchanged.
@@ -1509,5 +1509,9 @@ mod tests {
         }
         let all_ok = ["scout", "reel", "subs", "remux"].iter().all(|s| body["services"][s]["status"] == "ok");
         assert_eq!(body["status"], if all_ok { "ok" } else { "degraded" });
+
+        let (mounted_status, mounted_body) = get("/den/health").await;
+        assert_eq!(mounted_status, StatusCode::OK);
+        assert_eq!(mounted_body, body, "the routes-v1 probe sees Hearth's aggregate health");
     }
 }
