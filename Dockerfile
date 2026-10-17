@@ -12,8 +12,8 @@
 # meets), which that build cannot. Debian's package serves those two. Remux's lives at
 # /usr/local/bin/ffmpeg-remux and is the only one that is ever given the GPU.
 #
-# Runtime is debian-slim, not Alpine: the old Remux image was Alpine/musl, but Reel's MP4Box, the yt-dlp
-# standalone binary and deno are glibc builds. Builds amd64, the box's arch.
+# Runtime is debian-slim, not Alpine: the old Remux image was Alpine/musl, but Reel's MP4Box and deno
+# are glibc builds, while its yt-dlp zipapp needs Python. Builds amd64, the box's arch.
 
 # ---- build: Rust, with the dependency layer cached by cargo-chef ----------------------------------
 FROM rust:1-trixie AS chef
@@ -73,33 +73,21 @@ RUN set -eux; \
     echo "${sha}  /tmp/deno.zip" | sha256sum -c -; \
     unzip -q -d /usr/local/bin /tmp/deno.zip
 
-# Pinned yt-dlp STANDALONE binary (PyInstaller onefile — bundles Python, so no system python3
-# needed). Bump YTDLP_VERSION to update (YouTube changes often — that's the whole maintenance
-# burden, and it's yt-dlp's, not ours).
+# Pinned yt-dlp zipapp. System Python executes this file for the CLI fallback, and the resident
+# resolver imports the very same file. Keeping one verified artifact avoids carrying yt-dlp's
+# PyInstaller build and its second bundled Python alongside the system Python the resolver needs.
+# Bump YTDLP_VERSION to update (YouTube changes often — that's the whole maintenance burden, and
+# it's yt-dlp's, not ours).
 ARG YTDLP_VERSION=2026.08.19
-# SHA256 of each release asset, from the release's SHA2-256SUMS. Verifying the download is the
-# supply-chain guard — there's no advisory DB for a standalone binary, so integrity is the whole game.
-# Kept in lockstep with YTDLP_VERSION by .github/workflows/ytdlp-update.yml (which refreshes both).
-ARG YTDLP_SHA256_AMD64=58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a
-RUN set -eux; \
-    case "$TARGETARCH" in \
-      amd64) asset=yt-dlp_linux; sha=$YTDLP_SHA256_AMD64 ;; \
-      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${asset}" \
-      -o /usr/local/bin/yt-dlp; \
-    echo "${sha}  /usr/local/bin/yt-dlp" | sha256sum -c -; \
-    chmod +x /usr/local/bin/yt-dlp
-
-# The same release as a ZIPAPP, pinned the same way. It is a zip of the package, so `sys.path` can
-# import it — which is what lets the resident resolver reuse this verified artifact instead of a pip
-# install. Kept in lockstep with YTDLP_VERSION by .github/workflows/ytdlp-update.yml, which refreshes
-# both sums: a bump that renewed only one would fail this build on the other.
+# SHA256 from the release's SHA2-256SUMS. Verifying the download is the supply-chain guard — there
+# is no package-manager advisory database involved. Kept in lockstep with YTDLP_VERSION by
+# .github/workflows/ytdlp-update.yml.
 ARG YTDLP_SHA256_ZIPAPP=1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6
 RUN set -eux; \
     curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
-      -o /usr/local/lib/yt-dlp.zip; \
-    echo "${YTDLP_SHA256_ZIPAPP}  /usr/local/lib/yt-dlp.zip" | sha256sum -c -
+      -o /usr/local/bin/yt-dlp; \
+    echo "${YTDLP_SHA256_ZIPAPP}  /usr/local/bin/yt-dlp" | sha256sum -c -; \
+    chmod +x /usr/local/bin/yt-dlp
 
 # youtubei.js, Reel's fast resolver (crates/reel/worker/youtubei). Its four npm packages are fetched HERE,
 # at build time, with the deno above — the one runtime the image already trusts — into a cache the runtime
@@ -204,7 +192,7 @@ RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 FROM debian:trixie-slim AS runtime
 
 # ffmpeg (Reel and Subtitles) + ca-certificates (TLS roots) + python3 (Reel's resident resolver:
-# spawning the standalone yt-dlp costs ~840ms of interpreter start for every trailer). The libraries
+# spawning yt-dlp pays interpreter and import startup for every trailer). The libraries
 # Remux's ffmpeg links are named here rather than left to ffmpeg's own dependencies. On amd64 — the box,
 # with its UHD 630 — Intel's VAAPI driver (iHD) comes too, the non-free build (non-free component enabled for
 # that install only): the free `intel-media-va-driver` exposes only the low-power encode entrypoint, which
@@ -226,10 +214,14 @@ RUN apt-get update && apt-get upgrade -y \
 
 COPY --from=tools /usr/local/bin/deno /usr/local/bin/deno
 COPY --from=tools /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp
-# The importable copy, and the process that imports it. The binary above stays: it is what a resolve
-# falls back to when the resident one cannot be started or has died.
-COPY --from=tools /usr/local/lib/yt-dlp.zip /usr/local/lib/yt-dlp.zip
+# The process that imports the same zipapp. Executing this file is the fallback when the resident
+# resolver cannot be started or has died.
 COPY crates/reel/worker/resolve.py /app/resolve.py
+# The PR image build is the yt-dlp update gate. Prove both uses of the single artifact here, without
+# relying on YouTube being reachable from a CI address.
+RUN cli="$(yt-dlp --version)" \
+    && imported="$(python3 -c 'import sys; sys.path.insert(0, "/usr/local/bin/yt-dlp"); import yt_dlp; print(yt_dlp.version.__version__)')" \
+    && test "$cli" = "$imported"
 # The fast resolver, the packages it was locked to, and deno's cache of them (`deno/`, which the worker is
 # pointed at as DENO_DIR and which only it uses: yt-dlp's own deno keeps its cache elsewhere).
 COPY --from=tools /youtubei/main.mjs /youtubei/quiet.mjs /youtubei/errors.mjs /youtubei/select.mjs /youtubei/deno.json /youtubei/deno.lock /app/youtubei/

@@ -51,7 +51,7 @@ standalone services. Scout needs nothing outside the binary.
 
 One image, `den-hearth`, replaces the per-service images (`den-reel`, `den-subtitles`, `den-remux`, and the Go
 `den-scout` once switched over). It is
-Debian trixie-slim (glibc: Reel's yt-dlp, deno and MP4Box are glibc builds) with:
+Debian trixie-slim (Reel's yt-dlp needs Python, while deno and MP4Box are glibc builds) with:
 
 | Tool | For | Source |
 |---|---|---|
@@ -59,7 +59,7 @@ Debian trixie-slim (glibc: Reel's yt-dlp, deno and MP4Box are glibc builds) with
 | `ffmpeg` (Debian) | Reel (mux, cropdetect) and Subtitles (audio decode for sync) | apt |
 | `ffmpeg-remux` | Remux: minimal source build, VAAPI, checksummed tarball | `FFMPEG_VERSION` / `FFMPEG_SHA256` |
 | `intel-media-va-driver-non-free` | Remux's GPU transcode (UHD 630, driver `iHD`), amd64 only. The free package has no bitrate-controlled encode (CQP only) and no `scale_vaapi` kernels, so the non-free component is enabled for this one install | apt |
-| `yt-dlp` (binary + zipapp), `deno`, `python3` | Reel's extractor and its resident resolver | pinned versions, SHA-256 checked |
+| `yt-dlp` zipapp, `deno`, `python3` | Reel's extractor and its resident resolver | pinned versions, SHA-256 checked |
 | `MP4Box` + `libgpac` | Reel's `clap` box | GPAC pinned to a commit |
 | `alass` | Subtitles' aligner | `cargo install --locked`, pinned |
 
