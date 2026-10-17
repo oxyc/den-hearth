@@ -41,6 +41,7 @@ mod rank;
 mod rank_show;
 mod redirect;
 mod refusal;
+mod releaselog;
 mod remux;
 mod reqlog;
 mod rust_wire_vectors;
