@@ -14,6 +14,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `moov-at-end.mp4` | A `moov` after the `mdat`, found by walking box headers | 0, 2, 5 | 8.0 |
 | `av1.mkv` | AV1: SVT-AV1's 10-bit HDR10 (PQ, BT.2020), `V_AV1` with its `av1C` CodecPrivate, Colour element and sequence header; Opus audio | 0, 2.5, 6, 8.5, 12, 14, 18.5, 21, 24, 27.5 | 30.008 |
 | `av1.mp4` | `av1.mkv`'s video copied into MP4: the `av01` sample entry's `av1C` and `colr` | as `av1.mkv` | 29.999 |
+| `av1-sdr.mkv` | AV1 in SDR: SVT-AV1's 8-bit BT.709, named with no VIDEO-RANGE; Opus audio | as `av1.mkv` | 30.008 |
 | `surround.mkv` | `h264.mkv`'s video copied, with a 5.1 AAC track (eng) and a 7.1 one (swe): converted to AAC 5.1 | as `h264.mkv` | 30.021 |
 | `subs.mkv` | `h264.mkv` with three text subtitle tracks: SRT English, ASS Finnish (an italic override) and a forced SRT Swedish. Cues sit inside a segment (1, 9, 26 s), across a cut at 13 s (12–14) and after it (14.5), so the segments 0–8, 8–13, 13–19.5, 19.5–24, 24–30 each hold a known set | as `h264.mkv` | 30.021 |
 | `open-gop.mkv` | Open GOPs: x265's own keyframes every 3 s are CRAs, each with three RASL leading pictures that reference the GOP before (`closed_gops` false, no `EXT-X-INDEPENDENT-SEGMENTS`) | 0, 3, 6, 9 | 12.0 |
@@ -66,6 +67,12 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine
   -c:a libopus -b:a 32k -ac 2 -metadata:s:a:0 language=eng av1.mkv
 
 ffmpeg -y -i av1.mkv -map 0:v -c copy -movflags +faststart av1.mp4
+
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine=frequency=500:duration=30:sample_rate=48000 \
+  -map 0:v -map 1:a -vf setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p \
+  -c:v libsvtav1 -preset 10 -crf 60 -g 1000 -force_key_frames 0,2.5,6,8.5,12,14,18.5,21,24,27.5 \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -c:a libopus -b:a 32k -ac 2 -metadata:s:a:0 language=eng av1-sdr.mkv
 
 # Open GOPs need the encoder's own keyframes: a forced one ends the mini-GOP before it, so nothing leads it.
 ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=12 -f lavfi -i sine=frequency=550:duration=12:sample_rate=48000 \
