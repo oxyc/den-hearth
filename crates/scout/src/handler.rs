@@ -1236,6 +1236,12 @@ impl Inner {
         if let Some(filename) = request.filename.as_deref().filter(|name| !name.is_empty()) {
             candidates.retain(|candidate| candidate.title == filename);
         }
+        if let Some(client) = request.playable.as_ref().filter(|_| request.receiver) {
+            candidates.retain(|candidate| {
+                client.cost((*candidate).clone(), stream_attributes((*candidate).clone()))
+                    < crate::client::VIDEO_CONVERTED_COST
+            });
+        }
         if candidates.is_empty() {
             return Err(if list.degraded.is_empty() {
                 ManagedHlsError::NotFound
