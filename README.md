@@ -170,6 +170,8 @@ it validates only capabilities Reel minted for a Den install, as Reel's own rout
 When enabled, `/den/<config>/playback` accepts the current Remux play fields plus an `Idempotency-Key`. Hearth
 derives Scout and Subtitles from that same combined config, chooses direct managed HLS only for a trusted Edge
 request, and otherwise translates the existing Remux session into a response whose one required field is `url`.
+A `"player": "cast"` request takes managed HLS only for a release its `playable` plays without converting the
+video, since a Cast receiver plays TorBox's stream as it is; anything else goes to Remux.
 It does not create an outer session. Responses are JSON with `Cache-Control: no-store`; completed retries are
 held briefly in bounded memory so a lost response cannot create another Remux session.
 

@@ -650,6 +650,80 @@ async fn revoked_install_admission_wins_over_a_saved_playback_answer() {
     assert!(!String::from_utf8_lossy(&body).contains("should-not-replay"));
 }
 
+/// The managed-playback Hearth as Den Edge reaches it (the trusted relay and its secret), whose Scout reaches no real
+/// indexer or Cinemeta: every upstream URL is a closed local port, so a title has no releases and asks nothing more.
+fn trusted_offline_playback_hearth() -> Arc<Hearth> {
+    let settings = || {
+        let mut s = den_scout::deps::settings_from_env(|name| {
+            if name.ends_with("_URL") && name != "PUBLIC_BASE_URL" {
+                "http://127.0.0.1:9".to_string()
+            } else {
+                String::new()
+            }
+        });
+        s.cache_dir = String::new();
+        s
+    };
+    let den = den_with(None, "", "0", false);
+    let mut hearth = Hearth::new(
+        Some(den_reel::AppState::new(den_reel::Config::from_env())),
+        Some(den_subtitles::AppState::new(den_subtitles::Config::from_env())),
+        Some(den_remux::AppState::new(den_remux::Config::from_env())),
+        Some(scout::Scout::new(settings(), settings(), &den.scout)),
+        den,
+        Limits::default(),
+        Options { managed_playback: true, ..Default::default() },
+    );
+    let state = Arc::get_mut(&mut hearth).unwrap();
+    let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
+    remux.cfg.public_session_proxy = Some("10.0.0.2".parse().unwrap());
+    remux.cfg.edge_secret = Some("edge-secret".into());
+    hearth
+}
+
+/// How many managed (TorBox) preparations Hearth attempted, whatever came of them.
+fn managed_attempts(hearth: &Hearth) -> u64 {
+    let mut metrics = String::new();
+    hearth.playback.render(&mut metrics);
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("den_hearth_playback_managed_prepare_total{"))
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        .sum()
+}
+
+async fn edge_playback(hearth: &Arc<Hearth>, segment: &str, key: &str, body: Value) -> Response<Body> {
+    let request = Request::post(format!("/den/{segment}/playback"))
+        .header("content-type", "application/json")
+        .header("idempotency-key", key)
+        .header("x-den-edge-secret", "edge-secret")
+        .header("x-den-managed-playback", "1")
+        .extension(den_remux::Peer("10.0.0.2".parse().unwrap()))
+        .body(http_body_util::Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+        .unwrap();
+    handle(hearth.clone(), None, false, request).await
+}
+
+// Den Web asks again with `player: "cast"` and `transcode: "never"` when a title playing from TorBox is cast (every
+// change made mid-film carries `transcode: "never"`). Hearth sent every such request straight to Remux, so casting a
+// TorBox stream always swapped it for a Remux session — of another release, for a conservative receiver.
+#[tokio::test]
+async fn a_mid_film_cast_request_still_tries_the_managed_stream_first() {
+    let hearth = trusted_offline_playback_hearth();
+    let segment = plain(&config(0, &[SCOUT]));
+
+    // An audio track TorBox can't choose is Remux's alone: no managed attempt.
+    let track = serde_json::json!({"imdb": "tt0111161", "audioTrack": 1});
+    let _ = edge_playback(&hearth, &segment, "track", track).await;
+    assert_eq!(managed_attempts(&hearth), 0);
+
+    let cast = serde_json::json!({
+        "imdb": "tt0111161", "player": "cast", "transcode": "never", "filename": "Movie 2160p.mkv",
+    });
+    let _ = edge_playback(&hearth, &segment, "cast", cast).await;
+    assert_eq!(managed_attempts(&hearth), 1, "the cast request tried TorBox before Remux");
+}
+
 #[tokio::test]
 async fn a_config_with_no_member_or_one_its_service_refuses_is_no_config() {
     let hearth = hearth_den(Limits::default(), None, den_with(None, "", "0", false));

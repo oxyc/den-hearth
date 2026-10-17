@@ -452,13 +452,11 @@ fn install_url(config: &str) -> String {
 fn managed_request(request: &Value) -> Option<den_scout::managed_hls::ManagedHlsRequest> {
     let object = request.as_object()?;
     // TorBox v1 intentionally uses its default audio and has no Remux session to replace. Preserve explicit
-    // track and replacement behavior by sending those requests to Remux.
+    // track and replacement behavior by sending those requests to Remux. `transcode: "never"` is not one of them:
+    // Den Web sends it with every change made mid-film (casting among them), and it only keeps Remux's conversion
+    // from replacing what is playing. Routing it to Remux turned every cast of a TorBox stream into a Remux session.
     let excluded = object.get("exclude").and_then(Value::as_array).is_some_and(|values| !values.is_empty());
-    if object.contains_key("audioTrack")
-        || object.contains_key("replaces")
-        || object.get("transcode").and_then(Value::as_str) == Some("never")
-        || excluded
-    {
+    if object.contains_key("audioTrack") || object.contains_key("replaces") || excluded {
         return None;
     }
     let integer = |name: &str| -> Option<Option<i64>> {
@@ -481,6 +479,7 @@ fn managed_request(request: &Value) -> Option<den_scout::managed_hls::ManagedHls
         episode: integer("episode")?,
         filename,
         playable,
+        receiver: object.get("player").and_then(Value::as_str) == Some("cast"),
     })
 }
 
