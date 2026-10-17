@@ -640,8 +640,7 @@ mod tests {
             "Nothing was saved.",
             "denFetch(DEN_GUEST.saveUrl",
             "JSON.stringify({ install: segment })",
-            "location.origin + DEN_GUEST.base + \"/manifest.json\"",
-            "Could not save this guest install. Please try again.",
+            "Could not save these settings. Please try again.",
         ] {
             assert!(page.contains(needle), "the guest bridge no longer has: {needle}");
         }
@@ -664,9 +663,9 @@ mod tests {
         );
         assert!(at("if (!sealPublicKey || !window.DenSeal)") < at("$(\"go\").disabled = false"));
         assert!(at("if (DEN_GUEST && (!segment || !lastBuildSealed))") < at("denFetch(DEN_GUEST.saveUrl"));
+        let saved = page[at("if (!r.ok) throw new Error(\"save failed\")")..].to_owned();
         assert!(
-            at("if (!r.ok) throw new Error(\"save failed\")")
-                < at("location.origin + DEN_GUEST.base + \"/manifest.json\"")
+            saved.find("throw").unwrap() < saved.find("$(\"out\").classList.remove(\"hidden\")").unwrap()
         );
         assert!(
             page.contains("if (DEN_GUEST !== null) {\n      lastBuildSealed = false;\n      return null;")
