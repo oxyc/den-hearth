@@ -5,10 +5,11 @@
 //! did around it is done here: a pooled client that refuses to replay a body across a redirect, a tiered
 //! cache with an hourly sweep, a bounded request read.
 //!
-//! There are THREE handlers over one client and one cache. Two differ only in the public origin they put in
+//! There are FOUR handlers over one client and one cache. Two differ only in the public origin they put in
 //! absolute URLs: the one behind `/scout` keeps that prefix (`HEARTH_PUBLIC_BASE_URL/scout`), the one on
 //! Scout's own listener uses `SCOUT_PUBLIC_BASE_URL` as-is, which is what the old container produced. The
-//! third is the combined Den addon's (`den.rs`), on that addon's keys, revocation and base.
+//! third is the combined Den addon's (`den.rs`), on that addon's keys, revocation and base; the fourth is the
+//! same on Remux's in-process playback base.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,10 @@ pub struct Scout {
     /// The combined Den addon's (`/den`): `mount`'s settings, on that addon's keys and revocation, reading its
     /// Scout member. Its play tickets are keyed from those keys, so they open only here.
     den: Handler,
+    /// `den` exactly, but writing its play URLs on the in-process playback base (`playback::DEN_ADDON_BASE`) rather
+    /// than the addon's public one. Remux lists through that base, so the `/p/<ticket>` it then follows stays on
+    /// scout's origin and in process; on the public base it would be an outside hop, and Remux refuses a LAN one.
+    den_local: Handler,
     cache: Arc<TieredCache>,
     summary: String,
 }
@@ -71,21 +76,25 @@ impl Scout {
         let deps = |settings: &Settings| {
             build_deps_shared(settings, client.clone(), cache.clone() as Arc<dyn Cache>)
         };
-        let mut den_deps = deps(&mount);
-        den_deps.seal_keyring = den.keyring.clone().map(Arc::new);
-        den_deps.config_key_invalid = den.key_invalid;
-        den_deps.revocation = den.revocation.clone();
-        den_deps.config_slice = Some(den.slice);
-        den_deps.public_url = den.public_base.clone().unwrap_or_default();
-        den_deps.mount = den_seal::addon::MOUNT;
-        // No list from before the Den addon can name a `/<config>/play` URL, so with tickets on that route is
-        // closed from the start; without them (no key) it is the only play route there is.
-        den_deps.legacy_play_until = den.keyring.as_ref().map(|_| std::time::UNIX_EPOCH);
+        let den_deps = |public_url: String| {
+            let mut den_deps = deps(&mount);
+            den_deps.seal_keyring = den.keyring.clone().map(Arc::new);
+            den_deps.config_key_invalid = den.key_invalid;
+            den_deps.revocation = den.revocation.clone();
+            den_deps.config_slice = Some(den.slice);
+            den_deps.public_url = public_url;
+            den_deps.mount = den_seal::addon::MOUNT;
+            // No list from before the Den addon can name a `/<config>/play` URL, so with tickets on that route is
+            // closed from the start; without them (no key) it is the only play route there is.
+            den_deps.legacy_play_until = den.keyring.as_ref().map(|_| std::time::UNIX_EPOCH);
+            den_deps
+        };
         let summary = startup_summary(&legacy, cache.persistent().unwrap_or(false));
         Scout {
             mount: new_handler(deps(&mount)),
             legacy: new_handler(deps(&legacy)),
-            den: new_handler(den_deps),
+            den: new_handler(den_deps(den.public_base.clone().unwrap_or_default())),
+            den_local: new_handler(den_deps(crate::playback::DEN_ADDON_BASE.to_string())),
             cache,
             summary,
         }
@@ -128,6 +137,15 @@ impl Scout {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         Self::bounded(&self.den, true, req).await
+    }
+
+    /// `serve_den` for Remux's in-process calls through the playback base (`den_local`).
+    pub async fn serve_den_local<B>(&self, req: Request<B>) -> Response<Body>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self::bounded(&self.den_local, true, req).await
     }
 
     /// Resolve and prepare direct managed HLS through the combined addon's Scout member. This has no HTTP

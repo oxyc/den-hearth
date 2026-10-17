@@ -146,9 +146,11 @@ async fn call_den_scout(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Res
             None => den_http::not_found(),
         };
     }
-    if matches!(resource, Some("stream" | "play" | "account" | "availability")) {
+    // `/p/<ticket>`: the play URL the stream list just named on this same base.
+    let ticket = req.uri().path().starts_with("/p/");
+    if ticket || matches!(resource, Some("stream" | "play" | "account" | "availability")) {
         return match &hearth.scout {
-            Some(scout) => scout.serve_den(req.map(Full::new)).await,
+            Some(scout) => scout.serve_den_local(req.map(Full::new)).await,
             None => den_http::not_found(),
         };
     }
@@ -238,6 +240,14 @@ mod tests {
     const RELEASE: &str = r#"{"streams":[{"name":"Torrentio\n1080p","title":"Film.1994.2160p.BluRay.REMUX.HEVC\n👤 50 💾 58 GB","infoHash":"0123456789abcdef0123456789abcdef01234567","fileIdx":0,"behaviorHints":{"filename":"Film.1994.2160p.BluRay.REMUX.HEVC.mkv"}}]}"#;
 
     fn hearth_with(admission: crate::admit::Limits, upstream: &str) -> Arc<Hearth> {
+        hearth_with_den(
+            admission,
+            upstream,
+            crate::den::Den::new(None, false, Default::default(), None, "none"),
+        )
+    }
+
+    fn hearth_with_den(admission: crate::admit::Limits, upstream: &str, den: crate::den::Den) -> Arc<Hearth> {
         let upstream = upstream.to_string();
         let settings = || {
             let mut s = den_scout::deps::settings_from_env(|name| match name {
@@ -252,7 +262,6 @@ mod tests {
             s.cache_dir = String::new();
             s
         };
-        let den = crate::den::Den::new(None, false, Default::default(), None, "none");
         Hearth::new(
             Some(den_reel::AppState::new(den_reel::Config::from_env())),
             Some(den_subtitles::AppState::new(den_subtitles::Config::from_env())),
@@ -391,6 +400,45 @@ mod tests {
             ]
         );
         assert_eq!(accepted.load(Relaxed), 0, "a request served in process reached Scout's port");
+    }
+
+    /// Remux lists a combined install through the playback base, then follows each release's play URL. Those URLs
+    /// must name that same base, so the ticket is served in process on scout's origin: on the addon's public base
+    /// (a LAN name in production) Remux's guard refused every release.
+    #[tokio::test]
+    async fn the_playback_base_lists_play_urls_it_serves_itself() {
+        const DEN_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let keyring = || den_seal::Keyring::from_env(DEN_PRIV, "").unwrap().unwrap();
+        let upstream = upstream_stub().await;
+        let den = crate::den::Den::new(
+            Some(keyring()),
+            false,
+            Default::default(),
+            Some("http://hearth.lan:8090/den".into()),
+            "env",
+        );
+        let hearth = hearth_with_den(crate::admit::Limits::default(), &upstream, den);
+        install(&hearth, &[]);
+
+        let member =
+            r#"{"scout":{"debrid":[{"service":"realdebrid","token":"t"}],"indexers":["torrentio"]}}"#;
+        let mut framed = vec![den_seal::SEALED_VERSION];
+        framed.extend(den_seal::seal(&keyring().keys[0].pub_key, member.as_bytes()).unwrap());
+        let segment = den_scout::util::b64url_encode(&framed);
+
+        let base = crate::playback::DEN_ADDON_BASE;
+        let (status, _, body) =
+            in_process(&hearth, &format!("{base}/{segment}/stream/movie/tt0111161.json"), Some(REMUX_KEY))
+                .await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let play = list["streams"][0]["url"].as_str().expect("a release with a play URL").to_string();
+        assert!(play.starts_with(&format!("{base}/p/")), "{play}");
+
+        let local = hearth.remux.as_ref().unwrap().local_scout.get().expect("installed");
+        let ticket =
+            local.get(&play, headers(Some(REMUX_KEY)), 1 << 20).expect("the ticket is served in process");
+        assert_ne!(ticket.await.unwrap().status(), StatusCode::NOT_FOUND, "the facade routes the ticket");
     }
 
     /// The in-process call is admitted like a request on the socket: with the bulk lane full it is refused in the
