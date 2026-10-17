@@ -56,8 +56,19 @@ async fn a_den_install_s_links_are_minted_under_its_base_and_bound_as_its() {
     let body: Value = meta(&den, &combined(0)).await.json().await.unwrap();
     let link = &body["meta"]["links"][0];
     let tag = bound_tag("cachedVid07", Binding::Den { iid: Some(IID), ep: 0 });
-    assert_eq!(link["trailers"], format!("http://node.test/den/play/cachedVid07.mp4?s={tag}&i={IID}&e=0"));
-    assert_eq!(link["sources"], format!("http://node.test/den/sources/cachedVid07.json?s={tag}&i={IID}&e=0"));
+    // Relative to what the client asked under hearth's `/den`, which resolves under that mount.
+    let asked =
+        reqwest::Url::parse(&format!("http://node.test/den/{}/meta/movie/tt0111161.json", combined(0)))
+            .unwrap();
+    let resolved = |field: &str| asked.join(link[field].as_str().unwrap()).unwrap().to_string();
+    assert_eq!(
+        resolved("trailers"),
+        format!("http://node.test/den/play/cachedVid07.mp4?s={tag}&i={IID}&e=0")
+    );
+    assert_eq!(
+        resolved("sources"),
+        format!("http://node.test/den/sources/cachedVid07.json?s={tag}&i={IID}&e=0")
+    );
     // The same install's tag as Reel's own would be another one: the scope is in what is signed.
     assert_ne!(tag, bound_tag("cachedVid07", Binding::Install { iid: Some(IID), ep: 0 }));
 }

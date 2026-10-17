@@ -617,16 +617,14 @@ fn signed_state(dir: PathBuf, revoked: &str, epoch: &str, require_iid: bool) -> 
     )
 }
 
-/// The play link `/meta` hands the install whose config is `json`, as a path and query.
+/// The play link `/meta` hands the install whose config is `json`, resolved against the URL that asked, as a
+/// path and query.
 async fn minted_link(base: &str, json: &str) -> String {
-    let body: Value = reqwest::get(format!("{base}/{}/meta/movie/tt0111161.json", plain_segment(json)))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let link = body["meta"]["links"][0]["trailers"].as_str().expect("a link").to_string();
-    link.strip_prefix(base).expect("a link on this host").to_string()
+    let asked = format!("{base}/{}/meta/movie/tt0111161.json", plain_segment(json));
+    let body: Value = reqwest::get(&asked).await.unwrap().json().await.unwrap();
+    let link = body["meta"]["links"][0]["trailers"].as_str().expect("a link");
+    let resolved = reqwest::Url::parse(&asked).unwrap().join(link).unwrap();
+    resolved.as_str().strip_prefix(base).expect("a link on this host").to_string()
 }
 
 /// Revoking an install used to leave every trailer link it had been handed playing until
@@ -1549,22 +1547,59 @@ async fn get_meta_rejects_non_imdb_with_no_upstream_call() {
     assert_eq!(fake.calls(), 0, "no upstream call for a non-imdb id");
 }
 
+/// `/meta` reaches public visitors through Den Edge's relay, so its links name no origin of Reel's own: not
+/// `PUBLIC_BASE_URL`, not the Host or forwarded host it was asked at. Each is relative to the request, and
+/// resolved against the relay's URL for it lands on a `/play` and a `/sources` that Reel serves and verifies.
 #[tokio::test]
-async fn get_meta_resolves_imdb_to_play_url_on_request_host() {
-    let fake = FakeUpstream::new(&["vidKey12345"], None);
-    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+async fn get_meta_links_are_relative_to_the_request_and_name_no_origin() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.public_base_url = Some("http://10.20.30.40:8092".into());
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["cachedVid07"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
     let base = spawn_server(state).await;
-    let body: Value = reqwest::Client::new()
-        .get(format!("{base}/meta/movie/tt0111161.json"))
-        .header("x-forwarded-host", "trailers.example.com")
-        .header("x-forwarded-proto", "https")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
+    let client = reqwest::Client::new();
+    let config = plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}","ep":0}}"#));
+    for path in ["/meta/movie/tt0111161.json".to_string(), format!("/{config}/meta/movie/tt0111161.json")] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("x-forwarded-host", "trailers.example.com")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        assert!(response.headers().get("vary").is_none(), "{path}: the body no longer depends on the host");
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("://"), "{path}: {text}");
+        for origin in ["10.20.30.40", ":8092", "trailers.example.com", "127.0.0.1"] {
+            assert!(!text.contains(origin), "{path} names {origin}: {text}");
+        }
+        let body: Value = serde_json::from_str(&text).unwrap();
+        let link = &body["meta"]["links"][0];
+
+        // What the client asked, through the relay that mounts Reel at `/reel`.
+        let asked = reqwest::Url::parse(&format!("https://edge.example/reel{path}")).unwrap();
+        for (field, route) in
+            [("trailers", "/reel/play/cachedVid07.mp4"), ("sources", "/reel/sources/cachedVid07.json")]
+        {
+            let resolved = asked.join(link[field].as_str().unwrap()).unwrap();
+            assert_eq!(resolved.origin(), asked.origin(), "{path}: {resolved}");
+            assert_eq!(resolved.path(), route, "{path}: {resolved}");
+        }
+
+        // Past the relay's prefix the trailer plays: its signature verifies where it resolved to.
+        let play = asked.join(link["trailers"].as_str().unwrap()).unwrap();
+        let reel_path = play.path().strip_prefix("/reel").unwrap();
+        let played = client.get(format!("{base}{reel_path}?{}", play.query().unwrap())).send().await.unwrap();
+        assert_eq!(played.status(), 200, "{path}: {play}");
+    }
 }
 
 #[tokio::test]
@@ -1661,7 +1696,7 @@ async fn sealed_config_url_resolves_manifest_and_meta() {
         .unwrap();
     assert!(cc(&meta).starts_with("private,"), "{}", cc(&meta));
     let body: Value = meta.json().await.unwrap();
-    assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
+    assert_eq!(body["meta"]["links"][0]["trailers"], "../../../play/vidKey12345.mp4");
 }
 
 #[tokio::test]
@@ -3126,22 +3161,33 @@ async fn a_failed_download_leaves_none_of_its_scratch_behind() {
     assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was removed");
 }
 
-/// /meta embeds play URLs built from the forwarded host and scheme, or from `Host` when nothing is
-/// forwarded, and goes out `public`. Without naming those inputs, a shared cache may hand one
-/// requester's body — pointing at an authority they chose — to everyone else. A body that embeds no
-/// host names none of them, or it splits every cache for nothing.
+/// A v1 prepare answer embeds a `sourcesBase` built from the forwarded host and scheme, or from `Host` when
+/// nothing is forwarded. Without naming those inputs, a cache may hand one requester's body — pointing at an
+/// authority they chose — to everyone else. A body that embeds no host (`/meta`, whose links are relative, and
+/// the manifest) names none of them, or it splits every cache for nothing.
 #[tokio::test]
 async fn only_a_body_built_from_the_host_varies_on_it() {
     let fake = FakeUpstream::new(&["vidKey12345"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
 
-    let meta = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
-    let vary = meta.headers().get("vary").map(|v| v.to_str().unwrap().to_ascii_lowercase());
-    let vary = vary.unwrap_or_default();
+    let prepare = reqwest::get(format!(
+        "{base}/prepare/movie/tt0111161.json?surface=audible&player=native&intent=warm"
+    ))
+    .await
+    .unwrap();
+    let vary: Vec<String> = prepare
+        .headers()
+        .get_all("vary")
+        .iter()
+        .flat_map(|v| v.to_str().unwrap().split(',').map(|n| n.trim().to_ascii_lowercase()))
+        .collect();
     for name in ["x-forwarded-host", "x-forwarded-proto", "host"] {
-        assert!(vary.split(',').any(|v| v.trim() == name), "/meta did not vary on {name}: {vary:?}");
+        assert!(vary.iter().any(|v| v == name), "/prepare did not vary on {name}: {vary:?}");
     }
+
+    let meta = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert!(meta.headers().get("vary").is_none(), "/meta names no host but varied on one");
 
     let manifest = reqwest::get(format!("{base}/manifest.json")).await.unwrap();
     assert!(manifest.headers().get("etag").is_some(), "the manifest lost its validator");

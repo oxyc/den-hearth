@@ -120,6 +120,19 @@ pub(crate) fn self_base(cfg_public: Option<&str>, headers: &HeaderMap, port: u16
     format!("{proto}://{host}")
 }
 
+/// Reel's root, relative to a discovery request (`/meta|prepare/<type>/<id>.json`, two segments below it, or
+/// `/<config>/…`, three). The links `/meta` and v2 `/prepare` answer are built on it, so they name no origin:
+/// those answers reach public visitors through Den Edge's relay, and the address Reel was reached at (its LAN
+/// address, or `PUBLIC_BASE_URL`) must not be in them. The client resolves a link against the URL it asked,
+/// which keeps it under whatever prefix Reel is mounted at (Edge's `/reel`, Hearth's `/reel` or `/den`).
+pub(crate) fn request_root(configured: bool) -> &'static str {
+    if configured {
+        "../../.."
+    } else {
+        "../.."
+    }
+}
+
 /// A hostname/authority we're willing to reflect into a returned URL: alnum + the punctuation a
 /// host+port uses. Rejects spaces, slashes, `@`, etc.
 fn is_sane_host(h: &str) -> bool {
@@ -513,12 +526,13 @@ pub async fn handle_meta(
         Some(c) => crate::sign::Binding::install(c.iid.as_deref(), c.ep, den.is_some()),
         None => crate::sign::Binding::Unbound,
     };
+    let base = request_root(cfg.is_some());
     // Only an imdb or a tmdb id reaches the upstreams (and our URLs) — reject anything else so a
     // crafted id can't be interpolated into a TMDB/KinoCheck request.
     if !prepared.valid {
         return httputil::json(
             StatusCode::OK,
-            &build_meta(ty, &prepared.id, &prepared.base, &[], state.cfg.play_secret.as_deref(), binding),
+            &build_meta(ty, &prepared.id, base, &[], state.cfg.play_secret.as_deref(), binding),
             &[("cache-control", "no-store")],
         );
     }
@@ -546,14 +560,8 @@ pub async fn handle_meta(
             }
         }
     }
-    let payload = build_meta(
-        ty,
-        &prepared.id,
-        &prepared.base,
-        &prepared.yt_ids,
-        state.cfg.play_secret.as_deref(),
-        binding,
-    );
+    let payload =
+        build_meta(ty, &prepared.id, base, &prepared.yt_ids, state.cfg.play_secret.as_deref(), binding);
     // A SUCCESSFUL resolution (a real trailer) is cacheable; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
@@ -587,12 +595,8 @@ pub async fn handle_meta(
     } else {
         "no-store".to_string()
     };
-    let mut extra = vec![("cache-control", cache_control.as_str())];
-    // The links are built from `self_base`, so the body depends on the host it was asked at. An empty
-    // answer names no URL at all.
-    if has_link {
-        extra.push(httputil::VARY_SELF_BASE);
-    }
+    // The links are relative (`request_root`), so the body does not depend on the host it was asked at.
+    let extra = [("cache-control", cache_control.as_str())];
     let mut resp = httputil::timed(httputil::json(StatusCode::OK, &payload, &extra), &prepared.timing);
     // Not for a demotion: that order is this server's best current knowledge, not a fallback.
     if let Some(reason) = prepared.degraded {
