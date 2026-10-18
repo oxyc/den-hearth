@@ -146,7 +146,7 @@ impl AddBudget {
         }
         let id = self
             .next_charge
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("the process admitted 2^64 provider adds");
         let charge = AddCharge { id };
         kept.push(SpentCharge { charge, at: now });

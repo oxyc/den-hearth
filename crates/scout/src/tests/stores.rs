@@ -742,7 +742,8 @@ async fn account_listing_unique_cancellation_flood_is_bounded_and_recovers() {
     // cancel them as a client disconnect would. None may insert a key or park a detached task.
     let started = Arc::new(AtomicUsize::new(0));
     let mut flood = Vec::new();
-    for store in stores.iter().skip(LIMIT).cloned() {
+    for store in stores.iter().skip(LIMIT) {
+        let store = Arc::clone(store);
         let (owner, started) = (runtime.clone(), started.clone());
         flood.push(tokio::spawn(crate::runtime::scope(owner, async move {
             started.fetch_add(1, Ordering::SeqCst);

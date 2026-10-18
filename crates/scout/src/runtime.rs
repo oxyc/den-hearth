@@ -83,7 +83,7 @@ impl ScoutRuntime {
     ) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_RUNTIME_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("ScoutRuntime id space exhausted"),
             add_budget: Mutex::new(Arc::new(AddBudget::new(ADD_BUDGET_WINDOW, ADD_BUDGET_LIMIT))),
             metrics: Arc::new(new_metric_set()),

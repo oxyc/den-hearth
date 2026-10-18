@@ -1654,14 +1654,18 @@ mod tests {
         let mut cmd = tokio::process::Command::new(&script);
         cmd.arg(&pid_file);
         let task = tokio::spawn(async move { grouped_probe(cmd, None, Duration::from_secs(30)).await });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !pid_file.exists() {
+        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap();
-        let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        .expect("the startup probe did not report its descendant pid");
         task.abort();
         let _ = task.await;
         tokio::time::timeout(Duration::from_secs(2), async {
