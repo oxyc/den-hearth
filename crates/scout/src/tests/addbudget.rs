@@ -3584,21 +3584,22 @@ async fn add_budget_tor_box_refunds_only_what_the_answer_denies() {
 /// rediscover a queued torrent — for fifteen seconds, on /play as well as the probe route.
 #[tokio::test]
 async fn tor_box_a_timed_out_listing_is_not_a_miss() {
+    const TOKEN: &str = "timed-out-listing-account";
     let cache = new_cache();
     let failing =
-        tb("tok", doer(|_| Err(io::Error::other("deadline has elapsed").into())), Some(cache.clone()));
+        tb(TOKEN, doer(|_| Err(io::Error::other("deadline has elapsed").into())), Some(cache.clone()));
     assert!(
         !failing.provider_status(&tgt(H)).await.is_downloading(),
         "a timed-out listing cannot report a status"
     );
     assert!(
-        cache.get(&torrent_miss_key("tok", H)).is_none(),
+        cache.get(&torrent_miss_key(TOKEN, H)).is_none(),
         "a timeout was remembered as the account not holding the torrent"
     );
 
     // The list recovers, and the very next poll must be allowed to ask again.
     let healthy = tb(
-        "tok",
+        TOKEN,
         doer(|req| {
             if req.url().query().unwrap_or("").contains("id=") {
                 return Ok(resp(200, r#"{"data":{"progress":0.5,"download_finished":false}}"#));
@@ -3614,10 +3615,10 @@ async fn tor_box_a_timed_out_listing_is_not_a_miss() {
 
     // An authoritative miss — the list was read and the hash is not in it — IS still remembered.
     let other = new_cache();
-    let absent = tb("tok", doer(|_| Ok(resp(200, r#"{"data":[]}"#))), Some(other.clone()));
+    let absent = tb(TOKEN, doer(|_| Ok(resp(200, r#"{"data":[]}"#))), Some(other.clone()));
     let _ = absent.provider_status(&tgt(H)).await;
     assert!(
-        other.get(&torrent_miss_key("tok", H)).is_some(),
+        other.get(&torrent_miss_key(TOKEN, H)).is_some(),
         "an answered miss must still be remembered, or every poll re-fetches the whole list"
     );
 }
