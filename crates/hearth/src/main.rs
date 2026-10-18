@@ -26,6 +26,7 @@ mod route;
 mod scout;
 mod services;
 mod sock;
+mod wanted;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -73,6 +74,8 @@ struct Hearth {
     playback: playback::Playback,
     /// Legacy config exchange. Off until the matching Edge client and keyrings are deployed.
     legacy_migration: bool,
+    /// The downloads each install asked Hearth to keep looking for (`/den/<config>/wanted`).
+    wanted: wanted::Wanted,
 }
 
 /// Every bound the node enforces; `Default` is production, tests shrink it.
@@ -87,6 +90,8 @@ struct Options {
     metrics_token: Option<String>,
     managed_playback: bool,
     legacy_migration: bool,
+    /// Where the wanted lists are kept across a restart; None keeps them in RAM only.
+    wanted_file: Option<std::path::PathBuf>,
 }
 
 impl Hearth {
@@ -110,6 +115,7 @@ impl Hearth {
             metrics_token: options.metrics_token,
             playback: playback::Playback::new(options.managed_playback),
             legacy_migration: options.legacy_migration,
+            wanted: wanted::Wanted::new(Box::new(wanted::InProcess), options.wanted_file),
         })
     }
 }
@@ -261,6 +267,7 @@ where
             None => bad_path(),
         },
         den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
+        den::Route::Wanted(config) => wanted::handle(hearth, &config, req).await,
         den::Route::Guest => guest::handle(hearth, req).await,
         den::Route::Migrate if hearth.legacy_migration => migrate_legacy(hearth, req).await,
         den::Route::Migrate => den_http::not_found(),
@@ -618,6 +625,7 @@ struct Configs {
     metrics_token: Option<String>,
     managed_playback: bool,
     legacy_migration: bool,
+    wanted_file: Option<std::path::PathBuf>,
     services: services::Services,
 }
 
@@ -679,10 +687,15 @@ async fn run(c: Configs) -> std::io::Result<()> {
             metrics_token: c.metrics_token,
             managed_playback: c.managed_playback,
             legacy_migration: c.legacy_migration,
+            wanted_file: c.wanted_file,
         },
     );
     if let Some(scout) = &hearth.scout {
         scout.start_sweep();
+    }
+    let looks_for_downloads = c.services.den() && hearth.scout.is_some();
+    if looks_for_downloads {
+        wanted::start(hearth.clone());
     }
     let in_process = inproc::install(&hearth, &c.scout_bases);
     let (stop, shutdown) = watch::channel(false);
@@ -728,6 +741,9 @@ async fn run(c: Configs) -> std::io::Result<()> {
     if c.services.den() {
         eprintln!("{}", hearth.den.summary());
     }
+    if looks_for_downloads {
+        eprintln!("{}", hearth.wanted.summary());
+    }
     eprintln!("managed playback: {}", hearth.playback.summary());
     eprintln!("legacy install migration: {}", if hearth.legacy_migration { "enabled" } else { "disabled" });
     eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
@@ -772,6 +788,8 @@ async fn run(c: Configs) -> std::io::Result<()> {
     if let Some(remux) = &hearth.remux {
         den_remux::finish(remux).await;
     }
+    // What the last searches learned, which is otherwise written at most every 15 minutes.
+    hearth.wanted.flush(wanted::now_ms(), true);
     if drained {
         eprintln!("shut down cleanly");
     }
@@ -883,6 +901,13 @@ fn main() {
         scout_own.as_ref().map_or("", |settings| settings.config_key.as_str()),
         scout_own.as_ref().map_or("", |settings| settings.config_keys_prev.as_str()),
     );
+    // Beside Scout's disk cache, and only while sealing is on, when a config can only be a sealed one: a plaintext
+    // config segment on disk would be a debrid token.
+    let wanted_file = scout_own
+        .as_ref()
+        .map(|settings| settings.cache_dir.clone())
+        .filter(|dir| !dir.is_empty() && den.scout.keyring.is_some())
+        .map(|dir| std::path::Path::new(&dir).join("hearth-wanted.json"));
 
     let metrics_token = std::env::var("HEARTH_METRICS_TOKEN")
         .or_else(|_| std::env::var("METRICS_TOKEN"))
@@ -914,6 +939,7 @@ fn main() {
         metrics_token,
         managed_playback,
         legacy_migration,
+        wanted_file,
         services,
     };
     if let Err(e) = rt.block_on(run(configs)) {
@@ -927,6 +953,7 @@ mod tests {
     use super::*;
 
     mod den_addon;
+    mod wanted_downloads;
 
     fn hearth_with(limits: Limits, token: Option<&str>) -> Arc<Hearth> {
         hearth_den(limits, token, den::Den::new(None, false, Default::default(), None, "none"))
