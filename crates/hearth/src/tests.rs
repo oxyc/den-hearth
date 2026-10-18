@@ -619,8 +619,26 @@ async fn each_prefix_reaches_its_own_service() {
 }
 
 #[tokio::test]
+async fn the_updater_manifest_probe_proves_the_combined_hearth_release() {
+    let root = send(&hearth(), "/manifest.json").await;
+    assert_eq!(root.status(), StatusCode::OK);
+    assert_eq!(root.headers()["content-type"], "application/json");
+    let root = json_of(root).await;
+    assert_eq!(root["id"], "com.den.hearth");
+    assert_eq!(root["version"], env!("CARGO_PKG_VERSION"));
+
+    let mounted = json_of(send(&hearth(), "/den/manifest.json").await).await;
+    assert_eq!(root, mounted, "the updater alias must be the sole combined manifest");
+
+    assert_eq!(send(&hearth(), "/configure").await.status(), StatusCode::NOT_FOUND);
+    for path in ["/scout/manifest.json", "/reel/manifest.json", "/subs/manifest.json"] {
+        assert_eq!(send(&hearth(), path).await.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn an_unrouted_path_is_hearths_404_not_a_services() {
-    let (status, body) = get("/manifest.json").await;
+    let (status, body) = get("/not-a-route").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"], "not_found");
 }

@@ -34,9 +34,13 @@ for service in "den-scout $version" "den-reel $version" "den-subtitles $version"
     esac
 done
 
-# The sole install manifest reports the release; every service still answers its operational health boundary.
-got=$(curl -fsS http://127.0.0.1:18090/den/manifest.json | jq -r .version)
-[ "$got" = "$version" ] || { echo "::error::/den/manifest.json version is '$got', expected $version"; exit 1; }
+# The sole install manifest reports the release at its canonical path and at den-update's root compatibility
+# probe. The two paths must be the same combined Hearth addon, not standalone service manifests.
+manifest=$(curl -fsS http://127.0.0.1:18090/den/manifest.json)
+root_manifest=$(curl -fsS http://127.0.0.1:18090/manifest.json)
+[ "$root_manifest" = "$manifest" ] || { echo "::error::root and /den manifests differ"; exit 1; }
+got=$(jq -r .version <<<"$root_manifest")
+[ "$got" = "$version" ] || { echo "::error::/manifest.json version is '$got', expected $version"; exit 1; }
 for path in scout reel subs; do
     curl -fsS "http://127.0.0.1:18090/$path/health" | jq -e '.status' >/dev/null
 done
