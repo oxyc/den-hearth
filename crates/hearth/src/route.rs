@@ -50,6 +50,12 @@ pub fn target(path: &str) -> Target {
     if matches!(path, "/health" | "/den/health") {
         return Target::Health;
     }
+    // den-update's generic addon proof reads the main listener's `/manifest.json` after `/health`.
+    // Keep that compatibility alias pointed at the sole, combined Hearth manifest; it does not restore any
+    // standalone service manifest or configure page.
+    if path == "/manifest.json" {
+        return Target::Den(Route::Manifest);
+    }
     if path == "/metrics" {
         return Target::Metrics;
     }
@@ -366,6 +372,12 @@ mod tests {
     fn health_is_hearths_own() {
         assert_eq!(target("/health"), Target::Health);
         assert_eq!(target("/den/health"), Target::Health);
+    }
+
+    #[test]
+    fn the_root_manifest_is_only_an_alias_for_the_combined_addon() {
+        assert_eq!(target("/manifest.json"), Target::Den(Route::Manifest));
+        assert_eq!(target("/configure"), Target::NotFound);
     }
 
     #[test]
