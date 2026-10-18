@@ -19,6 +19,9 @@ den-scout = { path = "../scout" }
 den-http = { path = "../http" }
 # The combined Den addon's keys, revocation and config (`den.rs`).
 den-seal = { path = "../seal" }
+# The download rules both clients run (`download_retry`, `rank_releases`), for the searches Hearth makes for them
+# (`wanted.rs`). Pinned like den-atlas pins it; a ranking change reaches Hearth with a bump of this rev.
+den-sync = { git = "https://github.com/oxyc/den-core.git", rev = "8d975ffc259853f3d3115f6a186aea63f06c97dd" }
 # The services were written for a current_thread runtime; one process serving all of them has more to
 # do, so hearth runs a small multi-thread pool instead (HEARTH_WORKER_THREADS).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
@@ -43,3 +46,5 @@ tikv-jemalloc-ctl = "0.7"
 blake2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tokio = { version = "1", features = ["test-util", "io-util"] }
+# The wanted lists' file, in a directory of its own (`wanted.rs`).
+tempfile = "3"

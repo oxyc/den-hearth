@@ -26,6 +26,7 @@ mod route;
 mod scout;
 mod services;
 mod sock;
+mod wanted;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -73,6 +74,8 @@ struct Hearth {
     playback: playback::Playback,
     /// Legacy config exchange. Off until the matching Edge client and keyrings are deployed.
     legacy_migration: bool,
+    /// The downloads each install asked Hearth to keep looking for (`/den/<config>/wanted`).
+    wanted: wanted::Wanted,
 }
 
 /// Every bound the node enforces; `Default` is production, tests shrink it.
@@ -87,6 +90,8 @@ struct Options {
     metrics_token: Option<String>,
     managed_playback: bool,
     legacy_migration: bool,
+    /// Where the wanted lists are kept across a restart; None keeps them in RAM only.
+    wanted_file: Option<std::path::PathBuf>,
 }
 
 impl Hearth {
@@ -110,6 +115,7 @@ impl Hearth {
             metrics_token: options.metrics_token,
             playback: playback::Playback::new(options.managed_playback),
             legacy_migration: options.legacy_migration,
+            wanted: wanted::Wanted::new(Box::new(wanted::InProcess), options.wanted_file),
         })
     }
 }
@@ -261,6 +267,7 @@ where
             None => bad_path(),
         },
         den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
+        den::Route::Wanted(config) => wanted::handle(hearth, &config, req).await,
         den::Route::Guest => guest::handle(hearth, req).await,
         den::Route::Migrate if hearth.legacy_migration => migrate_legacy(hearth, req).await,
         den::Route::Migrate => den_http::not_found(),
@@ -618,7 +625,39 @@ struct Configs {
     metrics_token: Option<String>,
     managed_playback: bool,
     legacy_migration: bool,
+    wanted_file: Option<std::path::PathBuf>,
     services: services::Services,
+}
+
+/// The handed-over sockets, each as the listener on its port. One on a port this node does not serve is an error:
+/// left unserved, it would accept connections that nothing ever answers.
+fn adopt_inherited(
+    inherited: Vec<std::net::TcpListener>,
+    main: u16,
+    own: &[(Service, u16)],
+) -> std::io::Result<Vec<(Option<Service>, TcpListener)>> {
+    inherited
+        .into_iter()
+        .map(|socket| {
+            let at = socket.local_addr()?;
+            let Some(service) = listener_for(at.port(), main, own) else {
+                return Err(std::io::Error::other(format!(
+                    "an inherited socket on {at} is none of this node's ports"
+                )));
+            };
+            eprintln!("serving on an inherited socket, {at}");
+            Ok((service, TcpListener::from_std(socket)?))
+        })
+        .collect()
+}
+
+/// Which listener a socket on `port` stands for: `Some(None)` the main one, `Some(Some(service))` that service's
+/// own, `None` neither.
+fn listener_for(port: u16, main: u16, own: &[(Service, u16)]) -> Option<Option<Service>> {
+    if port == main {
+        return Some(None);
+    }
+    own.iter().find(|(_, p)| *p == port).map(|(service, _)| Some(*service))
 }
 
 async fn bind(port: u16) -> std::io::Result<TcpListener> {
@@ -648,10 +687,15 @@ async fn run(c: Configs) -> std::io::Result<()> {
             metrics_token: c.metrics_token,
             managed_playback: c.managed_playback,
             legacy_migration: c.legacy_migration,
+            wanted_file: c.wanted_file,
         },
     );
     if let Some(scout) = &hearth.scout {
         scout.start_sweep();
+    }
+    let looks_for_downloads = c.services.den() && hearth.scout.is_some();
+    if looks_for_downloads {
+        wanted::start(hearth.clone());
     }
     let in_process = inproc::install(&hearth, &c.scout_bases);
     let (stop, shutdown) = watch::channel(false);
@@ -660,10 +704,14 @@ async fn run(c: Configs) -> std::io::Result<()> {
         signal.await;
         let _ = stop.send(true);
     });
+    // Every port is bound here: it is the address containers on the same network reach this one by. A socket the
+    // supervisor handed over is served as well, as the listener with its port, and is the one that stays open while
+    // this process is replaced.
     let mut listeners = vec![(None, bind(port).await?)];
     for (service, own_port) in &c.own {
         listeners.push((Some(*service), bind(*own_port).await?));
     }
+    listeners.extend(adopt_inherited(sock::inherited_listeners()?, port, &c.own)?);
     let own_listeners = if c.own.is_empty() {
         "none".to_string()
     } else {
@@ -692,6 +740,9 @@ async fn run(c: Configs) -> std::io::Result<()> {
     }
     if c.services.den() {
         eprintln!("{}", hearth.den.summary());
+    }
+    if looks_for_downloads {
+        eprintln!("{}", hearth.wanted.summary());
     }
     eprintln!("managed playback: {}", hearth.playback.summary());
     eprintln!("legacy install migration: {}", if hearth.legacy_migration { "enabled" } else { "disabled" });
@@ -737,6 +788,8 @@ async fn run(c: Configs) -> std::io::Result<()> {
     if let Some(remux) = &hearth.remux {
         den_remux::finish(remux).await;
     }
+    // What the last searches learned, which is otherwise written at most every 15 minutes.
+    hearth.wanted.flush(wanted::now_ms(), true);
     if drained {
         eprintln!("shut down cleanly");
     }
@@ -848,6 +901,13 @@ fn main() {
         scout_own.as_ref().map_or("", |settings| settings.config_key.as_str()),
         scout_own.as_ref().map_or("", |settings| settings.config_keys_prev.as_str()),
     );
+    // Beside Scout's disk cache, and only while sealing is on, when a config can only be a sealed one: a plaintext
+    // config segment on disk would be a debrid token.
+    let wanted_file = scout_own
+        .as_ref()
+        .map(|settings| settings.cache_dir.clone())
+        .filter(|dir| !dir.is_empty() && den.scout.keyring.is_some())
+        .map(|dir| std::path::Path::new(&dir).join("hearth-wanted.json"));
 
     let metrics_token = std::env::var("HEARTH_METRICS_TOKEN")
         .or_else(|_| std::env::var("METRICS_TOKEN"))
@@ -879,6 +939,7 @@ fn main() {
         metrics_token,
         managed_playback,
         legacy_migration,
+        wanted_file,
         services,
     };
     if let Err(e) = rt.block_on(run(configs)) {
@@ -892,6 +953,7 @@ mod tests {
     use super::*;
 
     mod den_addon;
+    mod wanted_downloads;
 
     fn hearth_with(limits: Limits, token: Option<&str>) -> Arc<Hearth> {
         hearth_den(limits, token, den::Den::new(None, false, Default::default(), None, "none"))
@@ -1242,6 +1304,44 @@ mod tests {
         let (stop, stopped) = watch::channel(false);
         let server = tokio::spawn(serve_until(listener, None, hearth(), stopped, grace));
         (addr, stop, server)
+    }
+
+    /// A handed-over socket is served as the listener with its port; one on a port the node does not serve is
+    /// refused rather than left accepting connections nothing answers.
+    #[test]
+    fn an_inherited_socket_stands_for_the_listener_on_its_port() {
+        let own = [(Service::Scout, 8080), (Service::Reel, 8092), (Service::Remux, 8095)];
+        assert_eq!(listener_for(8090, 8090, &own), Some(None));
+        assert_eq!(listener_for(8080, 8090, &own), Some(Some(Service::Scout)));
+        assert_eq!(listener_for(8095, 8090, &own), Some(Some(Service::Remux)));
+        assert_eq!(listener_for(8094, 8090, &own), None);
+    }
+
+    /// The point of the handed-over socket: a connection made while no process is serving (a restart) waits in
+    /// the kernel queue, and the next process adopts the socket as that service's listener and answers it.
+    #[tokio::test]
+    async fn a_connection_queued_on_an_inherited_socket_is_answered_by_the_next_process() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let supervisor = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = supervisor.local_addr().unwrap();
+        let mut early = tokio::net::TcpStream::connect(addr).await.unwrap();
+        early.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        supervisor.set_nonblocking(true).unwrap();
+        let stray = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(adopt_inherited(vec![stray], 1, &[]).is_err(), "a socket on a port nobody serves");
+        let mut adopted = adopt_inherited(vec![supervisor], 1, &[(Service::Scout, addr.port())]).unwrap();
+        let (own, listener) = adopted.pop().unwrap();
+        assert_eq!(own, Some(Service::Scout));
+        let (stop, stopped) = watch::channel(false);
+        let server = tokio::spawn(serve_until(listener, own, hearth(), stopped, Duration::from_secs(1)));
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(5), early.read_to_string(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        stop.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), server).await.unwrap().unwrap());
     }
 
     #[tokio::test]

@@ -56,6 +56,7 @@ use crate::probe_fanout::{
 use crate::rank::{
     cap_seeds, rank_streams_debug, real_debrid_blocked, title_tokens, RankDebug, RankFilters, RawStream,
 };
+use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;
 use crate::scrape::{scrape_covered, Doer, ScrapeQuery, Scraper};
 use crate::stores::pool::{has_cache_truth, status_detail_among, StorePool};
@@ -408,7 +409,9 @@ pub(crate) fn json_response(status: StatusCode, body: &(impl Serialize + ?Sized)
 
 /// The refusal every route writes: `{"error": <code>}`, never stored.
 pub(crate) fn error(status: StatusCode, code: &str) -> Resp {
-    json_response(status, &json!({ "error": code }))
+    let mut resp = json_response(status, &json!({ "error": code }));
+    resp.extensions_mut().insert(ReleaseAnswer::new(code, ""));
+    resp
 }
 
 /// A refusal of the method, naming the ones the route takes.
@@ -1235,6 +1238,12 @@ impl Inner {
         let mut candidates: Vec<&RawStream> = list.ranked.iter().collect();
         if let Some(filename) = request.filename.as_deref().filter(|name| !name.is_empty()) {
             candidates.retain(|candidate| candidate.title == filename);
+        }
+        if let Some(client) = request.playable.as_ref().filter(|_| request.receiver) {
+            candidates.retain(|candidate| {
+                client.cost((*candidate).clone(), stream_attributes((*candidate).clone()))
+                    < crate::client::VIDEO_CONVERTED_COST
+            });
         }
         if candidates.is_empty() {
             return Err(if list.degraded.is_empty() {
@@ -2464,8 +2473,6 @@ impl Inner {
         phases: &mut String,
     ) -> Resp {
         let start = Instant::now();
-        let pool = StorePool { stores: (self.deps.make_stores)(config) };
-        let resolve_deadline = Self::deadline_in(RESOLVE_BUDGET);
         let rid = rid(req);
         let rt = ResolveTarget {
             info_hash: target.info_hash.clone(),
@@ -2479,6 +2486,26 @@ impl Inner {
             prefetch: query_is(req, "prefetch", "1"),
             ..Default::default()
         };
+        let resp = self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases).await;
+        let route = if query_is(req, "probe", "1") { "probe" } else { "play" };
+        crate::releaselog::observe(&rt, &rid, route, start.elapsed(), &resp);
+        resp
+    }
+
+    /// `resolve_play`'s answer for `rt`, before it is logged as the release's state.
+    #[allow(clippy::too_many_arguments)]
+    async fn answer_play(
+        self: &Arc<Self>,
+        req: &Request<Bytes>,
+        config: &Config,
+        target: &PlayTarget,
+        rt: ResolveTarget,
+        rid: String,
+        start: Instant,
+        phases: &mut String,
+    ) -> Resp {
+        let pool = StorePool { stores: (self.deps.make_stores)(config) };
+        let resolve_deadline = Self::deadline_in(RESOLVE_BUDGET);
         let status_budget = self.status_budget();
 
         // ?probe=1 — answer, don't act. Asking /play for an uncached release is what QUEUES it, so a client
@@ -3620,7 +3647,10 @@ pub(crate) fn write_queued(rt: &ResolveTarget, rid: &str, dur: Duration, status:
         "downloading",
         &play_decision("play", "fallback", &reason, status.service.map_or("", |s| s.as_str()), dur, rid, rt),
     );
-    write_queued_body(status)
+    let mut resp = write_queued_body(status);
+    resp.extensions_mut()
+        .insert(ReleaseAnswer::new(queued_state(status), status.service.map_or("", |s| s.as_str())));
+    resp
 }
 
 fn optional_count(n: Option<i64>) -> String {
@@ -3686,6 +3716,10 @@ fn wait_secs(wait: Duration) -> u64 {
 fn write_unavailable(wait: Duration, body: &serde_json::Value) -> Resp {
     let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, body);
     resp.headers_mut().insert(RETRY_AFTER, HeaderValue::from(wait_secs(wait)));
+    resp.extensions_mut().insert(ReleaseAnswer::new(
+        body["error"].as_str().unwrap_or("unavailable"),
+        body["service"].as_str().unwrap_or(""),
+    ));
     resp
 }
 

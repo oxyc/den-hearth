@@ -51,6 +51,8 @@ pub enum Route {
     Installed(String),
     /// `/den/<config>/playback`, with the config segment. Hearth chooses the delivery path.
     Playback(String),
+    /// `/den/<config>/wanted`, with the config segment: the downloads Hearth keeps looking for (`wanted`).
+    Wanted(String),
     /// A path as Scout, Subtitles or Reel routes it.
     Scout(String),
     Subs(String),
@@ -85,6 +87,7 @@ pub fn route(path: &str) -> Route {
         ("", _) => Route::NotFound,
         (config, Some("manifest.json")) if third.is_none() => Route::Installed(config.to_string()),
         (config, Some("playback")) if third.is_none() => Route::Playback(config.to_string()),
+        (config, Some("wanted")) if third.is_none() => Route::Wanted(config.to_string()),
         (_, Some("stream" | "play" | "account" | "availability")) => Route::Scout(path.to_string()),
         (_, Some("subtitles" | "subtitle" | "translate")) => Route::Subs(path.to_string()),
         (_, Some("meta" | "prepare")) => Route::Reel(path.to_string()),
@@ -275,6 +278,7 @@ impl Den {
             Route::Migrate
             | Route::Guest
             | Route::Playback(_)
+            | Route::Wanted(_)
             | Route::Scout(_)
             | Route::Subs(_)
             | Route::Reel(_)
@@ -521,6 +525,8 @@ mod tests {
         assert_eq!(route("/config-key"), Route::ConfigKey);
         assert_eq!(route("/CFG/manifest.json"), Route::Installed("CFG".into()));
         assert_eq!(route("/CFG/playback"), Route::Playback("CFG".into()));
+        assert_eq!(route("/CFG/wanted"), Route::Wanted("CFG".into()));
+        assert_eq!(route("/CFG/wanted/more"), Route::NotFound);
     }
 
     #[test]
