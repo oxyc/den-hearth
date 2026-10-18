@@ -388,8 +388,8 @@ def build_cases(base="http://hearth:8090", manifests="/tmp/manifests.paths", sco
             {"args": ["--base", base, "--path", "/health", "--concurrency", "4", "--label", "control-health-8090", "--check-retry-after", "--duration", ov]},
             {"args": ["--base", legacy(8095), "--path", "/remux/health", "--concurrency", "2", "--label", "control-remux-health-8095", "--duration", ov]},
             {"args": ["--base", legacy(8080), "--path", "/health", "--concurrency", "2", "--label", "control-scout-health-8080", "--duration", ov]},
-            {"args": ["--base", legacy(8092), "--path", "/manifest.json", "--concurrency", "2", "--label", "control-reel-manifest-8092", "--duration", ov]},
-            {"args": ["--base", legacy(8093), "--path", "/manifest.json", "--concurrency", "2", "--label", "control-subs-manifest-8093", "--duration", ov]},
+            {"args": ["--base", legacy(8092), "--path", "/health", "--concurrency", "2", "--label", "control-reel-health-8092", "--duration", ov]},
+            {"args": ["--base", legacy(8093), "--path", "/health", "--concurrency", "2", "--label", "control-subs-health-8093", "--duration", ov]},
         ],
     })
     # More PERSISTENT clients than the node's 256 connections, all busy so none idles out. Before the probation
@@ -493,12 +493,12 @@ def main():
                         check=False)
         if egress.returncode:
             raise RuntimeError("the benchmark network can reach the internet; refusing to run")
-        (out / "manifests.paths").write_text(f"/reel/manifest.json\n/subs/manifest.json\n/subs/{SUBS_CFG}/manifest.json\n")
+        (out / "manifests.paths").write_text("/den/manifest.json\n/reel/health\n/subs/health\n")
         run.exec(DRIVER, "sh", "-c", "true")
         engine("cp", str(out / "manifests.paths"), f"{DRIVER}:/tmp/manifests.paths")
         # Warm everything lazy (stub reachability, upstream clients, first ffmpeg start) before the baseline.
         for path in ("/reel/meta/movie/tt0000001.json?prewarm=0", f"/subs/{SUBS_CFG}/subtitles/movie/tt0000001.json",
-                     f"/subs/{SUBS_CFG}/subtitle/101.srt", "/remux/speed?bytes=65536", "/reel/manifest.json"):
+                     f"/subs/{SUBS_CFG}/subtitle/101.srt", "/remux/speed?bytes=65536", "/den/manifest.json"):
             run.load("load.py", ["--base", "http://hearth:8090", "--path", path, "--requests", "3", "--concurrency", "1", "--duration", "30"], 60)
         run.load("remux_flow.py", ["--base", "http://hearth:8090", "--scout", "http://stub:9090", "--sessions", "1", "--duration", "3", "--concurrency", "1"], 120)
         time.sleep(2)

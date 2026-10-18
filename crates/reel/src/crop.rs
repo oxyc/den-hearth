@@ -306,15 +306,15 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
-    // Backstop timeout: on elapse the output future (owning the child) is dropped → kill_on_drop.
-    // In its own process group and registered live, so a SIGTERM kills it too. Without that it was
-    // orphaned on shutdown — and this timeout lives in den-reel's timer, so an orphan has none.
-    let out = tokio::time::timeout(
+    // The grouped runner owns the deadline and bounded pipe drains, so cancellation, timeout, and
+    // noisy output all reap ffmpeg and anything it forked.
+    let out = crate::ytdlp::output_in_group(
+        &mut cmd,
         Duration::from_secs(DETECT_TIMEOUT_SECS),
-        crate::ytdlp::output_in_group(&mut cmd),
+        crate::ytdlp::TOOL_OUTPUT_MAX_BYTES,
+        crate::ytdlp::TOOL_OUTPUT_MAX_BYTES,
     )
     .await
-    .ok()?
     .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     let boxes = parse_all_crops(&stderr);
@@ -485,14 +485,16 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
     // output(), not status(): a piped stderr nobody reads can wedge the child on a full pipe.
     // Grouped and registered for the same reason as detect: a bake orphaned by a redeploy keeps
     // rewriting the trailer with no timeout behind it.
-    match tokio::time::timeout(
+    match crate::ytdlp::output_in_group(
+        &mut cmd,
         Duration::from_secs(BAKE_TIMEOUT_SECS),
-        crate::ytdlp::output_in_group(&mut cmd),
+        crate::ytdlp::TOOL_OUTPUT_MAX_BYTES,
+        crate::ytdlp::TOOL_OUTPUT_MAX_BYTES,
     )
     .await
     {
-        Ok(Ok(o)) if o.status.success() => bake_outcome(BakeRun::Ok),
-        Ok(Ok(o)) => {
+        Ok(o) if o.status.success() => bake_outcome(BakeRun::Ok),
+        Ok(o) => {
             let touched = file_stamp(fp).await != before;
             eprintln!(
                 "bake_clap {}: exit {:?}{} — {}",
@@ -503,11 +505,11 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
             );
             bake_outcome(BakeRun::Refused { touched })
         }
-        Ok(Err(e)) => {
+        Err(crate::ytdlp::BoundedOutputError::Io(e)) => {
             eprintln!("bake_clap {}: could not start MP4Box — {e}", fp.display());
             bake_outcome(BakeRun::NeverStarted)
         }
-        Err(_) => {
+        Err(e) => {
             // Ask the file here too. The timeout covers MP4Box's read/parse phase as well as the
             // rewrite, so a bake killed while still reading a large trailer never touched the
             // target — condemning it on the exit alone is exactly the premise this stopped using.
@@ -515,7 +517,7 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
             tokio::time::sleep(KILL_SETTLE).await;
             let touched = file_stamp(fp).await != before;
             eprintln!(
-                "bake_clap {}: exceeded {BAKE_TIMEOUT_SECS}s and was killed{}",
+                "bake_clap {}: {e} and was killed{}",
                 fp.display(),
                 if touched { " mid-rewrite" } else { " before it wrote anything" }
             );

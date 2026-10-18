@@ -4,7 +4,7 @@
 #   scripts/probe-image.sh ghcr.io/oxyc/den-hearth@sha256:<digest> 0.1.0
 #
 # Unconfigured, den-hearth still starts and answers /health. The startup line must name the expected release for
-# all four services, each service's manifest or health must answer through its prefix on :8090 AND on the port its
+# all four services, the combined manifest and each service's health must answer through :8090 and on the port its
 # old container used (Scout 8080, Reel 8092, Subtitles 8093, Remux 8095), and Remux must not report a broken
 # ffmpeg, scratch directory or transcode. On a host with a GPU it also runs a real rate-controlled VAAPI encode.
 set -euo pipefail
@@ -34,18 +34,16 @@ for service in "den-scout $version" "den-reel $version" "den-subtitles $version"
     esac
 done
 
-# Each service answers through its own prefix and reports the release the image carries.
+# The sole install manifest reports the release; every service still answers its operational health boundary.
+got=$(curl -fsS http://127.0.0.1:18090/den/manifest.json | jq -r .version)
+[ "$got" = "$version" ] || { echo "::error::/den/manifest.json version is '$got', expected $version"; exit 1; }
 for path in scout reel subs; do
-    got=$(curl -fsS "http://127.0.0.1:18090/$path/manifest.json" | jq -r .version)
-    [ "$got" = "$version" ] || { echo "::error::/$path/manifest.json version is '$got', expected $version"; exit 1; }
     curl -fsS "http://127.0.0.1:18090/$path/health" | jq -e '.status' >/dev/null
 done
 curl -fsS http://127.0.0.1:18090/remux/health | jq -e '.status' >/dev/null
 
-# The same services on their old ports, at the root, the way installed links and relays reach them.
+# The same health probes on their old transport ports.
 for port in 18080 18092 18093; do
-    got=$(curl -fsS "http://127.0.0.1:$port/manifest.json" | jq -r .version)
-    [ "$got" = "$version" ] || { echo "::error::port $port /manifest.json version is '$got', expected $version"; exit 1; }
     curl -fsS "http://127.0.0.1:$port/health" | jq -e '.status' >/dev/null
 done
 curl -fsS http://127.0.0.1:18095/remux/health | jq -e '.status' >/dev/null
@@ -60,14 +58,20 @@ reply=$(printf '%s\n' '{"id":"x","format":"best","rungs":[]}' | \
 jq -e '.ok == false and (.error | type == "string" and length > 0)' <<<"$reply" >/dev/null \
     || { echo "::error::Reel's resident yt-dlp worker did not report its malformed-id failure: $reply"; exit 1; }
 echo "yt-dlp: zipapp $ytdlp_version executes as the CLI fallback and imports in the resident worker"
-# Scout's installer page is served at its root too. Read the whole body before matching: `grep -q` stops at the
-# first match and closes the pipe, which fails curl (23) under pipefail on a page that is fine.
-configure="$(curl -fsS http://127.0.0.1:18080/configure)"
+# Hearth owns the one installer page; every former per-service install route is gone at both boundaries.
+configure="$(curl -fsS http://127.0.0.1:18090/den/configure)"
 grep -qi '<html' <<<"$configure" \
-    || { echo "::error::Scout's /configure on :8080 is not a page"; exit 1; }
-configure="$(curl -fsS http://127.0.0.1:18090/scout/configure)"
-grep -qi '<html' <<<"$configure" \
-    || { echo "::error::Scout's /scout/configure is not a page"; exit 1; }
+    || { echo "::error::Hearth's /den/configure is not a page"; exit 1; }
+for url in \
+    http://127.0.0.1:18090/scout/manifest.json http://127.0.0.1:18090/scout/configure \
+    http://127.0.0.1:18090/reel/manifest.json http://127.0.0.1:18090/reel/configure \
+    http://127.0.0.1:18090/subs/manifest.json http://127.0.0.1:18090/subs/configure \
+    http://127.0.0.1:18080/manifest.json http://127.0.0.1:18080/configure \
+    http://127.0.0.1:18092/manifest.json http://127.0.0.1:18092/configure \
+    http://127.0.0.1:18093/manifest.json http://127.0.0.1:18093/configure; do
+    status=$(curl -sS -o /dev/null -w '%{http_code}' "$url")
+    [ "$status" = 404 ] || { echo "::error::$url returned $status, expected removed route 404"; exit 1; }
+done
 
 # Remux's ffmpeg and scratch directory are what a broken image loses first.
 reason=$(jq -r '.services.remux.reason // empty' <<<"$body")

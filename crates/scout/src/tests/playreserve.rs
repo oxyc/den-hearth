@@ -128,10 +128,9 @@ fn spend_add_prefetch_refusal_is_the_reserve_not_the_budget() {
     }
     let err = spend_add(DebridService::TorBox, "tok", H, true)
         .expect_err("the reserve refuses the second prefetch");
-    // Go: errors.Is(err, errPlayReserve) && errors.Is(err, errScoutSide). The frozen StoreError has one variant for
-    // scout's own refusals, and the reserve is told apart from a spent budget by `is_play_reserve`.
+    // The reserve is a typed scout-side refusal; its display/wire reason remains stable.
     assert!(
-        is_play_reserve(&err) && matches!(err, StoreError::ScoutSide(_)),
+        is_play_reserve(&err) && matches!(err, StoreError::PlayReserve(_)),
         "want errPlayReserve wrapped as scout-side, got {err:?}"
     );
     let cache = MemoryCache::new(1 << 20);
@@ -159,8 +158,8 @@ fn spend_add_prefetch_refusal_is_the_reserve_not_the_budget() {
 /// Retry-After and sends no add, while the same request without the flag still adds.
 #[tokio::test]
 async fn handle_play_prefetch_is_held_back_and_play_is_served() {
-    let _budget = install_budget(HOUR, 5);
-    global_add_budget().reserve.store(5, Ordering::SeqCst); // only the reserve is left: no prefetch may add, a viewer still may
+    let budget = install_budget(HOUR, 5);
+    budget.budget().reserve.store(5, Ordering::SeqCst); // only the reserve is left: no prefetch may add, a viewer still may
 
     let adds = Arc::new(AtomicI32::new(0));
     let cache = Arc::new(MemoryCache::new(1 << 20));
@@ -176,10 +175,12 @@ async fn handle_play_prefetch_is_held_back_and_play_is_served() {
             Ok(resp(200, r#"{"data":[]}"#))
         })),
     });
-    let h = new_handler(test_deps(move |d| {
+    let deps = test_deps(move |d| {
         d.cache = cache;
         d.make_stores = shared_stores(store.clone());
-    }));
+    });
+    deps.runtime.replace_add_budget(budget.budget());
+    let h = new_handler(deps);
     let path = format!(
         "/{}/play/{}",
         valid_blob(),

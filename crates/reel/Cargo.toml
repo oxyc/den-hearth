@@ -10,43 +10,47 @@ license = "MIT"
 
 [dependencies]
 # The sealed-config keyring and the install-revocation policy, shared with Scout and Subtitles.
-den-seal = { path = "../seal" }
+den-seal.workspace = true
 # Response builders, conditional GETs, CORS, the request log line and the metrics bearer check, shared with Subtitles and Remux.
-den-http = { path = "../http" }
+den-http.workspace = true
 # Client profiles, Retry-After and the per-credential pause, shared with Subtitles, Remux and Scout.
-den-upstream = { path = "../upstream" }
+den-upstream.workspace = true
 # The guarded SIGKILL to a download's process group, shared with Remux: kill_on_drop reaps only the direct child,
 # and yt-dlp forks ffmpeg to do the merge.
-den-net = { path = "../net" }
+den-net.workspace = true
+# Per-service live process-group registry and guarded signals, shared with Remux.
+den-process.workspace = true
+# Checked MP4 box spans used by the progressive indexer, shared with Remux's probe.
+den-media.workspace = true
 # Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
 # minimal on a homelab box.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1"] }
-http-body-util = "0.1"
-bytes = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tokio = { workspace = true, features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio", "http1"] }
+http-body-util.workspace = true
+bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 # rustls (not OpenSSL) with bundled webpki roots → no ca-certificates package needed at runtime,
 # and a static-friendly TLS stack for a slim image.
 # http2: manifest.googlevideo.com speaks it, so the HLS playlists /hls and /m/ fetch share a connection.
 # The rr*.googlevideo.com media hosts do not (they answer HTTP/1.1 even when h2 is offered, checked with curl
 # from the box on 2026-09-15), so it does nothing for /progressive's index or its body.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
-tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
+tokio-util = { workspace = true, features = ["io"] }
 # Only need Shared/FutureExt/TryStreamExt — skip the sink/io/compat machinery in the defaults.
-futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-async-trait = "0.1"
-base64 = "0.23"
+futures-util = { workspace = true, default-features = false, features = ["std", "async-await"] }
+async-trait.workspace = true
+base64.workspace = true
 # Keyed BLAKE2b for the optional /play + /crop URL signature (PLAY_SECRET), and a constant-time
 # compare for checking it. Both are ALREADY in the tree — crypto_box (under den-seal) uses blake2 for the
 # seal nonce and subtle throughout — so these edges add a direct dependency, not a new crate to compile.
-blake2 = "0.10"
-subtle = "2"
+blake2.workspace = true
+subtle.workspace = true
 # HTTP dates for /play's Last-Modified, If-Modified-Since and If-Range. hyper already builds it for
 # the Date header, so this too is a direct edge rather than new code.
-httpdate = "1"
+httpdate.workspace = true
 
 [features]
 # Forwards to the private modules' hot paths for benches/reel.rs (src/bench_api.rs). Off in every build that ships.
@@ -58,10 +62,10 @@ harness = false
 required-features = ["bench"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
 # Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
-divan = "0.1"
+divan.workspace = true
 
 # The tests' liveness probe, kill(pid, 0).
 [target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
+libc.workspace = true

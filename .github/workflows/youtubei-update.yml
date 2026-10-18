@@ -57,14 +57,7 @@ jobs:
       - name: Install the pinned deno
         if: steps.rel.outputs.proceed == 'true'
         run: |
-          set -euo pipefail
-          version=$(grep -oP '^ARG DENO_VERSION=\K\S+' Dockerfile)
-          sha=$(grep -oP '^ARG DENO_SHA256_AMD64=\K\S+' Dockerfile)
-          curl -fsSL "https://github.com/denoland/deno/releases/download/v${version}/deno-x86_64-unknown-linux-gnu.zip" -o deno.zip
-          echo "${sha}  deno.zip" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          unzip -q -d "$HOME/.local/bin" deno.zip
-          rm deno.zip
+          bash .github/scripts/install-pinned-deno.sh Dockerfile "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Re-lock and re-pin

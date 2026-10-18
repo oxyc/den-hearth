@@ -79,7 +79,7 @@ impl Keyring {
         Keyring { keys }
     }
 
-    /// The current recipient public key (std base64), served at `/config-key` so a client can seal to it.
+    /// The current recipient public key (std base64), served by Hearth at `/den/config-key` so a client can seal.
     /// Empty with no keys.
     pub fn current_pub_base64(&self) -> String {
         match self.keys.first() {

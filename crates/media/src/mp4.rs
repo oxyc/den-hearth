@@ -4,6 +4,111 @@
 //! The walk is the part that reads sizes out of untrusted bytes, so a size that is wrong ends it: one that
 //! overflows, runs past the buffer or is smaller than its own header never indexes outside the slice.
 
+/// Whether truncated input is an error or a useful, explicitly marked prefix. Structurally impossible sizes are an
+/// error in both modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkMode {
+    Strict,
+    Prefix,
+}
+
+/// Absolute byte boundaries of one box. `body` is the first payload byte; all offsets are relative to the source
+/// containing `buf`, not to `buf` itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoxSpan {
+    pub kind: [u8; 4],
+    pub start: u64,
+    pub body: u64,
+    pub end: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxWalkErrorKind {
+    TruncatedHeader,
+    TruncatedBox,
+    SizeSmallerThanHeader,
+    OffsetOverflow,
+    InvalidExtendedSize,
+}
+
+/// Why a checked walk stopped. `offset` is absolute and `kind` is present once the type field was available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoxWalkError {
+    pub offset: u64,
+    pub kind: Option<[u8; 4]>,
+    pub reason: BoxWalkErrorKind,
+}
+
+/// A complete walk, or in [`WalkMode::Prefix`] the valid boxes before `stopped`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoxWalk {
+    pub boxes: Vec<BoxSpan>,
+    pub stopped: Option<BoxWalkError>,
+}
+
+/// Walks sibling boxes with checked arithmetic and absolute offsets. Strict mode rejects the first incomplete or
+/// impossible box; prefix mode returns the valid prefix only for a cut header/body and carries the stop in
+/// [`BoxWalk::stopped`].
+pub fn walk_boxes(buf: &[u8], base_offset: u64, mode: WalkMode) -> Result<BoxWalk, BoxWalkError> {
+    let mut boxes = Vec::new();
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let absolute = base_offset.checked_add(pos as u64).ok_or(BoxWalkError {
+            offset: base_offset,
+            kind: None,
+            reason: BoxWalkErrorKind::OffsetOverflow,
+        })?;
+        let rest = &buf[pos..];
+        let kind = rest.get(4..8).and_then(|v| v.try_into().ok());
+        let fail = |reason| BoxWalkError { offset: absolute, kind, reason };
+        let Some(size32) = u32_at(rest, 0) else {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::TruncatedHeader), mode);
+        };
+        let Some(kind) = kind else {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::TruncatedHeader), mode);
+        };
+        let (size, header_len) = match size32 {
+            0 => (rest.len() as u64, 8usize),
+            1 => match u64_at(rest, 8) {
+                Some(0) => return finish_walk(boxes, fail(BoxWalkErrorKind::InvalidExtendedSize), mode),
+                Some(size) => (size, 16),
+                None => return finish_walk(boxes, fail(BoxWalkErrorKind::TruncatedHeader), mode),
+            },
+            size => (u64::from(size), 8),
+        };
+        if size < header_len as u64 {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::SizeSmallerThanHeader), mode);
+        }
+        let Some(end_pos) = (pos as u64).checked_add(size).and_then(|end| usize::try_from(end).ok()) else {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::OffsetOverflow), mode);
+        };
+        if end_pos > buf.len() {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::TruncatedBox), mode);
+        }
+        let Some(body) = absolute.checked_add(header_len as u64) else {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::OffsetOverflow), mode);
+        };
+        let Some(end) = absolute.checked_add(size) else {
+            return finish_walk(boxes, fail(BoxWalkErrorKind::OffsetOverflow), mode);
+        };
+        boxes.push(BoxSpan { kind, start: absolute, body, end });
+        pos = end_pos;
+    }
+    Ok(BoxWalk { boxes, stopped: None })
+}
+
+fn finish_walk(boxes: Vec<BoxSpan>, error: BoxWalkError, mode: WalkMode) -> Result<BoxWalk, BoxWalkError> {
+    match mode {
+        WalkMode::Strict => Err(error),
+        WalkMode::Prefix
+            if matches!(error.reason, BoxWalkErrorKind::TruncatedHeader | BoxWalkErrorKind::TruncatedBox) =>
+        {
+            Ok(BoxWalk { boxes, stopped: Some(error) })
+        }
+        WalkMode::Prefix => Err(error),
+    }
+}
+
 /// A box's size, type and header length. A 32-bit size of 0 means "to the end of the buffer" and is reported as
 /// 0; a size of 1 means the real, 64-bit size follows the type.
 pub fn header(buf: &[u8]) -> Option<(u64, [u8; 4], usize)> {
@@ -185,6 +290,41 @@ mod tests {
         let mut two = boxed(b"free", &[1]);
         two.extend_from_slice(&[0, 0, 0, 0xFF, b'b', b'o', b'x', b'x']);
         assert_eq!(boxes(&two).count(), 1);
+    }
+
+    #[test]
+    fn checked_walk_reports_absolute_spans_and_the_partial_stop() {
+        let mut data = boxed(b"free", &[1, 2]);
+        data.extend_from_slice(&[0, 0, 0, 12, b'm', b'd', b'a', b't', 9]);
+        let error = walk_boxes(&data, 1_000, WalkMode::Strict).unwrap_err();
+        assert_eq!(
+            error,
+            BoxWalkError { offset: 1_010, kind: Some(*b"mdat"), reason: BoxWalkErrorKind::TruncatedBox }
+        );
+        let prefix = walk_boxes(&data, 1_000, WalkMode::Prefix).unwrap();
+        assert_eq!(prefix.boxes, vec![BoxSpan { kind: *b"free", start: 1_000, body: 1_008, end: 1_010 }]);
+        assert_eq!(prefix.stopped, Some(error));
+    }
+
+    #[test]
+    fn checked_walk_distinguishes_cut_headers_and_impossible_sizes() {
+        let cut = walk_boxes(&[0, 0, 0], 7, WalkMode::Strict).unwrap_err();
+        assert_eq!(cut.reason, BoxWalkErrorKind::TruncatedHeader);
+        assert_eq!(cut.offset, 7);
+
+        let tiny = [0, 0, 0, 4, b'f', b'r', b'e', b'e'];
+        let bad = walk_boxes(&tiny, 20, WalkMode::Strict).unwrap_err();
+        assert_eq!(bad.kind, Some(*b"free"));
+        assert_eq!(bad.reason, BoxWalkErrorKind::SizeSmallerThanHeader);
+        assert_eq!(walk_boxes(&tiny, 20, WalkMode::Prefix), Err(bad));
+
+        let mut wide_zero = vec![0, 0, 0, 1];
+        wide_zero.extend_from_slice(b"wide");
+        wide_zero.extend_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            walk_boxes(&wide_zero, 0, WalkMode::Strict).unwrap_err().reason,
+            BoxWalkErrorKind::InvalidExtendedSize
+        );
     }
 
     #[test]

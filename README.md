@@ -18,8 +18,8 @@ serve loop of their own; hearth is every service's server.
 
 ## Scout, and the Go den-scout as the rollback
 
-Scout replaces the Go `den-scout` container. The Go container stays installed but stopped, and rolling back is
-starting it again: both listen on :8080, so only one runs at a time. Nothing installed changes either way.
+Scout replaces the Go `den-scout` container. The Go container can remain stopped as an operational rollback, but
+new installs use Hearth's combined `/den` addon rather than Scout's former standalone manifest.
 
 - **Wire compatibility runs both ways.** `crates/scout/src/tests/go_wire_vectors.rs` holds what the live Go code
   minted (config segments, play tickets, play tokens), which Rust must open. `rust_wire_vectors.rs` is the reverse
@@ -72,19 +72,15 @@ subprocess call.
 
 It runs as uid/gid 65532 (`nonroot`) with `/cache/{scout,reel,subs,remux}` owned by it and `VOLUME /cache`. It
 exposes 8090 (`PORT`) and the four legacy ports 8080, 8092, 8093 and 8095 (see Listeners). `HEALTHCHECK` polls `/health` every 5 minutes. The release number is `VERSION`, passed
-as `DEN_VERSION` (all three services report it); it is deliberately not in any `Cargo.toml`.
+as `DEN_VERSION` (the services report it); it is deliberately not in any `Cargo.toml`.
 
 ```
 docker build --platform linux/amd64 --build-arg DEN_VERSION="$(cat VERSION)" -t den-hearth:local .
 docker run --rm -p 8090:8090 -p 8080:8080 -p 8092:8092 -p 8093:8093 -p 8095:8095 den-hearth:local
 curl localhost:8090/health
-curl localhost:8090/scout/manifest.json
-curl localhost:8090/reel/manifest.json
-curl localhost:8090/subs/manifest.json
+curl localhost:8090/den/manifest.json
+curl localhost:8090/den/configure
 curl localhost:8090/remux/health
-curl localhost:8080/manifest.json      # Scout on its old port, at the root
-curl localhost:8092/manifest.json      # Reel
-curl localhost:8093/manifest.json      # Subtitles
 curl localhost:8095/remux/health       # Remux
 docker run --rm --entrypoint ffmpeg-remux den-hearth:local -hwaccels
 ```
@@ -123,9 +119,9 @@ tags or publishes a release, and publishing never writes or pushes directly to p
 
 | Path | Goes to | The service sees |
 |---|---|---|
-| `/scout/...` | Scout | `/...` (prefix removed) |
-| `/reel/...` | Reel | `/...` (prefix removed) |
-| `/subs/...` | Subtitles | `/...` (prefix removed) |
+| `/scout/...` | Scout transport/operations | `/...` (prefix removed; standalone install routes are 404) |
+| `/reel/...` | Reel transport/operations | `/...` (prefix removed; standalone install routes are 404) |
+| `/subs/...` | Subtitles transport/operations | `/...` (prefix removed; standalone install routes are 404) |
 | `/remux/...` | Remux | unchanged (Remux already serves everything under `/remux`) |
 | `/remux/metrics` | Remux | `/metrics` (its one route outside `/remux`) |
 | `/den/...` | the Den addon: hearth, or the service a resource belongs to | see "The Den addon" |
@@ -141,12 +137,13 @@ says anything but `ok`. Each service's own `/health` and `/metrics` stay reachab
 
 One Stremio addon for what were three installs ([oxyc/den#286](https://github.com/oxyc/den/issues/286)): one
 manifest, one `/den/configure` and one sealed config holding a member per service — `scout` (streams), `subs`
-(subtitles), `reel` (trailers), each exactly the config that service's own `/configure` builds — with one install
+(subtitles), `reel` (trailers) — with one install
 id (`iid`) and epoch (`ep`) at the top. The manifest at `/den/<config>/manifest.json` declares only the members the
 install has. Hearth answers the page, `/den/config-key` and both manifests; each resource goes to its service in
 process (`crates/hearth/src/den.rs`), which reads its member with the code that reads its own config and mints its
-links under `/den`, so they come back there and answer to the addon's revocation. A config or link of either kind is
-refused on the other's routes; every per-service route, key, revocation list and response is unchanged.
+links under `/den`, so they come back there and answer to the addon's revocation. The former service configure,
+config-key, unconfigured manifest, and configured manifest routes are 404; descriptor and resource APIs remain for
+the combined addon and internal transport.
 
 | Env | |
 |---|---|
@@ -173,7 +170,8 @@ request, and otherwise translates the existing Remux session into a response who
 A `"player": "cast"` request takes managed HLS only for a release its `playable` plays without converting the
 video, since a Cast receiver plays TorBox's stream as it is; anything else goes to Remux.
 It does not create an outer session. Responses are JSON with `Cache-Control: no-store`; completed retries are
-held briefly in bounded memory so a lost response cannot create another Remux session.
+held briefly in bounded memory so a lost response cannot create another Remux session. The 16 KiB command body
+must arrive within 15 seconds, before Hearth creates any idempotency or finalization record.
 
 `/den/<config>/wanted` keeps a season download looking for releases while no Den client is open
 (`crates/hearth/src/wanted.rs`). The client holding the download lease `POST`s `{"items": [...]}`, one per wanted
@@ -192,16 +190,15 @@ plaintext config segment is a debrid token. The startup line `wanted downloads: 
 
 ## Listeners
 
-Besides `PORT` (8090, the table above), each service can have a listener of its own, on the port its old standalone
-container used, where **every request goes to that service with the path unchanged**, exactly as that container
-served it. That is what lets the switch-over change nothing outside the box: the tunnels, the relays, the LAN
-addresses in `ROUTES` and every installed link keep pointing at the ports they point at today.
+Besides `PORT` (8090, the table above), each service can have a listener of its own on the port its old standalone
+container used. Requests reach the same service with the path unchanged, but install routes are deliberately gone;
+these listeners now preserve health, metrics, media, and internal transport compatibility only.
 
 | Env | Default | Service | Reached by |
 |---|---|---|---|
-| `HEARTH_SCOUT_PORT` | 8080 | Scout | `/<config>/manifest.json`, `/<config>/stream/...`, `/<config>/play/...`, `/p/<ticket>`, `/configure`, `/health`, `/validate`, `/metrics`, `/config-key` |
-| `HEARTH_REEL_PORT` | 8092 | Reel | `/play/...`, `/manifest.json`, ... |
-| `HEARTH_SUBS_PORT` | 8093 | Subtitles | `/<config>/manifest.json`, ... |
+| `HEARTH_SCOUT_PORT` | 8080 | Scout | `/<config>/stream/...`, `/<config>/play/...`, `/p/<ticket>`, `/health`, `/validate`, `/metrics` |
+| `HEARTH_REEL_PORT` | 8092 | Reel | `/play/...`, `/meta/...`, `/prepare/...`, `/health`, `/metrics` |
+| `HEARTH_SUBS_PORT` | 8093 | Subtitles | `/<config>/subtitles/...`, `/<config>/subtitle/...`, `/health`, `/metrics` |
 | `HEARTH_REMUX_PORT` | 8095 | Remux | `/remux/...` (it already serves under `/remux`, so this is a pass-through) |
 
 Unset takes the default; empty or `0` turns that listener off. A value that is not a port, or a port already used by
@@ -211,9 +208,10 @@ hearth's combined one.
 Absolute URLs. On its own listener a service builds them exactly as its old container did: from its own
 `PUBLIC_BASE_URL` (`<SERVICE>_PUBLIC_BASE_URL`) as-is, else from the request's forwarded headers or `Host`. Under
 `/scout`, `/reel` and `/subs` on :8090 the prefix must survive, which is what `HEARTH_PUBLIC_BASE_URL` is for (below).
-Scout is built twice for this (same client and cache, one handler per origin), so both are exact. Reel and Subtitles
-are one instance each, so while one has its own listener `HEARTH_PUBLIC_BASE_URL` is not applied to it (the
-prefixed paths on :8090 then follow its own `PUBLIC_BASE_URL`, or the request's `Host`, without the prefix).
+Scout's mounted, legacy, combined-addon, and in-process playback handlers share one explicit runtime, outbound
+client, and cache; only their public origins and addon scopes differ. Reel and Subtitles are one instance each, so
+while one has its own listener `HEARTH_PUBLIC_BASE_URL` is not applied to it (the prefixed paths on :8090 then
+follow its own `PUBLIC_BASE_URL`, or the request's `Host`, without the prefix).
 
 ## Scout in process
 
@@ -308,16 +306,17 @@ twice the requested size, 512 KiB, against the cgroup; at most 24 media bodies s
 The service's own 503s (Remux's `scratch_unavailable` and `scout_unconfigured`, Subtitles' `service_unavailable` and
 `translation_unavailable`) get `Retry-After: 5` from hearth when the service sent none.
 
-The 16 positions bulk cannot take are the control lane: `/health`, `/metrics`, the manifests and `/config-key`
-(Scout's and Reel's also `/` and `/configure`, their static page; every service's installed
-`/<config>/manifest.json`; Remux's bare `/health` on its own port), Remux's session keep-alive and end, and CORS preflights. It is
+The 16 positions bulk cannot take are the control lane: `/health`, `/metrics`, the combined `/den` manifest,
+configuration and revocation routes, Remux's bare `/health` on its own port, Remux's session keep-alive and end,
+and CORS preflights. It is
 an allowlist (`route::classify`); any route not named is bulk, which includes everything of Scout's that asks an
 indexer or a debrid service (`/<config>/stream`, `/play`, `/p/<ticket>`, `/account`, `/validate`). A media permit
 belongs to the response body and returns when the body finishes, the client goes away, the upstream fails or a
 deadline passes. Media is GET only: Reel's `/play` (also the bare `/play?v=<id>`), `/progressive`, `/hls/seg` and `/m/...`, and Remux's segments,
 `init.mp4` and `/speed`. Scout streams nothing (a play is a 302, a stream list a buffered JSON body), so it owns no
-media permit; its own deadlines are the 15 s request read and its upstream timeouts. Scout and Reel carry sealed
-configs in the URL, which is why :8090 and Scout's port keep a 32 KiB head.
+media permit; its own deadlines are the 15 s request read and its upstream timeouts. Internal service requests
+still carry the combined addon's sealed configuration in the URL, which is why :8090 and Scout's port keep a
+32 KiB head.
 
 The idle clock runs only while the client is not reading, so a slow reader that keeps moving bytes holds its permit
 until it finishes (or the 15 min lifetime). Remux's is short because a player fetches a segment whole and pauses

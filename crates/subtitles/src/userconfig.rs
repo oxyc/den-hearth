@@ -1,6 +1,6 @@
 //! Per-install config, base64url-encoded into the addon URL path (Torrentio/den-scout style). It
 //! carries the user's BYOK LLM credential, so it is a **bearer secret**: the Den app builds it at
-//! `/configure`, stores it in the Keychain, and never logs it. We validate + clamp the untrusted
+//! `/den/configure`, stores it in the Keychain, and never logs it. We validate + clamp the untrusted
 //! blob before use and never echo the key back.
 //!
 //! The segment's seal and the revocation policy are `den_seal`'s, shared with Scout and Reel.
@@ -82,7 +82,7 @@ pub struct UserConfig {
     /// Auto-sync non-hash results through Tier-1 reference alignment (`?ref=`). On by default; when
     /// off, the subtitle proxy still serves and caches, just without the automatic alignment.
     pub auto_sync: bool,
-    /// Install id (`iid`), minted by /configure for each link it builds: what `REVOKED_INSTALLS`
+    /// Install id (`iid`), minted by /den/configure for each link it builds: what `REVOKED_INSTALLS`
     /// names. `None` on a link built before ids existed, which only `CONFIG_EPOCH` can revoke.
     pub iid: Option<String>,
     /// The config epoch (`ep`) the link was stamped with; absent reads as 0.
@@ -130,7 +130,7 @@ pub fn decode_den(den: &den_seal::Addon, blob: &str) -> Result<UserConfig, Rejec
 /// Decode the config path segment into a validated config. The decoded bytes are either a SEALED blob
 /// (decrypt with the keyring) or a plaintext JSON config. Sealed with no keyring, or a decrypt failure,
 /// fails CLOSED — never a partial/empty config. Plaintext decodes only with no keyring: with one, every
-/// install `/configure` issues is sealed, and `/config-key` is public, so a plaintext config is one anyone
+/// install `/den/configure` issues is sealed, and `/den/config-key` is public, so a plaintext config is one anyone
 /// could have minted (`den_seal::open_segment`).
 fn decode_segment(keyring: Option<&Keyring>, blob: &str) -> Result<UserConfig, Rejected> {
     parse(open_segment(keyring, blob)?)
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn decodes_a_sealed_segment_minted_by_the_browser() {
-        // A fixed segment MINTED by the /configure browser bundle (tweetnacl + blake2b crypto_box_seal),
+        // A fixed segment minted by the /den/configure browser bundle (tweetnacl + blake2b crypto_box_seal),
         // sealing {osKey, provider, apiKey} to the vector key — the JS→Rust interop gate + full decode
         // path. Regenerate with scratch/sealsrc/entry.js's denSeal() if the wire format ever changes.
         const VEC_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";

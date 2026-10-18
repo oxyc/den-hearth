@@ -260,13 +260,13 @@ async fn play_queued_add_answers_202() {
     assert_eq!(rr.status(), 202, "play on a queued add: {:?}", rr.body());
 }
 
-// StatusAnswer only ever asked mylist (the torrent listing), never TorBox's own queue — so a release
+// ProviderStatus only ever asked mylist (the torrent listing), never TorBox's own queue — so a release
 // parked in the queue with no cached marker yet (a cold hash, or one whose marker's TTL lapsed) answered
 // "not fetching this" exactly like one TorBox never heard of. That is what made the probe route answer
 // 404 not_queued forever for a release still genuinely downloading, once den-scout started checking only
 // the active list.
 #[tokio::test]
-async fn status_answer_queued_release_with_no_marker_is_found_via_getqueued() {
+async fn provider_status_queued_release_with_no_marker_is_found_via_getqueued() {
     let hash = "d".repeat(40);
     let queued_hash = hash.clone();
     let s = TorBoxStore {
@@ -284,9 +284,9 @@ async fn status_answer_queued_release_with_no_marker_is_found_via_getqueued() {
     };
     let target = ResolveTarget { info_hash: hash.clone(), ..Default::default() };
     let status = s
-        .status(&target)
+        .provider_status(&target)
         .await
-        .expect("Status ok = false, want true for a release sitting in TorBox's own queue");
+        .expect_downloading("Status ok = false, want true for a release sitting in TorBox's own queue");
     assert_eq!(status.state, FETCH_QUEUED, "status.State");
     assert_eq!(status.service, Some(DebridService::TorBox), "status.Service");
     assert!(

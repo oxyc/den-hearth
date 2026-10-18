@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::attributes::stream_attributes;
+use crate::attributes::stream_attributes_ref;
 use crate::cache::Cache;
 use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
@@ -218,7 +218,7 @@ pub(crate) fn browser_probe_candidates(
         }
         if include_client {
             if let Some(client) = client {
-                out -= client.cost(stream.clone(), stream_attributes(stream.clone()));
+                out -= client.cost_ref(stream, stream_attributes_ref(stream));
             }
         }
         out

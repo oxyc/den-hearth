@@ -102,6 +102,7 @@ pub struct Config {
     pub segments_daily_cap: u32,
 }
 
+#[cfg(test)]
 fn env_opt(key: &str) -> Option<String> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
@@ -236,6 +237,15 @@ pub const REPLACE_GRACE_SECS: u64 = 60;
 
 impl Config {
     pub fn from_env() -> Config {
+        Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    /// Build from an explicit lookup so Hearth can select a service namespace without process-wide mutation.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Config {
+        let env_opt = |key: &str| match get(key) {
+            Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        };
         let (url_key, url_key_ephemeral) = match env_opt("REMUX_URL_KEY") {
             // Hashed, so any length the operator typed is a valid key of a fixed size.
             Some(k) => (crate::auth::sha256(k.as_bytes()).to_vec(), false),
@@ -301,8 +311,8 @@ impl Config {
             public_session_proxy: env_opt("PUBLIC_SESSION_PROXY").and_then(|value| value.parse().ok()),
             web_origins: parse_origins(&env_opt("WEB_ORIGINS").unwrap_or_default()),
             metrics_token: env_opt("METRICS_TOKEN"),
-            log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
-            log_identity: log_identity_on(env::var("LOG_IDENTITY").ok().as_deref()),
+            log_requests: log_requests_on(get("LOG_REQUESTS").as_deref()),
+            log_identity: log_identity_on(get("LOG_IDENTITY").as_deref()),
             edge_secret: env_opt("EDGE_SECRET"),
             guest_max_sessions: env_opt("GUEST_MAX_SESSIONS")
                 .and_then(|v| v.parse().ok())
@@ -348,6 +358,19 @@ mod tests {
         assert_eq!(env_opt("DEN_REMUX_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
         std::env::set_var("DEN_REMUX_TEST_ENV_OPT_TRIM", "   ");
         assert_eq!(env_opt("DEN_REMUX_TEST_ENV_OPT_TRIM"), None);
+    }
+
+    #[test]
+    fn config_can_be_built_from_an_explicit_lookup() {
+        let cfg = Config::from_lookup(|key| match key {
+            "PORT" => Some("9105".into()),
+            "REMUX_URL_KEY" => Some("stable".into()),
+            "LOG_REQUESTS" => Some("1".into()),
+            _ => None,
+        });
+        assert_eq!(cfg.port, 9105);
+        assert!(cfg.log_requests);
+        assert!(!cfg.url_key_ephemeral);
     }
 
     #[test]

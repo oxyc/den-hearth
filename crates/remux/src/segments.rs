@@ -732,7 +732,7 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
                 continue;
             }
         };
-        let door = st.doors.open(st.source_http.clone(), &resolved.url, &resolved.head, size);
+        let door = st.doors.open(resolved.client.clone(), &resolved.url, &resolved.head, size);
         let Some(input) = st.doors.url(&door) else {
             return Err(Failure::Failed("no loopback door".into()));
         };
@@ -772,7 +772,7 @@ async fn open(
     let info = match key.as_deref().and_then(|k| st.probe(k)) {
         Some(info) => info,
         None => {
-            let source = crate::probe::Source::Http { client: &st.source_http, url: &r.url, size: r.size };
+            let source = crate::probe::Source::Http { client: &r.client, url: &r.url, size: r.size };
             let info = crate::probe::probe(&source, &r.head).await.map_err(|e| e.to_string())?;
             if let Some(k) = key {
                 st.remember_probe(k, &info);
@@ -849,14 +849,30 @@ async fn decode(ffmpeg: &str, input: &str, start: f64, len: f64) -> Result<Vec<u
     let mut child = cmd.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
     let pid = child.id().unwrap_or(0);
     crate::job::register_group(pid);
-    struct Registered(u32);
-    impl Drop for Registered {
-        fn drop(&mut self) {
-            crate::job::unregister_group(self.0);
+    struct Registered {
+        pid: Option<u32>,
+        stderr: Option<tokio::task::AbortHandle>,
+    }
+    impl Registered {
+        fn finish_group(&mut self) {
+            let Some(pid) = self.pid.take() else { return };
+            den_process::kill_group(pid);
+            crate::job::unregister_group(pid);
         }
     }
-    let _registered = Registered(pid);
-    let stderr = child.stderr.take().map(|mut pipe| {
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            // `kill_on_drop` reaches only ffmpeg itself. The process-group signal also reaches any
+            // helper it forked, and aborting the bounded tail reader prevents an escaped descendant
+            // that inherited stderr from pinning a task after cancellation.
+            self.finish_group();
+            if let Some(stderr) = self.stderr.take() {
+                stderr.abort();
+            }
+        }
+    }
+    let mut registered = Registered { pid: Some(pid), stderr: None };
+    let mut stderr = child.stderr.take().map(|mut pipe| {
         tokio::spawn(async move {
             let mut tail = Vec::new();
             let mut buf = [0u8; 1024];
@@ -872,6 +888,7 @@ async fn decode(ffmpeg: &str, input: &str, start: f64, len: f64) -> Result<Vec<u
             String::from_utf8_lossy(&tail).into_owned()
         })
     });
+    registered.stderr = stderr.as_ref().map(tokio::task::JoinHandle::abort_handle);
     // The fingerprinter lives on a blocking thread, off the one runtime thread, fed a few chunks at a time: a slow
     // fingerprint holds ffmpeg back through the pipe rather than PCM piling up in memory.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<i16>>(4);
@@ -887,8 +904,22 @@ async fn decode(ffmpeg: &str, input: &str, start: f64, len: f64) -> Result<Vec<u
     let mut out = child.stdout.take().ok_or("ffmpeg has no stdout")?;
     let mut buf = vec![0u8; READ_CHUNK];
     let mut carry: Option<u8> = None;
+    let mut status = None;
     loop {
-        let n = out.read(&mut buf).await.map_err(|e| format!("reading ffmpeg: {e}"))?;
+        let n = if status.is_none() {
+            tokio::select! {
+                read = out.read(&mut buf) => read.map_err(|e| format!("reading ffmpeg: {e}"))?,
+                waited = child.wait() => {
+                    status = Some(waited.map_err(|e| format!("ffmpeg: {e}"))?);
+                    // A helper may retain stdout after the leader exits. Kill it and disarm the
+                    // registry now, then drain only the PCM already buffered in the pipe.
+                    registered.finish_group();
+                    continue;
+                }
+            }
+        } else {
+            out.read(&mut buf).await.map_err(|e| format!("reading ffmpeg: {e}"))?
+        };
         if n == 0 {
             break;
         }
@@ -906,12 +937,30 @@ async fn decode(ffmpeg: &str, input: &str, start: f64, len: f64) -> Result<Vec<u
         }
     }
     drop(tx);
-    let status = child.wait().await.map_err(|e| format!("ffmpeg: {e}"))?;
+    let status = match status {
+        Some(status) => status,
+        None => {
+            let status = child.wait().await.map_err(|e| format!("ffmpeg: {e}"))?;
+            // The leader is reaped. Stop any descendant that retained the group/pipes, then give the
+            // bounded tail reader a short chance to observe EOF before aborting it. Disarm first: after
+            // reap the numeric pid may be reused while the tail reader or fingerprinter is still awaited.
+            registered.finish_group();
+            status
+        }
+    };
+    let tail = match stderr.as_mut() {
+        Some(handle) => match tokio::time::timeout(Duration::from_millis(500), &mut *handle).await {
+            Ok(result) => result.unwrap_or_default(),
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                String::new()
+            }
+        },
+        None => String::new(),
+    };
+    registered.stderr = None;
     if !status.success() {
-        let tail = match stderr {
-            Some(h) => h.await.unwrap_or_default(),
-            None => String::new(),
-        };
         let last = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no message");
         return Err(format!("ffmpeg failed: {last}"));
     }
@@ -1047,6 +1096,79 @@ pub async fn get_route(st: &AppState, rest: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_fingerprint_decode_kills_its_descendant_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("den-remux-decode-{}", std::process::id()));
+        let script = base.with_extension("sh");
+        let pid_file = base.with_extension("pid");
+        let _ = std::fs::remove_file(&pid_file);
+        std::fs::write(&script, format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", pid_file.display()))
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script_for_task = script.to_string_lossy().into_owned();
+        let task = tokio::spawn(async move { decode(&script_for_task, "unused", 0.0, 1.0).await });
+        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fake decoder did not report its descendant pid");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while unsafe { libc::kill(descendant, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled fingerprint decode left its descendant alive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_fingerprint_decode_disarms_its_registry_entry_and_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("den-remux-decode-complete-{}", std::process::id()));
+        let script = base.with_extension("sh");
+        let leader_file = base.with_extension("leader");
+        let descendant_file = base.with_extension("descendant");
+        let _ = std::fs::remove_file(&leader_file);
+        let _ = std::fs::remove_file(&descendant_file);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nsleep 30 &\necho $! > '{}'\nprintf '\\0\\0\\0\\0'\nexit 0\n",
+                leader_file.display(),
+                descendant_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _got = decode(&script.to_string_lossy(), "unused", 0.0, 1.0)
+            .await
+            .expect("successful fake decoder failed");
+        let leader: u32 = std::fs::read_to_string(&leader_file).unwrap().trim().parse().unwrap();
+        assert!(!crate::job::is_group_live(leader), "reaped decoder stayed registered");
+        let descendant: i32 = std::fs::read_to_string(&descendant_file).unwrap().trim().parse().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while unsafe { libc::kill(descendant, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a normally completed fingerprint decode left its descendant alive");
+    }
 
     /// A deterministic stream of fingerprint points: xorshift.
     fn noise(seed: u32, n: usize) -> Vec<u32> {

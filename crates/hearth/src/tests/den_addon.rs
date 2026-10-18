@@ -571,9 +571,9 @@ async fn playback_route_pins_its_http_contract_end_to_end() {
 async fn playback_idempotency_replays_one_result_and_conflicts_on_another_intent() {
     let hearth = playback_hearth();
     let segment = plain(&config(0, &[SCOUT]));
-    // An unknown replacement is refused by Remux before it asks Scout, making the complete facade path
-    // deterministic and hermetic while still exercising a side-effecting operation's replay record.
-    let original = r#"{"imdb":"tt1","replaces":"not-a-session"}"#;
+    // A well-formed but unknown replacement is refused by Remux before it asks Scout, making the complete
+    // facade path deterministic and hermetic while still exercising a side-effecting operation's replay record.
+    let original = r#"{"imdb":"tt1","replaces":"AAAAAAAAAAAAAAAAAAAAAA"}"#;
     let first = response_bytes(
         playback_request(
             &hearth,
@@ -608,7 +608,7 @@ async fn playback_idempotency_replays_one_result_and_conflicts_on_another_intent
         &segment,
         Some("same-attempt"),
         Some("application/json"),
-        r#"{"imdb":"tt2","replaces":"not-a-session"}"#,
+        r#"{"imdb":"tt2","replaces":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
     )
     .await;
     let (status, headers, body) = response_bytes(conflict).await;
@@ -881,11 +881,11 @@ async fn a_malformed_den_key_refuses_every_den_config_and_nothing_else() {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert_eq!(body["error"], "config_key_invalid", "{path}");
     }
-    // The page and the unconfigured manifest need no key; the services' own routes are untouched.
+    // The page and the unconfigured combined manifest need no key; individual install routes stay gone.
     assert_eq!(send(&hearth, "/den/configure").await.status(), StatusCode::OK);
     assert_eq!(send(&hearth, "/den/manifest.json").await.status(), StatusCode::OK);
     let own = plain(r#"{"osKey":"os"}"#);
-    assert_eq!(send(&hearth, &format!("/subs/{own}/manifest.json")).await.status(), StatusCode::OK);
+    assert_eq!(send(&hearth, &format!("/subs/{own}/manifest.json")).await.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -903,6 +903,13 @@ async fn the_page_seals_to_the_key_it_is_served_with() {
         let resp = send(&hearth, path).await;
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
         assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(resp.headers()["x-frame-options"], "DENY");
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+        assert!(resp.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
         let page = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(page.contains("function denSeal(") && page.contains("collectScout"), "{path}");
     }
@@ -1073,8 +1080,8 @@ fn later() -> std::time::SystemTime {
     std::time::SystemTime::now() + std::time::Duration::from_secs(3600)
 }
 
-/// Every per-service route answers byte for byte as it did, whatever the Den addon is configured with —
-/// including the ones a key, a signature or a revocation decides, on services sealing, signing and revoking.
+/// Every retained per-service route answers byte for byte whatever the Den addon is configured with; obsolete
+/// standalone installation routes remain 404 on both sides.
 #[tokio::test]
 async fn the_services_own_routes_are_untouched_by_the_den_addon() {
     let opensubtitles = opensubtitles_stub().await;
@@ -1100,19 +1107,19 @@ async fn the_services_own_routes_are_untouched_by_the_den_addon() {
     let stream = "stream/movie/tt0111161.json";
     // Each request, and what it answers: a refusal must be the refusal it was, not a 404 both happen to give.
     let requests = [
-        ("/scout/manifest.json".to_string(), 200),
-        ("/scout/configure".to_string(), 200),
-        ("/scout/config-key".to_string(), 200),
-        (format!("/scout/{scout}/manifest.json"), 200),
+        ("/scout/manifest.json".to_string(), 404),
+        ("/scout/configure".to_string(), 404),
+        ("/scout/config-key".to_string(), 404),
+        (format!("/scout/{scout}/manifest.json"), 404),
         (format!("/scout/{scoped}/{stream}"), 403),
         (format!("/scout/{scout_revoked}/{stream}"), 400),
         (format!("/scout/p/{}", ticket(&scout_ring, scout_info, IID, expired())), 410),
         (format!("/scout/p/{}", ticket(&scout_ring, scout_info, REVOKED, later())), 400),
         (format!("/scout/p/{}", ticket(&scout_ring, den_info, IID, expired())), 400),
-        ("/reel/manifest.json".to_string(), 200),
-        ("/reel/configure".to_string(), 200),
-        ("/reel/config-key".to_string(), 200),
-        (format!("/reel/{reel}/manifest.json"), 200),
+        ("/reel/manifest.json".to_string(), 404),
+        ("/reel/configure".to_string(), 404),
+        ("/reel/config-key".to_string(), 404),
+        (format!("/reel/{reel}/manifest.json"), 404),
         (format!("/reel/{reel}/meta/movie/not-an-id.json"), 200),
         (format!("/reel{}", play_link(REVOKED, false)), 403),
         (format!("/reel{}", play_link(IID, true)), 403),
@@ -1120,10 +1127,10 @@ async fn the_services_own_routes_are_untouched_by_the_den_addon() {
         (format!("/reel{}", media_link(IID, false)), 404),
         (format!("/reel{}", media_link(REVOKED, false)), 403),
         (format!("/reel{}", media_link(IID, true)), 403),
-        ("/subs/manifest.json".to_string(), 200),
-        ("/subs/configure".to_string(), 200),
-        ("/subs/config-key".to_string(), 200),
-        (format!("/subs/{subs}/manifest.json"), 200),
+        ("/subs/manifest.json".to_string(), 404),
+        ("/subs/configure".to_string(), 404),
+        ("/subs/config-key".to_string(), 404),
+        (format!("/subs/{subs}/manifest.json"), 404),
         (format!("/subs/{subs}/subtitles/movie/tt0111161.json"), 200),
         (format!("/subs/{subs}/translate/movie/tt1/Swedish.status"), 400),
         ("/remux/health".to_string(), 200),

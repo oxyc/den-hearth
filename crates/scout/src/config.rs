@@ -53,7 +53,7 @@ pub const ALL_INDEXERS: [&str; 4] = ["torrentio", "comet", "mediafusion", "torz"
 pub const DEFAULT_INDEXERS: [&str; 2] = ["torrentio", "mediafusion"];
 
 /// Indexers whose stream endpoint lives behind a per-install config segment (`/{config}/stream/...`),
-/// obtainable only from that addon's own /configure page.
+/// obtainable only from the Den addon's /den/configure page.
 ///
 /// Asked without one they do not fail usefully: comet answers 403, and mediafusion answers **200 with an
 /// empty stream list** — a dead indexer wearing a healthy status. That empty success counted as a real
@@ -244,7 +244,7 @@ pub fn decode_config_slice(kr: Option<&SealKeyring>, blob: &str, slice: Option<&
     // sources at MAX_SOURCE_URL, every filter and a 256-character regex. The exact sizes are computed by the test
     // rather than trusted here. It was 8 KiB until household sources, whose links carry their own config segments. It
     // cannot come down without lowering those caps too, which is why the response-side multiplier is bounded
-    // by MAX_RESULT_CAP instead. A config from /configure is ~1 KB, and ~2 KB with one source.
+    // by MAX_RESULT_CAP instead. A Scout member from /den/configure is ~1 KB, and ~2 KB with one source.
     //
     // This bounds the segment, NOT what a request retains: the reply embeds a copy of the segment per
     // stream, so see MAX_RESULT_CAP for the other half.
@@ -258,8 +258,8 @@ pub fn decode_config_slice(kr: Option<&SealKeyring>, blob: &str, slice: Option<&
     let opened = match opened {
         Ok(opened) => opened,
         Err(Rejected::Plaintext) => {
-            // With a key configured, every install /configure issues is sealed, so a plaintext one was not
-            // issued here: /config-key is public, and anyone could otherwise base64 their own debrid token
+            // With a key configured, every install /den/configure issues is sealed, so a plaintext one was not
+            // issued here: /den/config-key is public, and anyone could otherwise base64 their own debrid token
             // into a working install. Sealing hides the token; this refusal is what makes an install one we
             // issued. Without a key (local development) plaintext stays the only form there is.
             log_limited("plaintext-refused", "config refused: plaintext config while sealing is on");

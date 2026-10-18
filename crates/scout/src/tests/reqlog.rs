@@ -30,13 +30,9 @@ fn redact_path() {
     let cases: Vec<(String, &str)> = vec![
         (String::new(), "/"),
         ("/".to_owned(), "/"),
-        ("/configure/".to_owned(), "/configure/"),
         ("/health".to_owned(), "/health"),
         ("/metrics".to_owned(), "/metrics"),
-        ("/manifest.json".to_owned(), "/manifest.json"),
-        ("/config-key".to_owned(), "/config-key"),
         ("/validate".to_owned(), "/validate"),
-        (format!("/{config}/manifest.json"), "/<config>/manifest.json"),
         (format!("/{config}/stream/series/tt1:2:3.json"), "/<config>/stream/series/tt1:2:3.json"),
         (format!("/{config}/play/secret-token"), "/<config>/play/<token>"),
         (format!("//{config}/play/secret-token"), "/<config>/play/<token>"),
@@ -101,15 +97,11 @@ async fn request_log_carries_the_request_id() {
     let h = new_handler(test_deps(|d| d.log_requests = true));
     get(&h, "/health", &[("X-Request-Id", "a1B2-c3_d4")]).await;
     let hostile = format!("x yGET /<config>/play 200 0ms{}", "z".repeat(100));
-    get(&h, "/manifest.json", &[("X-Request-Id", hostile.as_str())]).await;
-    get(&h, "/config-key", &[]).await;
-    get(&h, "/configure", &[("X-Request-Id", " <>")]).await;
+    get(&h, "/nope", &[("X-Request-Id", hostile.as_str())]).await;
     let got = out.text();
     for want in [
         r"(?m)^GET /health 200 \d+ms rid=a1B2-c3_d4$",
-        r"(?m)^GET /manifest\.json 200 \d+ms rid=xyGETconfigplay2000mszzzzzzzzzzz$",
-        r"(?m)^GET /config-key \d+ \d+ms$",
-        r"(?m)^GET /configure 200 \d+ms$",
+        r"(?m)^GET /<config> 404 \d+ms rid=xyGETconfigplay2000mszzzzzzzzzzz$",
     ] {
         assert!(Regex::new(want).unwrap().is_match(&got), "no line matching {want} in:\n{got}");
     }

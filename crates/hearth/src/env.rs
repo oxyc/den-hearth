@@ -6,39 +6,24 @@
 //! over the bare `<NAME>` for that service only. A bare name with no prefixed twin still reaches every
 //! service, which is what you want for `FFMPEG_PATH` and not what you want for `CACHE_DIR`.
 //!
-//! This runs while the process is still single-threaded, before the runtime exists, because the
-//! services read the environment inside `Config::from_env` and nowhere else.
+//! Configuration is resolved without changing the process environment: each service's
+//! `Config::from_lookup` receives this lookup directly.
 
-use std::collections::HashMap;
 use std::env;
 
-/// Run `load` with every `<prefix><NAME>` variable also visible as `<NAME>`, then put the environment
-/// back as it was. `mount`, when given, is the path the service is served under: with
-/// `HEARTH_PUBLIC_BASE_URL` set and no `<prefix>PUBLIC_BASE_URL`, the service's `PUBLIC_BASE_URL` becomes
-/// `<HEARTH_PUBLIC_BASE_URL>/<mount>`, so the absolute URLs it hands out carry the prefix hearth routes on.
-pub fn scoped<T>(prefix: &str, mount: Option<&str>, load: impl FnOnce() -> T) -> T {
-    let mut set: HashMap<String, String> = env::vars()
-        .filter_map(|(key, value)| {
-            Some((key.strip_prefix(prefix).filter(|name| !name.is_empty())?.to_string(), value))
-        })
-        .collect();
-    if let (Some(mount), Ok(base)) = (mount, env::var("HEARTH_PUBLIC_BASE_URL")) {
-        set.entry("PUBLIC_BASE_URL".to_string())
-            .or_insert_with(|| format!("{}/{mount}", base.trim_end_matches('/')));
+/// Read one service setting. A prefixed value wins even when it is empty; otherwise the bare value is
+/// the compatibility fallback. For a mounted service, Hearth's public base supplies `PUBLIC_BASE_URL`
+/// only when that service has no prefixed value, preserving the URL shape the old scoped loader produced.
+pub fn lookup(prefix: &str, mount: Option<&str>, name: &str) -> Option<String> {
+    if let Ok(value) = env::var(format!("{prefix}{name}")) {
+        return Some(value);
     }
-    let saved: Vec<(String, Option<String>)> =
-        set.keys().map(|name| (name.clone(), env::var(name).ok())).collect();
-    for (name, value) in &set {
-        env::set_var(name, value);
-    }
-    let loaded = load();
-    for (name, previous) in saved {
-        match previous {
-            Some(value) => env::set_var(name, value),
-            None => env::remove_var(name),
+    if name == "PUBLIC_BASE_URL" {
+        if let (Some(mount), Ok(base)) = (mount, env::var("HEARTH_PUBLIC_BASE_URL")) {
+            return Some(format!("{}/{mount}", base.trim_end_matches('/')));
         }
     }
-    loaded
+    env::var(name).ok()
 }
 
 #[cfg(test)]
@@ -49,26 +34,25 @@ mod tests {
     // test (or service) touches.
 
     #[test]
-    fn a_prefixed_name_wins_for_the_service_it_names_and_is_put_back() {
+    fn a_prefixed_name_wins_for_the_service_it_names() {
         env::set_var("SCOPED_A_X", "bare");
         env::set_var("ALPHA_SCOPED_A_X", "alpha");
         env::set_var("BETA_SCOPED_A_X", "beta");
-        assert_eq!(scoped("ALPHA_", None, || env::var("SCOPED_A_X").unwrap()), "alpha");
-        assert_eq!(scoped("BETA_", None, || env::var("SCOPED_A_X").unwrap()), "beta");
-        assert_eq!(env::var("SCOPED_A_X").unwrap(), "bare");
+        assert_eq!(lookup("ALPHA_", None, "SCOPED_A_X").as_deref(), Some("alpha"));
+        assert_eq!(lookup("BETA_", None, "SCOPED_A_X").as_deref(), Some("beta"));
     }
 
     #[test]
     fn a_bare_name_with_no_twin_reaches_every_service() {
         env::set_var("SCOPED_B_Y", "shared");
-        assert_eq!(scoped("GAMMA_", None, || env::var("SCOPED_B_Y").unwrap()), "shared");
+        assert_eq!(lookup("GAMMA_", None, "SCOPED_B_Y").as_deref(), Some("shared"));
     }
 
     #[test]
-    fn a_name_only_the_prefix_set_is_removed_afterwards() {
-        env::set_var("DELTA_SCOPED_C_Z", "only");
-        assert_eq!(scoped("DELTA_", None, || env::var("SCOPED_C_Z").unwrap()), "only");
-        assert!(env::var("SCOPED_C_Z").is_err());
+    fn an_empty_prefixed_value_still_suppresses_the_bare_fallback() {
+        env::set_var("SCOPED_C_Z", "bare");
+        env::set_var("DELTA_SCOPED_C_Z", "");
+        assert_eq!(lookup("DELTA_", None, "SCOPED_C_Z").as_deref(), Some(""));
     }
 
     #[test]
@@ -76,12 +60,12 @@ mod tests {
         env::set_var("HEARTH_PUBLIC_BASE_URL", "https://node.example/");
         env::set_var("EPSILON_PUBLIC_BASE_URL", "https://own.example");
         assert_eq!(
-            scoped("ZETA_", Some("reel"), || env::var("PUBLIC_BASE_URL").unwrap()),
-            "https://node.example/reel"
+            lookup("ZETA_", Some("reel"), "PUBLIC_BASE_URL").as_deref(),
+            Some("https://node.example/reel")
         );
         assert_eq!(
-            scoped("EPSILON_", Some("reel"), || env::var("PUBLIC_BASE_URL").unwrap()),
-            "https://own.example"
+            lookup("EPSILON_", Some("reel"), "PUBLIC_BASE_URL").as_deref(),
+            Some("https://own.example")
         );
         env::remove_var("HEARTH_PUBLIC_BASE_URL");
         env::remove_var("EPSILON_PUBLIC_BASE_URL");

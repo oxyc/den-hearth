@@ -5,17 +5,33 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::config::Config;
 
 const PROBE_TIMEOUT_SECS: u64 = 30; // yt-dlp --simulate should be quick; backstop a hang
 const DOWNLOAD_TIMEOUT_SECS: u64 = 240; // download+mux backstop (yt-dlp also gets --socket-timeout)
+/// yt-dlp is normally quiet: stdout is one format line and stderr is empty or a short error. Keep a
+/// generous diagnostic tail from either pipe, but never let a runaway child reserve memory in
+/// proportion to what it prints (there may be three downloads at once).
+pub(crate) const CHILD_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+/// Metadata probes print only a line or a handful of ids. This is deliberately separate from the
+/// download diagnostic ceiling so callers have to choose a bound appropriate to their protocol.
+pub(crate) const PROBE_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+/// A direct resolve also prints the format inventory's HLS manifest URL field. It is usually only a
+/// few KiB, but can be appreciably larger than the probe protocol without being pathological.
+pub(crate) const RESOLVE_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+/// ffmpeg cropdetect writes one diagnostic record per sampled keyframe. Keep all normal diagnostics
+/// available to the parser while bounding a corrupt/noisy input independently of process lifetime.
+pub(crate) const TOOL_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 /// How long to wait for yt-dlp's stderr pipe to close after it exits, before assuming a descendant
 /// is holding it open and killing the group. Long enough for a normal exit, short enough that a
 /// stuck one costs a download slot for seconds rather than the full download timeout.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// A process outside the child's group can inherit a pipe before daemonising. Once the group has
+/// been killed, EOF is therefore no longer something we may wait for indefinitely.
+const POST_KILL_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const _: () = assert!(
     STDERR_DRAIN_GRACE.as_secs() * 4 < DOWNLOAD_TIMEOUT_SECS,
     "the stderr grace must stay well inside the download timeout, or it is unreachable"
@@ -92,6 +108,27 @@ impl PlayError {
             reason: "timeout".into(),
             message: "This trailer took too long to fetch.".into(),
             detail: format!("yt-dlp exceeded {DOWNLOAD_TIMEOUT_SECS}s"),
+        }
+    }
+
+    pub(crate) fn panicked(operation: &str) -> PlayError {
+        PlayError {
+            status: 502,
+            reason: "internal_failure".into(),
+            message: "Could not fetch this trailer.".into(),
+            detail: format!("{operation} panicked; its shared flight was discarded"),
+        }
+    }
+
+    fn output_too_large(stream: &str, tail: &[u8]) -> PlayError {
+        PlayError {
+            status: 502,
+            reason: "extraction_failed".into(),
+            message: "Could not fetch this trailer.".into(),
+            detail: format!(
+                "yt-dlp {stream} exceeded {CHILD_OUTPUT_MAX_BYTES} bytes; tail: {}",
+                stderr_tail(tail)
+            ),
         }
     }
 }
@@ -263,12 +300,18 @@ pub async fn probe(cfg: &Config, vid: &str) -> Probe {
     .stderr(Stdio::piped()) // capture, never swallow — a silent probe error hid a total-outage regression
     .kill_on_drop(true); // cancelled/timed-out probe kills its yt-dlp too
     apply_extractor_args(&mut cmd, cfg);
-    // Timeout backstop: on elapse the output future is dropped → kill_on_drop reaps.
-    match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(o)) if o.status.success() => {
+    match output_in_group(
+        &mut cmd,
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+        PROBE_OUTPUT_MAX_BYTES,
+        PROBE_OUTPUT_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => {
             Probe::Playable { landscape: parse_landscape(&String::from_utf8_lossy(&o.stdout)) }
         }
-        Ok(Ok(o)) => {
+        Ok(o) => {
             // Non-zero exit. Surface WHY (was swallowed), then fall back to the proven plain
             // `--simulate` extractability gate: if yt-dlp can still extract the title, serve it (unknown
             // orientation → landscape) rather than dropping a good trailer over a `--print`/format quirk.
@@ -283,12 +326,16 @@ pub async fn probe(cfg: &Config, vid: &str) -> Probe {
                 Probe::Unplayable
             }
         }
-        Ok(Err(e)) => {
+        Err(BoundedOutputError::Io(e)) => {
             eprintln!("probe {vid}: yt-dlp spawn error — {e}");
             Probe::Unplayable
         }
-        Err(_) => {
+        Err(BoundedOutputError::TimedOut) => {
             eprintln!("probe {vid}: timed out after {PROBE_TIMEOUT_SECS}s");
+            Probe::Unplayable
+        }
+        Err(e @ BoundedOutputError::TooLarge { .. }) => {
+            eprintln!("probe {vid}: {e}");
             Probe::Unplayable
         }
     }
@@ -318,8 +365,14 @@ async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
     .kill_on_drop(true);
     apply_extractor_args(&mut cmd, cfg);
     matches!(
-        tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.status()).await,
-        Ok(Ok(s)) if s.success()
+        output_in_group(
+            &mut cmd,
+            Duration::from_secs(PROBE_TIMEOUT_SECS),
+            PROBE_OUTPUT_MAX_BYTES,
+            PROBE_OUTPUT_MAX_BYTES,
+        )
+        .await,
+        Ok(output) if output.status.success()
     )
 }
 
@@ -345,8 +398,15 @@ pub async fn search(cfg: &Config, query: &str, n: usize) -> Option<Vec<String>> 
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+    match output_in_group(
+        &mut cmd,
+        Duration::from_secs(PROBE_TIMEOUT_SECS),
+        PROBE_OUTPUT_MAX_BYTES,
+        PROBE_OUTPUT_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(|l| l.trim().to_string())
             // Same gate the TMDB and KinoCheck candidates get: this is the third source of ids and
@@ -354,20 +414,24 @@ pub async fn search(cfg: &Config, query: &str, n: usize) -> Option<Vec<String>> 
             .filter(|l| crate::is_valid_vid(l))
             .collect::<Vec<_>>()
             .into(),
-        Ok(Ok(o)) => {
+        Ok(o) => {
             crate::log_limited("search exit", || {
                 format!("search {query:?}: yt-dlp exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr))
             });
             None
         }
-        Ok(Err(e)) => {
+        Err(BoundedOutputError::Io(e)) => {
             crate::log_limited("search spawn", || format!("search {query:?}: yt-dlp spawn error — {e}"));
             None
         }
-        Err(_) => {
+        Err(BoundedOutputError::TimedOut) => {
             crate::log_limited("search timeout", || {
                 format!("search {query:?}: timed out after {PROBE_TIMEOUT_SECS}s")
             });
+            None
+        }
+        Err(e @ BoundedOutputError::TooLarge { .. }) => {
+            crate::log_limited("search output", || format!("search {query:?}: {e}"));
             None
         }
     }
@@ -411,7 +475,7 @@ async fn download_once(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, Pl
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let tmp_s = tmp.to_string_lossy().into_owned();
     // Shared so the guard below can reap the group even when the future is dropped mid-flight.
-    let group = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let group = std::sync::Arc::new(SharedGroup::new());
     let group_for_work = group.clone();
     let work = async {
         let mut cmd = Command::new(&cfg.ytdlp);
@@ -455,53 +519,70 @@ async fn download_once(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, Pl
         apply_extractor_args(&mut cmd, cfg); // same player-client override the probe validated with
         let mut child = cmd.spawn().map_err(PlayError::spawn)?;
         let pgid = child.id();
-        group_for_work.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        group_for_work.set(pgid);
         register_group(pgid);
 
         // Drain stderr AND stdout concurrently with wait() so a chatty yt-dlp can't deadlock on a
-        // full pipe. read_to_end, not read_to_string: read_to_string discards the WHOLE buffer on
-        // one non-UTF-8 byte, so a single accented character in an upstream error message left the
-        // log blank and the failure misclassified as a generic extraction error.
+        // full pipe. Each drain retains only a fixed-size tail. Besides bounding memory, it reports
+        // the first overflow to the waiter so a runaway printer is killed immediately rather than
+        // being allowed to spend the remainder of the 240-second download timeout.
+        let (oversize_tx, mut oversize_rx) = tokio::sync::mpsc::channel(2);
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+        let stderr_tx = oversize_tx.clone();
         let mut drain = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).into_owned()
+            capture_tail(&mut stderr_pipe, "stderr", CHILD_OUTPUT_MAX_BYTES, stderr_tx).await
         });
         let mut stdout_pipe = child.stdout.take().expect("stdout piped");
         let mut drain_stdout = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).into_owned()
+            capture_tail(&mut stdout_pipe, "stdout", CHILD_OUTPUT_MAX_BYTES, oversize_tx).await
         });
-        let status = child.wait().await.map_err(PlayError::spawn)?;
+        let (status, overflow_seen) = tokio::select! {
+            status = child.wait() => (status.map_err(PlayError::spawn)?, None),
+            stream = oversize_rx.recv() => {
+                // Killing the group closes both inherited pipes and reaps ffmpeg as well as yt-dlp.
+                group_for_work.kill();
+                (child.wait().await.map_err(PlayError::spawn)?, stream)
+            }
+        };
         // The stderr pipe is inherited by every descendant, so EOF means "the last of them exited",
-        // not "yt-dlp exited". Waiting on it unbounded let a lingering descendant pin a download
-        // that had already finished — complete file, exit 0 — until the 240s timeout turned it into
-        // a 504 whose cleanup deleted the file. Killing the group first fixed that and broke
-        // something worse: a descendant still writing the output got SIGKILLed mid-write and a
-        // truncated MP4 was published to the cache, and an ERROR line written after exit was lost,
-        // misrouting classify() and the /health signal.
-        //
-        // So: give the pipe a moment to close on its own — which is what stock yt-dlp does, and
-        // keeps stderr intact — and only force it if something is genuinely holding on.
-        let stderr = match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain).await {
-            Ok(r) => r.unwrap_or_default(),
-            Err(_) => {
-                eprintln!("yt-dlp {vid}: stderr still held after exit; killing the group");
-                kill_group(pgid);
-                drain.await.unwrap_or_default()
+        // not "yt-dlp exited". Preserve a short grace for the late diagnostic lines that are part
+        // of yt-dlp's effective protocol; unlike the generic grouped runner, classification depends
+        // on them. The grace is bounded, and a holder that outlives it is killed before the drain.
+        let forced = overflow_seen.is_some();
+        let stderr = if forced {
+            finish_after_kill(&mut drain).await
+        } else {
+            match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain).await {
+                Ok(r) => r.unwrap_or_default(),
+                Err(_) => {
+                    eprintln!("yt-dlp {vid}: stderr still held after exit; killing the group");
+                    group_for_work.kill();
+                    finish_after_kill(&mut drain).await
+                }
             }
         };
-        // Same pipe, same inheritance quirk; the kill above (if it fired) already closed this one
-        // too, so no second warning line and no second kill.
-        let stdout = match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain_stdout).await {
-            Ok(r) => r.unwrap_or_default(),
-            Err(_) => {
-                kill_group(pgid);
-                drain_stdout.await.unwrap_or_default()
+        let stdout = if forced {
+            finish_after_kill(&mut drain_stdout).await
+        } else {
+            match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain_stdout).await {
+                Ok(r) => r.unwrap_or_default(),
+                Err(_) => {
+                    group_for_work.kill();
+                    finish_after_kill(&mut drain_stdout).await
+                }
             }
         };
+        // The bounded protocol grace is over. Kill any pipe-less helper, remove the registry entry,
+        // and clear the numeric pgid before metadata/classification awaits can expose it to reuse.
+        group_for_work.reaped();
+        if let Some(stream) =
+            overflow_seen.or(stderr.overflow.then_some("stderr")).or(stdout.overflow.then_some("stdout"))
+        {
+            let tail = if stream == "stderr" { &stderr.tail } else { &stdout.tail };
+            return Err(PlayError::output_too_large(stream, tail));
+        }
+        let stderr = String::from_utf8_lossy(&stderr.tail);
+        let stdout = String::from_utf8_lossy(&stdout.tail);
         let format = stdout.lines().map(str::trim).find(|l| !l.is_empty()).and_then(parse_format);
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
@@ -532,14 +613,84 @@ async fn download_once(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, Pl
     }
 }
 
+#[derive(Default)]
+struct TailCapture {
+    tail: Vec<u8>,
+    overflow: bool,
+}
+
+/// Drain a child pipe to EOF while retaining at most [`CHILD_OUTPUT_MAX_BYTES`] of its suffix.
+/// The suffix is the useful part for diagnostics (yt-dlp writes its final ERROR last), while an
+/// in-limit stdout remains complete and can still be parsed for the selected format.
+async fn capture_tail<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    stream: &'static str,
+    max_bytes: usize,
+    oversize: tokio::sync::mpsc::Sender<&'static str>,
+) -> TailCapture {
+    let mut captured = TailCapture { tail: Vec::with_capacity(max_bytes), overflow: false };
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if !captured.overflow && captured.tail.len().saturating_add(read) > max_bytes {
+            captured.overflow = true;
+            let _ = oversize.try_send(stream);
+        }
+        if read >= max_bytes {
+            captured.tail.clear();
+            captured.tail.extend_from_slice(&chunk[read - max_bytes..read]);
+        } else {
+            let excess = captured.tail.len().saturating_add(read).saturating_sub(max_bytes);
+            if excess != 0 {
+                captured.tail.drain(..excess);
+            }
+            captured.tail.extend_from_slice(&chunk[..read]);
+        }
+    }
+    captured
+}
+
 /// Kills the download's process group on the way out, however the future ended.
-struct GroupGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
+struct SharedGroup {
+    pgid: std::sync::atomic::AtomicU32,
+    signalled: std::sync::atomic::AtomicBool,
+}
+
+impl SharedGroup {
+    fn new() -> Self {
+        Self {
+            pgid: std::sync::atomic::AtomicU32::new(0),
+            signalled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn set(&self, pgid: Option<u32>) {
+        self.pgid.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::Release);
+    }
+
+    fn kill(&self) {
+        if self.signalled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let pgid = Some(self.pgid.load(std::sync::atomic::Ordering::Acquire)).filter(|&p| p != 0);
+        kill_group(pgid);
+    }
+
+    fn reaped(&self) {
+        self.kill();
+        let pgid = Some(self.pgid.swap(0, std::sync::atomic::Ordering::AcqRel)).filter(|&p| p != 0);
+        unregister_group(pgid);
+    }
+}
+
+struct GroupGuard(std::sync::Arc<SharedGroup>);
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        let pgid = Some(self.0.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p != 0);
-        kill_group(pgid);
-        unregister_group(pgid);
+        self.0.reaped();
     }
 }
 
@@ -549,31 +700,82 @@ impl Drop for GroupGuard {
 /// `in_flight` holds a `Shared` clone of a future that itself captures the `Arc<AppState>` the map
 /// lives in, so the cycle keeps the child alive past runtime teardown. Registering the groups gives
 /// shutdown something it can act on directly, without depending on drop order.
-static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
+static LIVE_GROUPS: den_process::Registry = den_process::Registry::new();
 
 pub(crate) fn register_group(pgid: Option<u32>) {
-    if let Some(p) = pgid.filter(|&p| p > 1 && p <= i32::MAX as u32) {
-        let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-        g.get_or_insert_with(Default::default).insert(p);
-    }
+    LIVE_GROUPS.register(pgid);
 }
 
 pub(crate) fn unregister_group(pgid: Option<u32>) {
-    if let Some(p) = pgid.filter(|&p| p != 0) {
-        let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(set) = g.as_mut() {
-            set.remove(&p);
+    LIVE_GROUPS.unregister(pgid);
+}
+
+#[derive(Debug)]
+pub(crate) enum BoundedOutputError {
+    Io(std::io::Error),
+    TimedOut,
+    TooLarge { stream: &'static str, limit: usize, tail: Vec<u8> },
+}
+
+impl std::fmt::Display for BoundedOutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::TimedOut => f.write_str("child process timed out"),
+            Self::TooLarge { stream, limit, tail } => {
+                write!(f, "child {stream} exceeded {limit} bytes; tail: {}", stderr_tail(tail))
+            }
         }
     }
 }
 
-/// Run `cmd` in its own process group, registered as live for the duration, so shutdown can kill
-/// the whole tree. `Command::output()` owns the child, so `kill_on_drop` covers a timeout or a
-/// cancelled task — but not the process exiting out from under it, which is what shutdown is.
-pub(crate) async fn output_in_group(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+impl std::error::Error for BoundedOutputError {}
+
+impl From<std::io::Error> for BoundedOutputError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+fn pipe_drain(
+    mut pipe: Option<impl AsyncRead + Unpin + Send + 'static>,
+    stream: &'static str,
+    max_bytes: usize,
+    oversize: tokio::sync::mpsc::Sender<&'static str>,
+) -> tokio::task::JoinHandle<TailCapture> {
+    tokio::spawn(async move {
+        match pipe.as_mut() {
+            Some(pipe) => capture_tail(pipe, stream, max_bytes, oversize).await,
+            None => TailCapture::default(),
+        }
+    })
+}
+
+async fn finish_after_kill(drain: &mut tokio::task::JoinHandle<TailCapture>) -> TailCapture {
+    match tokio::time::timeout(POST_KILL_DRAIN_GRACE, &mut *drain).await {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            drain.abort();
+            let _ = drain.await;
+            TailCapture::default()
+        }
+    }
+}
+
+/// Run `cmd` in its own process group, concurrently draining both pipes with explicit byte ceilings.
+/// The deadline covers spawning, execution, and the normal post-exit pipe grace. Overflow and timeout
+/// kill the complete group before the direct child is reaped; cancellation does the same through the
+/// guard. Output at or below each ceiling remains byte-for-byte complete for existing parsers.
+pub(crate) async fn output_in_group(
+    cmd: &mut Command,
+    timeout: Duration,
+    stdout_max: usize,
+    stderr_max: usize,
+) -> Result<std::process::Output, BoundedOutputError> {
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = cmd.spawn()?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut child = cmd.spawn()?;
     let pgid = child.id();
     register_group(pgid);
     // A guard, not statements after the await: the await is a cancellation point, and the routine
@@ -581,17 +783,72 @@ pub(crate) async fn output_in_group(cmd: &mut Command) -> std::io::Result<std::p
     // Cleaning up only on the happy path left the pgid registered forever — nothing else prunes it
     // — so shutdown signalled a group that had been dead for hours, and pid reuse makes that
     // somebody else's group. Same reason download_to uses GroupGuard.
-    let _entry = GroupEntry(pgid);
-    child.wait_with_output().await
+    let mut entry = GroupEntry::new(pgid);
+    let (oversize_tx, mut oversize_rx) = tokio::sync::mpsc::channel(2);
+    let stderr_tx = oversize_tx.clone();
+    let mut stdout = pipe_drain(child.stdout.take(), "stdout", stdout_max, oversize_tx);
+    let mut stderr = pipe_drain(child.stderr.take(), "stderr", stderr_max, stderr_tx);
+    let mut timed_out = false;
+    let (status, overflow) = tokio::select! {
+        result = child.wait() => (result?, None),
+        Some(stream) = oversize_rx.recv() => {
+            entry.kill();
+            (child.wait().await?, Some(stream))
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            timed_out = true;
+            entry.kill();
+            (child.wait().await?, None)
+        }
+    };
+    // Once wait has reaped the leader, descendants are killed and the registry entry is removed
+    // before any pipe drain can await. Keeping a numeric pgid armed past this point risks signalling
+    // an unrelated group after pid reuse.
+    entry.reaped();
+    let stdout = finish_after_kill(&mut stdout).await;
+    let stderr = finish_after_kill(&mut stderr).await;
+    if timed_out || tokio::time::Instant::now() > deadline {
+        return Err(BoundedOutputError::TimedOut);
+    }
+    if let Some(stream) =
+        overflow.or(stdout.overflow.then_some("stdout")).or(stderr.overflow.then_some("stderr"))
+    {
+        let (limit, tail) =
+            if stream == "stdout" { (stdout_max, stdout.tail) } else { (stderr_max, stderr.tail) };
+        return Err(BoundedOutputError::TooLarge { stream, limit, tail });
+    }
+    Ok(std::process::Output { status, stdout: stdout.tail, stderr: stderr.tail })
 }
 
 /// Kills the group and deregisters it however the future ended — return, error, or cancellation.
-struct GroupEntry(Option<u32>);
+struct GroupEntry {
+    pgid: Option<u32>,
+    signalled: bool,
+}
+
+impl GroupEntry {
+    fn new(pgid: Option<u32>) -> Self {
+        Self { pgid, signalled: false }
+    }
+
+    fn kill(&mut self) {
+        if self.signalled {
+            return;
+        }
+        self.signalled = true;
+        kill_group(self.pgid);
+    }
+
+    fn reaped(&mut self) {
+        self.kill();
+        unregister_group(self.pgid.take());
+    }
+}
 
 impl Drop for GroupEntry {
     fn drop(&mut self) {
-        kill_group(self.0); // whatever it forked
-        unregister_group(self.0);
+        self.kill();
+        unregister_group(self.pgid.take());
     }
 }
 
@@ -599,24 +856,16 @@ impl Drop for GroupEntry {
 /// on its size races other tests' subprocesses; asking about one id does not.
 #[cfg(test)]
 pub(crate) fn is_group_live(pgid: u32) -> bool {
-    let g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().is_some_and(|set| set.contains(&pgid))
+    LIVE_GROUPS.contains(pgid)
 }
 
 /// SIGKILL every download still running. Returns how many groups it signalled.
 pub fn kill_live_groups() -> usize {
-    let taken = {
-        let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-        g.take().unwrap_or_default()
-    };
-    for p in &taken {
-        kill_group(Some(*p));
-    }
-    taken.len()
+    LIVE_GROUPS.kill_all()
 }
 
 pub(crate) fn kill_group(pgid: Option<u32>) {
     if let Some(pgid) = pgid {
-        den_net::kill_group(pgid);
+        den_process::kill_group(pgid);
     }
 }

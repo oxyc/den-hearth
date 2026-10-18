@@ -1,7 +1,7 @@
 //! Per-install config, base64url-encoded into the addon URL path (den-scout/den-subtitles style). It
 //! carries the user's BYOK TMDB key (and an optional KinoCheck key) — the discovery credentials that
 //! used to live in the server environment. It is a **bearer secret**: the Den app builds it at
-//! `/configure`, seals it to the addon's key, stores it in the Keychain, and never logs it. We validate
+//! `/den/configure`, seals it to the addon's key, stores it in the Keychain, and never logs it. We validate
 //! + bound the untrusted blob before use and never echo the key back.
 //!
 //! The segment's seal and the revocation policy are `den_seal`'s, shared with Scout and Subtitles.
@@ -16,7 +16,7 @@ use serde::Deserialize;
 pub struct UserConfig {
     pub tmdb_key: String,
     pub kinocheck_key: Option<String>,
-    /// Install id (`iid`), minted by /configure for each link it builds: what `REVOKED_INSTALLS`
+    /// Install id (`iid`), minted by /den/configure for each link it builds: what `REVOKED_INSTALLS`
     /// names. `None` on a link built before ids existed, which only `CONFIG_EPOCH` can revoke.
     pub iid: Option<String>,
     /// The config epoch (`ep`) the link was stamped with; absent reads as 0.
@@ -49,7 +49,7 @@ pub fn decode_checked(
 /// Decode the config path segment into a validated config. The decoded bytes are either a SEALED blob
 /// (decrypt with the keyring) or a plaintext JSON config. Sealed with no keyring, or a decrypt failure,
 /// fails CLOSED — never a partial/empty config. Plaintext decodes only with no keyring: with one, every
-/// install `/configure` issues is sealed, and `/config-key` is public, so a plaintext config is one anyone
+/// install `/den/configure` issues is sealed, and `/den/config-key` is public, so a plaintext config is one anyone
 /// could have minted (`den_seal::open_segment`).
 fn decode_segment(keyring: Option<&Keyring>, blob: &str) -> Result<UserConfig, Rejected> {
     parse(open_segment(keyring, blob)?)

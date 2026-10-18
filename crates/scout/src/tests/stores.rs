@@ -14,7 +14,7 @@ use crate::handler::{queued_body, rd_only};
 use crate::scrape::{DoError, Doer};
 use crate::stores::pool::{build_stores, has_cache_truth, StorePool};
 use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
-use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
+use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{cached_key, known_cached, torbox_account_identity, CACHED_TTL};
 use crate::stores::refusal::{resolve_key, torrent_id_key};
 use crate::stores::torbox::{
@@ -23,8 +23,8 @@ use crate::stores::torbox::{
 };
 use crate::stores::{dead_link, DeadLinkError, StoreError, StoreStatus, ERR_CHECK_FAILED};
 use crate::stores::{
-    rd_fetch_state, torbox_fetch_state, ResolveTarget, StatusAnswer, Store, FETCH_DOWNLOADING, FETCH_FAILED,
-    FETCH_FETCHING, FETCH_QUEUED, FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
+    rd_fetch_state, torbox_fetch_state, ProviderStatus, ResolveTarget, Store, FETCH_DOWNLOADING,
+    FETCH_FAILED, FETCH_FETCHING, FETCH_QUEUED, FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
 };
 use crate::tests::mock::{resp, MockDoer};
 use crate::util::key_hash;
@@ -163,31 +163,34 @@ async fn torbox_cache_check_singleflight_includes_api_identity() {
 // degraded signal; without it, playing one pays an add for a torrent the account already had.
 #[tokio::test]
 async fn torbox_cache_check_a_failed_batch_is_absent_not_uncached() {
-    let hashes: Vec<String> = (0..CACHE_BATCH + 2).map(|i| format!("{i:040x}")).collect();
-    // The first batch answers (and holds nothing); the second — the last two hashes — fails.
-    let d = mock(|req| {
-        let n = query(&req, "hash").matches(',').count() + 1;
-        if n == CACHE_BATCH {
-            Ok(resp(200, r#"{"data":{}}"#))
-        } else {
-            Ok(resp(503, "down"))
-        }
-    });
-    let s = tb("t", TORBOX_API, None, d);
-    let m = match s.cache_check(&hashes).await {
-        Ok(m) => m,
-        Err(e) => panic!("one good batch is not a total failure: {e:?}"),
-    };
-    let answered = m.get(&hashes[0]).copied();
-    assert_eq!(
-        answered,
-        Some(false),
-        "a hash in the batch that came back must be present and false: value={answered:?}"
-    );
-    assert!(
-        !m.contains_key(&hashes[CACHE_BATCH]),
-        "a hash in the FAILED batch must be absent — present-and-false claims TorBox does not hold it"
-    );
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        let hashes: Vec<String> = (0..CACHE_BATCH + 2).map(|i| format!("{i:040x}")).collect();
+        // The first batch answers (and holds nothing); the second — the last two hashes — fails.
+        let d = mock(|req| {
+            let n = query(&req, "hash").matches(',').count() + 1;
+            if n == CACHE_BATCH {
+                Ok(resp(200, r#"{"data":{}}"#))
+            } else {
+                Ok(resp(503, "down"))
+            }
+        });
+        let s = tb("t", TORBOX_API, None, d);
+        let m = match s.cache_check(&hashes).await {
+            Ok(m) => m,
+            Err(e) => panic!("one good batch is not a total failure: {e:?}"),
+        };
+        let answered = m.get(&hashes[0]).copied();
+        assert_eq!(
+            answered,
+            Some(false),
+            "a hash in the batch that came back must be present and false: value={answered:?}"
+        );
+        assert!(
+            !m.contains_key(&hashes[CACHE_BATCH]),
+            "a hash in the FAILED batch must be absent — present-and-false claims TorBox does not hold it"
+        );
+    })
+    .await;
 }
 
 // The account's whole torrent list is fetched to find a hash, and only hits were remembered. So a miss —
@@ -682,6 +685,113 @@ struct GatedDoer {
     arrival_tx: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
+/// Holds account listings on a counted semaphore so admission, cancellation, joining, and recovery can be
+/// asserted without waiting for the production fifteen-second shared deadline.
+struct ListingAdmissionDoer {
+    release: Arc<tokio::sync::Semaphore>,
+    arrivals: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+#[async_trait::async_trait]
+impl Doer for ListingAdmissionDoer {
+    async fn do_request(&self, _req: reqwest::Request) -> Result<reqwest::Response, DoError> {
+        let _ = self.arrivals.send(());
+        self.release.clone().acquire_owned().await.expect("listing release semaphore").forget();
+        Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":4,"hash":"{H}"}}]}}"#)))
+    }
+}
+
+// A distinct account key used to be inserted and detached before it waited for the 64-call outbound semaphore.
+// Thousands of cancelled unique-token requests therefore left thousands of map entries and tasks until the
+// shared 15-second timeout. Admission must happen before insertion, while a same-key join remains available at
+// saturation and a refused account remains retryable once admitted work completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_listing_unique_cancellation_flood_is_bounded_and_recovers() {
+    const LIMIT: usize = 2;
+    const FLOOD: usize = 512;
+    let runtime = crate::runtime::ScoutRuntime::new_with_account_listing_limit(LIMIT);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (arrival_tx, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let client: Arc<dyn Doer> =
+        Arc::new(ListingAdmissionDoer { release: release.clone(), arrivals: arrival_tx });
+    let stores: Vec<Arc<TorBoxStore>> = (0..FLOOD + LIMIT)
+        .map(|i| Arc::new(tb(&format!("listing-admission-{i}"), TORBOX_API, None, client.clone())))
+        .collect();
+    let spawn_listing = |store: Arc<TorBoxStore>| {
+        let owner = runtime.clone();
+        tokio::spawn(crate::runtime::scope(owner, async move { store.account_listing().await }))
+    };
+
+    let leaders = [spawn_listing(stores[0].clone()), spawn_listing(stores[1].clone())];
+    for _ in 0..LIMIT {
+        tokio::time::timeout(Duration::from_secs(1), arrivals.recv())
+            .await
+            .expect("an admitted listing did not start")
+            .expect("arrival channel closed");
+    }
+    assert_eq!(runtime.torbox.active_listing_flights(), LIMIT);
+
+    // Saturation must not reject a join of an already-admitted key or start another upstream fetch.
+    let joiner = spawn_listing(stores[0].clone());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), arrivals.recv()).await.is_err(),
+        "same-key join started a second account listing"
+    );
+
+    // Every other account is caller-controlled and unique. Let all request futures enter account_listing, then
+    // cancel them as a client disconnect would. None may insert a key or park a detached task.
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut flood = Vec::new();
+    for store in stores.iter().skip(LIMIT) {
+        let store = Arc::clone(store);
+        let (owner, started) = (runtime.clone(), started.clone());
+        flood.push(tokio::spawn(crate::runtime::scope(owner, async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            store.account_listing().await
+        })));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while started.load(Ordering::SeqCst) != FLOOD {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the cancellation flood did not start");
+    for request in flood {
+        request.abort();
+    }
+    for leader in &leaders {
+        leader.abort();
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(
+        runtime.torbox.active_listing_flights(),
+        LIMIT,
+        "unique cancelled accounts escaped pre-insertion admission"
+    );
+
+    // Creator cancellation cannot cancel admitted work: the joiner still receives the first account's answer.
+    release.add_permits(LIMIT);
+    let (ids, ok) = tokio::time::timeout(Duration::from_secs(1), joiner)
+        .await
+        .expect("same-key join did not complete")
+        .expect("join task");
+    assert!(ok && ids.get(H) == Some(&4), "joiner lost detached listing work");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.torbox.active_listing_flights() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed listings leaked flight entries or admission permits");
+
+    // A key refused during the flood has no negative memo/account state and succeeds once a permit returns.
+    release.add_permits(1);
+    let (ids, ok) = spawn_listing(stores[LIMIT].clone()).await.expect("recovery task");
+    assert!(ok && ids.get(H) == Some(&4), "a refused account did not recover on retry");
+    assert_eq!(runtime.torbox.active_listing_flights(), 0);
+}
+
 #[async_trait::async_trait]
 impl Doer for GatedDoer {
     async fn do_request(&self, _req: reqwest::Request) -> Result<reqwest::Response, DoError> {
@@ -691,77 +801,83 @@ impl Doer for GatedDoer {
     }
 }
 
-// StatusAnswer's doubt comes from the lookup it already did, not from a second one.
+// ProviderStatus's doubt comes from the lookup it already did, not from a second one.
 //
 // The three-valued answer was first built by re-running findTorrentByHash purely to learn whether the
 // listing had been readable. That call goes straight to accountListing and so steps over torrentMissKey,
 // whose entire purpose is that a remembered miss costs no fetch — measured at four listing requests per
 // /play against a throttled account where one was enough, on the exact path that is already refusing.
 #[tokio::test]
-async fn torbox_status_answer_takes_its_doubt_from_the_lookup_it_already_did() {
-    struct Case {
-        name: &'static str,
-        // The listing reply, which decides whether the miss is authoritative.
-        listing: fn() -> reqwest::Response,
-        want_answer: StatusAnswer,
-        // Fetches over two polls: the first reads the listing, the second must read nothing — either
-        // because the miss was remembered or because the oversize/failure path decided for itself.
-        want_fetches: usize,
-    }
-    let cases = [
-        // Read in full, hash absent: an authoritative no, remembered, so the second poll costs nothing.
-        Case {
-            name: "an empty account is a definitive no",
-            listing: || resp(200, r#"{"success":true,"data":[]}"#),
-            want_answer: StatusAnswer::No,
-            want_fetches: 1,
-        },
-        // The list was never read, so "not in it" is not a fact about the account. The miss must NOT be
-        // remembered here — that retry is the only thing that rediscovers a queued torrent — so the
-        // second poll does fetch again, and neither poll may fetch twice.
-        Case {
-            name: "an unreadable listing is doubt, not a no",
-            listing: || resp(503, "down"),
-            want_answer: StatusAnswer::Unknown,
-            want_fetches: 2,
-        },
-    ];
-    for tc in cases {
-        // A definitive "no" from mylist now also checks TorBox's OWN QUEUE before settling on
-        // statusNo (see statusAnswerUncached) — a separate listing, answered empty here so this test
-        // stays about the torrent listing's own doubt/certainty contract. An unreadable mylist (the
-        // second case) must never reach that check at all: authoritative=false returns before it.
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let queue_fetches = Arc::new(AtomicUsize::new(0));
-        let (f, q) = (fetches.clone(), queue_fetches.clone());
-        let listing = tc.listing;
-        let s = tb(
-            "t",
-            TORBOX_API,
-            Some(Arc::new(MemoryCache::new(1 << 20))),
-            mock(move |req| {
-                let p = req.url().path().to_owned();
-                if p.contains("mylist") && query(&req, "id").is_empty() {
-                    f.fetch_add(1, Ordering::SeqCst);
-                    return Ok(listing());
-                }
-                if p.contains("getqueued") {
-                    q.fetch_add(1, Ordering::SeqCst);
-                    return Ok(resp(200, r#"{"success":true,"data":[]}"#));
-                }
-                panic!("unexpected request: {}", req.url());
-            }),
-        );
-        for i in 0..2 {
-            let (_, answer) =
-                s.status_answer(&target_hash(H)).await.expect("the TorBox store answers three-valued");
-            assert_eq!(answer, tc.want_answer, "{}: poll {i} answered {answer:?}", tc.name);
+async fn torbox_provider_status_takes_its_doubt_from_the_lookup_it_already_did() {
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        struct Case {
+            name: &'static str,
+            // The listing reply, which decides whether the miss is authoritative.
+            listing: fn() -> reqwest::Response,
+            want_answer: ProviderStatus,
+            // Fetches over two polls: the first reads the listing, the second must read nothing — either
+            // because the miss was remembered or because the oversize/failure path decided for itself.
+            want_fetches: usize,
         }
-        let n = fetches.load(Ordering::SeqCst);
-        assert_eq!(n, tc.want_fetches, "{}: listed the account {n} times over two polls", tc.name);
-        let q = queue_fetches.load(Ordering::SeqCst);
-        assert!(q <= 1, "{}: checked TorBox's own queue {q} times over two polls, want at most 1", tc.name);
-    }
+        let cases = [
+            // Read in full, hash absent: an authoritative no, remembered, so the second poll costs nothing.
+            Case {
+                name: "an empty account is a definitive no",
+                listing: || resp(200, r#"{"success":true,"data":[]}"#),
+                want_answer: ProviderStatus::NotFetching,
+                want_fetches: 1,
+            },
+            // The list was never read, so "not in it" is not a fact about the account. The miss must NOT be
+            // remembered here — that retry is the only thing that rediscovers a queued torrent — so the
+            // second poll does fetch again, and neither poll may fetch twice.
+            Case {
+                name: "an unreadable listing is doubt, not a no",
+                listing: || resp(503, "down"),
+                want_answer: ProviderStatus::Unknown,
+                want_fetches: 2,
+            },
+        ];
+        for tc in cases {
+            // A definitive "no" from mylist now also checks TorBox's OWN QUEUE before settling on
+            // statusNo (see statusAnswerUncached) — a separate listing, answered empty here so this test
+            // stays about the torrent listing's own doubt/certainty contract. An unreadable mylist (the
+            // second case) must never reach that check at all: authoritative=false returns before it.
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let queue_fetches = Arc::new(AtomicUsize::new(0));
+            let (f, q) = (fetches.clone(), queue_fetches.clone());
+            let listing = tc.listing;
+            let s = tb(
+                "t",
+                TORBOX_API,
+                Some(Arc::new(MemoryCache::new(1 << 20))),
+                mock(move |req| {
+                    let p = req.url().path().to_owned();
+                    if p.contains("mylist") && query(&req, "id").is_empty() {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        return Ok(listing());
+                    }
+                    if p.contains("getqueued") {
+                        q.fetch_add(1, Ordering::SeqCst);
+                        return Ok(resp(200, r#"{"success":true,"data":[]}"#));
+                    }
+                    panic!("unexpected request: {}", req.url());
+                }),
+            );
+            for i in 0..2 {
+                let answer = s.provider_status(&target_hash(H)).await;
+                assert_eq!(answer, tc.want_answer, "{}: poll {i} answered {answer:?}", tc.name);
+            }
+            let n = fetches.load(Ordering::SeqCst);
+            assert_eq!(n, tc.want_fetches, "{}: listed the account {n} times over two polls", tc.name);
+            let q = queue_fetches.load(Ordering::SeqCst);
+            assert!(
+                q <= 1,
+                "{}: checked TorBox's own queue {q} times over two polls, want at most 1",
+                tc.name
+            );
+        }
+    })
+    .await;
 }
 
 // The outbound limiter bounds how many TorBox calls are in flight, and a call that waits for a slot
@@ -1292,11 +1408,11 @@ impl Store for FakeStore {
         self.resolve.clone().expect("this fake store was given no resolve")
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
         if self.status_blocks {
             std::future::pending::<()>().await;
         }
-        self.status.clone()
+        self.status.clone().into()
     }
 }
 
@@ -1305,7 +1421,7 @@ impl Store for FakeStore {
 #[derive(Clone)]
 struct AnsweringStore {
     svc: DebridService,
-    answer: StatusAnswer,
+    answer: ProviderStatus,
     asked: Arc<AtomicUsize>,
     /// Go `onAsk`: runs after the answer is recorded, so a test can make the world change mid-loop — here, the
     /// clock running past the pool's deadline, which stands in for the caller hanging up.
@@ -1313,7 +1429,7 @@ struct AnsweringStore {
 }
 
 impl AnsweringStore {
-    fn new(svc: DebridService, answer: StatusAnswer, asked: Arc<AtomicUsize>) -> AnsweringStore {
+    fn new(svc: DebridService, answer: ProviderStatus, asked: Arc<AtomicUsize>) -> AnsweringStore {
         AnsweringStore { svc, answer, asked, on_ask: None }
     }
 }
@@ -1332,16 +1448,18 @@ impl Store for AnsweringStore {
         panic!("not resolved in these tests")
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
-    }
-
-    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
         self.asked.fetch_add(1, Ordering::SeqCst);
         if let Some(on_ask) = &self.on_ask {
             on_ask();
         }
-        Some((StoreStatus { progress: 0.5, ..Default::default() }, self.answer))
+        match self.answer {
+            ProviderStatus::Downloading(_) => {
+                ProviderStatus::Downloading(StoreStatus { progress: 0.5, ..Default::default() })
+            }
+            ProviderStatus::NotFetching => ProviderStatus::NotFetching,
+            ProviderStatus::Unknown => ProviderStatus::Unknown,
+        }
     }
 }
 
@@ -1430,19 +1548,24 @@ async fn premiumize() {
 async fn store_pool_prefers_the_three_valued_answer() {
     // A store whose two-valued Status always says "no", and whose three-valued answer is set per case.
     for (name, answer, want_ok, want_unknown) in [
-        ("unknown is carried, not flattened to no", StatusAnswer::Unknown, false, true),
-        ("downloading is carried too", StatusAnswer::Downloading, true, false),
+        ("unknown is carried, not flattened to no", ProviderStatus::Unknown, false, true),
+        ("downloading is carried too", ProviderStatus::Downloading(StoreStatus::default()), true, false),
     ] {
         let asked = Arc::new(AtomicUsize::new(0));
         let pool = StorePool {
             stores: vec![Box::new(AnsweringStore::new(DebridService::TorBox, answer, asked.clone()))],
         };
-        let (status, ok, unknown) = pool.status(&target_hash(H), None).await;
+        let outcome = pool.status_outcome(&target_hash(H), None).await;
+        let (status, ok, unknown) = match outcome.result {
+            ProviderStatus::Downloading(status) => (status, true, false),
+            ProviderStatus::NotFetching => (StoreStatus::default(), false, false),
+            ProviderStatus::Unknown => (StoreStatus::default(), false, true),
+        };
         assert!(ok == want_ok && unknown == want_unknown, "{name}: pool answered ok={ok} unknown={unknown}");
         assert_eq!(
             asked.load(Ordering::SeqCst),
             1,
-            "{name}: StatusAnswer called the wrong number of times — the pool used the bool fallback"
+            "{name}: ProviderStatus called the wrong number of times — the pool used the bool fallback"
         );
         if want_ok {
             assert_eq!(status.progress, 0.5, "{name}: the status itself was dropped");
@@ -1590,51 +1713,77 @@ async fn torbox_account_state_is_isolated_by_api_and_token() {
 
 #[tokio::test]
 async fn torbox_status() {
-    // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
-    for (name, body, want_ok, want_prog) in [
-        (
-            "downloading",
-            r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#,
-            true,
-            0.42,
-        ),
-        (
-            "array payload",
-            r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#,
-            true,
-            0.1,
-        ),
-        (
-            "finished but unresolvable",
-            r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#,
-            false,
-            0.0,
-        ),
-        ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
-        ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
-        ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
-    ] {
-        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
-        cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
-        let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
-        let got = s.status(&target_hash(H)).await;
-        assert_eq!(got.is_some(), want_ok, "{name}: ok");
-        if let (true, Some(g)) = (want_ok, got) {
-            assert_eq!(g.progress, want_prog, "{name}: progress");
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        // A download TorBox reports on is a wait; an unknown or finished-but-unresolvable one is not.
+        for (name, body, want_ok, want_prog) in [
+            (
+                "downloading",
+                r#"{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}"#,
+                true,
+                0.42,
+            ),
+            (
+                "array payload",
+                r#"{"success":true,"data":[{"progress":0.1,"download_finished":false}]}"#,
+                true,
+                0.1,
+            ),
+            (
+                "finished but unresolvable",
+                r#"{"success":true,"data":{"progress":1,"download_finished":true}}"#,
+                false,
+                0.0,
+            ),
+            ("deleted torrent", r#"{"success":false,"data":null}"#, false, 0.0),
+            ("null payload", r#"{"success":true,"data":null}"#, false, 0.0),
+            ("empty object", r#"{"success":true,"data":{}}"#, false, 0.0),
+        ] {
+            let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
+            cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
+            let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
+            let got = s.provider_status(&target_hash(H)).await;
+            assert_eq!(got.is_downloading(), want_ok, "{name}: ok");
+            if let (true, ProviderStatus::Downloading(g)) = (want_ok, got) {
+                assert_eq!(g.progress, want_prog, "{name}: progress");
+            }
         }
-    }
-    // No torrent id remembered, and the account doesn't hold it either → nothing to report.
-    let empty = tb(
-        "t",
-        TORBOX_API,
-        Some(Arc::new(MemoryCache::new(1 << 16))),
-        mock(|_| Ok(resp(200, r#"{"data":[]}"#))),
-    );
-    assert!(empty.status(&target_hash(H)).await.is_none(), "an unknown infohash must not report a download");
+        // No torrent id remembered, and the account doesn't hold it either → nothing to report.
+        let empty = tb(
+            "t",
+            TORBOX_API,
+            Some(Arc::new(MemoryCache::new(1 << 16))),
+            mock(|_| Ok(resp(200, r#"{"data":[]}"#))),
+        );
+        assert!(
+            !empty.provider_status(&target_hash(H)).await.is_downloading(),
+            "an unknown infohash must not report a download"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn held_real_debrid_transport_failure_remains_unknown() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
+    let target = target_hash(H);
+    cache.put(&rd_torrent_key("t", H, &target), "rd-id", Duration::from_secs(3600));
+    let store = RealDebridStore {
+        token: "t".into(),
+        api: REAL_DEBRID_API.into(),
+        cache: Some(cache),
+        client: mock(|_| Err(Box::new(std::io::Error::other("transport failed")))),
+    };
+
+    assert_eq!(store.provider_status(&target).await, ProviderStatus::Unknown);
+    let pool = StorePool { stores: vec![Box::new(store)] };
+    let outcome = pool.status_outcome(&target, None).await;
+    assert!(matches!(outcome.result, ProviderStatus::Unknown));
+    assert_eq!(outcome.unresolved.len(), 1, "the provider must remain available for a targeted retry");
 }
 
 #[tokio::test]
 async fn torbox_status_carries_state_and_swarm() {
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
     // Status carries TorBox's state and swarm through, rather than reducing every wait to a percentage.
     for (name, body, want_state, want_seeds, want_peers) in [
         (
@@ -1663,13 +1812,18 @@ async fn torbox_status_carries_state_and_swarm() {
         let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16));
         cache.put(&torrent_id_key("t", H), "7", Duration::from_secs(3600));
         let s = tb("t", TORBOX_API, Some(cache), mock(move |_| Ok(resp(200, body))));
-        let got = s.status(&target_hash(H)).await.expect("a download TorBox reports on must be a wait");
+        let got = s
+            .provider_status(&target_hash(H))
+            .await
+            .expect_downloading("a download TorBox reports on must be a wait");
         assert_eq!(got.state, want_state, "{name}: state");
         assert!(
             same_count(got.seeds, want_seeds) && same_count(got.peers, want_peers),
             "{name}: seeds/peers"
         );
     }
+    })
+    .await;
 }
 
 /// Go `sameCount`: two optional counts are the same when both are absent or both are present and equal.
@@ -1679,36 +1833,41 @@ fn same_count(a: Option<i64>, b: Option<i64>) -> bool {
 
 #[tokio::test]
 async fn torbox_status_rediscovers_lost_torrent_id() {
-    // Losing the cached torrent id is not losing the download: the id is rediscovered from the account's
-    // own list, and remembered, so the next poll is a single-id lookup again.
-    let list_calls = Arc::new(AtomicUsize::new(0));
-    let lc = list_calls.clone();
-    // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
-    let target = H.to_uppercase();
-    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
-    let s = tb(
-        "t",
-        TORBOX_API,
-        Some(cache.clone()),
-        mock(move |req| {
-            if req.url().query().unwrap_or("").contains("id=") {
-                return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
-            }
-            lc.fetch_add(1, Ordering::SeqCst);
-            Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
-        }),
-    );
-    let got =
-        s.status(&target_hash(&target)).await.expect("a download the account is holding must be reported");
-    assert_eq!(got.progress, 0.25, "progress");
-    assert_eq!(
-        cache.get(&torrent_id_key("t", &target)).as_deref(),
-        Some("7"),
-        "the rediscovered id must be remembered"
-    );
-    // Second call must reuse the cache rather than list the whole account again.
-    assert!(s.status(&target_hash(&target)).await.is_some(), "second status");
-    assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        // Losing the cached torrent id is not losing the download: the id is rediscovered from the account's
+        // own list, and remembered, so the next poll is a single-id lookup again.
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let lc = list_calls.clone();
+        // The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
+        let target = H.to_uppercase();
+        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 16)); // deliberately empty
+        let s = tb(
+            "t",
+            TORBOX_API,
+            Some(cache.clone()),
+            mock(move |req| {
+                if req.url().query().unwrap_or("").contains("id=") {
+                    return Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false}}"#));
+                }
+                lc.fetch_add(1, Ordering::SeqCst);
+                Ok(resp(200, &format!(r#"{{"data":[{{"id":7,"hash":"{H}"}}]}}"#)))
+            }),
+        );
+        let got = s
+            .provider_status(&target_hash(&target))
+            .await
+            .expect_downloading("a download the account is holding must be reported");
+        assert_eq!(got.progress, 0.25, "progress");
+        assert_eq!(
+            cache.get(&torrent_id_key("t", &target)).as_deref(),
+            Some("7"),
+            "the rediscovered id must be remembered"
+        );
+        // Second call must reuse the cache rather than list the whole account again.
+        assert!(s.provider_status(&target_hash(&target)).await.is_downloading(), "second status");
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1, "account listed more than once");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1758,7 +1917,7 @@ impl Doer for SlowStatusDoer {
 }
 
 #[tokio::test]
-async fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
+async fn torbox_provider_status_coalesces_viewers_and_reuses_snapshot() {
     // 20 concurrent viewers of one download make one status call; a warm snapshot makes no further call.
     const TOKEN: &str = "status-coordination-test";
     let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
@@ -1772,8 +1931,7 @@ async fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
         let (store, barrier) = (store.clone(), barrier.clone());
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-            assert_eq!(answer, StatusAnswer::Downloading, "answer");
+            assert!(store.provider_status(&target_hash(H)).await.is_downloading(), "answer");
         }));
     }
     barrier.wait().await;
@@ -1781,13 +1939,12 @@ async fn torbox_status_answer_coalesces_viewers_and_reuses_snapshot() {
         t.await.expect("task");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "20 concurrent viewers made status calls, want 1");
-    let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-    assert_eq!(answer, StatusAnswer::Downloading, "snapshot answer");
+    assert!(store.provider_status(&target_hash(H)).await.is_downloading(), "snapshot answer");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "warm snapshot made another call");
 }
 
 #[tokio::test]
-async fn torbox_status_answer_coordination_includes_api_identity() {
+async fn torbox_provider_status_coordination_includes_api_identity() {
     // Two API identities sharing one token must not share status coordination.
     const TOKEN: &str = "same-status-token-different-api";
     let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
@@ -1800,8 +1957,7 @@ async fn torbox_status_answer_coordination_includes_api_identity() {
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            let (_, answer) = store.status_answer(&target_hash(H)).await.expect("answer");
-            assert_eq!(answer, StatusAnswer::Downloading, "{api} answer");
+            assert!(store.provider_status(&target_hash(H)).await.is_downloading(), "{api} answer");
         }));
     }
     barrier.wait().await;
@@ -1843,7 +1999,9 @@ async fn store_pool_status_reports_when_a_store_could_not_answer() {
     let pool = StorePool { stores: vec![Box::new(wedged), Box::new(silent.clone())] };
     let start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
-    let (_, ok, unknown) = pool.status(&target_hash(H), Some(deadline)).await;
+    let outcome = pool.status_outcome(&target_hash(H), Some(deadline)).await;
+    let ok = outcome.result.is_downloading();
+    let unknown = !outcome.unresolved.is_empty();
     assert!(!ok, "a wedged store reported a download");
     assert!(unknown, "a store that ran out of time was reported as a definitive 'not downloading'");
     assert!(
@@ -1855,29 +2013,34 @@ async fn store_pool_status_reports_when_a_store_could_not_answer() {
     // Every store answering promptly → a real answer, not indeterminate.
     let clean = StorePool { stores: vec![Box::new(silent.clone()), Box::new(silent)] };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let (_, ok, unknown) = clean.status(&target_hash(H), Some(deadline)).await;
+    let outcome = clean.status_outcome(&target_hash(H), Some(deadline)).await;
+    let ok = outcome.result.is_downloading();
+    let unknown = !outcome.unresolved.is_empty();
     assert!(!ok && !unknown, "prompt answers reported ok={ok} unknown={unknown}, want false/false");
 }
 
 #[tokio::test]
-async fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() {
-    // StatusDetail names the stores that could not answer, so the escalated retry asks only those.
+async fn store_pool_status_outcome_names_only_the_stores_that_could_not_answer() {
+    // The named outcome retains stores that could not answer, so the escalated retry asks only those.
     let uncertain_asks = Arc::new(AtomicUsize::new(0));
     let definite_asks = Arc::new(AtomicUsize::new(0));
-    let uncertain = AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, uncertain_asks.clone());
-    let definite = AnsweringStore::new(DebridService::RealDebrid, StatusAnswer::No, definite_asks.clone());
+    let uncertain =
+        AnsweringStore::new(DebridService::TorBox, ProviderStatus::Unknown, uncertain_asks.clone());
+    let definite =
+        AnsweringStore::new(DebridService::RealDebrid, ProviderStatus::NotFetching, definite_asks.clone());
 
     let pool = StorePool {
         stores: vec![Box::new(definite.clone()), Box::new(uncertain), Box::new(definite.clone())],
     };
-    let (_, ok, unknown) = pool.status_detail(&target_hash(H), None).await;
-    assert!(!ok, "nothing was downloading");
+    let outcome = pool.status_outcome(&target_hash(H), None).await;
+    assert!(!outcome.result.is_downloading(), "nothing was downloading");
+    let unknown = outcome.unresolved;
     assert_eq!(unknown.len(), 1, "reported {} stores as unable to answer, want 1", unknown.len());
     assert_eq!(unknown[0].service(), DebridService::TorBox, "named the store that could not answer");
 
     // The retry, as handlePlay performs it: only the named store is asked again.
     let before = definite_asks.load(Ordering::SeqCst);
-    let _ = crate::stores::pool::status_detail_among(&unknown, &target_hash(H), None).await;
+    let _ = crate::stores::pool::status_outcome_among(&unknown, &target_hash(H), None).await;
     assert_eq!(
         definite_asks.load(Ordering::SeqCst),
         before,
@@ -1892,53 +2055,73 @@ async fn store_pool_status_detail_names_only_the_stores_that_could_not_answer() 
 }
 
 #[tokio::test]
-async fn store_pool_status_detail_keeps_uncertain_stores_when_time_runs_out() {
+async fn store_pool_status_outcome_keeps_uncertain_stores_when_time_runs_out() {
     // Running out of time mid-loop keeps the stores that ALREADY said they could not answer, as well as the ones
     // never reached: three stores — answered, uncertain, never reached — and the caller hangs up (here: the clock
     // passes the deadline while the second store is being asked, which a blocking sleep makes certain).
     let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
-    let answered =
-        AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No, Arc::new(AtomicUsize::new(0)));
+    let answered = AnsweringStore::new(
+        DebridService::Premiumize,
+        ProviderStatus::NotFetching,
+        Arc::new(AtomicUsize::new(0)),
+    );
     let mut uncertain =
-        AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown, Arc::new(AtomicUsize::new(0)));
+        AnsweringStore::new(DebridService::TorBox, ProviderStatus::Unknown, Arc::new(AtomicUsize::new(0)));
     uncertain.on_ask = Some(Arc::new(|| std::thread::sleep(Duration::from_millis(60))));
     let unreached = FakeStore::new(DebridService::RealDebrid);
 
     let pool = StorePool { stores: vec![Box::new(answered), Box::new(uncertain), Box::new(unreached)] };
-    let (_, ok, unknown) = pool.status_detail(&target_hash(H), Some(deadline)).await;
-    assert!(!ok, "nothing was downloading");
+    let outcome = pool.status_outcome(&target_hash(H), Some(deadline)).await;
+    assert!(!outcome.result.is_downloading(), "nothing was downloading");
+    let unknown = outcome.unresolved;
     let named: Vec<DebridService> = unknown.iter().map(|s| s.service()).collect();
     assert_eq!(named, vec![DebridService::TorBox, DebridService::RealDebrid], "named as unable to answer");
 }
 
 #[tokio::test]
 async fn account_listing_a_panic_in_the_fetch_is_abandoned_not_fatal() {
-    // A panic inside the listing fetch is abandoned, not fatal.
-    let before = crate::metrics::background_panic();
-    let s = tb(
-        "panics",
-        TORBOX_API,
-        Some(Arc::new(MemoryCache::new(1 << 20))),
-        mock(|_| panic!("a parser went off the end")),
-    );
-    let s = Arc::new(s);
-    let mut tasks = Vec::new();
-    for _ in 0..2 {
-        let s = s.clone();
-        tasks.push(tokio::spawn(async move {
-            let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing())
-                .await
-                .expect("a caller never returned from a panicking fetch");
-            ok || !ids.is_empty()
-        }));
-    }
-    for t in tasks {
-        assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
-    }
-    assert!(
-        crate::metrics::background_panic() > before,
-        "the panic was not counted — an operator has nothing to alert on"
-    );
+    // A panic inside the listing fetch is abandoned, not fatal. Its sole admission slot and map entry must both
+    // be returned: otherwise an unrelated healthy account remains refused forever after one parser panic.
+    let runtime = crate::runtime::ScoutRuntime::new_with_account_listing_limit(1);
+    crate::runtime::scope(runtime.clone(), async move {
+        let before = crate::metrics::background_panic();
+        let s = tb(
+            "panics",
+            TORBOX_API,
+            Some(Arc::new(MemoryCache::new(1 << 20))),
+            mock(|_| panic!("a parser went off the end")),
+        );
+        let s = Arc::new(s);
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let s = s.clone();
+            let owner = runtime.clone();
+            tasks.push(tokio::spawn(crate::runtime::scope(owner, async move {
+                let (ids, ok) = tokio::time::timeout(Duration::from_secs(5), s.account_listing())
+                    .await
+                    .expect("a caller never returned from a panicking fetch");
+                ok || !ids.is_empty()
+            })));
+        }
+        for t in tasks {
+            assert!(!t.await.expect("task"), "a panicking fetch reported an answer");
+        }
+        assert!(
+            crate::metrics::background_panic() > before,
+            "the panic was not counted — an operator has nothing to alert on"
+        );
+        assert_eq!(runtime.torbox.active_listing_flights(), 0, "panicking fetch leaked its flight key");
+
+        let healthy = tb(
+            "after-panic",
+            TORBOX_API,
+            None,
+            mock(|_| Ok(resp(200, &format!(r#"{{"success":true,"data":[{{"id":9,"hash":"{H}"}}]}}"#)))),
+        );
+        let (ids, ok) = healthy.account_listing().await;
+        assert!(ok && ids.get(H) == Some(&9), "panic leaked the only admission permit");
+    })
+    .await;
 }
 
 // Not in the Go suite: the parts of the three allocation-measuring decode tests that do not need a counting

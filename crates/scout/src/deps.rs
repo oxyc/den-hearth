@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use den_seal::Revocation;
 use den_upstream::ClientProfile;
 
-use crate::addbudget::{set_play_reserve, ADD_BUDGET_LIMIT, DEFAULT_PLAY_RESERVE};
+use crate::addbudget::{ADD_BUDGET_LIMIT, DEFAULT_PLAY_RESERVE};
 use crate::cache::Cache;
 use crate::cinemeta::{cinemeta_meta, Cinemeta, CINEMETA_BASE};
 use crate::config::{Config, Indexer, ALL_INDEXERS, DEFAULT_INDEXERS, DISABLED_INDEXERS};
@@ -21,6 +21,7 @@ use crate::indexerconfig::enable_indexer_config_minting;
 use crate::loglimit::emit;
 use crate::managed_hls::{ManagedHlsResolver, TorBoxManagedHls};
 use crate::manifest::manifest_version;
+use crate::runtime::{shared_runtime, ScoutRuntime};
 use crate::scrape::{make_scrapers, new_source_doer, DoError, Doer, Scraper};
 use crate::seal::{parse_seal_keyring, SealKeyring};
 use crate::stores::pool::build_stores;
@@ -337,6 +338,8 @@ pub type StoreFactory = Arc<dyn Fn(&Config) -> Vec<Box<dyn Store>> + Send + Sync
 /// factories, mocked in tests). Go declares it in `handler.go`; it lives here because `BuildDeps` is what
 /// fills it.
 pub struct Deps {
+    /// Shared mutable runtime. Hearth constructs one and injects it into every Scout-facing handler.
+    pub runtime: Arc<ScoutRuntime>,
     pub cache: Arc<dyn Cache>,
     /// Client for reading the head of a resolved link. Separate from the scraper client so a probe's longer
     /// body read can't tie up the timeouts tuned for indexer queries. `None` means no probe runs.
@@ -360,7 +363,7 @@ pub struct Deps {
     /// `(_, false)` and the list is served unfiltered.
     pub(crate) meta: Option<Arc<Cinemeta>>,
     /// Decrypts a sealed config path segment (docs/SEALED-CONFIG.md). None = sealed URLs disabled (legacy
-    /// plaintext still works); the current key's public half is served at /config-key.
+    /// plaintext still works); Hearth derives or selects the combined addon's public key for `/den/config-key`.
     pub seal_keyring: Option<Arc<SealKeyring>>,
     /// CONFIG_KEY is set but malformed: install configs are refused and /health is degraded.
     pub config_key_invalid: bool,
@@ -404,14 +407,33 @@ pub fn build_deps(settings: &Settings, client: reqwest::Client, cache: Arc<dyn C
     // Go wraps the client's transport in PauseOnRefusal (cmd/den-scout/main.go): every debrid and indexer
     // request shares one memory of who asked to be left alone.
     let http: Arc<dyn Doer> = Arc::new(pause_on_refusal(ReqwestDoer(client.clone())));
-    build_deps_with(settings, http, Some(client), cache)
+    build_deps_with(settings, http, Some(client), cache, shared_runtime())
+}
+
+pub fn build_deps_with_runtime(
+    settings: &Settings,
+    client: reqwest::Client,
+    cache: Arc<dyn Cache>,
+    runtime: Arc<ScoutRuntime>,
+) -> Deps {
+    let http: Arc<dyn Doer> = Arc::new(pause_on_refusal(ReqwestDoer(client.clone())));
+    build_deps_with(settings, http, Some(client), cache, runtime)
 }
 
 /// `build_deps` over an outbound client built once by the caller. Go has one process-wide client, and so one memory
 /// of who asked to be left alone; a process serving several handlers builds `http` once (see `shared_http`) and
 /// passes it to each, so a pause one handler learns is honoured by the others.
 pub fn build_deps_shared(settings: &Settings, http: Arc<dyn Doer>, cache: Arc<dyn Cache>) -> Deps {
-    build_deps_with(settings, http, None, cache)
+    build_deps_with(settings, http, None, cache, shared_runtime())
+}
+
+pub fn build_deps_shared_with_runtime(
+    settings: &Settings,
+    http: Arc<dyn Doer>,
+    cache: Arc<dyn Cache>,
+    runtime: Arc<ScoutRuntime>,
+) -> Deps {
+    build_deps_with(settings, http, None, cache, runtime)
 }
 
 /// Go `main.go`'s client: `client` with its redirect policy enforced per method, under one pause memory.
@@ -424,10 +446,11 @@ fn build_deps_with(
     doer: Arc<dyn Doer>,
     probe_client: Option<reqwest::Client>,
     cache: Arc<dyn Cache>,
+    runtime: Arc<ScoutRuntime>,
 ) -> Deps {
     // Decided once, at startup, from the operator's environment — never from a request.
     enable_indexer_config_minting(settings.mint_indexer_configs);
-    set_play_reserve(settings.play_reserve_adds);
+    runtime.set_play_reserve(settings.play_reserve_adds);
     set_log_identity(settings.log_identity);
     // A client can first use a list's tickets up to 3×LIST_TTL_SECS after the list was built (see
     // defaultPlayTicketTTL), so a TTL at or under that hands out tickets that are dead on arrival.
@@ -449,6 +472,7 @@ fn build_deps_with(
         .map(|resolver| Arc::new(resolver) as Arc<dyn ManagedHlsResolver>);
     let (seal_keyring, config_key_invalid) = build_keyring(&settings.config_key, &settings.config_keys_prev);
     Deps {
+        runtime,
         probe_doer: Some(doer.clone()),
         meta: Some(Arc::new(cinemeta_meta(doer, &settings.cinemeta_url, cache.clone()))),
         cache,

@@ -7,7 +7,7 @@
 //! {"iid": "…", "ep": 0, "scout": {"debrid": […]}, "subs": {"osKey": "…"}, "reel": {"tmdbKey": "…"}}
 //! ```
 //!
-//! Each member is exactly the config that service's own `/configure` builds, minus `iid` and `ep`. A service
+//! Each member is exactly the config `/den/configure` builds for that service, minus `iid` and `ep`. A service
 //! reads its member as though it were its own config, with the top-level `iid` and `ep` put in, so it labels and
 //! admits the request as the combined install. A service's own config has no such member, so a segment of one kind
 //! never opens as the other.

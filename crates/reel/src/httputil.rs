@@ -3,7 +3,7 @@
 
 pub use den_http::percent_decode_path as percent_decode;
 pub use den_http::{
-    apply_conditional, error, etag_of, full, html, if_range_holds, json, not_found, timed, timing, Body,
+    apply_conditional, error, etag_of, full, if_range_holds, json, not_found, timed, timing, Body,
 };
 
 /// The `Vary` for a body built from [`crate::addon::self_base`]. Its play URLs come from the

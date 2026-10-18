@@ -49,7 +49,7 @@ carrying `alass`/`ffmpeg`.
 
 ## Status
 
-Working: manifest + `/configure`, OpenSubtitles hash-matched search, cached subtitle proxy, the full
+Working: combined-manifest integration through Hearth, OpenSubtitles hash-matched search, cached subtitle proxy, the full
 BYOK translation harness (all providers), the cache, the Docker image, and the **sync ladder**
 (`src/sync.rs`) — now wired into the request path:
 
@@ -95,7 +95,7 @@ is served as-is; only the Tier-2 resync closes it. See the ticket.
 
 Every reply carries `Access-Control-Allow-Origin: *`, and `OPTIONS` on any path answers a 204 CORS
 preflight. A path the router does not serve answers 404 `{"error":"not_found"}`. `<config>` is the
-per-install config segment built at `/configure`.
+per-install config segment built by Hearth at `/den/configure`.
 
 The subtitles, subtitle and translate responses carry `Server-Timing`, naming where the time went —
 `opensubtitles;dur=`, `download;dur=`, `sync;dur=` (when a sync tier ran), `translate;dur=`, or
@@ -106,9 +106,8 @@ OpenSubtitles search failed (or a translation served unaligned because its ancho
 search stays fresh for six hours and is kept seven days past that for this), and `sync_failed` for a
 subtitle served unaligned because its sync failed. A normal answer carries no reason.
 
-Caching. `/manifest.json`, `/configure` and `/config-key` are `public`. Everything under `/<config>/`
-is `private`, because the segment is the install's credentials: the configured manifest
-(`max-age=3600, stale-while-revalidate=600`), the subtitles list (`max-age=3600,
+Caching. Everything under `/<config>/` is `private`, because the segment is the install's credentials:
+the subtitles list (`max-age=3600,
 stale-while-revalidate=3600, stale-if-error=86400`, or `max-age=60` for a `stale_search` answer), and
 a settled subtitle, proxied or translated (`max-age=31536000, immutable`). A subtitle served unaligned
 because its sync failed is `private, no-cache`. Every cacheable answer carries a strong `ETag` and
@@ -133,16 +132,9 @@ key across batches and films. The first successful answer ends a pause.
   disk tier is on and how many of its writes failed, translations running now, and fixed-cardinality
   per-tier sync running, queue-time, admission, completion, timeout, failure and cancellation series —
   computed per scrape, with nothing per-install in the labels.
-- `GET /`, `GET /configure` — the install page that builds (and, with `CONFIG_KEY` set, seals) the
-  config segment.
-- `GET /config-key` — `{"key":"<base64 X25519 public key>","epoch":<CONFIG_EPOCH>}` for `/configure`
-  to seal to; 404 `{"error":"no_key","epoch":<CONFIG_EPOCH>}` when sealing is off.
-- `GET /manifest.json` — the unconfigured manifest (`configurationRequired`), what a client sees
-  before installing.
-- `GET /<config>/manifest.json` — the configured manifest, carrying the install's id as the top-level
-  `denInstallId` (absent for a link without one); 400 `{"error":"bad_config"}` for a segment
-  that does not decode, or whose install is revoked (see Configuration). Every `/<config>/…` route
-  gives a revoked install that same answer.
+- `GET /`, `/configure`, `/config-key`, `/manifest.json`, and `/<config>/manifest.json` — obsolete
+  standalone install surfaces; all return 404. Install only through Hearth's `/den/configure` page and
+  combined `/den` manifest.
 - `GET /<config>/subtitles/<type>/<id>[/<extra>].json` — the Stremio subtitles resource:
   hash-matched-first OpenSubtitles results, each `url` pointing at `/subtitle` below. A candidate
   already confirmed dead (the API's own 404/410, or two occasions of a cue-less body/expired link) is
@@ -175,10 +167,10 @@ key across batches and films. The first successful answer ends a pause.
 Per-install config is base64url-encoded in the addon URL (den-scout / Torrentio style), a bearer
 secret the app stores in the Keychain. The **OpenSubtitles key** (subtitle source) is required; the
 **LLM key** (translation) is **optional** — omit it for a fetch + auto-sync-only install with no AI.
-Build it at `/configure`.
+Build it through Hearth at `/den/configure`.
 
-Every link `/configure` builds also carries an install id (`iid`, 16 random bytes) and the config
-epoch it was built in (`ep`, from `/config-key`), sealed along with the keys. `REVOKED_INSTALLS`
+Every link Hearth's `/den/configure` builds also carries an install id (`iid`, 16 random bytes) and the
+config epoch it was built in (`ep`), sealed along with the keys. `REVOKED_INSTALLS`
 refuses one install by its id; raising `CONFIG_EPOCH` refuses every link stamped below it (a link
 from before ids existed counts as epoch 0), and new links pick up the new epoch. The config is in
 every `/subtitle` and `/translate` URL the addon hands out, so a revocation reaches those too. **Key
@@ -186,8 +178,8 @@ rotation is not revocation:** `CONFIG_KEYS_PREV` keeps links sealed to an old ke
 rotating `CONFIG_KEY` does nothing to a leaked link — revoke it instead. A refused install is logged
 as `bad_config: install revoked (iid=<first 6 chars>…)` or `bad_config: install epoch too old`.
 
-A link's id is shown in two places, spelled as `REVOKED_INSTALLS` takes it: `/configure` prints it
-under the link it just built, and the install's manifest carries it as `denInstallId`, so a client
+A link's id is shown in two places, spelled as `REVOKED_INSTALLS` takes it: `/den/configure` prints it
+under the link it just built, and the combined install's manifest carries it as `denInstallId`, so a client
 holding the link can show it (Den: Settings › Plugins). That is how to revoke one leaked link without
 raising the epoch for all of them.
 
@@ -212,10 +204,10 @@ it optional (`.env.example` lists the same):
 | `CACHE_DIR` | `$TMPDIR/den-subtitles-cache` (image: `/cache`) | Disk cache tier and the sync scratch dir. |
 | `CACHE_MAX_BYTES` | `268435456` (256 MiB) | Disk cache byte budget. The in-memory hot tier uses the same value clamped to 64 MiB, which the 512 MiB sync budget depends on. |
 | `PUBLIC_BASE_URL` | unset (derived from `Host`) | Fixed origin for the `/subtitle` and `/translate` URLs handed back to the app. |
-| `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key `/configure` seals configs to; back it up. |
+| `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key the combined `/den/configure` flow seals configs to; back it up. |
 | `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working — which is also why rotation is not revocation. |
 | `REVOKED_INSTALLS` | unset | Comma-separated install ids (`iid`, 22 characters) refused outright. A malformed entry is skipped with a warning. |
-| `CONFIG_EPOCH` | `0` | Links stamped with an `ep` below this are refused; raise it to revoke every existing link without rotating `CONFIG_KEY`. `/config-key` hands it to `/configure` for new links. Not a non-negative integer → warned and enforced as `0`. |
+| `CONFIG_EPOCH` | `0` | Links stamped with an `ep` below this are refused; raise it to revoke every existing link without rotating `CONFIG_KEY`. Hearth stamps it into new combined links. Not a non-negative integer → warned and enforced as `0`. |
 | `METRICS_TOKEN` | unset (`/metrics` 404s) | Bearer token for `/metrics`. |
 | `LOG_REQUESTS` | unset (off; `0` is off too) | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, with the config segment as `<config>` and no query string. |
 | `LOG_IDENTITY` | unset (on; `0`/`false`/`off`/`no` turns it off) | Whether the decision-log lines below (`event=rank`/`serve`/`sync`/`translate`) may carry identity fields — title id, season/episode, file ids, language, release names. Off drops those fields only; the rest of each line (event, outcome, reason, timing, `rid`) is unaffected. |

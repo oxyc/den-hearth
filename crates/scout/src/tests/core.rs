@@ -582,7 +582,10 @@ fn memory_cache_expiry_does_not_remove_a_concurrent_fresh_put() {
     c.put("k", "old", Duration::from_secs(10));
     *clock.lock().unwrap() += Duration::from_secs(11);
     armed.store(true, Ordering::SeqCst);
-    assert!(c.get("k").is_none(), "the expired value is not served");
+    let raced = c.get("k");
+    assert_ne!(raced.as_deref(), Some("old"), "the expired value must never be served");
+    // The shared cache deliberately rechecks memory before falling through to disk, so this racing read may
+    // already observe the fresh put. Both `None` and `Some("new")` are valid; only the expired generation is not.
     assert_eq!(c.get("k").as_deref(), Some("new"), "the fresh put was removed along with the expired value");
 }
 

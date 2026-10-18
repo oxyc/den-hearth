@@ -345,7 +345,10 @@ async fn torbox_resolve_add_failures() {
         want_dead(name, s.resolve(&target(H)).await);
         // Nothing was queued, so nothing may be claimed as downloading — a false "downloading"
         // here is a wait the viewer sits through forever.
-        assert!(s.status(&target(H)).await.is_none(), "claimed a download after the add failed");
+        assert!(
+            !s.provider_status(&target(H)).await.is_downloading(),
+            "claimed a download after the add failed"
+        );
     }
 }
 

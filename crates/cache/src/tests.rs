@@ -2,7 +2,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
@@ -11,7 +12,143 @@ use super::*;
 
 type C = Cache<Arc<str>>;
 
+#[derive(Clone)]
+struct BlockingValue(Arc<str>);
+
+static READBACK_HOOK: Mutex<Option<(SyncSender<()>, Receiver<()>)>> = Mutex::new(None);
+static BLOCKING_VALUE_TEST: Mutex<()> = Mutex::new(());
+
+impl Value for BlockingValue {
+    fn from_str(text: &str) -> Self {
+        let hook = READBACK_HOOK.lock().unwrap().take();
+        if let Some((started, resume)) = hook {
+            started.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        BlockingValue(Arc::from(text))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 const DAY: Duration = Duration::from_secs(24 * 3600);
+
+/// One Tokio worker is enough to prove the handoff: if `filesystem` occupied it, the second task could not run and
+/// release the first. The operation stays on the original task/thread instead of entering a queue of owned closures.
+#[test]
+fn filesystem_work_lends_tokio_its_core_worker() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let blocked = tokio::spawn(async move {
+            filesystem(|| {
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(0);
+        // This task runs on the replacement core worker. Without the handoff, the one worker is parked in recv and it
+        // cannot report progress. Keep a rescue sender so a failed assertion does not leave the runtime hung.
+        let rescue_tx = resume_tx.clone();
+        tokio::spawn(async move {
+            progress_tx.send(()).unwrap();
+            resume_tx.send(()).unwrap();
+        });
+        if progress_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            let _ = rescue_tx.send(());
+            panic!("filesystem work occupied the only Tokio core worker");
+        }
+        blocked.await.unwrap();
+    });
+}
+
+/// A second ordered operation must enter the blocking handoff before it waits for the first operation's stripe. With
+/// one core worker, acquiring the commit lock first would park the replacement core and prevent `progress` from ever
+/// running. The final assertions also cover the read-before-put ordering protected by that same lock.
+#[test]
+fn a_waiting_same_key_put_does_not_occupy_the_tokio_core() {
+    let _serial = BLOCKING_VALUE_TEST.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = TempDir::new().unwrap();
+    let key = "tokio-waiting-same-key";
+    put(&open(dir.path()), key, "old", DAY);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(4)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cache = Arc::new(Cache::<BlockingValue>::new(options(1 << 20, dir.path())));
+        let (read_started_tx, read_started_rx) = sync_channel(0);
+        let (read_resume_tx, read_resume_rx) = sync_channel(0);
+        *READBACK_HOOK.lock().unwrap() = Some((read_started_tx, read_resume_rx));
+
+        let reader_cache = Arc::clone(&cache);
+        let reader = tokio::spawn(async move { reader_cache.get(key).unwrap().as_str().to_owned() });
+        read_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (wait_started_tx, wait_started_rx) = sync_channel(0);
+        *COMMIT_WAIT_HOOK.lock().unwrap() = Some((key.to_owned(), wait_started_tx));
+        let writer_cache = Arc::clone(&cache);
+        let writer = tokio::spawn(async move {
+            writer_cache.put(key, BlockingValue(Arc::from("new")), 2 * DAY, Class::Durable);
+        });
+        wait_started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (progress_tx, progress_rx) = sync_channel(0);
+        tokio::spawn(async move {
+            progress_tx.send(()).unwrap();
+        });
+        let progressed = progress_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        read_resume_tx.send(()).unwrap();
+        let read = reader.await.unwrap();
+        writer.await.unwrap();
+
+        assert!(progressed, "a request waiting for the commit lock occupied the only Tokio core worker");
+        assert_eq!(read, "old");
+        assert_eq!(cache.get(key).unwrap().as_str(), "new");
+        assert_eq!(get(&open(dir.path()), key).as_deref(), Some("new"));
+    });
+}
+
+#[test]
+fn hot_memory_hits_never_enter_the_filesystem_path() {
+    let dir = TempDir::new().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).build().unwrap();
+    runtime.block_on(async {
+        let cache = open(dir.path());
+        put(&cache, "hot", "value", DAY);
+        let after_put = FILESYSTEM_CALLS.get();
+
+        assert_eq!(get(&cache, "hot").as_deref(), Some("value"));
+        assert_eq!(FILESYSTEM_CALLS.get(), after_put, "a hot hit entered the disk handoff");
+
+        cache.remove("hot");
+        assert_eq!(FILESYSTEM_CALLS.get(), after_put + 1, "a disk removal bypassed the handoff");
+    });
+}
+
+#[test]
+fn current_thread_runtime_keeps_the_direct_disk_path() {
+    let dir = TempDir::new().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    runtime.block_on(async {
+        let cache = open(dir.path());
+        put(&cache, "k", "value", DAY);
+        assert_eq!(get(&cache, "k").as_deref(), Some("value"));
+        cache.remove("k");
+        assert_eq!(get(&cache, "k"), None);
+    });
+}
 
 fn quiet(_: &str) {}
 
@@ -137,6 +274,60 @@ fn a_completed_put_leaves_exactly_one_file() {
     put(&c, "k", "v", DAY);
     put(&c, "k", "v2", DAY);
     assert_eq!(files(dir.path()), 1, "a put left scratch behind");
+}
+
+#[test]
+fn a_stale_sweep_verdict_cannot_unlink_a_new_generation() {
+    let dir = TempDir::new().unwrap();
+    let c = open(dir.path());
+    put(&c, "k", "old", DAY);
+    let old = c.disk.as_ref().unwrap().generation_for("k").unwrap();
+
+    // This is the exact ordering of a sweep that copied old metadata, then lost the namespace lock to a put.
+    put(&c, "k", "new", 2 * DAY);
+    c.disk.as_ref().unwrap().retire_generation_for_test("k", old);
+
+    assert_eq!(get(&open(dir.path()), "k").as_deref(), Some("new"));
+}
+
+#[test]
+fn write_bursts_coalesce_to_one_active_sweep_and_one_follow_up() {
+    let dir = TempDir::new().unwrap();
+    let c = open(dir.path());
+    let disk = c.disk.as_ref().unwrap();
+    let before = c.disk_counts().readdirs;
+    assert!(disk.request_burst_sweep(), "the idle tier did not assign a sweep owner");
+    assert!(!disk.request_burst_sweep(), "a second write burst tried to spawn another sweep");
+    assert!(!disk.request_burst_sweep(), "more writes should stay folded into the follow-up");
+    disk.sweep_after_burst(SystemTime::now());
+    assert_eq!(c.disk_counts().readdirs - before, 2, "the coalesced follow-up was lost or repeated");
+    assert!(disk.request_burst_sweep(), "the tier did not return to idle");
+    disk.sweep_after_burst(SystemTime::now());
+}
+
+#[test]
+fn a_readback_cannot_overwrite_a_put_that_began_while_it_was_decoding() {
+    let _serial = BLOCKING_VALUE_TEST.lock().unwrap_or_else(PoisonError::into_inner);
+    let dir = TempDir::new().unwrap();
+    put(&open(dir.path()), "k", "old", DAY);
+    let cache = Arc::new(Cache::<BlockingValue>::new(options(1 << 20, dir.path())));
+    let (started_tx, started_rx) = sync_channel(0);
+    let (resume_tx, resume_rx) = sync_channel(0);
+    *READBACK_HOOK.lock().unwrap() = Some((started_tx, resume_rx));
+
+    let reader_cache = Arc::clone(&cache);
+    let reader = std::thread::spawn(move || reader_cache.get("k").unwrap().as_str().to_owned());
+    started_rx.recv().unwrap();
+
+    let writer_cache = Arc::clone(&cache);
+    let writer = std::thread::spawn(move || {
+        writer_cache.put("k", BlockingValue(Arc::from("new")), 2 * DAY, Class::Durable);
+    });
+    resume_tx.send(()).unwrap();
+    assert_eq!(reader.join().unwrap(), "old");
+    writer.join().unwrap();
+    assert_eq!(cache.get("k").unwrap().as_str(), "new");
+    assert_eq!(get(&open(dir.path()), "k").as_deref(), Some("new"));
 }
 
 // ---- what is written --------------------------------------------------------------------------------------------

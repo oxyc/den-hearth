@@ -8,10 +8,10 @@ license = "MIT"
 
 [dependencies]
 # The lenient base64url the config segment is read with (`b64url_decode`).
-base64 = "0.23"
+base64.workspace = true
 # The browser's `playable` report (`Playable`), read by Remux and Reel and sent on by Remux.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 
 # kill(2) on a child's process group (`signal_group`).
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true

@@ -8,47 +8,47 @@ license = "MIT"
 
 [dependencies]
 # The public-address classifier household sources are guarded with, shared with Subtitles and Remux.
-den-net = { path = "../net" }
+den-net.workspace = true
 # The response body, conditional GETs, CORS, the bearer check and the request log line every addon shares.
-den-http = { path = "../http" }
+den-http.workspace = true
 # Client profiles, the dial-time address guard, Retry-After and the per-credential pause, shared with Reel,
 # Subtitles and Remux.
-den-upstream = { path = "../upstream" }
+den-upstream.workspace = true
 # The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file's head with, shared with Remux.
-den-media = { path = "../media" }
+den-media.workspace = true
 # The request and response bodies the handler serves.
-bytes = "1"
-http-body-util = "0.1"
-async-trait = "0.1"
+bytes.workspace = true
+http-body-util.workspace = true
+async-trait.workspace = true
 # Std and url base64 for the config path segment, the sealed-config key and the play token (Go
 # `encoding/base64`).
-base64 = "0.23"
+base64.workspace = true
 # Go `crypto/sha256`: the 128-bit cache-key digest `key_hash` returns (util.go), the disk tier's file
 # names (diskcache.go), and HKDF-SHA256 for play tickets.
-sha2 = "0.11"
+sha2.workspace = true
 # Go's `encoding/json`: `json.Marshal` for string literals in config fixtures (`jsonString`), the JSON
 # text `validate_config` takes, the streamed TorBox account listing (`decodeListing`), and the response
 # bodies the handler tests decode. `raw_value` is Go's `json.RawMessage`: a stale list keeps its `streams` array
 # exactly as it was written (coverage.rs `stale_body`).
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 # XChaCha20-Poly1305 for play tickets (Go `golang.org/x/crypto/chacha20poly1305`); the tests build a legacy
 # ticket with it too.
-chacha20poly1305 = "0.10"
+chacha20poly1305.workspace = true
 # The sealed-config keyring (crypto_box_seal; Go `seal.go`) and the install-revocation policy, shared with
 # Reel and Subtitles.
-den-seal = { path = "../seal" }
+den-seal.workspace = true
 # HKDF-SHA256 for the play-ticket key (Go `crypto/hkdf`), on the sha2/hmac pair den-remux already carries.
-hkdf = "0.13"
+hkdf.workspace = true
 # The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-serde = { version = "1", features = ["derive"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls-tls", "stream"] }
+serde = { workspace = true, features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
-http = "1"
+http.workspace = true
 # Go `time.NewTicker` (`TieredCache::sweep_every`), `sync/singleflight` (indexerconfig.rs, cinemeta.rs),
 # and the name lookups household sources are guarded at (sources.rs). `rt` is Go's `go func()`: the shared indexer
 # question outlives the caller that started it (scrape.rs, stores/torbox).
-tokio = { version = "1", features = ["net", "sync", "time", "rt"] }
+tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
 # Go `regexp` (RE2 syntax, linear time): the release-title patterns in rank.go, attributes.go and label.go.
 regex = "1"
 # Go `regexp2`: the patterns that need lookaround, which RE2 lacks (rank.go's "upscaled" junk pattern,
@@ -57,10 +57,10 @@ fancy-regex = "0.19"
 # Go `net/url`, for the household source links in sources.go.
 url = "2"
 # The two-tier cache (cache.rs `MemoryCache`, diskcache.rs `TieredCache`), shared with Subtitles.
-den-cache = { path = "../cache" }
+den-cache.workspace = true
 # Go `crypto/subtle`: the constant-time compare behind the metrics token and the config key. The same
 # version den-reel, den-remux and den-subtitles carry.
-subtle = "2"
+subtle.workspace = true
 
 [features]
 # Forwards to the pub(crate) hot paths for benches/scout.rs (src/bench_api.rs). Off in every build that ships.
@@ -83,9 +83,9 @@ required-features = ["bench"]
 
 [dev-dependencies]
 # Benchmarks, with an allocation-counting global allocator (benches/*.rs; `bench/micro.sh`).
-divan = "0.1"
+divan.workspace = true
 # Go's `t.TempDir()`.
-tempfile = "3"
+tempfile.workspace = true
 # A response whose body fails mid-read (`brokenBodyResponse`, `cancelledBodyResponse`): a stream that yields an error.
-futures-util = { version = "0.3", default-features = false }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }
+futures-util = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util", "net", "io-util"] }

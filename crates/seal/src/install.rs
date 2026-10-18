@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use base64::Engine;
 use crypto_box::aead::{rand_core::RngCore, OsRng};
 
-/// An install id as /configure mints it: 16 random bytes, base64url, unpadded, 22 characters. Decoding is
+/// An install id as /den/configure mints it: 16 random bytes, base64url, unpadded, 22 characters. Decoding is
 /// strict (no padding, no non-zero trailing bits), so each id has exactly one spelling and a
 /// `REVOKED_INSTALLS` entry cannot be dodged by re-encoding the same bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -114,7 +114,7 @@ impl Revocation {
         self.require_iid
     }
 
-    /// The oldest epoch still admitted — what /configure stamps into a new link.
+    /// The oldest epoch still admitted — what /den/configure stamps into a new link.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -152,7 +152,7 @@ impl Revocation {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rejected {
     Undecodable,
-    /// A plaintext config while sealing is on: every install `/configure` issues is sealed then.
+    /// A plaintext config while sealing is on: every install `/den/configure` issues is sealed then.
     Plaintext,
     Revoked {
         iid_prefix: String,

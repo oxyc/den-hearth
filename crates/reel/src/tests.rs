@@ -887,6 +887,50 @@ async fn an_unsafe_method_is_405_before_any_route_runs() {
     }
 }
 
+/// HEAD used to run the complete GET handler and discard its body afterwards. In particular, a
+/// crawler could resolve a title, launch its prewarm, or make a cold /play download a trailer.
+#[tokio::test]
+async fn head_refuses_work_routes_before_they_can_start_work() {
+    let fake = FakeUpstream::new(&["dQw4w9WgXcQ"], None);
+    let warmed = Arc::new(AtomicUsize::new(0));
+    let seen = warmed.clone();
+    let prewarm: PrewarmFn = Box::new(move |_state, _id| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), prewarm);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/meta/movie/tt0111161.json",
+        "/prepare/movie/tt0111161.json",
+        "/direct/dQw4w9WgXcQ.json",
+        "/play/coldVid0001.mp4",
+    ] {
+        let response = client.head(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 405, "{path}");
+        assert_eq!(response.headers()["allow"], "GET, OPTIONS", "{path}");
+        assert_eq!(response.content_length(), Some(0), "HEAD carried a body for {path}");
+    }
+    assert_eq!(fake.calls(), 0, "HEAD reached trailer discovery");
+    assert_eq!(warmed.load(Ordering::SeqCst), 0, "HEAD launched a prewarm");
+}
+
+#[tokio::test]
+async fn head_keeps_cheap_and_cached_reel_routes() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid09", 100);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let health = client.head(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), 200);
+    let cached = client.head(format!("{base}/play/cachedVid09.mp4")).send().await.unwrap();
+    assert_eq!(cached.status(), 200);
+    assert_eq!(cached.headers()["content-length"], "100");
+}
+
 async fn scrape_metrics(base: &str, token: Option<&str>) -> reqwest::Response {
     let mut req = reqwest::Client::new().get(format!("{base}/metrics"));
     if let Some(t) = token {
@@ -957,8 +1001,7 @@ async fn options_is_a_cors_preflight_on_any_path() {
     }
 }
 
-/// CORS is on every response, not just the JSON ones: the video, a plain-text error, the page, and
-/// a 304.
+/// CORS is on both successful and error responses.
 #[tokio::test]
 async fn every_response_allows_any_origin() {
     let dir = temp_dir();
@@ -974,13 +1017,9 @@ async fn every_response_allows_any_origin() {
     let bad_id = client.get(format!("{base}/play?v=nope")).send().await.unwrap();
     assert_eq!(bad_id.status(), 400);
     assert_eq!(acao(&bad_id).unwrap(), "*");
-    let page = client.get(format!("{base}/configure")).send().await.unwrap();
-    assert_eq!(acao(&page).unwrap(), "*");
-    let etag = page.headers().get("etag").unwrap().clone();
-    let revalidated =
-        client.get(format!("{base}/configure")).header("if-none-match", etag).send().await.unwrap();
-    assert_eq!(revalidated.status(), 304);
-    assert_eq!(acao(&revalidated).unwrap(), "*");
+    let missing = client.get(format!("{base}/configure")).send().await.unwrap();
+    assert_eq!(missing.status(), 404);
+    assert_eq!(acao(&missing).unwrap(), "*");
 }
 
 /// The request log never shows a config segment: it carries a BYOK key, sealed or not. Our own
@@ -1158,6 +1197,19 @@ fn env_opt_trims() {
     assert_eq!(crate::config::env_opt("DEN_REEL_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
     std::env::set_var("DEN_REEL_TEST_ENV_OPT_TRIM", "   ");
     assert_eq!(crate::config::env_opt("DEN_REEL_TEST_ENV_OPT_TRIM"), None);
+}
+
+#[test]
+fn config_can_be_built_from_an_explicit_lookup() {
+    let cfg = Config::from_lookup(|key| match key {
+        "PORT" => Some("9102".into()),
+        "PUBLIC_BASE_URL" => Some(" https://node.example/reel ".into()),
+        "CLAP" => Some(String::new()),
+        _ => None,
+    });
+    assert_eq!(cfg.port, 9102);
+    assert_eq!(cfg.public_base_url.as_deref(), Some("https://node.example/reel"));
+    assert!(!cfg.bake_clap, "an explicitly empty CLAP keeps its established off meaning");
 }
 
 /// yt-dlp's `%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s` print line, parsed for the decision
@@ -1502,38 +1554,23 @@ fn parse_landscape_reads_dims_and_defaults_safely() {
 // --- HTTP contract ----------------------------------------------------------
 
 #[tokio::test]
-async fn get_manifest_returns_addon_manifest() {
+async fn standalone_install_surfaces_are_not_served() {
     let state =
         build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
-    let body: Value = reqwest::get(format!("{base}/manifest.json")).await.unwrap().json().await.unwrap();
-    assert_eq!(body["id"], "com.den.reel");
-    assert_eq!(body["resources"][0], "meta");
-    assert!(body.get("denInstallId").is_none(), "the config-less manifest names no install");
-    assert_eq!(body["denAttribution"][0]["link"], "KinoCheck");
-}
-
-/// A configured install's manifest names its install id — the value to put in REVOKED_INSTALLS —
-/// and is otherwise the same manifest.
-#[tokio::test]
-async fn a_configured_manifest_carries_its_install_id() {
-    let base = spawn_server(revoking_state("", "0")).await;
-    let get = |path: String| async move { reqwest::get(path).await.unwrap().json::<Value>().await.unwrap() };
-    let bare = get(format!("{base}/manifest.json")).await;
-
-    let with = get(format!(
-        "{base}/{}/manifest.json",
-        plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}"}}"#))
-    ))
-    .await;
-    assert_eq!(with["denInstallId"], IID);
-    let mut rest = with.clone();
-    rest.as_object_mut().unwrap().remove("denInstallId");
-    assert_eq!(rest, bare, "the rest of the manifest changed");
-
-    let without = get(format!("{base}/{}/manifest.json", plain_segment(r#"{"tmdbKey":"k"}"#))).await;
-    assert!(without.get("denInstallId").is_none(), "a config without an install id names none: {without}");
-    assert_eq!(without, bare);
+    let segment = plain_segment(r#"{"tmdbKey":"k"}"#);
+    for path in [
+        "/",
+        "/configure",
+        "/configure/",
+        "/config-key",
+        "/manifest.json",
+        &format!("/{segment}/manifest.json"),
+    ] {
+        let response = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+        assert_eq!(response.json::<Value>().await.unwrap(), json!({"error": "not_found"}), "{path}");
+    }
 }
 
 #[tokio::test]
@@ -1603,7 +1640,7 @@ async fn get_meta_links_are_relative_to_the_request_and_name_no_origin() {
 }
 
 #[tokio::test]
-async fn get_meta_caches_success_not_empty() {
+async fn get_meta_caches_success_and_authoritative_empty_but_not_failures() {
     let fake = FakeUpstream::new(&["vidKey12345"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
     let base = spawn_server(state.clone()).await;
@@ -1613,12 +1650,18 @@ async fn get_meta_caches_success_not_empty() {
     assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("s-maxage=86400"));
 
     state.yt_cache.lock().unwrap().clear();
-    fake.set_tmdb(&[]); // no trailer → empty links → no-store (client re-checks, doesn't cache a miss)
+    fake.set_tmdb(&[]); // no trailer → an authoritative negative, bounded by YT_NEG_TTL_MS
     let empty = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
-    assert_eq!(empty.headers().get("cache-control").unwrap(), "no-store");
-    assert!(empty.headers().get("cache-tag").is_none(), "only what a shared cache keeps is tagged");
+    assert_eq!(empty.headers().get("cache-control").unwrap(), "public, max-age=300, s-maxage=3600");
+    assert_eq!(empty.headers().get("cache-tag").unwrap(), "reel");
     let body: Value = empty.json().await.unwrap();
     assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 0);
+
+    fake.fail_next();
+    let failed = client.get(format!("{base}/meta/movie/tt0111162.json")).send().await.unwrap();
+    assert_eq!(failed.headers().get("cache-control").unwrap(), "no-store");
+    assert!(failed.headers().get("cache-tag").is_none(), "a transient miss reached the shared cache");
+    assert_eq!(failed.headers().get("x-den-degraded").unwrap(), "upstream_unavailable");
 }
 
 #[tokio::test]
@@ -1643,7 +1686,6 @@ async fn prewarm_default_but_not_when_opted_out() {
 // The fixed vector key + a PyNaCl-sealed {tmdbKey,kinocheckKey} segment (same key the seal/userconfig
 // unit tests use), driven through the real router so the config-scoped routes are proven end-to-end.
 const VEC_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
-const VEC_PUB: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8=";
 const SEALED_SEG: &str = "Abo-qmntVxuOmeVa0Q5pPWju0VrZDS4aRoAP-0JHNtk7nmMcduhttWlvldwvUdXPafUGUegc4ul5J3gFVo8nEGOd8htc7he_3BihPsWtiuA5_2Du-FL5NpaNzfvqhDAHM_LAjw";
 
 /// Build a state with the sealed-config keyring enabled and NO env TMDB key — so a resolved trailer
@@ -1656,37 +1698,27 @@ fn sealed_state(fake: FakeUpstream) -> Arc<AppState> {
 }
 
 #[tokio::test]
-async fn config_key_serves_pubkey_when_keyring_set() {
+async fn configured_negative_results_stay_in_the_install_cache() {
     let base = spawn_server(sealed_state(FakeUpstream::new(&[], None))).await;
-    let r = reqwest::get(format!("{base}/config-key")).await.unwrap();
-    assert_eq!(r.status(), 200);
-    let body: Value = r.json().await.unwrap();
-    assert_eq!(body["key"], VEC_PUB);
+    let client = reqwest::Client::new();
+    for tail in [
+        "meta/movie/tt0111161.json",
+        "prepare/movie/tt0111162.json?surface=audible&player=native&intent=warm",
+    ] {
+        let response = client.get(format!("{base}/{SEALED_SEG}/{tail}")).send().await.unwrap();
+        assert_eq!(response.headers()["cache-control"], "private, max-age=3600", "{tail}");
+        assert!(response.headers().get("cache-tag").is_none(), "configured negative was shared: {tail}");
+    }
 }
 
 #[tokio::test]
-async fn config_key_404s_when_sealing_disabled() {
-    // Default test state has no CONFIG_KEY → sealing disabled.
-    let state =
-        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
-    let base = spawn_server(state).await;
-    assert_eq!(reqwest::get(format!("{base}/config-key")).await.unwrap().status(), 404);
-}
-
-#[tokio::test]
-async fn sealed_config_url_resolves_manifest_and_meta() {
+async fn sealed_config_url_resolves_meta() {
     let fake = FakeUpstream::new(&["vidKey12345"], None);
     let base = spawn_server(sealed_state(fake)).await;
     let client = reqwest::Client::new();
 
-    // The pasted install URL.
-    let manifest = client.get(format!("{base}/{SEALED_SEG}/manifest.json")).send().await.unwrap();
-    assert_eq!(manifest.status(), 200);
-    // The path carries the sealed key: no shared cache may keep either answer.
+    // The path carries the sealed key: no shared cache may keep the answer.
     let cc = |r: &reqwest::Response| r.headers()["cache-control"].to_str().unwrap().to_string();
-    assert!(cc(&manifest).starts_with("private,"), "{}", cc(&manifest));
-
-    // Stremio then derives /<config>/meta/... — resolves the trailer using the sealed BYOK TMDB key.
     let meta = client
         .get(format!("{base}/{SEALED_SEG}/meta/movie/tt0111161.json"))
         .header("x-forwarded-host", "trailers.example.com")
@@ -1704,7 +1736,8 @@ async fn a_bad_config_segment_fails_closed() {
     let base = spawn_server(sealed_state(FakeUpstream::new(&["x"], None))).await;
     let client = reqwest::Client::new();
     // Garbage where a config belongs → 400, never a silent env-key fallback under a config-shaped URL.
-    let bad = client.get(format!("{base}/not-a-valid-config/manifest.json")).send().await.unwrap();
+    let bad =
+        client.get(format!("{base}/not-a-valid-config/meta/movie/tt0111161.json")).send().await.unwrap();
     assert_eq!(bad.status(), 400);
     let body: Value = bad.json().await.unwrap();
     assert_eq!(body["error"], "bad_config");
@@ -1724,17 +1757,15 @@ async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health
     assert!(crate::startup_line(&state).contains("sealed=invalid"), "{}", crate::startup_line(&state));
     let base = spawn_server(state).await;
     let client = reqwest::Client::new();
-    // Plaintext and sealed alike, on every config-scoped route: 503, never served.
+    // Plaintext and sealed alike, on every remaining config-scoped resource route: 503, never served.
     for seg in [plain_segment(r#"{"tmdbKey":"k"}"#), SEALED_SEG.to_string()] {
-        for tail in ["manifest.json", "meta/movie/tt0111161.json", "prepare/movie/tt0111161.json"] {
+        for tail in ["meta/movie/tt0111161.json", "prepare/movie/tt0111161.json"] {
             let r = client.get(format!("{base}/{seg}/{tail}")).send().await.unwrap();
             assert_eq!(r.status(), 503, "{tail}");
             assert_eq!(r.headers()["retry-after"], "60");
             assert_eq!(r.json::<Value>().await.unwrap()["error"], "config_key_invalid");
         }
     }
-    // No pubkey is handed to /configure, and /health says why.
-    assert_eq!(client.get(format!("{base}/config-key")).send().await.unwrap().status(), 503);
     let health: Value = client.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
     assert_eq!(health["status"], "degraded");
     assert_eq!(health["reason"], "config_key_invalid");
@@ -1748,7 +1779,7 @@ async fn an_unset_config_key_still_accepts_plaintext_and_a_valid_one_still_seals
     assert!(crate::startup_line(&unset).contains("sealed=off"));
     let base = spawn_server(unset).await;
     let seg = plain_segment(r#"{"tmdbKey":"k"}"#);
-    assert_eq!(reqwest::get(format!("{base}/{seg}/manifest.json")).await.unwrap().status(), 200);
+    assert_eq!(reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json")).await.unwrap().status(), 200);
     let health: Value = reqwest::get(format!("{base}/health")).await.unwrap().json().await.unwrap();
     assert_eq!(health["status"], "ok");
 
@@ -1762,7 +1793,7 @@ async fn an_unset_config_key_still_accepts_plaintext_and_a_valid_one_still_seals
     assert!(crate::startup_line(&state).contains("sealed=on"));
 }
 
-// Issue #8 R3: an install id as /configure mints it (bytes 0..16).
+// Issue #8 R3: an install id as the combined Hearth configure page mints it (bytes 0..16).
 const IID: &str = "AAECAwQFBgcICQoLDA0ODw";
 
 fn plain_segment(json: &str) -> String {
@@ -1782,14 +1813,14 @@ fn revoking_state(revoked: &str, epoch: &str) -> Arc<AppState> {
     )
 }
 
-/// Both config-scoped routes refuse a revoked install, with exactly the answer an undecodable segment
+/// Every config-scoped resource route refuses a revoked install, with exactly the answer an undecodable segment
 /// gets. `/play` and `/crop` carry no config — a play URL names a video, not an install — so there is
 /// nothing on them for a revocation to reach.
 #[tokio::test]
 async fn a_revoked_install_is_refused_on_every_config_route() {
     let seg = plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}"}}"#));
     let base = spawn_server(revoking_state(IID, "0")).await;
-    for route in ["manifest.json", "meta/movie/tt0111161.json", "meta/series/tt0944947.json"] {
+    for route in ["meta/movie/tt0111161.json", "meta/series/tt0944947.json"] {
         let revoked = reqwest::get(format!("{base}/{seg}/{route}")).await.unwrap();
         let garbage = reqwest::get(format!("{base}/not-a-valid-config/{route}")).await.unwrap();
         assert_eq!(revoked.status(), 400, "{route}");
@@ -1800,7 +1831,7 @@ async fn a_revoked_install_is_refused_on_every_config_route() {
     }
     // The same install, not revoked, is served.
     let base = spawn_server(revoking_state("", "0")).await;
-    assert_eq!(reqwest::get(format!("{base}/{seg}/manifest.json")).await.unwrap().status(), 200);
+    assert_eq!(reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json")).await.unwrap().status(), 200);
 }
 
 #[tokio::test]
@@ -1812,7 +1843,8 @@ async fn an_install_stamped_below_config_epoch_is_refused() {
         (r#"{"tmdbKey":"k","ep":2}"#, 200),
         (r#"{"tmdbKey":"k","ep":3}"#, 200),
     ] {
-        let r = reqwest::get(format!("{base}/{}/manifest.json", plain_segment(json))).await.unwrap();
+        let r =
+            reqwest::get(format!("{base}/{}/meta/movie/tt0111161.json", plain_segment(json))).await.unwrap();
         assert_eq!(r.status(), want, "{json}");
     }
 }
@@ -1822,50 +1854,16 @@ async fn an_install_stamped_below_config_epoch_is_refused() {
 #[tokio::test]
 async fn a_config_without_an_install_id_works_at_epoch_zero() {
     let base = spawn_server(revoking_state(IID, "0")).await;
-    let r =
-        reqwest::get(format!("{base}/{}/manifest.json", plain_segment(r#"{"tmdbKey":"k"}"#))).await.unwrap();
+    let r = reqwest::get(format!("{base}/{}/meta/movie/tt0111161.json", plain_segment(r#"{"tmdbKey":"k"}"#)))
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
-}
-
-/// /configure stamps the epoch into every link, sealed or not, so both answers carry it.
-#[tokio::test]
-async fn config_key_carries_the_config_epoch() {
-    for (key, want) in [(VEC_PRIV, 200u16), ("", 404)] {
-        let mut cfg = test_cfg(temp_dir());
-        cfg.config_key = key.into();
-        cfg.revocation = crate::userconfig::Revocation::from_env("", Some("4"));
-        let state =
-            build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
-        let r = reqwest::get(format!("{}/config-key", spawn_server(state).await)).await.unwrap();
-        assert_eq!(r.status(), want);
-        let body: Value = r.json().await.unwrap();
-        assert_eq!(body["epoch"], 4, "{body}");
-    }
-}
-
-/// Every link the page builds names its install and the epoch it was minted in, and both are inside
-/// what gets sealed.
-#[tokio::test]
-async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
-    let state =
-        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
-    let page =
-        reqwest::get(format!("{}/configure", spawn_server(state).await)).await.unwrap().text().await.unwrap();
-    assert!(page.contains("crypto.getRandomValues(bytes)"), "the install id is not minted from the CSPRNG");
-    assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
-    assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
-    assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
-    assert!(page.contains(r#"fetch(addonBase() + "/config-key""#), "the config key loses the Hearth mount");
-    assert!(page.contains("location.origin + addonBase()"), "the install URL loses the Hearth mount");
-    assert!(page.contains(r#"<code id="iid"></code>"#), "the page has nowhere to show the install id");
-    assert!(page.contains("iidEl.textContent = install.iid"), "the built link's install id is not shown");
-    assert!(page.contains("REVOKED_INSTALLS</code> to revoke just this link"), "the id is not explained");
 }
 
 #[tokio::test]
 async fn a_plaintext_config_is_refused_while_sealing_is_on() {
-    // Every install /configure issues is sealed once a key is set, and /config-key is public: a plaintext
-    // segment is one anyone could have minted.
+    // Every install Hearth issues is sealed once a key is set, so a plaintext segment is one anyone
+    // could have minted.
     use base64::Engine;
     let fake = FakeUpstream::new(&["vidKey12345"], None);
     let base = spawn_server(sealed_state(fake)).await;
@@ -3163,8 +3161,8 @@ async fn a_failed_download_leaves_none_of_its_scratch_behind() {
 
 /// A v1 prepare answer embeds a `sourcesBase` built from the forwarded host and scheme, or from `Host` when
 /// nothing is forwarded. Without naming those inputs, a cache may hand one requester's body — pointing at an
-/// authority they chose — to everyone else. A body that embeds no host (`/meta`, whose links are relative, and
-/// the manifest) names none of them, or it splits every cache for nothing.
+/// authority they chose — to everyone else. A body that embeds no host (`/meta`, whose links are relative,
+/// and `/health`) names none of them, or it splits every cache for nothing.
 #[tokio::test]
 async fn only_a_body_built_from_the_host_varies_on_it() {
     let fake = FakeUpstream::new(&["vidKey12345"], None);
@@ -3189,9 +3187,8 @@ async fn only_a_body_built_from_the_host_varies_on_it() {
     let meta = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
     assert!(meta.headers().get("vary").is_none(), "/meta names no host but varied on one");
 
-    let manifest = reqwest::get(format!("{base}/manifest.json")).await.unwrap();
-    assert!(manifest.headers().get("etag").is_some(), "the manifest lost its validator");
-    assert!(manifest.headers().get("vary").is_none(), "the manifest names no host but varied on one");
+    let health = reqwest::get(format!("{base}/health")).await.unwrap();
+    assert!(health.headers().get("vary").is_none(), "the health body names no host but varied on one");
 }
 
 /// A broken yt-dlp made the search fallback return the same empty list as "YouTube has nothing",
@@ -4465,10 +4462,26 @@ async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() 
         "surface=audible&player=native&intent=warm",
     )
     .await;
-    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["cache-control"], "public, max-age=300, s-maxage=3600");
     let body = direct_body(response).await;
     assert!(body["primary"].is_null());
     assert_eq!(body["sources"], json!([]));
+
+    let failed_upstream = FakeUpstream::new(&[], None);
+    failed_upstream.fail_next();
+    let failed = build_state(temp_dir(), Box::new(failed_upstream), always_playable(), noop_prewarm());
+    let response = crate::prepare::handle_prepare(
+        &failed,
+        &hyper::HeaderMap::new(),
+        None,
+        None,
+        "series",
+        "tt0111162",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-den-degraded"], "upstream_unavailable");
 }
 
 #[tokio::test]
@@ -4896,6 +4909,103 @@ async fn a_resolve_capped_twice_is_served_after_one_retry() {
     assert_eq!(spawn_count(&runs), 2, "retried more than once, or not at all");
 }
 
+/// Admission happens before a distinct resolve gets a map entry or detached driver. A standing
+/// same-key flight remains joinable while the probe budget is full; cached answers remain readable;
+/// arbitrary new keys neither form a queue nor poison their later retry; and aborting the creator
+/// does not release the admission owned by its self-driving resolve.
+#[tokio::test]
+async fn direct_resolve_admission_bounds_churn_and_recovers_after_cancellation() {
+    let dir = temp_dir();
+    let media = serve_capped_or_whole().await;
+    let release = dir.join("release-resolve");
+    let reply = format!(
+        "while [ ! -f '{}' ]; do sleep 0.01; done\n{}",
+        release.display(),
+        url_reply(&media, "whole")
+    );
+    let (worker, requests) = fake_worker(&dir, "admission", &reply);
+    let mut state = resolver_state(&dir, Some(worker), None);
+    Arc::get_mut(&mut state).unwrap().probe_sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+    let first = {
+        let state = state.clone();
+        tokio::spawn(async move { crate::direct::answer(&state, "dQw4w9WgXcQ", None).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while spawn_count(&requests) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted resolve never reached its worker");
+    assert_eq!(state.probe_sem.available_permits(), 0);
+    assert_eq!(state.direct_inflight.lock().unwrap().len(), 1);
+
+    // A duplicate joins the admitted flight even though no permit remains. Cancelling the caller
+    // that created it must not cancel the detached driver or hand admission to another key early.
+    let duplicate = {
+        let state = state.clone();
+        tokio::spawn(async move { crate::direct::answer(&state, "dQw4w9WgXcQ", None).await })
+    };
+    tokio::task::yield_now().await;
+    first.abort();
+    let _ = first.await;
+    assert_eq!(state.probe_sem.available_permits(), 0, "caller cancellation released admission");
+    assert_eq!(spawn_count(&requests), 1, "the duplicate started a second extraction");
+
+    // Cache hits do not need admission. A miss rejected at saturation leaves neither a map entry
+    // nor a cooldown/cache entry, so the exact same key can recover as soon as capacity returns.
+    let cached = crate::direct::Direct {
+        video: format!("{media}/whole?itag=137&clen=100&expire=4000000000"),
+        audio: None,
+        width: Some(1920),
+        height: Some(1080),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+    state
+        .direct_cache
+        .lock()
+        .unwrap()
+        .insert(crate::direct::key("cached00001", None), (Ok(cached.clone()), u64::MAX));
+    let (cache_hit, timing) = crate::direct::answer(&state, "cached00001", None).await;
+    assert_eq!(cache_hit.unwrap().video, cached.video);
+    assert!(timing.is_none(), "a cached answer was treated as admitted work");
+
+    for n in 0..128 {
+        let id = format!("churn{n:06}");
+        let (refused, _) =
+            tokio::time::timeout(Duration::from_millis(100), crate::direct::answer(&state, &id, None))
+                .await
+                .expect("a saturated distinct resolve queued instead of being refused");
+        assert_eq!(refused.unwrap_err().reason, "busy");
+    }
+    assert_eq!(state.direct_inflight.lock().unwrap().len(), 1, "refused churn left shared futures behind");
+    assert!(crate::direct::peek(&state, "churn000000", None).is_none(), "busy was cached as a video failure");
+    assert_eq!(spawn_count(&requests), 1, "refused churn reached the resolver");
+    assert_eq!(counted(&state.resolves.count), 0, "queued/refused work changed resolve metrics");
+
+    std::fs::write(&release, b"go").unwrap();
+    let (joined, _) = tokio::time::timeout(Duration::from_secs(2), duplicate)
+        .await
+        .expect("the detached resolve did not finish after release")
+        .expect("the duplicate waiter panicked");
+    assert!(joined.is_ok());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.probe_sem.available_permits() == 0 || !state.direct_inflight.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the completed resolve did not return admission and clear its map entry");
+    assert_eq!(counted(&state.resolves.count), 1);
+
+    let (recovered, _) = crate::direct::answer(&state, "churn000000", None).await;
+    assert!(recovered.is_ok(), "a key refused while busy did not recover: {recovered:?}");
+    assert_eq!(spawn_count(&requests), 2);
+    assert_eq!(counted(&state.resolves.count), 2, "recovery was not the only additional real resolve");
+}
+
 /// `?height=` lands on a step of the ladder, so a caller cannot make one video resolve once per
 /// number, and it never reaches past `MAX_HEIGHT`.
 #[test]
@@ -4964,6 +5074,79 @@ fn the_resident_workers_replies_are_read_as_answers_or_reasons() {
     assert_eq!(crate::ytdlp::classify(None, &said).reason, "unavailable");
 
     assert!(crate::worker::read_reply("Traceback (most recent call last):").is_err());
+}
+
+/// A worker that never terminates its reply used to grow `String` until the answer timeout. It is
+/// now discarded at the byte ceiling, and the next resolve starts a clean replacement process.
+#[tokio::test]
+async fn an_oversized_unterminated_worker_reply_restarts_the_worker() {
+    let dir = temp_dir();
+    let runs = dir.join("worker-oversize-runs");
+    let descendant = dir.join("worker-descendant-pid");
+    let script = dir.join("worker-oversize.sh");
+    let good = r#"{"ok":true,"width":1920,"height":1080,"urls":["https://example.test/video"],"hls":null}"#;
+    std::fs::write(
+        &script,
+        format!(
+            "echo x >> {runs}\n\
+             if [ $(wc -l < {runs}) -eq 1 ]; then\n\
+               sleep 30 & echo $! > {descendant}\n\
+               while read -r line; do head -c {} /dev/zero | tr '\\000' x; done\n\
+             else\n\
+               while read -r line; do printf '%s\\n' '{good}'; done\n\
+             fi\n",
+            crate::worker::REPLY_MAX_BYTES + 1,
+            runs = runs.display(),
+            descendant = descendant.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = Some(script.to_string_lossy().into_owned());
+    let worker = crate::worker::Worker::default();
+
+    let first = worker.resolve(&cfg, "abcdefghij1", "best", &[1080]).await;
+    assert!(first.is_none(), "an oversized protocol reply was believed: {first:?}");
+    let child_pid: u32 = std::fs::read_to_string(&descendant).unwrap().trim().parse().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pid_is_alive(child_pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacing the worker left its descendant alive");
+    let second = worker.resolve(&cfg, "abcdefghij1", "best", &[1080]).await;
+    assert!(matches!(second, Some(Ok(_))), "the worker did not restart cleanly: {second:?}");
+    assert_eq!(spawn_count(&runs), 2, "the poisoned worker process was reused");
+    worker.shutdown().await;
+}
+
+/// The ceiling is inclusive. This uses an ignored JSON field to make a real child emit an exactly
+/// `REPLY_MAX_BYTES`-byte payload followed by its delimiter; it must remain a normal answer.
+#[tokio::test]
+async fn a_worker_reply_at_the_ceiling_is_accepted() {
+    let dir = temp_dir();
+    let script = dir.join("worker-boundary.sh");
+    let prefix = r#"{"ok":true,"width":1920,"height":1080,"urls":["https://example.test/video"],"hls":null,"padding":""#;
+    let suffix = r#""}"#;
+    let padding = crate::worker::REPLY_MAX_BYTES - prefix.len() - suffix.len();
+    std::fs::write(
+        &script,
+        format!(
+            "while read -r line; do printf '%s' '{prefix}'; head -c {padding} /dev/zero | tr '\\000' x; printf '%s\\n' '{suffix}'; done\n"
+        ),
+    )
+    .unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = Some(script.to_string_lossy().into_owned());
+    let worker = crate::worker::Worker::default();
+    let answer = worker.resolve(&cfg, "abcdefghij1", "best", &[1080]).await;
+    assert!(matches!(answer, Some(Ok(_))), "the inclusive boundary was rejected: {answer:?}");
+    worker.shutdown().await;
 }
 
 /// A browser that plays YouTube's own URL never reads the downloaded file, so asking for it spends
@@ -5885,7 +6068,12 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
             // Every production caller sets this; without it the drop path under test is not theirs,
             // and tokio leaves the child unreaped as a zombie for the life of the test binary.
             .kill_on_drop(true);
-        let fut = crate::ytdlp::output_in_group(&mut cmd);
+        let fut = crate::ytdlp::output_in_group(
+            &mut cmd,
+            Duration::from_secs(30),
+            crate::ytdlp::PROBE_OUTPUT_MAX_BYTES,
+            crate::ytdlp::PROBE_OUTPUT_MAX_BYTES,
+        );
         tokio::pin!(fut);
 
         tokio::select! {
@@ -5916,6 +6104,99 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
     );
 }
 
+/// Every metadata/tool subprocess now uses the same bounded drain. A runaway printer must be
+/// stopped before its deadline, retain the useful suffix, leave no stale shutdown-registry entry,
+/// and not poison the next child invocation.
+#[tokio::test]
+async fn grouped_output_overflow_is_reaped_and_the_next_child_recovers() {
+    let dir = temp_dir();
+    let noisy = dir.join("noisy-child");
+    let pid_file = dir.join("noisy.pid");
+    let limit = 4096usize;
+    std::fs::write(
+        &noisy,
+        format!(
+            "#!/bin/sh\necho $$ > \"$1\"\n(head -c {} /dev/zero | tr '\\000' x; printf 'TAIL-MARKER'; head -c 64 /dev/zero | tr '\\000' y) >&2\nsleep 30\n",
+            limit - 32
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&noisy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = tokio::process::Command::new(&noisy);
+    cmd.arg(&pid_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let started = std::time::Instant::now();
+    let err = crate::ytdlp::output_in_group(&mut cmd, Duration::from_secs(10), limit, limit)
+        .await
+        .expect_err("oversized stderr was accepted");
+    let (stream, tail) = match err {
+        crate::ytdlp::BoundedOutputError::TooLarge { stream, tail, .. } => (stream, tail),
+        other => panic!("wrong output failure: {other:?}"),
+    };
+    assert_eq!(stream, "stderr");
+    assert!(crate::ytdlp::stderr_tail(&tail).contains("TAIL-MARKER"));
+    assert!(started.elapsed() < Duration::from_secs(3), "overflow waited for the deadline");
+    let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(!crate::ytdlp::is_group_live(pid), "reaped overflow remained registered");
+
+    let recovered = dir.join("recovered-child");
+    let recovered_pid = dir.join("recovered.pid");
+    std::fs::write(&recovered, "#!/bin/sh\necho $$ > \"$1\"\nprintf recovered\n").unwrap();
+    std::fs::set_permissions(&recovered, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut next = tokio::process::Command::new(&recovered);
+    next.arg(&recovered_pid)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let out = crate::ytdlp::output_in_group(&mut next, Duration::from_secs(2), limit, limit)
+        .await
+        .expect("the child runner did not recover after overflow");
+    assert_eq!(out.stdout, b"recovered");
+    let pid: u32 = std::fs::read_to_string(recovered_pid).unwrap().trim().parse().unwrap();
+    assert!(!crate::ytdlp::is_group_live(pid), "successful child remained registered after reap");
+}
+
+/// A process can daemonise into a new session after inheriting the child's pipes. Killing the
+/// original process group cannot close those descriptors, so the post-kill drain itself needs a
+/// short ceiling rather than trusting EOF.
+#[tokio::test]
+async fn a_daemonized_pipe_holder_cannot_pin_grouped_output_after_kill() {
+    let dir = temp_dir();
+    let noisy = dir.join("escaped-pipe-holder");
+    let escaped_pid = dir.join("escaped.pid");
+    let limit = 4096usize;
+    std::fs::write(
+        &noisy,
+        format!(
+            "#!/bin/sh\npython3 -c 'import os,time; os.setsid(); time.sleep(30)' &\necho $! > \"$1\"\nsleep 0.2\nhead -c {} /dev/zero | tr '\\000' x >&2\nsleep 30\n",
+            limit + 1
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&noisy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cmd = tokio::process::Command::new(&noisy);
+    cmd.arg(&escaped_pid)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let started = std::time::Instant::now();
+    let result = crate::ytdlp::output_in_group(&mut cmd, Duration::from_secs(10), limit, limit).await;
+    let pid: u32 = std::fs::read_to_string(&escaped_pid).unwrap().trim().parse().unwrap();
+    assert!(pid_is_alive(pid), "the supposed escaped holder never survived its old group");
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    assert!(matches!(result, Err(crate::ytdlp::BoundedOutputError::TooLarge { .. })));
+    assert!(started.elapsed() < Duration::from_secs(3), "escaped pipe holder pinned the drain");
+}
+
 /// yt-dlp's stderr pipe is inherited by everything it forks, so draining to EOF waits on the
 /// longest-lived descendant rather than on yt-dlp. A download that had already finished — complete
 /// file on disk, exit 0 — blocked for as long as that descendant lived, holding a download slot,
@@ -5924,11 +6205,15 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
 async fn a_lingering_descendant_does_not_pin_a_finished_download() {
     let dir = temp_dir();
     let fake = dir.join("ytdlp-leaves-a-child");
+    let leader_pid = dir.join("ytdlp-leader.pid");
     // Fork a grandchild that holds the inherited stderr open, then exit 0 having written the file.
     std::fs::write(
         &fake,
-        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
-         (sleep 30) &\nhead -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+             (sleep 30) &\nhead -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+            leader_pid.display()
+        ),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -5943,6 +6228,8 @@ async fn a_lingering_descendant_does_not_pin_a_finished_download() {
     let took = started.elapsed();
 
     assert!(r.is_ok(), "the download failed: {r:?}");
+    let pid: u32 = std::fs::read_to_string(leader_pid).unwrap().trim().parse().unwrap();
+    assert!(!crate::ytdlp::is_group_live(pid), "successful download remained registered after reap");
     assert!(
         took < std::time::Duration::from_secs(10),
         "a finished download was pinned by a lingering descendant for {took:?}"
@@ -6002,6 +6289,118 @@ async fn a_non_utf8_byte_does_not_discard_the_whole_error() {
         .expect_err("the fake exits 1");
 
     assert_eq!(err.status, 451, "a geo-block was misclassified: {err:?}");
+}
+
+/// A runaway child can fill stdout without ever completing the one-line `--print` protocol. The
+/// download slot must fail promptly and retain only the fixed diagnostic tail, even if a file was
+/// already written.
+#[tokio::test]
+async fn an_oversized_unterminated_ytdlp_stdout_fails_the_download() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-huge-stdout");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+             head -c 1000 /dev/zero > \"$out\"\nhead -c {} /dev/zero | tr '\\000' x\nsleep 30\n",
+            crate::ytdlp::CHILD_OUTPUT_MAX_BYTES + 1
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let started = std::time::Instant::now();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("oversized stdout was accepted");
+
+    assert_eq!(err.reason, "extraction_failed", "{err:?}");
+    assert!(err.detail.contains("stdout exceeded"), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "the runaway child was left until timeout");
+}
+
+/// stderr is the classification input, but it is still child-controlled. Keep its suffix for the
+/// operator and fail once it crosses the ceiling rather than retaining everything it printed.
+#[tokio::test]
+async fn an_oversized_unterminated_ytdlp_stderr_is_bounded_with_a_tail() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-huge-stderr");
+    let before_marker = crate::ytdlp::CHILD_OUTPUT_MAX_BYTES - 32;
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n(head -c {before_marker} /dev/zero | tr '\\000' x; printf 'TAIL-MARKER'; head -c 64 /dev/zero | tr '\\000' y) >&2\nsleep 30\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("oversized stderr was accepted");
+
+    assert_eq!(err.reason, "extraction_failed", "{err:?}");
+    assert!(err.detail.contains("stderr exceeded"), "{err:?}");
+    assert!(err.detail.contains("TAIL-MARKER"), "the bounded diagnostic tail was lost: {err:?}");
+}
+
+/// Exactly the ceiling is valid: stdout remains complete, so the first format line is parsed just
+/// as it was before the memory bound was introduced.
+#[tokio::test]
+async fn ytdlp_stdout_at_the_ceiling_keeps_the_format_protocol() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-boundary-stdout");
+    let format_line = "137+140|1080|avc1.640028|mp4a.40.2\n";
+    let padding = crate::ytdlp::CHILD_OUTPUT_MAX_BYTES - format_line.len();
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+             head -c 1000 /dev/zero > \"$out\"\nprintf '{format_line}'\nhead -c {padding} /dev/zero | tr '\\000' x\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let format = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect("an exactly-at-limit stdout was rejected");
+    assert_eq!(format.format_id, "137+140");
+}
+
+/// Exactly the ceiling on stderr remains a normal yt-dlp failure and therefore keeps the existing
+/// unavailable classification. Only byte `limit + 1` changes the outcome to an overflow.
+#[tokio::test]
+async fn ytdlp_stderr_at_the_ceiling_keeps_failure_classification() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-boundary-stderr");
+    let diagnostic = "ERROR: [youtube] Video unavailable\n";
+    let padding = crate::ytdlp::CHILD_OUTPUT_MAX_BYTES - diagnostic.len();
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n(head -c {padding} /dev/zero | tr '\\000' x; printf '{diagnostic}') >&2\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("the fake exits 1");
+    assert_eq!(err.reason, "unavailable", "the boundary changed classification: {err:?}");
 }
 
 /// A fake yt-dlp that fails the way a capped extraction does — `HTTP Error 403` part-way — for its
@@ -6471,6 +6870,54 @@ async fn a_flood_of_distinct_ids_cannot_grow_the_in_flight_map_without_bound() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(!waiter.is_finished(), "a request joining a live download was refused by the cap");
     waiter.abort();
+}
+
+#[tokio::test]
+async fn a_panicked_download_flight_releases_its_slot_and_permit_for_a_same_key_retry() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let runs = dir.join("panic-download-runs");
+    let yt = dir.join("yt-panic-once");
+    std::fs::write(
+        &yt,
+        format!(
+            "#!/bin/sh\necho x >> {runs}\nif [ $(wc -l < {runs}) -eq 1 ]; then\n  echo 'ERROR: HTTP Error 429: Too Many Requests' >&2\n  exit 1\nfi\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nprintf '137+140|1080|avc1.640028|mp4a.40.2\\n'\nhead -c 1000 /dev/zero > \"$out\"\n",
+            runs = runs.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.ffmpeg = dir.join("missing-ffmpeg").to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let clock: crate::state::ClockFn = Box::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) == 2 {
+            panic!("injected download-flight panic");
+        }
+        1_000
+    });
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock);
+
+    let first = crate::play::fetch_trailer(state.clone(), "panicvideo1".into())
+        .await
+        .expect_err("the injected panic became success");
+    assert_eq!(first.reason, "internal_failure");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !state.in_flight.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the panicked download flight stayed in the map");
+    assert_eq!(state.download_sem.available_permits(), crate::DOWNLOAD_CONCURRENCY);
+
+    let second = crate::play::fetch_trailer(state.clone(), "panicvideo1".into()).await;
+    assert!(second.is_ok(), "the same key could not recover: {second:?}");
+    assert_eq!(spawn_count(&runs), 2);
 }
 
 /// A `/play` verdict was the one thing this service learned and then immediately forgot: the
@@ -7108,6 +7555,77 @@ async fn the_fast_resolver_answers_before_yt_dlp_is_asked() {
     assert_eq!((spawn_count(&fast_log), spawn_count(&slow_log)), (1, 0));
     assert_eq!(counted(&state.resolver.youtubei_answers), 1);
     assert_eq!(counted(&state.resolver.ytdlp_answers), 0);
+}
+
+/// Once admission has created the self-driving flight, disconnecting its first waiter must not
+/// release the permit early or abandon cache fill. A later request joins/reads the completed work
+/// instead of spawning a second extraction.
+#[tokio::test]
+async fn an_admitted_direct_resolve_completes_after_its_first_waiter_is_cancelled() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let reply = format!("sleep 0.1\n{}", url_reply(&base, "whole"));
+    let (slow, requests) = fake_worker(&dir, "cancelled-direct", &reply);
+    let state = resolver_state(&dir, Some(slow), None);
+
+    let waiting = {
+        let state = state.clone();
+        tokio::spawn(async move { crate::direct::answer(&state, "dQw4w9WgXcQ", None).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while spawn_count(&requests) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the admitted resolve started");
+    waiting.abort();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while crate::direct::peek(&state, "dQw4w9WgXcQ", None).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the detached driver completed the cancelled caller's resolve");
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.is_ok());
+    assert_eq!(spawn_count(&requests), 1, "cancellation caused a second extraction");
+}
+
+#[tokio::test]
+async fn a_panicked_direct_flight_releases_its_slot_and_permit_for_a_same_key_retry() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (worker, requests) = fake_worker(&dir, "panic-direct", &url_reply(&base, "whole"));
+    let mut cfg = test_cfg(dir.clone());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = Some(worker);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let clock: crate::state::ClockFn = Box::new(move || {
+        if seen.fetch_add(1, Ordering::SeqCst) == 1 {
+            panic!("injected direct-flight panic");
+        }
+        1_000
+    });
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock);
+
+    let (first, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert_eq!(first.unwrap_err().reason, "internal_failure");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !state.direct_inflight.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the panicked direct flight stayed in the map");
+    assert_eq!(state.probe_sem.available_permits(), crate::PROBE_CONCURRENCY);
+
+    let (second, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(second.is_ok(), "the same key could not recover: {second:?}");
+    assert_eq!(spawn_count(&requests), 1, "the panic happened after an extraction unexpectedly started");
+    state.worker.shutdown().await;
 }
 
 /// A failure for THIS video is not the end of it: yt-dlp is asked the same question, whatever the

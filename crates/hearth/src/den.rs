@@ -23,9 +23,13 @@
 //! malformed key refuses every combined config, as each service does. Revocation:
 //! `HEARTH_REVOKED_INSTALLS`, `HEARTH_CONFIG_EPOCH`, `HEARTH_REQUIRE_INSTALL_ID`.
 
+use std::io::Write;
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use base64::Engine;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use hyper::header::{HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING};
 use hyper::{HeaderMap, Method, Response, StatusCode};
 use serde_json::{json, Value};
 
@@ -106,6 +110,9 @@ pub struct Den {
     pub reel: Arc<Addon>,
     /// Where the key ring came from, for the startup line.
     key_source: &'static str,
+    /// Public bodies whose bytes cannot change during this process. Their ETags and serialization are paid once.
+    manifest: den_http::StaticBody,
+    config_key: Option<den_http::StaticBody>,
 }
 
 impl Den {
@@ -128,6 +135,12 @@ impl Den {
             subs: Arc::new(member("subs")),
             reel: Arc::new(member("reel")),
             key_source,
+            manifest: den_http::StaticBody::json(&manifest(None)),
+            config_key: keyring.as_ref().map(|keyring| {
+                den_http::StaticBody::json(
+                    &json!({"key": keyring.current_pub_base64(), "epoch": revocation.epoch()}),
+                )
+            }),
         }
     }
 
@@ -213,7 +226,9 @@ impl Den {
     pub fn answer(&self, route: Route, method: &Method, headers: &HeaderMap) -> Response<Body> {
         let mut resp = match *method {
             Method::OPTIONS => den_http::preflight(),
-            Method::GET | Method::HEAD => den_http::apply_conditional(method, headers, self.read(route)),
+            Method::GET | Method::HEAD => {
+                den_http::apply_conditional(method, headers, self.read(route, headers))
+            }
             _ => den_http::json(
                 StatusCode::METHOD_NOT_ALLOWED,
                 &json!({"error": "method_not_allowed"}),
@@ -225,26 +240,22 @@ impl Den {
         resp
     }
 
-    fn read(&self, route: Route) -> Response<Body> {
+    fn read(&self, route: Route, headers: &HeaderMap) -> Response<Body> {
         let terms = &self.scout;
         match route {
-            Route::Configure => {
-                den_http::html(StatusCode::OK, configure_page(), &[("cache-control", STATIC_CACHE)])
-            }
-            Route::Manifest => {
-                den_http::json(StatusCode::OK, &manifest(None), &[("cache-control", STATIC_CACHE)])
-            }
+            Route::Configure => configure_page().response(headers),
+            Route::Manifest => self.manifest.response("application/json", STATIC_CACHE, &[]),
             Route::ConfigKey => {
                 if terms.key_invalid {
                     return key_invalid();
                 }
                 let epoch = terms.revocation.epoch();
                 match &terms.keyring {
-                    Some(keyring) => den_http::json(
-                        StatusCode::OK,
-                        &json!({"key": keyring.current_pub_base64(), "epoch": epoch}),
-                        &[("cache-control", "public, max-age=300")],
-                    ),
+                    Some(_) => self
+                        .config_key
+                        .as_ref()
+                        .expect("a configured key has a cached public answer")
+                        .response("application/json", "public, max-age=300", &[]),
                     None => den_http::json(
                         StatusCode::NOT_FOUND,
                         &json!({"error": "no_key", "epoch": epoch}),
@@ -483,31 +494,87 @@ pub fn manifest(install: Option<&Install>) -> Value {
 
 /// The marker in `den_configure.html` the DenSeal bundle replaces.
 const SEAL_MARKER: &str = "<!-- DenSeal bundle -->";
+/// The audited browser implementation Hearth embeds in its combined configure page.
+const SEAL_JS: &str = include_str!("den_seal.js");
 /// Edge replaces this exact, single JavaScript expression with the versioned guest bridge context.
 pub const GUEST_CONTEXT_MARKER: &str = "/*__DEN_HEARTH_GUEST_CONTEXT_V1__*/ null";
 
-/// The `<script>` element holding the DenSeal bundle (tweetnacl + blakejs, libsodium `crypto_box_seal`) in a
-/// service's configure page. All three carry the same one; it is taken from Scout's.
-fn seal_bundle(page: &str) -> &str {
-    let start =
-        page.find("<script>\n/*\n * DenSeal bundle").expect("the configure page carries the DenSeal bundle");
-    let end =
-        start + page[start..].find("</script>").expect("the bundle's script closes") + "</script>".len();
-    &page[start..end]
+/// The configure page, with the bundle put in once.
+struct ConfigurePage {
+    identity: den_http::StaticBody,
+    gzip: den_http::StaticBody,
 }
 
-/// The configure page, with the bundle put in once.
-fn configure_page() -> &'static str {
-    static PAGE: LazyLock<String> = LazyLock::new(|| {
+impl ConfigurePage {
+    fn response(&self, headers: &HeaderMap) -> Response<Body> {
+        let gzip = accepts_gzip(headers);
+        let body = if gzip { &self.gzip } else { &self.identity };
+        let mut response = body.response(
+            "text/html; charset=utf-8",
+            STATIC_CACHE,
+            &[
+                ("vary", "Accept-Encoding"),
+                (
+                    "content-security-policy",
+                    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                ),
+                ("referrer-policy", "no-referrer"),
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+            ],
+        );
+        if gzip {
+            response.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+        response
+    }
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let mut wildcard = None;
+    let mut gzip = None;
+    for value in headers.get_all(ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else { continue };
+        for item in value.split(',') {
+            let mut parts = item.trim().split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            let mut quality = 1.0;
+            for parameter in parts {
+                let parameter = parameter.trim();
+                if parameter.get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case("q=")) {
+                    quality = parameter[2..]
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|quality| (0.0..=1.0).contains(quality))
+                        .unwrap_or(0.0);
+                }
+            }
+            if coding.eq_ignore_ascii_case("gzip") {
+                gzip = Some(quality);
+            } else if coding == "*" {
+                wildcard = Some(quality);
+            }
+        }
+    }
+    gzip.or(wildcard).is_some_and(|quality| quality > 0.0)
+}
+
+fn configure_page() -> &'static ConfigurePage {
+    static PAGE: LazyLock<ConfigurePage> = LazyLock::new(|| {
         let template = include_str!("den_configure.html");
         assert_eq!(
             template.matches(GUEST_CONTEXT_MARKER).count(),
             1,
             "the guest bridge marker must occur exactly once"
         );
-        template.replace(SEAL_MARKER, seal_bundle(den_scout::configure::CONFIGURE_PAGE))
+        let bundle = format!("<script>\n{SEAL_JS}</script>");
+        let identity = den_http::StaticBody::new(template.replace(SEAL_MARKER, &bundle));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(identity.bytes()).expect("writing gzip output to memory cannot fail");
+        let gzip = den_http::StaticBody::new(encoder.finish().expect("finishing gzip output cannot fail"));
+        ConfigurePage { identity, gzip }
     });
-    PAGE.as_str()
+    &PAGE
 }
 
 #[cfg(test)]
@@ -587,28 +654,76 @@ mod tests {
     }
 
     #[test]
-    fn the_page_carries_the_seal_bundle_every_service_page_carries() {
-        let page = configure_page();
+    fn the_page_carries_hearths_embedded_seal_asset_once() {
+        let page = std::str::from_utf8(configure_page().identity.bytes()).unwrap();
         assert!(!page.contains(SEAL_MARKER));
-        let bundle = seal_bundle(den_scout::configure::CONFIGURE_PAGE);
-        assert!(bundle.contains("function denSeal(") && bundle.ends_with("</script>"), "{}", &bundle[..80]);
-        assert!(page.contains(bundle));
-        // The same bytes in Subtitles' and Reel's pages: one audited bundle, wherever it is served.
-        for other in [
-            include_str!("../../subtitles/src/configure.html"),
-            include_str!("../../reel/src/configure.html"),
-        ] {
-            assert_eq!(seal_bundle(other), bundle);
-        }
+        assert!(SEAL_JS.contains("function denSeal("));
+        assert!(SEAL_JS.contains("window.DenSeal"));
+        assert_eq!(page.matches(SEAL_JS).count(), 1);
     }
 
-    /// The page builds `{iid, ep, scout?, subs?, reel?}`, each member as its service's own page builds it, and
-    /// calls the routes beside it.
+    #[tokio::test]
+    async fn the_configure_page_negotiates_one_precompressed_representation() {
+        let page = configure_page();
+        let plain = page.response(&HeaderMap::new());
+        assert!(!plain.headers().contains_key(CONTENT_ENCODING));
+        assert_eq!(plain.headers()["vary"], "Accept-Encoding");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "br, gzip".parse().unwrap());
+        let gzip = page.response(&headers);
+        assert_eq!(gzip.headers()[CONTENT_ENCODING], "gzip");
+        assert_ne!(gzip.headers()["etag"], plain.headers()["etag"]);
+        assert!(
+            gzip.headers()["content-length"].to_str().unwrap().parse::<usize>().unwrap()
+                < plain.headers()["content-length"].to_str().unwrap().parse::<usize>().unwrap()
+        );
+        let compressed = gzip.into_body();
+        let compressed = http_body_util::BodyExt::collect(compressed).await.unwrap().to_bytes();
+        let mut decoder = flate2::read::GzDecoder::new(compressed.as_ref());
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        assert_eq!(decoded, page.identity.bytes());
+
+        headers.insert(ACCEPT_ENCODING, "gzip;q=0, *;q=1".parse().unwrap());
+        assert!(!page.response(&headers).headers().contains_key(CONTENT_ENCODING));
+        headers.insert(ACCEPT_ENCODING, "gzip;q=invalid".parse().unwrap());
+        assert!(!page.response(&headers).headers().contains_key(CONTENT_ENCODING));
+    }
+
+    #[test]
+    fn the_selected_configure_representation_revalidates_without_a_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let etag = configure_page().response(&headers).headers()["etag"].clone();
+        headers.insert("if-none-match", etag.clone());
+        let response =
+            den_http::apply_conditional(&Method::GET, &headers, configure_page().response(&headers));
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()["etag"], etag);
+        assert_eq!(response.headers()["vary"], "Accept-Encoding");
+    }
+
+    #[test]
+    fn compression_never_changes_no_store_key_errors() {
+        let den = Den::new(None, false, Default::default(), None, "none");
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let response = den.answer(Route::ConfigKey, &Method::GET, &headers);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key(CONTENT_ENCODING));
+        assert!(!response.headers().contains_key("etag"));
+        assert!(!response.headers().contains_key("vary"));
+    }
+
+    /// The page builds `{iid, ep, scout?, subs?, reel?}` in the shapes each service consumes, and calls the routes
+    /// beside it.
     #[test]
     fn the_page_builds_the_shape_the_server_reads() {
         let page = include_str!("den_configure.html");
         for needle in [
-            "var config = {}, parts = { scout: collectScout, subs: collectSubs, reel: collectReel };",
+            "var config = {}, parts = { scout: collectScout, subs: collectSubs };",
             "Object.assign({ iid: mintInstallId(), ep: configEpoch }, config)",
             "BASE + \"/config-key\"",
             "BASE + \"/validate\"",
@@ -616,9 +731,12 @@ mod tests {
             "{ debrid: [{ service: $(\"service\").value, token: token }] }",
             "{ osKey: osKey, autoSync: $(\"autoSync\").checked }",
             "{ tmdbKey: tmdb }",
-            "Leave a section blank to keep using its shared settings.",
+            "A service stays off until its main key is added.",
+            "<details class=\"service\" aria-labelledby=\"streamsTitle\">",
+            "<output class=\"service-state\" id=\"streamState\">Off</output>",
+            "badge.textContent = state.ready ? \"On\" : state.partial ? \"Needs key\"",
             "$(\"go\").textContent = \"Save settings\"",
-            "STORE_KEY + \":\" + DEN_GUEST.base",
+            "STORE_KEY = DEN_GUEST === null ? STORE_KEY : null",
             SEAL_MARKER,
         ] {
             assert!(page.contains(needle), "the page no longer has: {needle}");
@@ -640,9 +758,9 @@ mod tests {
         for needle in [
             "DEN_GUEST_CONTEXT.v === 2",
             "if (DEN_GUEST === false)",
-            "if (DEN_GUEST !== null) $(\"go\").disabled = true",
+            "type=\"button\" disabled>Checking encryption…</button>",
             "if (!sealPublicKey || !window.DenSeal)",
-            "if (DEN_GUEST && (!segment || !lastBuildSealed))",
+            "if (!segment || (DEN_GUEST && !lastBuildSealed))",
             "Nothing was saved.",
             "denFetch(DEN_GUEST.saveUrl",
             "JSON.stringify({ install: segment })",
@@ -653,8 +771,8 @@ mod tests {
         for forbidden in ["x-den-grant", "DEN_GUEST_CONTEXT.claim"] {
             assert!(!page.contains(forbidden), "the cookie-authenticated page exposed {forbidden}");
         }
-        for slice in SLICES {
-            assert!(page.contains(&format!("{slice}: collect")), "{slice}");
+        for needle in ["scout: collectScout", "subs: collectSubs", "parts.reel = collectReel"] {
+            assert!(page.contains(needle), "{needle}");
         }
     }
 
@@ -665,16 +783,78 @@ mod tests {
             |needle: &str| page.find(needle).unwrap_or_else(|| panic!("missing guest invariant: {needle}"));
 
         assert!(
-            at("if (DEN_GUEST !== null) $(\"go\").disabled = true") < at("denFetch(BASE + \"/config-key\"")
+            at("type=\"button\" disabled>Checking encryption…</button>")
+                < at("denFetch(BASE + \"/config-key\"")
         );
+        assert!(at("denFetch(BASE + \"/config-key\"") < at("$(\"go\").disabled = false"));
         assert!(at("if (!sealPublicKey || !window.DenSeal)") < at("$(\"go\").disabled = false"));
-        assert!(at("if (DEN_GUEST && (!segment || !lastBuildSealed))") < at("denFetch(DEN_GUEST.saveUrl"));
+        assert!(at("if (!segment || (DEN_GUEST && !lastBuildSealed))") < at("denFetch(DEN_GUEST.saveUrl"));
         let saved = page[at("if (!r.ok) throw new Error(\"save failed\")")..].to_owned();
         assert!(
             saved.find("throw").unwrap() < saved.find("$(\"out\").classList.remove(\"hidden\")").unwrap()
         );
         assert!(
-            page.contains("if (DEN_GUEST !== null) {\n      lastBuildSealed = false;\n      return null;")
+            page.contains("if (!plaintextAllowed || DEN_GUEST !== null) {\n      lastBuildSealed = false;")
         );
+    }
+
+    #[test]
+    fn the_page_waits_for_sealing_and_ignores_stale_validation_answers() {
+        let page = include_str!("den_configure.html");
+        for needle in [
+            "var sourceCheckSerial = 0",
+            "if (serial !== sourceCheckSerial) return",
+            "$(\"sources\").addEventListener(\"input\", invalidateSourceCheck)",
+            "var tokenCheckSerial = 0",
+            "if (serial !== tokenCheckSerial) return",
+            "$(\"test\").disabled = true",
+            "out.setAttribute(\"aria-busy\", \"true\")",
+            "var plaintextAvailable = r.status === 404 && j.error === \"no_key\"",
+            "if (!keyAvailable && !plaintextAvailable) throw new Error(\"key check failed\")",
+            "if (keyAvailable && !window.DenSeal) throw new Error(\"seal implementation unavailable\")",
+            "if (!plaintextAllowed || DEN_GUEST !== null)",
+            "Could not encrypt this install. Reload the page and try again; nothing was built.",
+            "$(\"go\").textContent = DEN_GUEST !== null ? \"Settings unavailable\" : \"Encryption check failed\"",
+        ] {
+            assert!(page.contains(needle), "the configure safety invariant is missing: {needle}");
+        }
+    }
+
+    #[test]
+    fn the_guest_page_uses_shared_trailers_and_rejects_an_empty_override() {
+        let page = include_str!("den_configure.html");
+        for needle in [
+            "Uses the shared TMDB settings.",
+            "$(\"trailerService\").hidden = true",
+            "$(\"rememberControl\").hidden = true",
+            "$(\"forgetControl\").hidden = true",
+            "if (!DEN_GUEST) parts.reel = collectReel",
+            "if (!DEN_GUEST && s.reel) fillReel(s.reel)",
+            "Add a personal stream or subtitle override. To use only shared settings, remove your personal settings in Den.",
+            "personal override",
+        ] {
+            assert!(page.contains(needle), "the guest configure contract is missing: {needle}");
+        }
+        assert!(!page.contains("if (DEN_GUEST) return config"));
+        assert!(page.contains("STORE_KEY = DEN_GUEST === null ? STORE_KEY : null"));
+    }
+
+    #[test]
+    fn the_page_only_persists_or_copies_credentials_after_an_explicit_action() {
+        let page = include_str!("den_configure.html");
+        for needle in [
+            "id=\"rememberSettings\" type=\"checkbox\"",
+            "Available after a refresh and cleared when this tab closes.",
+            "if ($(\"rememberSettings\").checked) sessionStorage.setItem",
+            "if (!this.checked && STORE_KEY) try { sessionStorage.removeItem(STORE_KEY); }",
+            "navigator.clipboard.writeText(field.value).then(flashCopied",
+            "if (copied) flashCopied()",
+            "el.addEventListener(\"input\", markOutputStale)",
+            "if (buildGeneration !== configGeneration)",
+            "Earlier settings were saved, but this form changed while saving.",
+        ] {
+            assert!(page.contains(needle), "the credential-handling contract is missing: {needle}");
+        }
+        assert_eq!(page.matches("copyInstallURL()").count(), 1);
     }
 }

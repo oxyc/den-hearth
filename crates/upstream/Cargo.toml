@@ -8,14 +8,14 @@ license = "MIT"
 
 [dependencies]
 # The shared public-address classifier the guard judges every address with.
-den-net = { path = "../net" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+den-net.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 # `lookup_host`, for the guard's name checks and the dial-time resolver.
-tokio = { version = "1", features = ["net"] }
+tokio = { workspace = true, features = ["net"] }
 # Retry-After's HTTP-date form; hyper already builds the same dates for the Date header.
-httpdate = "1"
+httpdate.workspace = true
 # The jitter on an unstated pause.
-fastrand = "2"
+fastrand.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "test-util"] }

@@ -15,7 +15,7 @@ mod name;
 mod tests;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use quick_cache::sync::Cache as Sharded;
@@ -140,11 +140,42 @@ const MAX_SHARDS: usize = 16;
 /// What expiry reads the time from.
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
+#[cfg(test)]
+thread_local! {
+    static FILESYSTEM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+static COMMIT_WAIT_HOOK: Mutex<Option<(String, std::sync::mpsc::SyncSender<()>)>> = Mutex::new(None);
+
+/// Runs one indivisible filesystem operation without occupying a Tokio core worker in Hearth.
+///
+/// `block_in_place` deliberately does not enqueue a closure: this task's thread performs the operation while Tokio
+/// lends its core-worker role to another thread. That matters for a slow volume because the amount of waiting work is
+/// therefore bounded by Hearth's admitted requests, rather than by an unbounded `spawn_blocking` queue. Standalone
+/// services still use current-thread runtimes, where there is no worker role to hand off, and synchronous callers have
+/// no runtime at all; both retain the direct behavior they had before.
+fn filesystem<R>(operation: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    FILESYSTEM_CALLS.set(FILESYSTEM_CALLS.get() + 1);
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
+    }
+}
+
 pub struct Cache<V: Value> {
     /// The clock expiry reads in both tiers. A replay or a test swaps it for one it can move.
     clock: Clock,
     mem: Sharded<String, Entry<V>, ByteWeight>,
     disk: Option<Arc<Disk>>,
+    /// Orders disk-backed puts, removals and readback-to-memory commits for the same key. Hot memory reads and
+    /// unrelated keys never queue behind one another.
+    commits: Vec<Mutex<()>>,
+    commit_hasher: DefaultHashBuilder,
 }
 
 impl<V: Value> Cache<V> {
@@ -168,7 +199,27 @@ impl<V: Value> Cache<V> {
             .as_deref()
             .filter(|d| !d.as_os_str().is_empty())
             .map(|d| Arc::new(Disk::open(&o, d, clock())));
-        Cache { clock, mem, disk }
+        let commits = (0..64).map(|_| Mutex::new(())).collect();
+        Cache { clock, mem, disk, commits, commit_hasher: DefaultHashBuilder::default() }
+    }
+
+    fn commit(&self, key: &str) -> MutexGuard<'_, ()> {
+        #[cfg(test)]
+        {
+            let sender = {
+                let mut hook = COMMIT_WAIT_HOOK.lock().unwrap_or_else(PoisonError::into_inner);
+                if hook.as_ref().is_some_and(|(hook_key, _)| hook_key == key) {
+                    hook.take().map(|(_, sender)| sender)
+                } else {
+                    None
+                }
+            };
+            if let Some(sender) = sender {
+                sender.send(()).unwrap();
+            }
+        }
+        let shard = self.commit_hasher.hash_one(key) as usize % self.commits.len();
+        self.commits[shard].lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Reads time from `clock` in both tiers.
@@ -219,15 +270,23 @@ impl<V: Value> Cache<V> {
     /// The value and the time left on it, read back from the file and put in memory for the next hit.
     fn read_back(&self, key: &str) -> Option<(V, Duration)> {
         let disk = self.disk.as_ref()?;
-        let now = (self.clock)();
-        let (name, loaded) = disk.read(key, now)?;
-        let text = loaded.text()?;
-        // The one copy of the file's value: shared with the memory tier and the caller from here on.
-        let value = V::from_str(text);
-        disk.remember(&name, text);
-        let left = until(loaded.expires, now);
-        self.insert_mem(key, value.clone(), left, now);
-        Some((value, left))
+        filesystem(|| {
+            let _commit = self.commit(key);
+            // A miss can wait behind a put. Recheck after taking ownership so an older disk generation cannot replace
+            // the value that put just committed to memory.
+            if let Some((value, expires, now)) = self.mem_entry(key) {
+                return Some((value, expires.duration_since(now).unwrap_or_default()));
+            }
+            let now = (self.clock)();
+            let (name, loaded) = disk.read(key, now)?;
+            let text = loaded.text()?;
+            // The one copy of the file's value: shared with the memory tier and the caller from here on.
+            let value = V::from_str(text);
+            disk.remember(&name, loaded.generation, text);
+            let left = until(loaded.expires, now);
+            self.insert_mem(key, value.clone(), left, now);
+            Some((value, left))
+        })
     }
 
     /// A live memory entry: the value, when it expires and the clock reading that judged it.
@@ -251,8 +310,12 @@ impl<V: Value> Cache<V> {
             self.insert_mem(key, value, ttl, now);
             return;
         };
-        self.insert_mem(key, value.clone(), ttl, now);
-        if disk.put(key, value.as_str(), ttl, class, now) {
+        let sweep = filesystem(|| {
+            let _commit = self.commit(key);
+            self.insert_mem(key, value.clone(), ttl, now);
+            disk.put(key, value.as_str(), ttl, class, now) && disk.request_burst_sweep()
+        });
+        if sweep {
             // A burst is what the hourly sweep cannot answer on its own, so it brings the sweep forward. It runs on
             // its own thread so the write that tripped it does not wait for the directory scan.
             let disk = Arc::clone(disk);
@@ -270,10 +333,16 @@ impl<V: Value> Cache<V> {
     /// Forgets a key in both tiers. For an entry proven wrong rather than merely stale: writing it back with a zero
     /// TTL would mean a disk write to say "delete this".
     pub fn remove(&self, key: &str) {
-        self.mem.remove(key);
-        if let Some(d) = &self.disk {
-            d.remove(key);
-        }
+        let Some(disk) = &self.disk else {
+            let _commit = self.commit(key);
+            self.mem.remove(key);
+            return;
+        };
+        filesystem(|| {
+            let _commit = self.commit(key);
+            self.mem.remove(key);
+            disk.remove(key);
+        });
     }
 
     /// Forgets a key in memory only: the companion to a volatile put, for a key no file was ever written for.
@@ -288,7 +357,7 @@ impl<V: Value> Cache<V> {
     pub fn sweep(&self) -> i64 {
         let now = (self.clock)();
         self.mem.retain(|_, e| e.expires > now);
-        self.disk.as_ref().map_or(0, |d| d.sweep(now))
+        self.disk.as_ref().map_or(0, |d| filesystem(|| d.sweep(now)))
     }
 
     pub fn mem_stats(&self) -> MemStats {

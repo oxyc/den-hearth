@@ -1,5 +1,5 @@
-//! den-scout: the stream-list and play addon. den-hearth serves it (`crates/hearth`): `handler::new_handler` over
-//! `deps::build_deps`.
+//! den-scout: Hearth's stream-list and play service. den-hearth serves it (`crates/hearth`):
+//! `handler::new_handler` over `deps::build_deps`.
 
 pub mod addbudget;
 pub mod attributes;
@@ -8,7 +8,6 @@ pub mod cache;
 pub mod cinemeta;
 pub mod client;
 pub mod config;
-pub mod configure;
 pub mod coverage;
 pub mod decisionlog;
 pub mod deps;
@@ -33,6 +32,7 @@ pub mod probe_mp4;
 pub mod rank;
 pub mod releaselog;
 pub mod reqlog;
+pub mod runtime;
 pub mod scrape;
 pub mod seal;
 pub mod season;

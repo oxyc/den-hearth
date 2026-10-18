@@ -199,7 +199,7 @@ impl Inner {
         let (this, config, imdb, key) = (self.clone(), config.clone(), imdb.to_owned(), key.to_owned());
         // A background task, so the request's recovery cannot see a panic here — and the booking is released from
         // a guard, so a panic cannot strand the key either.
-        spawn_background("availability check", async move {
+        spawn_background(self.deps.runtime.clone(), "availability check", async move {
             let _done = CheckDone { inner: this.clone(), key: key.clone() };
             let deadline = TokioInstant::now() + this.deps.scrape_timeout + LIST_BUILD_SLACK;
             // Cache truth only changes ordering unless the install explicitly asks for cached-only results.

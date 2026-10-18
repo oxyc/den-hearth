@@ -14,6 +14,51 @@ use serde::Serialize;
 
 use crate::conditional::etag_of;
 
+/// A process-stable response body with its validator computed once. Cloning `Bytes` only bumps a reference count,
+/// so static pages and small immutable JSON answers do not re-hash or re-allocate their body on every request.
+#[derive(Clone, Debug)]
+pub struct StaticBody {
+    bytes: Bytes,
+    etag: HeaderValue,
+}
+
+impl StaticBody {
+    pub fn new(data: impl Into<Bytes>) -> Self {
+        let bytes = data.into();
+        let etag = HeaderValue::from_str(&etag_of(&bytes)).expect("an ETag is always an ASCII header value");
+        Self { bytes, etag }
+    }
+
+    /// Serialize a process-stable JSON value once. The infallible fallback matches [`json`].
+    pub fn json<T: Serialize + ?Sized>(value: &T) -> Self {
+        Self::new(serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Build a cacheable 200 from the saved bytes and ETag. Callers still name the cache policy explicitly, which
+    /// keeps private/no-store decisions at the route that owns them.
+    pub fn response(
+        &self,
+        content_type: &'static str,
+        cache_control: &'static str,
+        extra: &[(&str, &str)],
+    ) -> Response<Body> {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", content_type)
+            .header("content-length", self.bytes.len())
+            .header("cache-control", cache_control)
+            .header(ETAG, self.etag.clone());
+        for (name, value) in extra {
+            response = response.header(*name, *value);
+        }
+        response.body(full(self.bytes.clone())).expect("static response headers are valid")
+    }
+}
+
 /// `Server-Timing`: which phases a response spent its time in, in milliseconds. Phase names only: never a title,
 /// an install or a URL.
 pub const SERVER_TIMING: &str = "server-timing";
@@ -87,7 +132,17 @@ pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> R
 /// The one 404 every Den addon answers, for an unknown path and a refused `/metrics` alike, so a refusal cannot be
 /// told apart from a route that does not exist.
 pub fn not_found() -> Response<Body> {
-    json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), &[("cache-control", "no-store")])
+    // This is among the hottest error responses (route misses and deliberately hidden metrics both use it), and
+    // its bytes never vary. Building a `Value` and serializing it allocated a fresh 21-byte payload for every 404;
+    // keep the payload in the binary and let each response hold a zero-copy `Bytes` view of it instead.
+    const BODY: &[u8] = br#"{"error":"not_found"}"#;
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "application/json")
+        .header("content-length", BODY.len())
+        .header("cache-control", "no-store")
+        .body(full(Bytes::from_static(BODY)))
+        .unwrap()
 }
 
 /// A typed error body `{ "error": <code>, "detail": <text> }` — the shape every Den addon answers with (no-store
@@ -194,6 +249,17 @@ mod tests {
         assert_eq!(header(&resp, "content-type").as_deref(), Some("text/html; charset=utf-8"));
     }
 
+    #[tokio::test]
+    async fn a_static_body_reuses_its_bytes_and_validator() {
+        let body = StaticBody::new(Bytes::from_static(b"unchanging"));
+        let first = body.response("text/plain", "public, max-age=60", &[]);
+        let second = body.response("text/plain", "public, max-age=60", &[]);
+        assert_eq!(first.headers()[ETAG], second.headers()[ETAG]);
+        assert_eq!(first.headers()["content-length"], "10");
+        let bytes = second.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes, body.bytes());
+    }
+
     #[test]
     fn errors_and_no_store_bodies_have_no_etag_and_errors_are_never_cached() {
         let ok = json(StatusCode::OK, &serde_json::json!({"a": 1}), &[("cache-control", "no-store")]);
@@ -219,6 +285,14 @@ mod tests {
             body(error(StatusCode::BAD_REQUEST, "bad_request", "Expected a u= parameter.")).await,
             serde_json::json!({"error": "bad_request", "detail": "Expected a u= parameter."})
         );
+    }
+
+    #[tokio::test]
+    async fn not_found_responses_share_the_static_payload() {
+        let first = not_found().into_body().collect().await.unwrap().to_bytes();
+        let second = not_found().into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(first, br#"{"error":"not_found"}"#[..]);
+        assert_eq!(first.as_ptr(), second.as_ptr(), "a 404 allocated or copied its fixed payload");
     }
 
     #[test]

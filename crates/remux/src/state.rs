@@ -5,8 +5,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use den_upstream::{ClientProfile, Redirect};
@@ -64,7 +67,12 @@ impl OpenedCache {
             self.entries.remove(0);
         }
         let head = resolved.head[..resolved.head.len().min(crate::subs::HASH_CHUNK as usize)].to_vec();
-        let resolved = Resolved { url: resolved.url.clone(), head, size: resolved.size };
+        let resolved = Resolved {
+            url: resolved.url.clone(),
+            head,
+            size: resolved.size,
+            client: resolved.client.clone(),
+        };
         self.entries.push(Opened { key, at: now, resolved, info: info.clone() });
     }
 
@@ -330,8 +338,12 @@ fn read_bounded(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     if file.metadata()?.len() > max as u64 {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds size limit"));
     }
+    read_bounded_from(file, max)
+}
+
+fn read_bounded_from(reader: impl Read, max: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    reader.take(max as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > max {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file grew past size limit"));
     }
@@ -349,6 +361,13 @@ pub fn probe_key(size: Option<u64>, head: &[u8]) -> Option<String> {
 
 /// Releases remembered as playing nowhere.
 const UNPLAYABLE_MAX: usize = 10_000;
+/// Enough for every admitted verdict at its maximum encoded size, while keeping a corrupt file from allocating in
+/// proportion to arbitrary disk contents. Reads take one byte past this cap, so growth after `metadata` is noticed.
+const UNPLAYABLE_FILE_MAX_BYTES: usize = 24 * 1024 * 1024;
+/// Both strings originate in bounded request/probe data, but persisted input is an untrusted restart boundary.
+const UNPLAYABLE_STRING_MAX: usize = 1024;
+/// Keeps even heavily JSON-escaped strings inside the whole-file cap at `UNPLAYABLE_MAX` entries.
+const UNPLAYABLE_ENTRY_MAX_BYTES: usize = 2048;
 /// How long such a verdict holds. The file does not change; this only lets a wrong verdict — a probe fixed since, a
 /// debrid that served something else under a release's name — heal on its own.
 pub const UNPLAYABLE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -375,6 +394,13 @@ pub struct Unplayable {
 }
 
 impl Unplayable {
+    fn valid_entry(key: &str, at: u64, why: &str) -> bool {
+        key.len() <= UNPLAYABLE_STRING_MAX
+            && why.len() <= UNPLAYABLE_STRING_MAX
+            && serde_json::to_vec(&UnplayableEntry { key: key.into(), at, why: why.into() })
+                .is_ok_and(|json| json.len() <= UNPLAYABLE_ENTRY_MAX_BYTES)
+    }
+
     /// Why the release under `key` plays nowhere, when that was found within `UNPLAYABLE_TTL_SECS` of `now`.
     pub fn get(&self, key: &str, now: u64) -> Option<String> {
         self.entries
@@ -385,6 +411,9 @@ impl Unplayable {
 
     /// Remember a release that plays nowhere; past `UNPLAYABLE_MAX` the oldest verdict gives way.
     pub fn put(&mut self, key: String, why: String, now: u64) {
+        if !Self::valid_entry(&key, now, &why) {
+            return;
+        }
         if !self.entries.contains_key(&key) && self.entries.len() >= UNPLAYABLE_MAX {
             self.entries.retain(|_, (at, _)| now.saturating_sub(*at) < UNPLAYABLE_TTL_SECS);
         }
@@ -409,7 +438,13 @@ impl Unplayable {
 
     /// What `to_json` wrote, less what has expired by `now`, the newest `UNPLAYABLE_MAX` of it.
     fn from_json(bytes: &[u8], now: u64) -> Result<Unplayable, String> {
+        if bytes.len() > UNPLAYABLE_FILE_MAX_BYTES {
+            return Err(format!("{} bytes exceeds {UNPLAYABLE_FILE_MAX_BYTES}", bytes.len()));
+        }
         let mut list: Vec<UnplayableEntry> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        if list.len() > UNPLAYABLE_MAX || list.iter().any(|e| !Self::valid_entry(&e.key, e.at, &e.why)) {
+            return Err("too many or oversized unplayable entries".into());
+        }
         list.retain(|e| now.saturating_sub(e.at) < UNPLAYABLE_TTL_SECS);
         list.sort_by_key(|e| std::cmp::Reverse(e.at));
         list.truncate(UNPLAYABLE_MAX);
@@ -417,11 +452,101 @@ impl Unplayable {
     }
 }
 
+/// One blocking persistence worker per state kind. Mutations only change their generation while this is scheduled;
+/// the worker takes another snapshot until it catches up. The condition variable is solely for orderly shutdown.
+struct PersistenceWrite {
+    written: Mutex<u64>,
+    scheduled: AtomicBool,
+    idle: Condvar,
+    #[cfg(test)]
+    spawned: AtomicUsize,
+    #[cfg(test)]
+    gate: Mutex<Option<Arc<TestWriteGate>>>,
+}
+
+impl PersistenceWrite {
+    fn new() -> Self {
+        Self {
+            written: Mutex::new(0),
+            scheduled: AtomicBool::new(false),
+            idle: Condvar::new(),
+            #[cfg(test)]
+            spawned: AtomicUsize::new(0),
+            #[cfg(test)]
+            gate: Mutex::new(None),
+        }
+    }
+
+    fn schedule(&self) -> bool {
+        self.scheduled.compare_exchange(false, true, AcqRel, Acquire).is_ok()
+    }
+
+    fn caught_up_or_keep_running(&self, generation: u64) -> bool {
+        let written = *self.written.lock().unwrap_or_else(|e| e.into_inner());
+        if generation > written {
+            return false;
+        }
+        self.scheduled.store(false, Release);
+        self.idle.notify_all();
+        true
+    }
+
+    fn wait_idle(&self) {
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        while self.scheduled.load(Acquire) {
+            written = self.idle.wait(written).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    #[cfg(test)]
+    fn before_write(&self) {
+        if let Some(gate) = self.gate.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            gate.block_once();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestWriteGate {
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    ready: Condvar,
+}
+
+#[cfg(test)]
+impl TestWriteGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { entered: AtomicBool::new(false), released: Mutex::new(false), ready: Condvar::new() })
+    }
+
+    fn block_once(&self) {
+        if self.entered.swap(true, AcqRel) {
+            return;
+        }
+        self.ready.notify_all();
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        while !*released {
+            released = self.ready.wait(released).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    pub(crate) async fn wait_entered(&self) {
+        while !self.entered.load(Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.ready.notify_all();
+    }
+}
+
 /// How long a read from a release's host may sit with no byte arriving, while it is being read.
-const SOURCE_READ_IDLE: Duration = Duration::from_secs(30);
+pub(crate) const SOURCE_READ_IDLE: Duration = Duration::from_secs(30);
 
 /// How long a connection to a release's host, or to scout, may take to open.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The profile of the client that reads releases: the probe's ranged reads, and a session's ffmpeg through its door
 /// (`source`), on one pool, so ffmpeg's reads go over the connection the probe opened. No total timeout: a read of the
@@ -491,10 +616,10 @@ pub struct AppState {
     /// What opened releases showed of their video, for `POST /remux/releases`.
     known: Mutex<KnownReleases>,
     probe_cache: Mutex<ProbeCache>,
-    probe_cache_written: Mutex<u64>,
+    probe_cache_write: PersistenceWrite,
     /// Releases that play in no browser, and the generation of them last written to disk.
     unplayable: Mutex<Unplayable>,
-    unplayable_written: Mutex<u64>,
+    unplayable_write: PersistenceWrite,
     pub scratch_bytes: AtomicU64,
     pub sessions_started: AtomicU64,
     pub jobs_started: AtomicU64,
@@ -614,9 +739,9 @@ impl AppState {
             opened: Mutex::new(OpenedCache::default()),
             known: Mutex::new(KnownReleases::default()),
             probe_cache: Mutex::new(ProbeCache::default()),
-            probe_cache_written: Mutex::new(0),
+            probe_cache_write: PersistenceWrite::new(),
             unplayable: Mutex::new(Unplayable::default()),
-            unplayable_written: Mutex::new(0),
+            unplayable_write: PersistenceWrite::new(),
             scratch_bytes: AtomicU64::new(0),
             sessions_started: AtomicU64::new(0),
             jobs_started: AtomicU64::new(0),
@@ -732,9 +857,18 @@ impl AppState {
     }
 
     pub fn remember_probe(self: &Arc<Self>, key: String, info: &MediaInfo) {
-        self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).put(key, info);
-        let st = self.clone();
-        tokio::task::spawn_blocking(move || st.write_probe_cache());
+        let changed = {
+            let mut cache = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let before = cache.generation;
+            cache.put(key, info);
+            cache.generation != before
+        };
+        if changed && self.probe_cache_write.schedule() {
+            #[cfg(test)]
+            self.probe_cache_write.spawned.fetch_add(1, Relaxed);
+            let st = self.clone();
+            tokio::task::spawn_blocking(move || st.drain_probe_cache());
+        }
     }
 
     pub fn load_probe_cache(&self) {
@@ -753,22 +887,54 @@ impl AppState {
         }
     }
 
-    fn write_probe_cache(&self) {
-        let mut written = self.probe_cache_written.lock().unwrap_or_else(|e| e.into_inner());
+    fn write_probe_cache(&self) -> Result<(), u64> {
+        let mut written = self.probe_cache_write.written.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, json) = {
             let cache = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
             (cache.generation, cache.to_json())
         };
         if generation <= *written {
-            return;
+            return Ok(());
         }
+        #[cfg(test)]
+        self.probe_cache_write.before_write();
         let path = self.cfg.scratch_dir.join(PROBE_FILE);
         let tmp = path.with_extension("json.tmp");
         match std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
-            Ok(()) => *written = generation,
-            Err(e) => crate::log_limited("probe_cache_write", || {
-                format!("probe cache: {} could not be written: {e}", path.display())
-            }),
+            Ok(()) => {
+                *written = generation;
+                Ok(())
+            }
+            Err(e) => {
+                crate::log_limited("probe_cache_write", || {
+                    format!("probe cache: {} could not be written: {e}", path.display())
+                });
+                Err(generation)
+            }
+        }
+    }
+
+    fn drain_probe_cache(self: &Arc<Self>) {
+        loop {
+            if let Err(attempted) = self.write_probe_cache() {
+                self.probe_cache_write.scheduled.store(false, Release);
+                self.probe_cache_write.idle.notify_all();
+                let latest = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).generation;
+                if latest <= attempted || !self.probe_cache_write.schedule() {
+                    return;
+                }
+                continue;
+            }
+            let generation = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).generation;
+            if self.probe_cache_write.caught_up_or_keep_running(generation) {
+                // Close the store(false) / mutation race: either this worker takes ownership again, or the mutation
+                // already scheduled its successor. In the latter case this worker must leave it alone.
+                let latest = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).generation;
+                let written = *self.probe_cache_write.written.lock().unwrap_or_else(|e| e.into_inner());
+                if latest <= written || !self.probe_cache_write.schedule() {
+                    return;
+                }
+            }
         }
     }
 
@@ -780,7 +946,7 @@ impl AppState {
     /// is said, and replaced by the next verdict.
     pub fn load_unplayable(&self) {
         let path = self.cfg.scratch_dir.join(UNPLAYABLE_FILE);
-        let loaded = match std::fs::read(&path) {
+        let loaded = match read_bounded(&path, UNPLAYABLE_FILE_MAX_BYTES) {
             Ok(bytes) => Unplayable::from_json(&bytes, unix_now()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => Err(e.to_string()),
@@ -796,29 +962,97 @@ impl AppState {
 
     /// Remember that the release under `key` plays nowhere, and keep that in scratch, off the runtime's threads.
     pub fn remember_unplayable(self: &Arc<Self>, key: String, why: String) {
-        self.unplayable().put(key, why, unix_now());
-        let st = self.clone();
-        tokio::task::spawn_blocking(move || st.write_unplayable());
+        let changed = {
+            let mut unplayable = self.unplayable();
+            let before = unplayable.generation;
+            unplayable.put(key, why, unix_now());
+            unplayable.generation != before
+        };
+        if changed && self.unplayable_write.schedule() {
+            #[cfg(test)]
+            self.unplayable_write.spawned.fetch_add(1, Relaxed);
+            let st = self.clone();
+            tokio::task::spawn_blocking(move || st.drain_unplayable());
+        }
     }
 
     /// Write the verdicts to scratch, whole, through a rename — unless a newer state is already there.
-    fn write_unplayable(&self) {
-        let mut written = self.unplayable_written.lock().unwrap_or_else(|e| e.into_inner());
+    fn write_unplayable(&self) -> Result<(), u64> {
+        let mut written = self.unplayable_write.written.lock().unwrap_or_else(|e| e.into_inner());
         let (generation, json) = {
             let u = self.unplayable();
             (u.generation, u.to_json())
         };
         if generation <= *written {
-            return;
+            return Ok(());
         }
+        #[cfg(test)]
+        self.unplayable_write.before_write();
         let path = self.cfg.scratch_dir.join(UNPLAYABLE_FILE);
         let tmp = path.with_extension("json.tmp");
         match std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
-            Ok(()) => *written = generation,
-            Err(e) => crate::log_limited("unplayable_write", || {
-                format!("unplayable: {} could not be written: {e}", path.display())
-            }),
+            Ok(()) => {
+                *written = generation;
+                Ok(())
+            }
+            Err(e) => {
+                crate::log_limited("unplayable_write", || {
+                    format!("unplayable: {} could not be written: {e}", path.display())
+                });
+                Err(generation)
+            }
         }
+    }
+
+    fn drain_unplayable(self: &Arc<Self>) {
+        loop {
+            if let Err(attempted) = self.write_unplayable() {
+                self.unplayable_write.scheduled.store(false, Release);
+                self.unplayable_write.idle.notify_all();
+                let latest = self.unplayable().generation;
+                if latest <= attempted || !self.unplayable_write.schedule() {
+                    return;
+                }
+                continue;
+            }
+            let generation = self.unplayable().generation;
+            if self.unplayable_write.caught_up_or_keep_running(generation) {
+                let latest = self.unplayable().generation;
+                let written = *self.unplayable_write.written.lock().unwrap_or_else(|e| e.into_inner());
+                if latest <= written || !self.unplayable_write.schedule() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Wait for the finite, single-flight disk writes before the Tokio runtime is torn down.
+    pub async fn flush_persistence(self: &Arc<Self>) {
+        let st = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            st.probe_cache_write.wait_idle();
+            st.unplayable_write.wait_idle();
+        })
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_probe_write(&self) -> Arc<TestWriteGate> {
+        let gate = TestWriteGate::new();
+        *self.probe_cache_write.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_unplayable_write(&self) -> Arc<TestWriteGate> {
+        let gate = TestWriteGate::new();
+        *self.unplayable_write.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_spawn_counts(&self) -> (usize, usize) {
+        (self.probe_cache_write.spawned.load(Relaxed), self.unplayable_write.spawned.load(Relaxed))
     }
 
     pub fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
@@ -1167,6 +1401,166 @@ fn encode_probe_args(device: &str) -> Vec<String> {
     a
 }
 
+const PROBE_OUTPUT_MAX: usize = 64 * 1024;
+const PROBE_POST_KILL_DRAIN: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct ProbeCapture {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+async fn capture_probe<R: tokio::io::AsyncRead + Unpin>(
+    mut pipe: R,
+    stream: &'static str,
+    overflow: tokio::sync::mpsc::Sender<&'static str>,
+) -> ProbeCapture {
+    use tokio::io::AsyncReadExt;
+    let mut captured = ProbeCapture { bytes: Vec::with_capacity(PROBE_OUTPUT_MAX), overflow: false };
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if captured.bytes.len().saturating_add(n) > PROBE_OUTPUT_MAX {
+            captured.overflow = true;
+            let _ = overflow.try_send(stream);
+        }
+        let room = PROBE_OUTPUT_MAX.saturating_sub(captured.bytes.len());
+        captured.bytes.extend_from_slice(&chunk[..n.min(room)]);
+    }
+    captured
+}
+
+struct ProbeGroup {
+    pid: Option<u32>,
+    signalled: bool,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl ProbeGroup {
+    fn kill(&mut self) {
+        if self.signalled {
+            return;
+        }
+        self.signalled = true;
+        if let Some(pid) = self.pid {
+            den_process::kill_group(pid);
+        }
+    }
+
+    fn reaped(&mut self) {
+        self.kill();
+        if let Some(pid) = self.pid.take() {
+            crate::job::unregister_group(pid);
+        }
+    }
+}
+
+impl Drop for ProbeGroup {
+    fn drop(&mut self) {
+        self.kill();
+        if let Some(pid) = self.pid.take() {
+            crate::job::unregister_group(pid);
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+async fn finish_probe_capture(task: &mut tokio::task::JoinHandle<ProbeCapture>) -> ProbeCapture {
+    match tokio::time::timeout(PROBE_POST_KILL_DRAIN, &mut *task).await {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            ProbeCapture::default()
+        }
+    }
+}
+
+/// Small startup commands get the same ownership rule as session ffmpeg: one process group,
+/// registered until its leader is reaped, with bounded pipe memory and bounded post-kill drains.
+async fn grouped_probe(
+    mut cmd: tokio::process::Command,
+    input: Option<Vec<u8>>,
+    budget: Duration,
+) -> Result<std::process::Output, String> {
+    use tokio::io::AsyncWriteExt;
+    cmd.stdin(if input.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("cannot start: {e}"))?;
+    let pid = child.id().unwrap_or(0);
+    crate::job::register_group(pid);
+    let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
+    let mut stdout = tokio::spawn(capture_probe(
+        child.stdout.take().expect("stdout was piped"),
+        "stdout",
+        overflow_tx.clone(),
+    ));
+    let mut stderr =
+        tokio::spawn(capture_probe(child.stderr.take().expect("stderr was piped"), "stderr", overflow_tx));
+    let mut writer = input.map(|input| {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+        })
+    });
+    let mut group = ProbeGroup {
+        pid: Some(pid),
+        signalled: false,
+        tasks: [
+            Some(stdout.abort_handle()),
+            Some(stderr.abort_handle()),
+            writer.as_ref().map(|w| w.abort_handle()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    };
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut why = None;
+    let status = tokio::select! {
+        status = child.wait() => status.map_err(|e| e.to_string())?,
+        Some(stream) = overflow_rx.recv() => {
+            why = Some(format!("{stream} exceeded {PROBE_OUTPUT_MAX} bytes"));
+            group.kill();
+            tokio::time::timeout(Duration::from_secs(2), child.wait()).await
+                .map_err(|_| "child did not reap after output overflow".to_owned())?
+                .map_err(|e| e.to_string())?
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            why = Some(format!("timed out after {}s", budget.as_secs()));
+            group.kill();
+            tokio::time::timeout(Duration::from_secs(2), child.wait()).await
+                .map_err(|_| "child did not reap after timeout".to_owned())?
+                .map_err(|e| e.to_string())?
+        }
+    };
+    // The leader is gone; kill helpers that retained its group or pipes before draining them.
+    group.reaped();
+    if let Some(writer) = writer.as_mut() {
+        writer.abort();
+        let _ = writer.await;
+    }
+    let stdout = finish_probe_capture(&mut stdout).await;
+    let stderr = finish_probe_capture(&mut stderr).await;
+    group.tasks.clear();
+    if let Some(why) = why {
+        return Err(why);
+    }
+    if stdout.overflow || stderr.overflow {
+        return Err(format!("startup probe output exceeded {PROBE_OUTPUT_MAX} bytes"));
+    }
+    Ok(std::process::Output { status, stdout: stdout.bytes, stderr: stderr.bytes })
+}
+
 #[cfg(test)]
 pub fn probe_args_for_test() -> Vec<String> {
     encode_probe_args("/dev/dri/renderD128")
@@ -1177,28 +1571,13 @@ pub fn probe_args_for_test() -> Vec<String> {
 /// bitrate-controlled encode ("Driver does not support any RC mode"). This runs the real thing, once, on a
 /// few frames. `Err` is ffmpeg's own last words.
 pub async fn probe_encode(ffmpeg: &str, device: &Path) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new(ffmpeg)
-        .args(encode_probe_args(&device.to_string_lossy()))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("cannot start {ffmpeg}: {e}"))?;
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    // ffmpeg may exit before it has read the clip (a device that will not open), so a broken pipe is not
-    // this check's failure: the exit status and stderr below say why.
-    let feed = tokio::spawn(async move {
-        let _ = stdin.write_all(ENCODE_PROBE_CLIP).await;
-    });
-    let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await;
-    feed.abort();
-    match out {
-        Err(_) => Err("the test encode did not finish in 20 s".to_string()),
-        Ok(Err(e)) => Err(format!("the test encode could not be awaited: {e}")),
-        Ok(Ok(o)) if o.status.success() => Ok(()),
-        Ok(Ok(o)) => {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(encode_probe_args(&device.to_string_lossy()));
+    match grouped_probe(cmd, Some(ENCODE_PROBE_CLIP.to_vec()), Duration::from_secs(20)).await {
+        Err(e) if e.contains("timed out") => Err("the test encode did not finish in 20 s".to_string()),
+        Err(e) => Err(format!("the test encode could not be awaited: {e}")),
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
             let said = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" | ");
             let said: String = said.chars().take(400).collect();
@@ -1210,16 +1589,10 @@ pub async fn probe_encode(ffmpeg: &str, device: &Path) -> Result<(), String> {
 /// Does `ffmpeg <args>` print `want`, for every pair? Says the first that does not.
 pub(crate) async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> bool {
     for (args, want) in checks {
-        let out = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::process::Command::new(ffmpeg)
-                .args(*args)
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        let ok = matches!(&out, Ok(Ok(o)) if String::from_utf8_lossy(&o.stdout).contains(want));
+        let mut cmd = tokio::process::Command::new(ffmpeg);
+        cmd.args(*args);
+        let out = grouped_probe(cmd, None, Duration::from_secs(10)).await;
+        let ok = matches!(&out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(want));
         if !ok {
             eprintln!("ffmpeg check: `{ffmpeg} {}` does not report {want}", args.join(" "));
             return false;
@@ -1231,6 +1604,89 @@ pub(crate) async fn reports_all(ffmpeg: &str, checks: &[(&[&str], &str)]) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn executable_script(body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "den-remux-probe-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Relaxed)
+        ));
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_probe_overflow_kills_the_group_and_the_next_probe_recovers() {
+        let noisy =
+            executable_script(&format!("#!/bin/sh\nhead -c {} /dev/zero\nsleep 30\n", PROBE_OUTPUT_MAX + 1));
+        let mut cmd = tokio::process::Command::new(&noisy);
+        let began = Instant::now();
+        let err = grouped_probe(cmd, None, Duration::from_secs(10)).await.unwrap_err();
+        assert!(err.contains("exceeded"), "{err}");
+        assert!(began.elapsed() < Duration::from_secs(3), "overflow waited for the outer deadline");
+
+        let recovered_pid =
+            std::env::temp_dir().join(format!("den-remux-recovered-probe-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&recovered_pid);
+        let recovered = executable_script(&format!(
+            "#!/bin/sh\necho $$ > '{}'\nprintf recovered\n",
+            recovered_pid.display()
+        ));
+        cmd = tokio::process::Command::new(&recovered);
+        let out = grouped_probe(cmd, None, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(out.stdout, b"recovered");
+        let pid: u32 = std::fs::read_to_string(recovered_pid).unwrap().trim().parse().unwrap();
+        assert!(!crate::job::is_group_live(pid), "reaped startup probe stayed registered");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_startup_probe_kills_its_descendant_group() {
+        let pid_file = std::env::temp_dir().join(format!("den-remux-descendant-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = executable_script("#!/bin/sh\nsleep 30 &\necho $! > \"$1\"\nwait\n");
+        let mut cmd = tokio::process::Command::new(&script);
+        cmd.arg(&pid_file);
+        let task = tokio::spawn(async move { grouped_probe(cmd, None, Duration::from_secs(30)).await });
+        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the startup probe did not report its descendant pid");
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while unsafe { libc::kill(descendant, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled startup probe left its descendant alive");
+    }
+
+    fn persistence_state() -> Arc<AppState> {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let mut cfg = Config::from_env();
+        cfg.scratch_dir = std::env::temp_dir().join(format!(
+            "den-remux-persistence-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Relaxed)
+        ));
+        std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
+        AppState::new(cfg)
+    }
 
     /// Each client keeps the settings it was fixed with. The source client has no total timeout, only a connect
     /// bound and a read-idle one, and follows no redirect (#20): a redirect on a later read is a failed read. The
@@ -1283,7 +1739,15 @@ mod tests {
             byte_index: Vec::new(),
             video_bytes: None,
         };
-        (Resolved { url: url.into(), head: vec![7; 200_000], size: Some(1) }, info)
+        (
+            Resolved {
+                url: url.into(),
+                head: vec![7; 200_000],
+                size: Some(1),
+                client: source_client(Duration::from_secs(1), Duration::from_secs(1)),
+            },
+            info,
+        )
     }
 
     #[test]
@@ -1390,6 +1854,84 @@ mod tests {
         let result = read_bounded(&path, PROBE_FILE_MAX_BYTES);
         let _ = std::fs::remove_file(path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_file_that_grows_after_metadata_is_still_bounded() {
+        let bytes = vec![b'x'; 129];
+        let result = read_bounded_from(std::io::Cursor::new(bytes), 128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unplayable_startup_preserves_valid_state_and_rejects_oversized_or_corrupt_files() {
+        let state = persistence_state();
+        let path = state.cfg.scratch_dir.join(UNPLAYABLE_FILE);
+        let now = unix_now();
+        let valid = vec![UnplayableEntry { key: "release".into(), at: now, why: "unsupported video".into() }];
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+        state.load_unplayable();
+        assert_eq!(state.unplayable().get("release", now).as_deref(), Some("unsupported video"));
+
+        *state.unplayable() = Unplayable::default();
+        std::fs::File::create(&path).unwrap().set_len(UNPLAYABLE_FILE_MAX_BYTES as u64 + 1).unwrap();
+        state.load_unplayable();
+        assert!(state.unplayable().entries.is_empty());
+
+        std::fs::write(&path, b"not json").unwrap();
+        state.load_unplayable();
+        assert!(state.unplayable().entries.is_empty());
+
+        let oversized =
+            vec![UnplayableEntry { key: "k".repeat(UNPLAYABLE_STRING_MAX + 1), at: now, why: "why".into() }];
+        assert!(Unplayable::from_json(&serde_json::to_vec(&oversized).unwrap(), now).is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_write_bursts_coalesce_behind_a_blocked_first_write() {
+        let state = persistence_state();
+        let gate = state.block_probe_write();
+        let (_, info) = opened("https://debrid/probe");
+        state.remember_probe(probe_key(Some(1), b"first").unwrap(), &info);
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+            .await
+            .expect("the first probe-cache write did not reach the test gate");
+
+        for size in 2..=200 {
+            state.remember_probe(probe_key(Some(size), b"burst").unwrap(), &info);
+        }
+        assert_eq!(state.persistence_spawn_counts().0, 1, "the burst queued more blocking writers");
+        gate.release();
+        state.flush_persistence().await;
+
+        let bytes = read_bounded(&state.cfg.scratch_dir.join(PROBE_FILE), PROBE_FILE_MAX_BYTES).unwrap();
+        let mut restored = ProbeCache::from_json(&bytes).unwrap();
+        assert!(
+            restored.get(&probe_key(Some(200), b"burst").unwrap()).is_some(),
+            "the newest snapshot was lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn unplayable_write_bursts_coalesce_behind_a_blocked_first_write() {
+        let state = persistence_state();
+        let gate = state.block_unplayable_write();
+        state.remember_unplayable("release-1".into(), "first".into());
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+            .await
+            .expect("the first unplayable write did not reach the test gate");
+
+        for n in 2..=200 {
+            state.remember_unplayable(format!("release-{n}"), format!("reason-{n}"));
+        }
+        assert_eq!(state.persistence_spawn_counts().1, 1, "the burst queued more blocking writers");
+        gate.release();
+        state.flush_persistence().await;
+
+        let bytes =
+            read_bounded(&state.cfg.scratch_dir.join(UNPLAYABLE_FILE), UNPLAYABLE_FILE_MAX_BYTES).unwrap();
+        let restored = Unplayable::from_json(&bytes, unix_now()).unwrap();
+        assert_eq!(restored.get("release-200", unix_now()).as_deref(), Some("reason-200"));
     }
 
     #[test]

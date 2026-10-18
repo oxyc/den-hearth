@@ -6,10 +6,13 @@
 //! caller's context (the shared status read, the account listing, the check-cached batcher) runs in its own
 //! task, for the same reason Go gives: another waiter may still need the answer.
 
+mod batching;
 mod listing;
+mod status;
 pub(crate) mod support;
+mod transport;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -18,19 +21,19 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, Notify, Semaphore, SemaphorePermit};
+use tokio::sync::{mpsc, Semaphore};
 
 use super::{
-    CancelOutcome, ResolveTarget, StatusAnswer, Store, StoreError, StoreStatus, FETCH_QUEUED, FETCH_STALLED,
-    MAX_LISTING_BYTES, MAX_STORE_BYTES,
+    CancelOutcome, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus, FETCH_QUEUED,
+    FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
 };
-use crate::addbudget::{budget_account, global_add_budget, refund_add, spend_add, RequestNotSent};
+use crate::addbudget::{budget_account, global_add_budget, refund_add, spend_add, AddCharge, RequestNotSent};
 use crate::cache::{Cache, CacheClass};
 use crate::config::DebridService;
 use crate::linkcheck::size_of;
 use crate::loglimit::log_limited;
 use crate::metrics::metrics;
-use crate::scrape::{DoError, Doer};
+use crate::scrape::Doer;
 use crate::season::{
     ambiguous_episode_guess, is_feature_sized, largest_episode_candidate, largest_playable,
     pick_episode_file, TorrentFile,
@@ -43,16 +46,18 @@ use crate::stores::refusal::{
     torrent_miss_key, transport_error, transport_kind, unknown_outcome, TORRENT_MISS_TTL,
 };
 use crate::util::{key_hash, Shape, LEAF};
+use batching::SharedBatcher;
 
 use super::{
-    build_request, dead_link, encode_form, join_all, magnet_for, read_limited, read_store_error,
-    redact_token, store_error_text, store_refused_us, torbox_fetch_state as fetch_state, unavailable,
+    build_request, dead_link, encode_form, join_all, magnet_for, null_default, redact_token,
+    store_error_text, store_refused_us, torbox_fetch_state as fetch_state, unavailable,
 };
-use crate::util::{scoped, DetachedFlight};
+use crate::util::DetachedFlight;
 pub(crate) use listing::{decode_listing, ListingFault, TruncationDetector};
+use status::CachedStatus;
 use support::{
-    envelope, first_value, int_or_zero, lock, no_file_list, opt_bool, opt_float, opt_int, opt_string,
-    string_or_empty, torrent_gone, would_add, GaugeGuard,
+    envelope, int_or_zero, lock, no_file_list, opt_bool, opt_float, opt_int, opt_string, string_or_empty,
+    torrent_gone, would_add, Gauge, GaugeGuard,
 };
 
 /// Go `torboxAPI`.
@@ -68,6 +73,10 @@ pub(crate) const RESOLVE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// outbound concurrency. Waiting here preserves truth (a caller that runs out of context gets "unknown",
 /// never a fabricated miss) while preventing an outage from being amplified by more sockets and requests.
 pub(crate) const MAX_TORBOX_OUTBOUND: usize = 64;
+/// Distinct detached whole-account listing fetches admitted before their keys enter the flight map. Keeping this
+/// no larger than the outbound ceiling prevents unique-token cancellation traffic from parking unbounded tasks
+/// ahead of the shared HTTP semaphore.
+pub(crate) const MAX_ACCOUNT_LISTING_FLIGHTS: usize = MAX_TORBOX_OUTBOUND;
 /// Go `cacheBatch`: TorBox hashes per checkcached call.
 pub(crate) const CACHE_BATCH: usize = 100;
 /// Go `maxListingEntries` bounds what the listing RETAINS, which the byte cap does not: the map holds one
@@ -163,25 +172,47 @@ pub(crate) struct TorboxCheckResult {
     pub(crate) ok: bool,
 }
 
-// --- process-wide state (Go package variables) ---
+// --- runtime-owned coordinator state ---
 
-/// Go `torboxOutboundSlots`.
-static OUTBOUND: Semaphore = Semaphore::const_new(MAX_TORBOX_OUTBOUND);
-/// Go `torboxStatusSlots`.
-static STATUS_SLOT_POOL: Semaphore = Semaphore::const_new(STATUS_SLOTS);
-/// Go `torboxCheckFlights`, `torboxStatusFlights`, `listingFlight`.
-///
-/// listingFlight collapses concurrent fetches of one account's listing into a single round trip. The cache
-/// alone only helps SEQUENTIAL callers, and the case this exists for — a poster grid probing eight releases at
-/// once — is anything but sequential.
-static CHECK_FLIGHTS: DetachedFlight<TorboxCheckResult> = DetachedFlight::new("torbox check-cached round");
-static STATUS_FLIGHTS: DetachedFlight<CachedStatus> = DetachedFlight::new("torbox status read");
-static LISTING_FLIGHTS: DetachedFlight<Option<Arc<HashMap<String, i64>>>> =
-    DetachedFlight::new("account listing fetch");
-/// Go `torboxBatchers`.
-static BATCHERS: Mutex<BTreeMap<String, Arc<Batcher>>> = Mutex::new(BTreeMap::new());
-/// Go `listingMemo` with `listingMemoMu`. See `LISTING_MEMO`'s notes on `memo_key`.
-static LISTING_MEMO: Mutex<BTreeMap<(usize, String), ListingMemoEntry>> = Mutex::new(BTreeMap::new());
+pub(crate) struct TorboxRuntime {
+    outbound: Arc<Semaphore>,
+    listing_slots: Arc<Semaphore>,
+    status_slots: Arc<Semaphore>,
+    check_flights: DetachedFlight<TorboxCheckResult>,
+    status_flights: DetachedFlight<CachedStatus>,
+    listing_flights: DetachedFlight<Option<Arc<HashMap<String, i64>>>>,
+    batchers: Mutex<BTreeMap<String, SharedBatcher>>,
+    listing_memo: Mutex<BTreeMap<(usize, String), ListingMemoEntry>>,
+}
+
+impl TorboxRuntime {
+    pub(crate) fn new() -> Self {
+        Self::with_listing_limit(MAX_ACCOUNT_LISTING_FLIGHTS)
+    }
+
+    fn with_listing_limit(listing_limit: usize) -> Self {
+        Self {
+            outbound: Arc::new(Semaphore::new(MAX_TORBOX_OUTBOUND)),
+            listing_slots: Arc::new(Semaphore::new(listing_limit)),
+            status_slots: Arc::new(Semaphore::new(STATUS_SLOTS)),
+            check_flights: DetachedFlight::new("torbox check-cached round"),
+            status_flights: DetachedFlight::new("torbox status read"),
+            listing_flights: DetachedFlight::new("account listing fetch"),
+            batchers: Mutex::new(BTreeMap::new()),
+            listing_memo: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_listing_limit(listing_limit: usize) -> Self {
+        Self::with_listing_limit(listing_limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_listing_flights(&self) -> usize {
+        self.listing_flights.active()
+    }
+}
 
 // --- the store ---
 
@@ -191,57 +222,13 @@ static LISTING_MEMO: Mutex<BTreeMap<(usize, String), ListingMemoEntry>> = Mutex:
 /// would bound only dial/header latency and let slow or hostile bodies accumulate without a ceiling. Every
 /// caller already drops its response when it is done; the slot is coupled to that lifetime (Go
 /// `torboxSlotBody`).
-struct Reply {
-    resp: reqwest::Response,
-    _slot: SemaphorePermit<'static>,
-}
-
-impl Reply {
-    fn status(&self) -> u16 {
-        self.resp.status().as_u16()
-    }
-
-    /// The body up to `limit` bytes.
-    async fn read(&mut self, limit: usize) -> Result<Vec<u8>, reqwest::Error> {
-        read_limited(&mut self.resp, limit).await
-    }
-
-    /// Go `json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body)`: the first JSON value of the
-    /// body, with keys matched to `shape` case-insensitively. None where Go returns an error.
-    async fn json(&mut self, shape: &Shape) -> Option<Value> {
-        let raw = self.read(MAX_STORE_BYTES).await.ok()?;
-        first_value(&raw, shape)
-    }
-
-    /// The service's own explanation of a failure, redacted: " (detail)".
-    async fn detail(&mut self, token: &str) -> String {
-        redact_token(&read_store_error(&mut self.resp).await, token)
-    }
-}
-
-/// Counts one TorBox call by endpoint and outcome when it ends, however it ends.
-///
-/// Go counts the call beside the request (`metrics.torboxCall(endpoint, err == nil && …)` after `s.do`), and a
-/// cancelled context makes `do` return an error, whether the caller was still waiting for an outbound slot or for
-/// the response. A call its caller walked away from is therefore an `error` in the counters. Cancellation here is
-/// dropping the future, which would otherwise leave the call uncounted.
-struct CallCount {
-    endpoint: &'static str,
-    ok: bool,
-}
-
-impl Drop for CallCount {
-    fn drop(&mut self) {
-        metrics().torbox_call(self.endpoint, self.ok);
-    }
-}
-
 /// What an add that createtorrent answered with a failure leaves behind when its caller goes away before the code
 /// that files the failure has run: the charge handed back (`refundUnusedAdd`) and the refusal `Resolve` writes for
 /// the error `addMagnet` returns. Armed across the one await between the answer and that code.
 struct AbandonedAnswer<'a> {
     store: &'a TorBoxStore,
     info_hash: &'a str,
+    charge: AddCharge,
     err: StoreError,
     armed: bool,
 }
@@ -252,7 +239,7 @@ impl Drop for AbandonedAnswer<'_> {
             return;
         }
         let identity = self.store.account_identity();
-        refund_unused_add(&identity);
+        refund_unused_add(&identity, self.charge);
         record_refusal(self.store.cache(), DebridService::TorBox, &identity, self.info_hash, &self.err);
     }
 }
@@ -313,42 +300,6 @@ impl TorBoxStore {
     /// Go `torBoxStore.accountIdentity`: the cache identity of this token on this API endpoint.
     pub(crate) fn account_identity(&self) -> String {
         torbox_account_identity(&self.api, &self.token)
-    }
-
-    /// Go `torBoxStore.get`.
-    async fn get(&self, u: &str) -> Result<Reply, DoError> {
-        let auth = format!("Bearer {}", self.token);
-        let req = build_request(
-            reqwest::Method::GET,
-            u,
-            &[("authorization", &auth), ("accept", "application/json")],
-            None,
-        )
-        .map_err(|e| DoError::from(e.to_string()))?;
-        self.send(req).await
-    }
-
-    /// Go `torBoxStore.do`: every TorBox request waits for an outbound slot first. The call is counted by endpoint
-    /// and outcome (Go does it beside the request in `get`, `addMagnet` and `controlRequest`; it is the same count).
-    async fn send(&self, req: reqwest::Request) -> Result<Reply, DoError> {
-        let mut count = CallCount { endpoint: torbox_endpoint(req.url()), ok: false };
-        let slot = OUTBOUND.acquire().await.map_err(|_| DoError::from("the outbound limiter is closed"))?;
-        let resp = self.client.do_request(req).await;
-        count.ok = resp.as_ref().is_ok_and(|r| r.status().is_success());
-        Ok(Reply { resp: resp?, _slot: slot })
-    }
-
-    /// Go `torBoxStore.post`: a form POST, authorised by header.
-    async fn post(&self, path: &str, form: &[(&str, &str)]) -> Result<Reply, DoError> {
-        let auth = format!("Bearer {}", self.token);
-        let req = build_request(
-            reqwest::Method::POST,
-            &format!("{}{path}", self.api),
-            &[("authorization", &auth), ("content-type", "application/x-www-form-urlencoded")],
-            Some(encode_form(form)),
-        )
-        .map_err(|e| DoError::from(e.to_string()))?;
-        self.send(req).await
     }
 
     /// Go `torBoxStore.fetchCached`: one checkcached round, bounded by the outbound limiter.
@@ -412,50 +363,17 @@ impl TorBoxStore {
         set.sort();
         let key = format!("{}:{}", key_hash(&self.account_identity()), key_hash(&set.join(",")));
         let store = self.clone();
-        let (answer, shared) =
-            CHECK_FLIGHTS.run(&key, move || async move { store.demand_check_cached(set).await }).await;
+        let runtime = crate::runtime::current_runtime();
+        let (answer, shared) = runtime
+            .torbox
+            .check_flights
+            .run(&key, move || async move { store.demand_check_cached(set).await })
+            .await;
         if shared {
             metrics().torbox_avoid("checkcached_singleflight");
         }
         let answer = answer?;
         answer.ok.then_some(answer.cached)
-    }
-
-    /// Go `torBoxStore.demandCheckCached`: asks for these hashes through the account's batcher, which folds the
-    /// demands of every request in a short window into one checkcached call.
-    async fn demand_check_cached(&self, hashes: Vec<String>) -> TorboxCheckResult {
-        let key = scoped(&key_hash(&self.account_identity()));
-        let (reply, answer) = oneshot::channel();
-        let mut demand = Some(Demand { hashes: hashes.clone(), reply });
-        {
-            let mut batchers = lock(&BATCHERS);
-            let batcher = match batchers.get(&key) {
-                Some(b) => Some(b.clone()),
-                None if batchers.len() < MAX_BATCHERS => {
-                    let b = Arc::new(Batcher {
-                        store: self.clone(),
-                        queue: Mutex::new(Vec::new()),
-                        full: Notify::new(),
-                    });
-                    batchers.insert(key.clone(), b.clone());
-                    tokio::spawn(b.clone().run(key));
-                    Some(b)
-                }
-                None => None,
-            };
-            if let (Some(b), Some(d)) = (batcher, demand.take()) {
-                // Every sender holds the registry lock while enqueueing, so the coordinator draining under
-                // it closes the race with a sender that found the batcher just as its timer fired.
-                if let Err(d) = b.try_push(d) {
-                    demand = Some(d);
-                }
-            }
-        }
-        if demand.is_none() {
-            return answer.await.unwrap_or_default();
-        }
-        // No batcher to join, or its queue was full: ask directly, still bounded by the outbound limiter.
-        tokio::time::timeout(SHARED_DEADLINE, self.fetch_cached(&hashes)).await.unwrap_or_default()
     }
 
     /// Go `torBoxStore.requestDownload`: asks TorBox for the playable link of one file of a torrent.
@@ -573,7 +491,7 @@ impl TorBoxStore {
         // once built a StoreUnavailableError here and hid the cause from isCancellation. It came back because
         // the guard was placed one line ABOVE noteAddAttempt, and it was the marker that used to route this
         // error away from recordRefusal.
-        spend_add(DebridService::TorBox, &identity, info_hash, prefetch)?;
+        let charge = spend_add(DebridService::TorBox, &identity, info_hash, prefetch)?;
         let magnet = magnet_for(info_hash);
         let mut form = vec![("magnet", magnet.as_str()), ("seed", "3"), ("allow_zip", "false")];
         if only_if_cached {
@@ -588,7 +506,7 @@ impl TorBoxStore {
         ) {
             Ok(r) => r,
             Err(e) => {
-                refund_add(DebridService::TorBox, &identity, &RequestNotSent);
+                refund_add(DebridService::TorBox, &identity, charge, &RequestNotSent);
                 return Err(e);
             }
         };
@@ -638,13 +556,14 @@ impl TorBoxStore {
                 let mut abandoned = AbandonedAnswer {
                     store: self,
                     info_hash,
+                    charge,
                     err: dead_link(format!("torbox createtorrent http {status}{detail}")),
                     armed: true,
                 };
                 let found = self.find_queued_by_hash(info_hash).await;
                 abandoned.armed = false;
                 if let Ok((qid, true)) = found {
-                    refund_unused_add(&identity);
+                    refund_unused_add(&identity, charge);
                     mark_added_by_us(cache, &identity, info_hash);
                     cache.put_class(
                         &torbox_queued_key(&identity, info_hash),
@@ -662,7 +581,7 @@ impl TorBoxStore {
             // TorBox answered and created nothing, so the charge goes back — the rule RD and Premiumize
             // already follow on their own answered failures. Kept here, a repeatedly polled bad magnet ate
             // this account's hourly allowance where the other two were already immune.
-            refund_unused_add(&identity);
+            refund_unused_add(&identity, charge);
             if store_refused_us(status) {
                 return Err(unavailable(
                     DebridService::TorBox,
@@ -692,7 +611,7 @@ impl TorBoxStore {
                 // simply does not fit this struct, and either may describe a torrent that exists. Only a body
                 // that is not JSON at all — a proxy or gateway page — proves nothing was created.
                 if !body.valid || body.success == Some(false) {
-                    refund_unused_add(&identity);
+                    refund_unused_add(&identity, charge);
                 }
                 return Err(dead_link("torbox no torrent_id"));
             }
@@ -991,120 +910,6 @@ impl TorBoxStore {
         Ok(len)
     }
 
-    /// Go `torBoxStore.statusAnswerUncached`.
-    async fn status_answer_uncached(&self, t: &ResolveTarget) -> (StoreStatus, StatusAnswer) {
-        let identity = self.account_identity();
-        // A parked add, the warm case: Resolve already recorded the queued-id marker (from a success body
-        // or, now, from addMagnet's DIFF_ISSUE branch), so this is a cache read, not an upstream call. Checked
-        // before torrentID below, which only ever finds a TORRENT — asking it alone answered "nothing here"
-        // for a release that was waiting in TorBox's own queue, never a torrent at all yet.
-        if self.known_queued_id(&t.info_hash).is_some() {
-            return (queued_status(), StatusAnswer::Downloading);
-        }
-        let (torrent_id, ok, authoritative) = self.torrent_id(&t.info_hash).await;
-        if !ok {
-            // A miss here is only trustworthy when the listing was actually read. torrentID declines to
-            // remember one otherwise, and the same doubt has to reach the caller — taken from the lookup that
-            // already happened rather than by asking again, which was a second full account fetch.
-            if !authoritative {
-                return (StoreStatus::default(), StatusAnswer::Unknown);
-            }
-            // Not an active torrent — but mylist and TorBox's own queue are two different listings, and a
-            // release parked in the queue (with no cached marker yet: a cold hash, or one whose marker's TTL
-            // lapsed) answers mylist exactly like one TorBox never heard of at all. Without this, the probe
-            // route read a genuinely queued download as "not queued" forever, which is what made it drop out
-            // of Home's in-flight states once the fallback's earlier release gave up. Found here, the marker
-            // is written so the next poll takes the cheap `knownQueuedID` path above instead.
-            //
-            // Gated by its own remembered miss, same as torrentMissKey above it: a release that is genuinely
-            // nowhere — neither listing holds it — must not pay for the queue listing again on every poll of
-            // a two-second cadence, which is exactly the cost torrentMissKey already exists to keep off this
-            // path for the torrent listing.
-            if live(self.cache(), &torbox_queued_miss_key(&identity, &t.info_hash)).is_some() {
-                return (StoreStatus::default(), StatusAnswer::No);
-            }
-            if let Ok((qid, found)) = self.find_queued_by_hash(&t.info_hash).await {
-                if found {
-                    self.cache().put_class(
-                        &torbox_queued_key(&identity, &t.info_hash),
-                        &qid.to_string(),
-                        RESOLVE_CACHE_TTL,
-                        CacheClass::Volatile,
-                    );
-                    return (queued_status(), StatusAnswer::Downloading);
-                }
-                self.cache().put_class(
-                    &torbox_queued_miss_key(&identity, &t.info_hash),
-                    "1",
-                    TORRENT_MISS_TTL,
-                    CacheClass::Volatile,
-                );
-            }
-            return (StoreStatus::default(), StatusAnswer::No);
-        }
-        let Ok(mut reply) =
-            self.get(&format!("{}/torrents/mylist?id={torrent_id}&bypass_cache=true", self.api)).await
-        else {
-            return (StoreStatus::default(), StatusAnswer::Unknown);
-        };
-        if reply.status() != 200 {
-            return (StoreStatus::default(), StatusAnswer::Unknown);
-        }
-        static SHAPE: Shape = Shape::Object(&[("success", &LEAF), ("data", &LEAF)]);
-        // a body we could not read is not the account saying no
-        let Some(obj) = reply.json(&SHAPE).await.and_then(envelope) else {
-            return (StoreStatus::default(), StatusAnswer::Unknown);
-        };
-        let Ok(success) = opt_bool(obj.get("success")) else {
-            return (StoreStatus::default(), StatusAnswer::Unknown);
-        };
-        // TorBox answers 200 with success:false / data:null for an id it no longer holds, and unmarshalling
-        // null into a struct succeeds silently — so both have to be rejected explicitly.
-        if success == Some(false) {
-            return (StoreStatus::default(), StatusAnswer::No);
-        }
-        // The ID is what makes an answer about OUR torrent. mylist is asked by id and should reply with one
-        // entry, but it can reply with the account list — that is why the array fallback exists at all — and
-        // this took arr[0] blind, the very mistake listFiles was hardened against. It has no id field even in
-        // principle, so it could not check. A finished arr[0] made a live download read as ok=false, which
-        // handlePlay answers 404 dead_link: the client blacklists a release that is downloading right now,
-        // which is the single failure Status exists to prevent. A downloading arr[0] is quieter and no better
-        // — the viewer watches another torrent's percentage, ETA and rate.
-        //
-        // An EXACT id wins; an id-less entry is only a fallback — the rule listFiles uses on this very payload.
-        // First-of-either let an unlabelled entry ahead of ours answer for it, and here that is the reading
-        // that decides "downloading" against "dead": a finished stranger at the head of the array made a live
-        // download report nothing. Two readers of one shape must not disagree about it. An entry with no id is
-        // taken at its word, since the single-entry answer to a by-id query need not repeat it; one that names
-        // a DIFFERENT torrent never is.
-        let Some(st) = pick_entry(obj.get("data"), torrent_id, StatusEntry::read) else {
-            return (StoreStatus::default(), StatusAnswer::No);
-        };
-        // Finished but Resolve still failed → not a wait we can promise anything about; reads as dead.
-        if st.download_finished == Some(true) {
-            return (StoreStatus::default(), StatusAnswer::No);
-        }
-        // Nothing said about the download at all (an empty object, a deleted torrent) — not a wait either.
-        if st.progress.is_none() && st.download_finished.is_none() {
-            return (StoreStatus::default(), StatusAnswer::No);
-        }
-        let mut out = StoreStatus::default();
-        if let Some(p) = st.progress {
-            out.progress = p;
-        }
-        if let Some(eta) = st.eta.filter(|eta| *eta > 0) {
-            out.eta_seconds = Some(eta);
-        }
-        // Zero is meaningful here — it is the stall — so only a missing or negative figure is dropped.
-        out.bytes_per_second = st.download_speed.filter(|s| *s >= 0);
-        if let Some(state) = &st.download_state {
-            out.state = fetch_state(state).to_owned();
-        }
-        out.seeds = st.seeds.filter(|n| *n >= 0);
-        out.peers = st.peers.filter(|n| *n >= 0);
-        (out, StatusAnswer::Downloading)
-    }
-
     /// Go `torBoxStore.knownTorrentID` answers "does this account already have this torrent?" from cache alone.
     ///
     /// Cache-only on purpose. The resolve entry is a six-hour convenience cache, not a record of what the
@@ -1159,7 +964,7 @@ impl TorBoxStore {
     /// The third result says whether a MISS is authoritative — the listing was read and the hash was not in
     /// it — as opposed to the listing not having been read at all.
     ///
-    /// Returned rather than re-derived. StatusAnswer needs the same fact, and asking findTorrentByHash a second
+    /// Returned rather than re-derived. ProviderStatus needs the same fact, and asking findTorrentByHash a second
     /// time for it meant a second real upstream fetch whenever the listing failed fast: measured at four full
     /// account-listing requests per /play against a throttled account, where the whole point of that code is
     /// not to pile load on an account already refusing. It also stepped over the miss marker this function
@@ -1329,9 +1134,12 @@ impl TorBoxStore {
         // caller's budget is a timeout around this whole call, which polls the answer before the clock.
         let store = self.clone();
         let memo_key = key.clone();
-        let (answer, _) =
-            LISTING_FLIGHTS
-                .run(&key, move || async move {
+        let runtime = crate::runtime::current_runtime();
+        let admitted =
+            runtime
+                .torbox
+                .listing_flights
+                .run_admitted(&key, &runtime.torbox.listing_slots, move || async move {
                     // A fetch past the shared deadline is no answer: empty, not ok, not a persistent fault.
                     let (ids, ok, persistent) =
                         tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing())
@@ -1353,6 +1161,11 @@ impl TorBoxStore {
                     Some(ids)
                 })
                 .await;
+        let Some((answer, _)) = admitted else {
+            // Saturation is doubt, not a fact about the account. It writes neither the listing memo nor the
+            // persistent-fault marker, so this exact account can recover as soon as a slot returns.
+            return unanswered();
+        };
         match answer.flatten() {
             Some(ids) => (ids, true),
             None => unanswered(),
@@ -1397,7 +1210,7 @@ impl TorBoxStore {
         });
         // Feed it until it has what it needs: a decode that has finished (or refused) drops its end, and the
         // rest of the body is not read.
-        while let Ok(Some(chunk)) = reply.resp.chunk().await {
+        while let Ok(Some(chunk)) = reply.chunk().await {
             if tx.send(chunk.to_vec()).await.is_err() {
                 break;
             }
@@ -1704,130 +1517,7 @@ impl TorBoxStore {
     }
 }
 
-// --- the checkcached batcher ---
-
-/// Go `torboxCheckDemand`.
-struct Demand {
-    hashes: Vec<String>,
-    reply: oneshot::Sender<TorboxCheckResult>,
-}
-
-/// Go `torboxCheckBatcher`: the demands of one account within a window, answered by one pass.
-struct Batcher {
-    store: TorBoxStore,
-    queue: Mutex<Vec<Demand>>,
-    /// Signalled when the queue reaches `MAX_DEMANDS`, which ends the window early.
-    full: Notify,
-}
-
-impl Batcher {
-    /// Enqueues a demand if there is room (Go's non-blocking channel send).
-    fn try_push(&self, d: Demand) -> Result<(), Demand> {
-        let mut queue = lock(&self.queue);
-        if queue.len() >= MAX_DEMANDS {
-            return Err(d);
-        }
-        queue.push(d);
-        if queue.len() == MAX_DEMANDS {
-            self.full.notify_one();
-        }
-        Ok(())
-    }
-
-    /// Go `torboxCheckBatcher.run`.
-    async fn run(self: Arc<Self>, key: String) {
-        // If this task ends any other way than by answering (a panic), the batcher is unpublished and its
-        // demands dropped, so their callers stop waiting instead of queueing behind a coordinator that is gone.
-        let _retire = Retire { key: key.clone(), batcher: self.clone() };
-        let _ = tokio::time::timeout(DEMAND_WINDOW, self.full.notified()).await;
-        // A sender may have found this batcher just as the timer fired. Every sender holds the registry lock
-        // while enqueueing, so draining under it closes that race before the coordinator is unpublished.
-        let demands = {
-            let mut batchers = lock(&BATCHERS);
-            if batchers.get(&key).is_some_and(|b| Arc::ptr_eq(b, &self)) {
-                batchers.remove(&key);
-            }
-            std::mem::take(&mut *lock(&self.queue))
-        };
-
-        let union: BTreeSet<&String> = demands.iter().flat_map(|d| d.hashes.iter()).collect();
-        let all: Vec<String> = union.into_iter().cloned().collect();
-        // Every call the demands would have made on their own, less the ones this pass makes, was saved by folding
-        // them together.
-        let avoided = demands.len().saturating_sub(all.len().div_ceil(CACHE_BATCH));
-        for _ in 0..avoided {
-            metrics().torbox_avoid("checkcached_batch");
-        }
-        let deadline = tokio::time::Instant::now() + SHARED_DEADLINE;
-        let mut answers: HashMap<String, bool> = HashMap::with_capacity(all.len());
-        for batch in all.chunks(CACHE_BATCH) {
-            let Ok(answer) = tokio::time::timeout_at(deadline, self.store.fetch_cached(batch)).await else {
-                continue;
-            };
-            if !answer.ok {
-                continue;
-            }
-            answers.extend(answer.cached);
-        }
-        for demand in demands {
-            let mut answer = HashMap::with_capacity(demand.hashes.len());
-            let mut ok = true;
-            for hash in &demand.hashes {
-                match answers.get(hash) {
-                    Some(cached) => {
-                        answer.insert(hash.clone(), *cached);
-                    }
-                    None => ok = false,
-                }
-            }
-            let _ = demand.reply.send(TorboxCheckResult { cached: answer, ok });
-        }
-    }
-}
-
-/// Unpublishes a batcher and drops what it still holds when its coordinator ends.
-struct Retire {
-    key: String,
-    batcher: Arc<Batcher>,
-}
-
-impl Drop for Retire {
-    fn drop(&mut self) {
-        let mut batchers = lock(&BATCHERS);
-        if batchers.get(&self.key).is_some_and(|b| Arc::ptr_eq(b, &self.batcher)) {
-            batchers.remove(&self.key);
-        }
-        lock(&self.batcher.queue).clear();
-    }
-}
-
-/// Go `torboxEndpoint`: which of the fixed debrid endpoints a request is for, for the call counters. Anything
-/// else is "", which the counters ignore, so a caller cannot grow the series.
-fn torbox_endpoint(u: &reqwest::Url) -> &'static str {
-    let path = u.path();
-    if path.ends_with("/torrents/checkcached") {
-        "checkcached"
-    } else if path.ends_with("/torrents/mylist") && u.query_pairs().any(|(k, v)| k == "id" && !v.is_empty()) {
-        "mylist_id"
-    } else if path.ends_with("/torrents/mylist") {
-        "mylist_account"
-    } else if path.ends_with("/torrents/requestdl") {
-        "requestdl"
-    } else if path.ends_with("/torrents/createtorrent") {
-        "createtorrent"
-    } else if path.ends_with("/torrents/controltorrent") {
-        "controltorrent"
-    } else if path.ends_with("/queued/controlqueued") {
-        "controlqueued"
-    } else if path.ends_with("/queued/getqueued") {
-        "getqueued"
-    } else if path.ends_with("/user/me") {
-        "user"
-    } else {
-        ""
-    }
-}
-
+// Checkcached batching state and execution live together in torbox::batching.
 /// Feeds the blocking listing decode from the async body reader.
 struct ChunkReader {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -1931,8 +1621,8 @@ fn torbox_account_summary_key(identity: &str) -> String {
 }
 
 /// Go `refundUnusedAdd` gives a charge back when the request turned out not to be an add at all.
-fn refund_unused_add(identity: &str) {
-    refund_add(DebridService::TorBox, identity, &RequestNotSent);
+fn refund_unused_add(identity: &str, charge: AddCharge) {
+    refund_add(DebridService::TorBox, identity, charge, &RequestNotSent);
 }
 
 // --- the listing memo ---
@@ -1983,7 +1673,8 @@ fn memo_key(cache: &Arc<dyn Cache>, key: &str) -> (usize, String) {
 /// Go `cachedListing`.
 fn cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str) -> Option<Arc<HashMap<String, i64>>> {
     let cache = cache?;
-    let mut memo = lock(&LISTING_MEMO);
+    let runtime = crate::runtime::current_runtime();
+    let mut memo = lock(&runtime.torbox.listing_memo);
     let k = memo_key(cache, key);
     let e = memo.get(&k)?;
     if e.at.elapsed() >= LISTING_TTL {
@@ -1998,7 +1689,8 @@ fn cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str) -> Option<Arc<HashM
 /// Go `putCachedListing`.
 fn put_cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str, ids: Arc<HashMap<String, i64>>) {
     let Some(cache) = cache else { return };
-    let mut memo = lock(&LISTING_MEMO);
+    let runtime = crate::runtime::current_runtime();
+    let mut memo = lock(&runtime.torbox.listing_memo);
     // The entry being REPLACED is dropped before the total is taken, or it is counted twice — once in held and
     // again as len(ids) — and a refresh of one account evicts another that fits perfectly well.
     let k = memo_key(cache, key);
@@ -2340,14 +2032,6 @@ struct ResolveFile {
     size_bytes: Option<i64>,
 }
 
-fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
-}
-
 impl ResolveEntry {
     fn new(torrent_id: i64, files: &[TorrentFile]) -> ResolveEntry {
         ResolveEntry {
@@ -2365,63 +2049,6 @@ impl ResolveEntry {
             .map(|f| TorrentFile { index: f.index, name: f.name, size_bytes: f.size_bytes })
             .collect()
     }
-}
-
-// --- status ---
-
-/// Go `cachedStatusAnswer`: a status read and its answer, as the shared snapshot keeps them.
-#[derive(Clone, Serialize, Deserialize)]
-struct CachedStatus {
-    progress: f64,
-    eta_seconds: Option<i64>,
-    bytes_per_second: Option<i64>,
-    state: String,
-    seeds: Option<i64>,
-    peers: Option<i64>,
-    service: Option<String>,
-    /// 0 no, 1 downloading, 2 unknown.
-    answer: u8,
-}
-
-impl CachedStatus {
-    fn new(status: StoreStatus, answer: StatusAnswer) -> CachedStatus {
-        CachedStatus {
-            progress: status.progress,
-            eta_seconds: status.eta_seconds,
-            bytes_per_second: status.bytes_per_second,
-            state: status.state,
-            seeds: status.seeds,
-            peers: status.peers,
-            service: status.service.map(|s| s.as_str().to_owned()),
-            answer: match answer {
-                StatusAnswer::No => 0,
-                StatusAnswer::Downloading => 1,
-                StatusAnswer::Unknown => 2,
-            },
-        }
-    }
-
-    fn parts(self) -> (StoreStatus, StatusAnswer) {
-        let answer = match self.answer {
-            0 => StatusAnswer::No,
-            1 => StatusAnswer::Downloading,
-            _ => StatusAnswer::Unknown,
-        };
-        let status = StoreStatus {
-            progress: self.progress,
-            eta_seconds: self.eta_seconds,
-            bytes_per_second: self.bytes_per_second,
-            state: self.state,
-            seeds: self.seeds,
-            peers: self.peers,
-            service: self.service.as_deref().and_then(DebridService::parse),
-        };
-        (status, answer)
-    }
-}
-
-fn queued_status() -> StoreStatus {
-    StoreStatus { state: FETCH_QUEUED.to_owned(), service: Some(DebridService::TorBox), ..Default::default() }
 }
 
 // --- the account summary ---
@@ -2888,14 +2515,7 @@ impl Store for TorBoxStore {
         link
     }
 
-    /// Go `torBoxStore.Status`, the two-valued half of the interface, for callers that only need "is it
-    /// downloading".
-    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
-        let (status, answer) = self.status_answer(t).await?;
-        (answer == StatusAnswer::Downloading).then_some(status)
-    }
-
-    /// Go `torBoxStore.StatusAnswer` — progress for a torrent this account has already been asked to fetch.
+    /// Go `torBoxStore.ProviderStatus` — progress for a torrent this account has already been asked to fetch.
     /// Resolve records the torrent id unconditionally, so a queued release (add succeeded, link not ready) is
     /// exactly the case this answers.
     ///
@@ -2908,52 +2528,8 @@ impl Store for TorBoxStore {
     /// three different facts and only the middle one may lead to an add. A throttled TorBox answering 503 used
     /// to read back as "nobody is fetching it", so /play queued a duplicate — more load on an account that was
     /// already refusing, which is the one failure mode that feeds itself.
-    async fn status_answer(&self, t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
-        let key = torbox_status_key(&self.account_identity(), &t.info_hash);
-        if let Some(raw) = self.cache.as_ref().and_then(|c| c.get(&key)) {
-            if let Ok(hit) = serde_json::from_str::<CachedStatus>(&raw) {
-                metrics().torbox_status_avoided.fetch_add(1, Ordering::Relaxed);
-                metrics().torbox_avoid("status_snapshot");
-                return Some(hit.parts());
-            }
-        }
-        let store = self.clone();
-        let target = t.clone();
-        let flight_key = key.clone();
-        let _waiting = GaugeGuard::new(&metrics().torbox_status_waiters);
-        let (answer, shared) = STATUS_FLIGHTS
-            .run(&key, move || async move {
-                // Bounded: a status read that finds the slots full answers "could not find out" at once, and
-                // does not remember it.
-                let Ok(_slot) = STATUS_SLOT_POOL.try_acquire() else {
-                    return CachedStatus::new(StoreStatus::default(), StatusAnswer::Unknown);
-                };
-                let _active = GaugeGuard::new(&metrics().torbox_status_active);
-                // Shared work cannot inherit one waiter's cancellation: another viewer may still need the
-                // answer.
-                let (status, answer) =
-                    tokio::time::timeout(SHARED_DEADLINE, store.status_answer_uncached(&target))
-                        .await
-                        .unwrap_or((StoreStatus::default(), StatusAnswer::Unknown));
-                let ttl = if answer == StatusAnswer::Unknown { UNKNOWN_STATUS_TTL } else { STATUS_TTL };
-                let shared = CachedStatus::new(status, answer);
-                if answer != StatusAnswer::Unknown {
-                    if let (Some(cache), Ok(raw)) = (&store.cache, serde_json::to_string(&shared)) {
-                        cache.put_class(&flight_key, &raw, ttl, CacheClass::Volatile);
-                    }
-                }
-                shared
-            })
-            .await;
-        if shared {
-            metrics().torbox_status_avoided.fetch_add(1, Ordering::Relaxed);
-            metrics().torbox_avoid("status_snapshot");
-        }
-        Some(match answer {
-            Some(shared) => shared.parts(),
-            // The shared read panicked: nothing is known.
-            None => (StoreStatus::default(), StatusAnswer::Unknown),
-        })
+    async fn provider_status(&self, t: &ResolveTarget) -> ProviderStatus {
+        self.status_for(t).await
     }
 
     /// Go `torBoxStore.Cancel` drops (or reannounces) the release this account is fetching for infoHash. See

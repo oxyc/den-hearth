@@ -30,7 +30,7 @@ pub fn manifest(install_id: Option<&str>) -> Value {
         // client-side guess about which install happens to be den-reel.
         "idPrefixes": ["tt", "tmdb:"],
         "catalogs": [],
-        // A BYOK TMDB key is entered (and sealed) at /configure — advertise it so a Stremio client shows
+        // A BYOK TMDB key is entered (and sealed) at /den/configure — advertise it so a Stremio client shows
         // the Configure button. The Den app builds the sealed URL directly, so this is just for parity.
         "behaviorHints": { "configurable": true },
         // The trailer source this addon adds to TMDB's own, for the client's credits (den-spec attribution-v1). TMDB
@@ -453,6 +453,23 @@ pub(crate) struct PreparedDiscovery {
     pub timing: String,
 }
 
+/// Cache a genuine "no trailer" response no longer than the resolve cache fact behind it. A configured
+/// path is an install credential and must remain private; a transient lookup failure has no authoritative
+/// negative fact to cache at all.
+pub(crate) fn negative_cache_control(configured: bool, degraded: Option<&str>) -> String {
+    if degraded.is_some() {
+        return "no-store".to_owned();
+    }
+    let seconds = YT_NEG_TTL_MS / 1000;
+    if configured {
+        format!("private, max-age={seconds}")
+    } else {
+        // Keep browsers responsive to a newly published trailer while letting the shared edge absorb
+        // repeated catalogue misses for the full lifetime of Reel's authoritative negative.
+        format!("public, max-age=300, s-maxage={seconds}")
+    }
+}
+
 /// `den`: the request came under the combined Den addon (hearth's `/den`), whose links are minted under its base.
 pub(crate) async fn prepare_discovery(
     state: &Arc<AppState>,
@@ -562,8 +579,8 @@ pub async fn handle_meta(
     }
     let payload =
         build_meta(ty, &prepared.id, base, &prepared.yt_ids, state.cfg.play_secret.as_deref(), binding);
-    // A SUCCESSFUL resolution (a real trailer) is cacheable; an empty result (no trailer /
-    // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
+    // Successful positive and authoritative negative resolutions are cacheable. A transient upstream
+    // fault stays no-store: it produced no fact that a client or shared edge may safely retain.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
     // A configured install's path carries its sealed key and its links name its install, so nothing
     // but that client's own cache may keep one. The config-less answer is the same for everyone.
@@ -593,7 +610,7 @@ pub async fn handle_meta(
         // A configured install's own answer, which only its client keeps: a day, as above.
         "private, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800".to_string()
     } else {
-        "no-store".to_string()
+        negative_cache_control(cfg.is_some(), prepared.degraded)
     };
     // The links are relative (`request_root`), so the body does not depend on the host it was asked at.
     let extra = [("cache-control", cache_control.as_str())];

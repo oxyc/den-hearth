@@ -18,6 +18,25 @@ use crate::config::Config;
 use crate::probe::{self, Source, VideoCodec};
 use crate::state::{AppState, Refused};
 
+struct NeverBody;
+
+impl hyper::body::Body for NeverBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Pending
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_incomplete_request_body_has_a_deadline() {
+    assert!(crate::read_body(NeverBody).await.is_none());
+}
+
 fn testdata(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
 }
@@ -3481,6 +3500,7 @@ async fn a_copy_within_thirty_seconds_then_a_transcode_then_the_least_starving_c
                 url: "http://127.0.0.1:9/h264.mkv".into(),
                 head: bytes.clone(),
                 size: Some(at),
+                client: crate::state::source_client(Duration::from_secs(1), Duration::from_secs(1)),
             },
             info,
         )
@@ -3545,6 +3565,7 @@ async fn a_conversion_is_not_made_from_a_release_far_above_the_link() {
             url: format!("http://127.0.0.1:9/{name}"),
             head: bytes.to_vec(),
             size: Some(size),
+            client: crate::state::source_client(Duration::from_secs(1), Duration::from_secs(1)),
         };
         state.opened().put(format!("{install}/0/{name}"), &resolved, &info, std::time::Instant::now());
     };

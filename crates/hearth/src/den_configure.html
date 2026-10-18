@@ -4,188 +4,312 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Den — Configure</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --bg: #1f1f1f; --field: #2b2b2b; --plate: #242424;
+    --line: rgba(242, 239, 233, .13); --muted: #aaa8a3; --text: #f2efe9; --ink: #17191b;
+    --accent: #f2efe9; --link: #e1b574; --good: #9fd2af; --warn: #e8b66e; }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #0d0f13; color: #e6e8ec;
-         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif; }
-  main { max-width: 34rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
-  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
-  p.sub { color: #9aa0aa; margin: 0 0 1.5rem; }
-  h2 { font-size: .78rem; color: #9aa0aa; text-transform: uppercase; letter-spacing: .06em;
-       margin: 1.75rem 0 .7rem; }
-  h3 { font-size: 1.05rem; margin: 2.25rem 0 .2rem; color: #e6e8ec; }
-  label { display: block; font-weight: 600; margin: 0 0 .35rem; color: #c9ccd3; }
+  html { scroll-behavior: smooth; scrollbar-gutter: stable; }
+  body { margin: 0; background: var(--bg);
+    color: var(--text); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif; }
+  button, input, select, textarea { font: inherit; }
+  button, summary, input[type=checkbox] { cursor: pointer; }
+  a { color: var(--link); text-underline-offset: .18em; }
+  main { width: min(70rem, 100%); margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  .masthead { max-width: 48rem; margin-bottom: 2.25rem; }
+  .brand { display: flex; align-items: center; gap: .65rem; margin: 0 0 .85rem; color: var(--text);
+    font-size: .9rem; font-weight: 650; }
+  .den-mark { display: block; width: 1.55rem; height: 1.55rem; border-radius: .38rem; overflow: hidden; }
+  h1 { margin: 0; font-size: clamp(2rem, 5vw, 2.6rem); line-height: 1.08; letter-spacing: -.025em; }
+  p.sub { max-width: 44rem; color: var(--muted); margin: .8rem 0 0; font-size: 1rem; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 19rem; gap: 2.5rem; align-items: start; }
+  .config-flow { min-width: 0; }
+  .journey { padding: 0; margin: 0; list-style: none; counter-reset: journey; }
+  .journey > li { counter-increment: journey; }
+  .flow-heading { display: flex; gap: .8rem; align-items: baseline; margin: 0 0 1rem; font-size: 1.25rem; }
+  .flow-heading::before { content: counter(journey); display: grid; place-items: center; flex: 0 0 1.7rem; height: 1.7rem;
+    border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font-size: .8rem; }
+  .section-copy { margin: -.65rem 0 1rem 2.5rem; color: var(--muted); font-size: .9rem; }
+  .accordion-list { margin-left: 2.5rem; }
+  .service, details.tune { padding: 0; border-top: 1px solid var(--line); }
+  .accordion-list > details:first-child { border-top: 0; }
+  .accordion-list > details:last-child { border-bottom: 1px solid var(--line); }
+  .service-heading, details.tune > summary { display: flex; align-items: center; gap: .7rem; padding: 1rem 0; list-style: none; }
+  .service-heading::-webkit-details-marker, details.tune > summary::-webkit-details-marker { display: none; }
+  .service-heading > div, .summary-copy { min-width: 0; }
+  h2, h3 { color: var(--text); }
+  h3 { margin: 0; font-size: 1.08rem; }
+  .service-heading p { margin: .12rem 0 0; color: var(--muted); font-size: .84rem; }
+  .service-state { min-width: 3.4rem; margin-left: auto; padding: .2rem .55rem; border: 1px solid var(--line); border-radius: 999px;
+    color: var(--muted); font-size: .75rem; font-weight: 650; text-align: center; }
+  .service-state.ready { color: var(--good); border-color: rgba(159, 210, 175, .3); }
+  .service-state.partial { color: var(--warn); border-color: rgba(232, 182, 110, .3); }
+  .disclosure { color: var(--muted); font-size: 1.15rem; line-height: 1; transition: transform .15s; }
+  details.tune > summary .disclosure { margin-left: auto; }
+  details[open] > summary .disclosure { transform: rotate(90deg); }
+  .service-body { padding: 0 0 1.35rem; }
+  .kicker { margin: 1.25rem 0 .65rem; color: var(--muted); font-size: .82rem; font-weight: 650; }
+  label { display: block; font-weight: 650; margin: 0 0 .38rem; color: var(--text); }
   input[type=text], input[type=password], input[type=number], select, textarea#sources {
-    width: 100%; padding: .65rem .7rem; border-radius: 9px; border: 1px solid #2a2f38;
-    background: #161a20; color: inherit; font: inherit; outline: none; }
-  input:focus, select:focus, textarea#sources:focus { border-color: #5b8cff; }
+    width: 100%; min-height: 2.9rem; padding: .72rem 1rem; border-radius: .875rem; border: 1px solid transparent;
+    background: var(--field); color: inherit; outline: none; transition: border-color .15s, background .15s; }
+  input:hover, select:hover, textarea#sources:hover { border-color: rgba(242, 239, 233, .24); }
+  input:focus-visible, select:focus-visible, textarea#sources:focus-visible, button:focus-visible, summary:focus-visible,
+  a:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-color: var(--accent); }
+  input::placeholder, textarea::placeholder { color: #9b9994; }
   textarea#sources { resize: vertical; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .field { margin-top: .9rem; }
-  .hint { color: #8b919b; font-size: .82rem; margin-top: .3rem; }
-  .hint a { color: #7fb0ff; }
-  .row-inputs { display: flex; gap: .75rem; } .row-inputs > * { flex: 1; }
-  .chk { display: inline-flex; align-items: center; gap: .5rem; margin: 0 1rem .55rem 0;
-         color: #c9ccd3; font-weight: 400; }
-  .chk input { width: auto; }
-  .optional { font-weight: 400; color: #8b919b; }
-  details#advancedSources { margin-top: .6rem; }
-  details#advancedSources > summary { cursor: pointer; color: #7fb0ff; margin-bottom: .7rem; }
-  button.primary { width: 100%; margin-top: 1.75rem; padding: .8rem; border: 0; border-radius: 10px;
-    background: #3b82f6; color: #fff; font-weight: 600; font-size: 1rem; cursor: pointer; }
-  #out { margin-top: 1.5rem; }
+  .field { margin-top: 1rem; }
+  .hint, .optional { color: var(--muted); font-size: .84rem; font-weight: 400; }
+  .hint { margin-top: .38rem; }
+  .row-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+  .inline-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .65rem; align-items: end; }
+  .chk { display: inline-flex; align-items: flex-start; gap: .55rem; margin: 0 1rem .65rem 0;
+    color: #d2d0cb; font-weight: 400; }
+  .chk input { width: 1rem; height: 1rem; margin: .22rem 0 0; accent-color: var(--accent); }
+  .tuning { margin: 2.5rem 0; }
+  .summary-copy { display: flex; flex-direction: column; }
+  .summary-copy strong { color: var(--text); font-size: 1rem; }
+  .summary-copy small { color: var(--muted); font-size: .8rem; font-weight: 400; }
+  .details-body { padding: 0 0 1.25rem; }
+  .details-body > :first-child { margin-top: 0; }
+  .review { position: sticky; top: 1.25rem; max-height: calc(100vh - 2.5rem); overflow-y: auto;
+    padding: .1rem 0 .5rem 1.5rem; border-left: 1px solid var(--line); }
+  .review h2 { margin: 0; font-size: 1.08rem; }
+  .review-intro { color: var(--muted); margin: .3rem 0 1rem; font-size: .84rem; }
+  .service-summary { list-style: none; padding: 0; margin: 0; }
+  .service-summary li { display: flex; justify-content: space-between; gap: .75rem; padding: .55rem 0;
+    border-top: 1px solid var(--line); font-size: .86rem; }
+  .service-summary output { color: var(--muted); text-align: right; }
+  .service-summary output.ready { color: var(--good); }
+  .privacy-control { margin: .9rem 0 0; padding-top: .9rem; border-top: 1px solid var(--line); }
+  .privacy-control .chk { display: flex; margin-bottom: .5rem; font-size: .84rem; }
+  .privacy-control .hint { margin: -.15rem 0 0 1.55rem; }
+  .security { display: flex; gap: .55rem; margin: .85rem 0 0; color: var(--muted); font-size: .8rem; }
+  .security::before { content: "◇"; color: var(--muted); }
+  button { min-height: 2.9rem; padding: .65rem 1rem; border: 1px solid var(--line); border-radius: .875rem;
+    background: var(--field); color: var(--text); font-weight: 650; }
+  button:hover:not(:disabled) { background: #343434; border-color: rgba(242, 239, 233, .28); }
+  button:disabled { cursor: not-allowed; opacity: .55; }
+  button.primary { width: 100%; margin-top: 1rem; border: 0; background: var(--accent); color: var(--ink);
+    font-size: .95rem; }
+  button.primary:hover:not(:disabled) { background: #fff; }
+  #out { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
   #out.hidden { display: none; }
-  #url { width: 100%; padding: .7rem; border: 1px solid #2a2f38; border-radius: 9px; background: #10141a;
-    color: #8ab4ff; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-    resize: vertical; overflow-wrap: anywhere; box-sizing: border-box; }
+  #out h2 { margin: 0 0 .65rem; font-size: 1rem; }
+  #url { width: 100%; padding: .75rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--field);
+    color: var(--text); font: .75rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
   .row { display: flex; gap: .6rem; margin-top: .6rem; }
-  #copy { padding: .55rem 1.1rem; border: 1px solid #2a2f38; border-radius: 9px; background: #1c212a;
-    color: #e6e8ec; font: inherit; cursor: pointer; }
   .note { font-size: .86rem; margin: .8rem 0 0; font-weight: 600; }
-  .note.sealed { color: #56d18c; }
-  .note.unsealed { color: #f0b74a; }
-  .disclaimer { color: #9aa0aa; font-size: .8rem; line-height: 1.55; margin: .55rem 0 0;
-    padding: .8rem .9rem; background: #12151b; border: 1px solid #222833; border-radius: 9px; }
-  .disclaimer b { color: #c9ccd3; font-weight: 600; }
-  .err { color: #ff6b6b; min-height: 1.1rem; margin-top: .5rem; font-size: .85rem; }
-  .foot { margin-top: 1rem; color: #8b919b; font-size: .8rem; }
-  .foot a { color: #8b919b; }
-  #installId { color: #c9ccd3; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
+  .note.sealed { color: var(--good); }
+  .note.unsealed { color: var(--warn); }
+  .disclaimer { color: var(--muted); font-size: .78rem; line-height: 1.5; margin: .55rem 0 0;
+    padding: .75rem; background: var(--plate); border: 1px solid var(--line); border-radius: .75rem; }
+  .disclaimer b { color: var(--text); font-weight: 650; }
+  .err { color: #ff8989; min-height: 1.1rem; margin-top: .7rem; font-size: .84rem; }
+  .foot { margin-top: .85rem; color: var(--muted); font-size: .77rem; }
+  .foot a { color: var(--muted); }
+  #installId { color: var(--text); font: .77rem ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
+  @media (max-width: 780px) {
+    main { padding: 2rem 1rem 4rem; }
+    .masthead { margin-bottom: 1.7rem; }
+    .layout { display: flex; flex-direction: column; align-items: stretch; gap: 0; }
+    .config-flow { width: 100%; }
+    .review { position: static; width: 100%; max-height: none; overflow: visible; margin-top: 1rem;
+      padding: 1.5rem 0 0; border-left: 0; border-top: 1px solid var(--line); }
+  }
+  @media (max-width: 480px) {
+    .row-inputs, .inline-action { grid-template-columns: 1fr; }
+    .details-body { padding-left: 0; }
+    .flow-heading { margin-bottom: .55rem; font-size: 1.32rem; }
+    .section-copy { margin: 0 0 1rem 2.5rem; }
+    .accordion-list { margin-left: 2.5rem; padding-left: .8rem; border-left: 1px solid var(--line); }
+    .service-heading, details.tune > summary { gap: .55rem; padding: .85rem 0; }
+    .service-heading h3 { font-size: 1rem; }
+    .service-heading p { font-size: .79rem; line-height: 1.4; }
+    .service-state { padding: .15rem .45rem; font-size: .7rem; }
+    .service-body { padding-left: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
 </style></head><body>
 <main>
-<h1>Den</h1>
-<p class="sub" id="mainIntro">One addon for streams, subtitles and trailers. Fill in the parts you want — each is optional, and
-  the addon offers only what you set up. Your keys stay in this link and are stored in the Den Keychain — treat
-  the link like a password.</p>
+<header class="masthead">
+  <p class="brand"><svg class="den-mark" viewBox="0 0 64 64" aria-hidden="true">
+    <rect width="64" height="64" rx="14" fill="#17191b"/>
+    <path d="M4.9 64V33.5a27.1 27.1 0 0 1 54.2 0V64H47.8V33.5a15.8 15.8 0 0 0-31.6 0V64Z" fill="#f2efe9"/>
+  </svg>Den</p>
+  <h1>Configure</h1>
+  <p class="sub" id="mainIntro">Add the services you use. The install link grants access to them, so keep it private.</p>
+</header>
+<div class="layout">
+<div class="config-flow">
+<ol class="journey">
+<li>
+  <h2 class="flow-heading">Services</h2>
+  <p class="section-copy">A service stays off until its main key is added.</p>
 
-<h3>Streams</h3>
-<p class="optional" id="streamsHelp">Resolved through your own debrid account. Leave the token blank for no streams.</p>
-<h2>Debrid</h2>
-<label for="service">Service</label>
-<select id="service">
-  <option value="torbox">TorBox</option>
-  <option value="realdebrid">Real-Debrid</option>
-  <option value="premiumize">Premiumize</option>
-</select>
-<div class="field">
-  <label for="token">API token</label>
-  <input id="token" type="password" autocomplete="off" placeholder="paste your debrid API key">
-</div>
-<div class="row"><button id="test" type="button">Test token</button></div>
-<p class="note" id="testResult"></p>
-<h2>Your own addons <span class="optional">(optional)</span></h2>
-<label for="sources">Stream addon links <span class="optional">(one per line, up to 3)</span></label>
-<textarea id="sources" rows="3" autocomplete="off" spellcheck="false"
-  placeholder="https://mediafusion.elfhosted.com/…/manifest.json"></textarea>
-<p class="hint">Stremio stream addons you set up yourself — MediaFusion, Comet or Torrentio with your debrid
-  account — asked alongside the indexers. Their links carry your settings, so they are sealed into this link
-  with your token.</p>
-<p class="note" id="sourcesResult"></p>
-<h2>Sources</h2>
-<p class="optional">Streams use the recommended indexers and filters, and pick up improvements to them
-  automatically — nothing to fill in.</p>
-<details id="advancedSources">
-<summary>Advanced: choose your own indexers and filters</summary>
-<label class="chk"><input type="checkbox" id="useDefaults" checked> Use the recommended defaults</label>
-<p class="optional" id="defaultsNote">Your link carries only your debrid account, so these follow the server
-  as its defaults change. Untick only if you need to pin your own.</p>
-<div id="tunables" hidden>
-<h2>Indexers <span class="optional">(all if none)</span></h2>
-<label class="chk"><input type="checkbox" name="indexer" value="torrentio" checked> Torrentio</label>
-<label class="chk"><input type="checkbox" name="indexer" value="comet" checked> Comet</label>
-<label class="chk"><input type="checkbox" name="indexer" value="mediafusion" checked> MediaFusion</label>
-<label class="chk"><input type="checkbox" name="indexer" value="torz" checked> Torz</label>
-<h2>Filters</h2>
-<label class="chk"><input type="checkbox" id="excludeCam" checked> Hide CAM / TS / screeners</label><br>
-<label class="chk"><input type="checkbox" id="cachedOnly"> Cached only (hide anything the debrid must fetch first)</label><br>
-<label class="chk"><input type="checkbox" id="hdrOnly"> HDR / Dolby Vision only</label>
-<div class="field">
-  <label>Resolutions <span class="optional">(all if none)</span></label>
-  <div>
-    <label class="chk"><input type="checkbox" name="res" value="2160p"> 4K</label>
-    <label class="chk"><input type="checkbox" name="res" value="1080p"> 1080p</label>
-    <label class="chk"><input type="checkbox" name="res" value="720p"> 720p</label>
-    <label class="chk"><input type="checkbox" name="res" value="480p"> 480p</label>
+  <div class="accordion-list">
+  <details class="service" aria-labelledby="streamsTitle">
+    <summary class="service-heading"><div>
+      <h3 id="streamsTitle">Streams</h3>
+      <p id="streamsHelp">Requires a debrid account.</p>
+    </div><output class="service-state" id="streamState">Off</output><span class="disclosure" aria-hidden="true">›</span></summary>
+    <div class="service-body">
+    <label for="service">Debrid service</label><select id="service">
+      <option value="torbox">TorBox</option><option value="realdebrid">Real-Debrid</option><option value="premiumize">Premiumize</option>
+    </select>
+    <div class="field inline-action"><div><label for="token">API token</label>
+      <input id="token" type="password" autocomplete="off" placeholder="Paste your debrid API key" aria-describedby="testResult"></div>
+      <button id="test" type="button">Test token</button></div>
+    <p class="note" id="testResult" role="status" aria-live="polite"></p>
+    </div>
+  </details>
+
+  <details class="service" aria-labelledby="subtitlesTitle">
+    <summary class="service-heading"><div>
+      <h3 id="subtitlesTitle">Subtitles</h3>
+      <p id="subtitlesHelp">Requires an OpenSubtitles API key.</p>
+    </div><output class="service-state" id="subsState">Off</output><span class="disclosure" aria-hidden="true">›</span></summary>
+    <div class="service-body">
+    <label for="osKey">OpenSubtitles API key</label>
+    <input id="osKey" type="password" autocomplete="off" placeholder="Your opensubtitles.com consumer key">
+    <div class="hint">Create a free app at <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener noreferrer">opensubtitles.com/consumers</a>.</div>
+    <div class="field"><label for="osToken">OpenSubtitles token <span class="optional">Optional · raises download quota</span></label>
+      <input id="osToken" type="password" autocomplete="off" placeholder="Service-account JWT"></div>
+    </div>
+  </details>
+
+  <details class="service" id="trailerService" aria-labelledby="trailersTitle">
+    <summary class="service-heading"><div>
+      <h3 id="trailersTitle">Trailers</h3>
+      <p id="trailersHelp">Requires a TMDB API key.</p>
+    </div><output class="service-state" id="reelState">Off</output><span class="disclosure" aria-hidden="true">›</span></summary>
+    <div class="service-body">
+    <div id="trailerFields">
+      <label for="tmdbKey">TMDB API key</label>
+      <input id="tmdbKey" type="password" autocomplete="off" placeholder="TMDB v3 API key or v4 read token">
+      <div class="hint">Free from <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener noreferrer">themoviedb.org/settings/api</a>.</div>
+      <div class="field"><label for="kinocheckKey">KinoCheck API key <span class="optional">Optional fallback</span></label>
+        <input id="kinocheckKey" type="password" autocomplete="off" placeholder="Leave blank to skip"></div>
+    </div>
+    </div>
+  </details>
   </div>
-</div>
-<div class="field">
-  <label for="preferResolution">Prefer <span class="optional">(ranked first, others still shown)</span></label>
-  <select id="preferResolution">
-    <option value="">No preference</option>
-    <option value="2160p">4K</option>
-    <option value="1080p">1080p</option>
-    <option value="720p">720p</option>
-    <option value="480p">480p</option>
-  </select>
-</div>
-<div class="field"><label for="maxSizeGB">Max size (GB, blank = no cap)</label>
-  <input id="maxSizeGB" type="number" min="0" placeholder="e.g. 25"></div>
-<div class="field"><label for="minSeeders">Min seeders (blank = any)</label>
-  <input id="minSeeders" type="number" min="0" placeholder="e.g. 3"></div>
-<div class="field"><label for="resultCap">Max results</label>
-  <input id="resultCap" type="number" min="1" max="50" value="20"></div>
-</div>
-</details>
+</li>
 
-<h3>Subtitles</h3>
-<p class="optional" id="subtitlesHelp">Hash-matched OpenSubtitles, auto-sync, and your-own-key AI translation. Leave the
-  OpenSubtitles key blank for no subtitles.</p>
-<label for="osKey">OpenSubtitles API key</label>
-<input id="osKey" type="password" autocomplete="off" placeholder="your opensubtitles.com consumer key">
-<div class="hint">Register a free app at
-  <a href="https://www.opensubtitles.com/consumers">opensubtitles.com/consumers</a>. This is the subtitle source.</div>
-<div class="field">
-  <label for="osToken">OpenSubtitles token <span class="optional">(optional)</span></label>
-  <input id="osToken" type="password" autocomplete="off" placeholder="service-account JWT — raises download quota">
-</div>
-<label class="chk" style="margin-top:1rem"><input id="autoSync" type="checkbox" checked> Auto-sync subtitles (hash + reference alignment)</label>
-<h2>AI translation <span class="optional" style="text-transform:none;letter-spacing:0">— optional</span></h2>
-<label for="provider">Provider</label>
-<select id="provider"></select>
-<div class="field">
-  <label for="modelSelect">Model</label>
-  <div class="row-inputs">
-    <select id="modelSelect"></select>
-    <input id="modelCustom" type="text" placeholder="or a custom model id">
+<li class="tuning">
+  <h2 class="flow-heading">More settings</h2>
+  <p class="section-copy">Defaults are used unless changed here.</p>
+
+  <div class="accordion-list">
+  <details class="tune" id="addonSources"><summary><span class="summary-copy"><strong>Additional stream addons</strong>
+    <small>Query up to three Stremio addons with Den’s indexers</small></span><span class="disclosure" aria-hidden="true">›</span></summary>
+    <div class="details-body"><label for="sources">Addon links <span class="optional">One per line, up to 3</span></label>
+      <textarea id="sources" rows="3" autocomplete="off" spellcheck="false" aria-describedby="sourcesHint sourcesResult"
+        placeholder="https://mediafusion.elfhosted.com/…/manifest.json"></textarea>
+      <p class="hint" id="sourcesHint">These links may contain account settings and are stored in the install link.</p>
+      <p class="note" id="sourcesResult" role="status" aria-live="polite"></p></div>
+  </details>
+
+  <details class="tune" id="advancedSources"><summary><span class="summary-copy"><strong>Stream discovery &amp; filters</strong>
+    <small>Pin indexers, quality filters, sizes and result limits</small></span><span class="disclosure" aria-hidden="true">›</span></summary>
+    <div class="details-body"><label class="chk"><input type="checkbox" id="useDefaults" checked> Use the recommended defaults</label>
+      <p class="optional" id="defaultsNote">Recommended settings improve automatically with the server. Turn this off only to pin your own.</p>
+      <div id="tunables" hidden>
+        <p class="kicker" id="indexersLabel">Indexers <span class="optional">All if none selected</span></p>
+        <div role="group" aria-labelledby="indexersLabel">
+          <label class="chk"><input type="checkbox" name="indexer" value="torrentio" checked> Torrentio</label>
+          <label class="chk"><input type="checkbox" name="indexer" value="comet" checked> Comet</label>
+          <label class="chk"><input type="checkbox" name="indexer" value="mediafusion" checked> MediaFusion</label>
+          <label class="chk"><input type="checkbox" name="indexer" value="torz" checked> Torz</label>
+        </div>
+        <p class="kicker" id="filtersLabel">Filters</p>
+        <div role="group" aria-labelledby="filtersLabel">
+          <label class="chk"><input type="checkbox" id="excludeCam" checked> Hide CAM / TS / screeners</label><br>
+          <label class="chk"><input type="checkbox" id="cachedOnly"> Cached only (hide anything the debrid must fetch first)</label><br>
+          <label class="chk"><input type="checkbox" id="hdrOnly"> HDR / Dolby Vision only</label>
+        </div>
+        <div class="field"><span id="resolutionLabel" class="kicker">Resolutions <span class="optional">All if none selected</span></span>
+          <div role="group" aria-labelledby="resolutionLabel">
+            <label class="chk"><input type="checkbox" name="res" value="2160p"> 4K</label>
+            <label class="chk"><input type="checkbox" name="res" value="1080p"> 1080p</label>
+            <label class="chk"><input type="checkbox" name="res" value="720p"> 720p</label>
+            <label class="chk"><input type="checkbox" name="res" value="480p"> 480p</label>
+          </div></div>
+        <div class="field"><label for="preferResolution">Preferred resolution <span class="optional">Others still shown</span></label>
+          <select id="preferResolution"><option value="">No preference</option><option value="2160p">4K</option>
+            <option value="1080p">1080p</option><option value="720p">720p</option><option value="480p">480p</option></select></div>
+        <div class="row-inputs">
+          <div class="field"><label for="maxSizeGB">Max size <span class="optional">GB</span></label><input id="maxSizeGB" type="number" min="0" placeholder="No cap"></div>
+          <div class="field"><label for="minSeeders">Min seeders</label><input id="minSeeders" type="number" min="0" placeholder="Any"></div>
+        </div>
+        <div class="field"><label for="resultCap">Max results</label><input id="resultCap" type="number" min="1" max="50" value="20"></div>
+      </div>
+    </div>
+  </details>
+
+  <details class="tune" id="translationOptions"><summary><span class="summary-copy"><strong>Subtitle processing</strong>
+    <small>Sync subtitles and optionally translate them</small></span><span class="disclosure" aria-hidden="true">›</span></summary>
+    <div class="details-body">
+      <label class="chk"><input id="autoSync" type="checkbox" checked> Auto-sync using hash and reference alignment</label>
+      <p class="kicker">Translation</p>
+      <label for="provider">Provider</label><select id="provider"></select>
+      <div class="field"><label for="modelSelect">Model</label><div class="row-inputs">
+        <select id="modelSelect"></select><input id="modelCustom" type="text" aria-label="Custom model ID" placeholder="Or a custom model ID">
+      </div><div class="hint">Use the default unless a translation needs a different model.</div></div>
+      <div class="field"><label for="apiKey">Provider API key</label>
+        <input id="apiKey" type="password" autocomplete="off" placeholder="Leave blank for subtitles without translation"></div>
+    </div>
+  </details>
   </div>
-  <div class="hint">Default is the cheap/fast/decent tier. Pick a bigger model to re-translate a title that reads badly.</div>
-</div>
-<div class="field">
-  <label for="apiKey">Provider API key <span class="optional">(leave blank for subtitles only)</span></label>
-  <input id="apiKey" type="password" autocomplete="off" placeholder="leave blank for fetch + sync without translation">
+</li>
+</ol>
 </div>
 
-<h3>Trailers</h3>
-<p class="optional" id="trailersHelp">Inline trailers resolved from your own TMDB key. Leave it blank for no trailers.</p>
-<label for="tmdbKey">TMDB API key</label>
-<input id="tmdbKey" type="password" autocomplete="off" placeholder="your themoviedb.org API key (v3) or read token (v4)">
-<div class="hint">Free from <a href="https://www.themoviedb.org/settings/api">themoviedb.org/settings/api</a>.
-  This is the trailer source (imdb → YouTube trailer).</div>
-<div class="field">
-  <label for="kinocheckKey">KinoCheck API key <span class="optional">(optional)</span></label>
-  <input id="kinocheckKey" type="password" autocomplete="off" placeholder="fallback trailer source — leave blank to skip">
-</div>
-
-<button id="go" class="primary">Build install link</button>
-<div class="err" id="err"></div>
-<div id="out" class="hidden">
-  <h2 id="outTitle">Your install link</h2>
+<aside class="review" aria-labelledby="reviewTitle">
+  <h2 id="reviewTitle">Install</h2>
+  <p class="review-intro" id="reviewCount">No services configured</p>
+  <ul class="service-summary">
+    <li><span>Streams</span><output id="streamSummary">Not configured</output></li>
+    <li><span>Subtitles</span><output id="subsSummary">Not configured</output></li>
+    <li><span>Trailers</span><output id="reelSummary">Not configured</output></li>
+  </ul>
+  <div class="privacy-control">
+    <label class="chk"><input id="showCredentials" type="checkbox"> Show credential values</label>
+    <div id="rememberControl">
+      <label class="chk"><input id="rememberSettings" type="checkbox"> Keep settings in this tab</label>
+      <p class="hint">Available after a refresh and cleared when this tab closes.</p>
+    </div>
+  </div>
+  <p class="security" id="sealStatus" role="status" aria-live="polite">Checking credential protection…</p>
+  <button id="go" class="primary" type="button" disabled>Checking encryption…</button>
+  <div class="err" id="err" role="alert" aria-live="assertive"></div>
+  <div id="out" class="hidden" aria-live="polite">
+  <h2 id="outTitle">Install link</h2>
   <textarea id="url" readonly rows="3" aria-label="Install URL"></textarea>
   <div class="row"><button id="copy" type="button">Copy link</button></div>
   <p class="foot" id="installMeta">Install id: <code id="installId"></code> — put this in <code>HEARTH_REVOKED_INSTALLS</code> to revoke just this link.</p>
   <p class="note" id="sealNote"></p>
   <p class="disclaimer" id="sealDisclaimer"></p>
-  <p class="foot"><span id="installDirections">In Den: Settings → Plugins → Add, paste this link.</span> &nbsp;·&nbsp;
-     <a href="#" id="forget">Forget saved settings on this browser</a></p>
+  <p class="foot"><span id="installDirections">In Den: Settings → Plugins → Add, paste this link.</span>
+     <span id="forgetControl"> &nbsp;·&nbsp; <a href="#" id="forget">Clear settings in this tab</a></span></p>
+</div></aside>
 </div>
 </main>
 <!-- DenSeal bundle -->
 <script>
 // Den (hearth's combined addon) — one config with a member per service: `scout` for streams, `subs` for
-// subtitles, `reel` for trailers. Each member is exactly what that service's own /configure page builds, so
-// the fields, defaults and checks below are theirs.
+// subtitles, `reel` for trailers. This is the only install page; the fields below still build the member shapes
+// each service consumes internally.
 var PRODUCT = "Den";
 var STORE_KEY = "den-addon.configure";
 var $ = function (id) { return document.getElementById(id); };
+function revealAndFocus(id) {
+  var el = $(id), parent = el && el.parentElement;
+  while (parent) {
+    if (parent.tagName === "DETAILS") parent.open = true;
+    parent = parent.parentElement;
+  }
+  if (el) el.focus();
+}
 // Edge may replace this one stable marker with {v:2, base, saveUrl}. Its short-lived HttpOnly cookie authorizes
 // the real page's same-origin requests, so no grant credential enters JavaScript. Hearth owns every detail of
 // the provider UI and save behavior; a non-null context with any other shape fails closed below.
@@ -200,18 +324,24 @@ var DEN_GUEST = DEN_GUEST_CONTEXT === null ? null :
 // Where this addon is mounted: the page is at <base>/configure (or <base>/), and every route it calls and
 // every link it builds sits beside it.
 var BASE = DEN_GUEST ? DEN_GUEST.base : location.pathname.replace(/\/(configure\/?)?$/, "");
-STORE_KEY = DEN_GUEST ? STORE_KEY + ":" + DEN_GUEST.base : DEN_GUEST === null ? STORE_KEY : null;
+// Guest overrides belong to Den, not this browser. Never cache them here: after Den removes an override,
+// reopening this page must not resurrect old credentials from Hearth-origin tab storage.
+STORE_KEY = DEN_GUEST === null ? STORE_KEY : null;
 if (DEN_GUEST) {
-  $("mainIntro").textContent = "Your settings override shared sections. Leave a section blank to keep using its shared settings.";
-  $("streamsHelp").textContent = "Use your own debrid account, or leave the token blank to use shared stream settings.";
-  $("subtitlesHelp").textContent = "Use your own OpenSubtitles settings, or leave the key blank to use shared subtitle settings.";
-  $("trailersHelp").textContent = "Use your own TMDB key, or leave it blank to use shared trailer settings.";
+  $("mainIntro").textContent = "Personal stream and subtitle settings override shared settings. Leave a service off to use the shared account.";
+  $("streamsHelp").textContent = "Add a debrid token to override shared streams.";
+  $("subtitlesHelp").textContent = "Add an OpenSubtitles key to override shared subtitles.";
+  $("trailersHelp").textContent = "Uses the shared TMDB settings.";
+  $("trailerService").hidden = true;
+  $("rememberControl").hidden = true;
+  $("forgetControl").hidden = true;
   $("go").textContent = "Save settings";
   $("outTitle").textContent = "Settings saved";
   // A guest's settings are saved to their shared access, not handed over as a link, so nothing about a link shows.
   ["url", "copy", "installMeta", "sealNote", "sealDisclaimer"].forEach(function (id) { $(id).hidden = true; });
   $("installDirections").textContent = "Den uses them from now on.";
 }
+var primaryLabel = DEN_GUEST ? "Save settings" : "Create install link";
 
 function denFetch(url, options) {
   if (DEN_GUEST === false) return Promise.reject(new Error("invalid guest context"));
@@ -236,12 +366,16 @@ function parseSources() {
   return { sources: out };
 }
 
+var sourceCheckSerial = 0;
 function checkSources() {
+  var serial = ++sourceCheckSerial;
   var out = $("sourcesResult"), parsed = parseSources();
   out.className = "note";
+  out.setAttribute("aria-busy", "false");
   if (parsed.error) { out.textContent = parsed.error; out.className = "note unsealed"; return; }
   if (!parsed.sources.length) { out.textContent = ""; return; }
   out.textContent = "Checking…";
+  out.setAttribute("aria-busy", "true");
   Promise.all(parsed.sources.map(function (base) {
     var host = base.replace(/^https:\/\//i, "").split("/")[0];
     return fetch(base + "/manifest.json")
@@ -252,10 +386,18 @@ function checkSources() {
       })
       .catch(function () { return { ok: false, text: "? " + host + ": couldn't read its manifest" }; });
   })).then(function (results) {
+    if (serial !== sourceCheckSerial) return;
+    out.setAttribute("aria-busy", "false");
     out.textContent = results.map(function (r) { return r.text; }).join("  ·  ");
     out.className = results.every(function (r) { return r.ok; }) ? "note sealed" : "note unsealed";
   });
 }
+function invalidateSourceCheck() {
+  sourceCheckSerial++;
+  $("sourcesResult").setAttribute("aria-busy", "false");
+  $("sourcesResult").textContent = "";
+}
+$("sources").addEventListener("input", invalidateSourceCheck);
 $("sources").addEventListener("change", checkSources);
 
 function checkedVals(name) {
@@ -279,9 +421,9 @@ function clampedNumVal(id) {
 function collectScout(err) {
   var token = $("token").value.trim();
   var parsed = parseSources();
-  if (parsed.error) { err.textContent = parsed.error; $("sources").focus(); return null; }
+  if (parsed.error) { err.textContent = parsed.error; revealAndFocus("sources"); return null; }
   if (!token) {
-    if (parsed.sources.length) { err.textContent = "Your own addons need a debrid token."; $("token").focus(); return null; }
+    if (parsed.sources.length) { err.textContent = "Your own addons need a debrid token."; revealAndFocus("token"); return null; }
     return undefined;
   }
   // Defaults means the member carries ONLY the account, so the link follows the server's defaults as they change.
@@ -326,7 +468,7 @@ function fillScout(s) {
     if (s.debrid[0].service) $("service").value = s.debrid[0].service;
     if (s.debrid[0].token) $("token").value = s.debrid[0].token;
   }
-  if (s.sources && s.sources.length) $("sources").value = s.sources.join("\n");
+  if (s.sources && s.sources.length) { $("sources").value = s.sources.join("\n"); $("addonSources").open = true; }
   setChecks("indexer", s.indexers && s.indexers.length ? s.indexers : ALL_INDEXERS);
   var pinned = !!s.filters || typeof s.cachedOnly === "boolean" || !!s.indexers || s.resultCap != null;
   $("useDefaults").checked = !pinned;
@@ -379,7 +521,7 @@ function fillModels() {
 function collectSubs(err) {
   var osKey = $("osKey").value.trim(), osToken = $("osToken").value.trim(), apiKey = $("apiKey").value.trim();
   if (!osKey) {
-    if (osToken || apiKey) { err.textContent = "Subtitles need an OpenSubtitles API key."; $("osKey").focus(); return null; }
+    if (osToken || apiKey) { err.textContent = "Subtitles need an OpenSubtitles API key."; revealAndFocus("osKey"); return null; }
     return undefined;
   }
   var config = { osKey: osKey, autoSync: $("autoSync").checked };
@@ -398,14 +540,14 @@ function fillSubs(s) {
   if (typeof s.autoSync === "boolean") $("autoSync").checked = s.autoSync;
   if (s.provider) { $("provider").value = s.provider; fillModels(); }
   if (s.model) $("modelCustom").value = s.model;
-  if (s.apiKey) $("apiKey").value = s.apiKey;
+  if (s.apiKey) { $("apiKey").value = s.apiKey; $("translationOptions").open = true; }
 }
 
 // --- Trailers (Reel) ----------------------------------------------------------------------------------------
 function collectReel(err) {
   var tmdb = $("tmdbKey").value.trim(), kino = $("kinocheckKey").value.trim();
   if (!tmdb) {
-    if (kino) { err.textContent = "Trailers need a TMDB API key."; $("tmdbKey").focus(); return null; }
+    if (kino) { err.textContent = "Trailers need a TMDB API key."; revealAndFocus("tmdbKey"); return null; }
     return undefined;
   }
   var config = { tmdbKey: tmdb };
@@ -423,15 +565,18 @@ function fillReel(s) {
 function collectConfig() {
   var err = $("err");
   err.textContent = "";
-  var config = {}, parts = { scout: collectScout, subs: collectSubs, reel: collectReel };
+  var config = {}, parts = { scout: collectScout, subs: collectSubs };
+  if (!DEN_GUEST) parts.reel = collectReel;
   for (var name in parts) {
     var member = parts[name](err);
     if (member === null) return null;
     if (member !== undefined) config[name] = member;
   }
   if (!Object.keys(config).length) {
-    err.textContent = "Fill in at least one of streams, subtitles or trailers.";
-    $("token").focus();
+    err.textContent = DEN_GUEST ?
+      "Add a personal stream or subtitle override. To use only shared settings, remove your personal settings in Den." :
+      "Add a key for at least one service.";
+    revealAndFocus("token");
     return null;
   }
   return config;
@@ -440,34 +585,63 @@ function collectConfig() {
 function fillForm(s) {
   if (s.scout) fillScout(s.scout);
   if (s.subs) fillSubs(s.subs);
-  if (s.reel) fillReel(s.reel);
+  if (!DEN_GUEST && s.reel) fillReel(s.reel);
+}
+
+function updateSummary() {
+  var states = [
+    { id: "streamSummary", stateId: "streamState", ready: !!$("token").value.trim(), partial: !!$("sources").value.trim() || !$("useDefaults").checked, label: $("service").options[$("service").selectedIndex].text },
+    { id: "subsSummary", stateId: "subsState", ready: !!$("osKey").value.trim(), partial: !!($("osToken").value.trim() || $("apiKey").value.trim()), label: $("apiKey").value.trim() ? "On + translation" : "On" },
+    { id: "reelSummary", stateId: "reelState", ready: !!$("tmdbKey").value.trim(), partial: !!$("kinocheckKey").value.trim(), label: "On" }
+  ];
+  var count = 0;
+  states.forEach(function (state) {
+    var out = $(state.id);
+    out.className = "";
+    if (state.ready) { count++; out.textContent = state.label; out.className = "ready"; }
+    else if (state.partial) out.textContent = "Needs main key";
+    else out.textContent = DEN_GUEST ? "Shared settings" : "Not configured";
+    var badge = $(state.stateId);
+    badge.className = "service-state" + (state.ready ? " ready" : state.partial ? " partial" : "");
+    badge.textContent = state.ready ? "On" : state.partial ? "Needs key" : DEN_GUEST ? "Shared" : "Off";
+  });
+  $("reviewCount").textContent = count ? count + (DEN_GUEST ? " personal override" : " service") +
+    (count === 1 ? "" : "s") + " configured" :
+    (DEN_GUEST ? "Using shared settings" : "No services configured");
 }
 
 (function () {
   // The addon's X25519 public key: when served, the config is SEALED to it in this browser; when not, the
   // addon only takes plaintext. Either answer carries the addon's config epoch, stamped into the link so it is
   // not born revoked. no-cache, so an epoch raised a minute ago is not read from a stale copy.
-  var sealPublicKey = null, configEpoch = 0;
-  if (DEN_GUEST !== null) $("go").disabled = true;
+  var sealPublicKey = null, plaintextAllowed = false, configEpoch = 0, configGeneration = 0;
   denFetch(BASE + "/config-key", { cache: "no-cache" })
     .then(function (r) {
       return r.json().then(function (j) {
-        if (r.ok && typeof j.key === "string" && j.key) sealPublicKey = j.key;
+        var keyAvailable = r.ok && typeof j.key === "string" && j.key;
+        var plaintextAvailable = r.status === 404 && j.error === "no_key";
+        if (!keyAvailable && !plaintextAvailable) throw new Error("key check failed");
+        if (keyAvailable) sealPublicKey = j.key;
+        if (keyAvailable && !window.DenSeal) throw new Error("seal implementation unavailable");
+        plaintextAllowed = plaintextAvailable;
         if (typeof j.epoch === "number") configEpoch = j.epoch;
+        $("sealStatus").textContent = sealPublicKey ?
+          "Credentials will be encrypted in this browser." :
+          "This server does not offer credential sealing; the install link will contain plain text.";
         if (DEN_GUEST) {
           if (!sealPublicKey || !window.DenSeal) throw new Error("guest sealing unavailable");
-          $("go").disabled = false;
         }
+        $("go").disabled = false;
+        $("go").textContent = primaryLabel;
       });
     })
     .catch(function () {
-      if (DEN_GUEST !== null) {
-        $("go").disabled = true;
-        $("err").textContent = DEN_GUEST === false ?
-          "This guest setup link is not valid. Open it again from Den." :
-          "Could not load encryption for this guest install. Please try again.";
-      }
-      // Standalone mode deliberately retains its previous plaintext fallback.
+      $("sealStatus").textContent = "Could not verify credential protection.";
+      $("go").disabled = true;
+      $("go").textContent = DEN_GUEST !== null ? "Settings unavailable" : "Encryption check failed";
+      $("err").textContent = DEN_GUEST === false ?
+        "This guest setup link is not valid. Open it again from Den." :
+        "Could not check this server’s encryption settings. Reload the page and try again.";
     });
 
   // A fresh install id for every link: 16 random bytes, base64url without padding (22 characters).
@@ -486,14 +660,17 @@ function fillForm(s) {
 
   var lastBuildSealed = false;
   function toSegment(config) {
-    if (sealPublicKey && window.DenSeal) {
+    if (sealPublicKey) {
       try {
         var segment = window.DenSeal.denSeal(sealPublicKey, JSON.stringify(config));
         lastBuildSealed = true;
         return segment;
-      } catch (e) { /* fall through to plaintext */ }
+      } catch (e) {
+        lastBuildSealed = false;
+        return null;
+      }
     }
-    if (DEN_GUEST !== null) {
+    if (!plaintextAllowed || DEN_GUEST !== null) {
       lastBuildSealed = false;
       return null;
     }
@@ -501,18 +678,28 @@ function fillForm(s) {
     return encodePlain(config);
   }
 
-  function saveSettings(config) { if (!STORE_KEY) return; try { localStorage.setItem(STORE_KEY, JSON.stringify(config)); } catch (e) {} }
-  function loadSettings() { if (!STORE_KEY) return null; try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } }
+  function saveSettings(config) {
+    if (!STORE_KEY) return;
+    try {
+      if ($("rememberSettings").checked) sessionStorage.setItem(STORE_KEY, JSON.stringify(config));
+      else sessionStorage.removeItem(STORE_KEY);
+    } catch (e) {}
+  }
+  function loadSettings() { if (!STORE_KEY) return null; try { return JSON.parse(sessionStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } }
 
-  function copyInstallURL() {
-    var field = $("url");
+  function legacyCopy(field) {
+    var copied = false;
     field.focus();
     field.select();
     field.setSelectionRange(0, 999999);
-    var copied = false;
     try { copied = document.execCommand("copy"); } catch (e) {}
-    if (navigator.clipboard) { navigator.clipboard.writeText(field.value).catch(function () {}); copied = true; }
     if (copied) flashCopied();
+  }
+  function copyInstallURL() {
+    var field = $("url");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(field.value).then(flashCopied, function () { legacyCopy(field); });
+    } else legacyCopy(field);
   }
   function flashCopied() {
     var btn = $("copy");
@@ -529,12 +716,12 @@ function fillForm(s) {
     }
     var config = collectConfig();
     if (!config) return;
-    saveSettings(config);
-    // Stamped after saving, so every build is a new install that can be revoked on its own.
+    // Every build is a new install that can be revoked on its own.
     var install = Object.assign({ iid: mintInstallId(), ep: configEpoch }, config);
     var segment = toSegment(install);
-    if (DEN_GUEST && (!segment || !lastBuildSealed)) {
-      $("err").textContent = "Could not encrypt this guest install. Nothing was saved.";
+    if (!segment || (DEN_GUEST && !lastBuildSealed)) {
+      $("err").textContent = DEN_GUEST ? "Could not encrypt this guest install. Nothing was saved." :
+        "Could not encrypt this install. Reload the page and try again; nothing was built.";
       $("url").value = "";
       return;
     }
@@ -544,11 +731,14 @@ function fillForm(s) {
       $("out").classList.remove("hidden");
       renderSecurityNote();
       $("url").value = location.origin + BASE + "/" + segment + "/manifest.json";
-      copyInstallURL();
+      saveSettings(config);
       return;
     }
     // A guest is told "saved" only once Edge has kept the install; until then the result stays hidden.
     $("out").classList.add("hidden");
+    $("go").disabled = true;
+    $("go").textContent = "Saving…";
+    var buildGeneration = configGeneration;
     denFetch(DEN_GUEST.saveUrl, {
       method: "PUT",
       cache: "no-store",
@@ -557,27 +747,41 @@ function fillForm(s) {
     })
       .then(function (r) {
         if (!r.ok) throw new Error("save failed");
+        saveSettings(config);
+        $("go").disabled = false;
+        $("go").textContent = primaryLabel;
+        if (buildGeneration !== configGeneration) {
+          $("err").textContent = "Earlier settings were saved, but this form changed while saving. Save again to apply these changes.";
+          return;
+        }
         $("out").classList.remove("hidden");
       })
       .catch(function () {
         $("err").textContent = "Could not save these settings. Please try again.";
+        $("go").disabled = false;
+        $("go").textContent = primaryLabel;
       });
   }
 
   // The one request that sends the debrid token unsealed: only when this button is pressed, to check it now
   // rather than as an empty list on the sofa. The server neither logs nor stores it.
+  var tokenCheckSerial = 0;
   function testToken() {
-    var out = $("testResult"), token = $("token").value.trim();
+    var serial = ++tokenCheckSerial;
+    var out = $("testResult"), token = $("token").value.trim(), service = $("service").value;
     if (!token) { out.textContent = "Paste a token first."; out.className = "note"; return; }
     out.textContent = "Checking…";
     out.className = "note";
+    out.setAttribute("aria-busy", "true");
+    $("test").disabled = true;
     denFetch(BASE + "/validate", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ service: $("service").value, token: token })
+      body: JSON.stringify({ service: service, token: token })
     })
       .then(function (r) { return r.json(); })
       .then(function (j) {
+        if (serial !== tokenCheckSerial) return;
         if (j && j.valid) {
           out.textContent = "✓ This token works.";
           out.className = "note sealed";
@@ -587,44 +791,81 @@ function fillForm(s) {
         }
       })
       .catch(function () {
+        if (serial !== tokenCheckSerial) return;
         out.textContent = "Could not reach the addon to check.";
         out.className = "note unsealed";
+      })
+      .then(function () {
+        if (serial !== tokenCheckSerial) return;
+        out.setAttribute("aria-busy", "false");
+        $("test").disabled = false;
       });
+  }
+
+  function invalidateTokenTest() {
+    tokenCheckSerial++;
+    $("test").disabled = false;
+    $("testResult").setAttribute("aria-busy", "false");
+    $("testResult").textContent = "";
   }
 
   function renderSecurityNote() {
     var note = $("sealNote"), disclaimer = $("sealDisclaimer");
     if (lastBuildSealed) {
-      note.textContent = "🔒 Sealed — your keys are encrypted inside this link.";
+      note.textContent = "Credentials encrypted";
       note.className = "note sealed";
       disclaimer.innerHTML =
-        "Your keys were encrypted <b>in this browser</b>, to " + PRODUCT + "’s public key, before the " +
-        "link was built — the link carries <b>ciphertext, not your keys</b>. Anyone who later sees the " +
-        "link (a server log, your browser history, a screenshot, the reverse proxy) cannot read your keys " +
-        "from it. " + PRODUCT + " decrypts them only in memory to answer a request and <b>stores nothing</b>." +
-        "<br><br>This is not zero-knowledge: the " + PRODUCT + " server itself decrypts the keys to use them. " +
-        "And the link is still a <b>bearer token</b> — whoever holds it can spend your accounts’ " +
-        "quota — so keep it private.";
+        "The link contains encrypted credentials. " + PRODUCT + " decrypts them in memory when handling a request. " +
+        "Anyone with the link can use the configured accounts, so keep it private.";
     } else {
-      note.textContent = "⚠︎ Not sealed — your keys are in plain text in this link.";
+      note.textContent = "Credentials stored as plain text";
       note.className = "note unsealed";
       disclaimer.innerHTML =
-        "This addon isn’t configured with an encryption key, so your keys ride in the link as <b>plain " +
-        "text</b> — anyone who sees the link can read them. Treat the link like a password, or ask the " +
-        "operator to set a config key so the link can be sealed.";
+        "Anyone with the link can read the credentials. Ask the operator to configure an encryption key before using it.";
     }
   }
 
   var saved = loadSettings();
-  if (saved) { try { fillForm(saved); } catch (e) {} }
+  if (saved) {
+    $("rememberSettings").checked = true;
+    try { fillForm(saved); } catch (e) {}
+  }
   syncDefaults();
+  updateSummary();
+  function markOutputStale() {
+    configGeneration++;
+    if (!$("out").classList.contains("hidden")) {
+      $("out").classList.add("hidden");
+      $("url").value = "";
+    }
+  }
   $("useDefaults").addEventListener("change", syncDefaults);
+  $("token").addEventListener("input", invalidateTokenTest);
+  $("service").addEventListener("change", invalidateTokenTest);
+  Array.prototype.slice.call(document.querySelectorAll("input, select, textarea")).forEach(function (el) {
+    if (el.id !== "url") {
+      el.addEventListener("input", updateSummary);
+      el.addEventListener("change", updateSummary);
+      if (el.id !== "showCredentials" && el.id !== "rememberSettings") {
+        el.addEventListener("input", markOutputStale);
+        el.addEventListener("change", markOutputStale);
+      }
+    }
+  });
+  $("showCredentials").addEventListener("change", function () {
+    var type = this.checked ? "text" : "password";
+    Array.prototype.slice.call(document.querySelectorAll("input[type=password], input[data-credential=true]"))
+      .forEach(function (el) { el.type = type; el.setAttribute("data-credential", "true"); });
+  });
+  $("rememberSettings").addEventListener("change", function () {
+    if (!this.checked && STORE_KEY) try { sessionStorage.removeItem(STORE_KEY); } catch (e) {}
+  });
   $("go").addEventListener("click", build);
   $("test").addEventListener("click", testToken);
   $("copy").addEventListener("click", copyInstallURL);
   $("forget").addEventListener("click", function (e) {
     e.preventDefault();
-    if (STORE_KEY) try { localStorage.removeItem(STORE_KEY); } catch (e2) {}
+    if (STORE_KEY) try { sessionStorage.removeItem(STORE_KEY); } catch (e2) {}
     location.reload();
   });
 })();

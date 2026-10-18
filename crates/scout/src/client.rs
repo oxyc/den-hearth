@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::attributes::{container_of, StreamAttributes};
+use crate::attributes::{container_of_ref, StreamAttributes};
 use crate::rank::RawStream;
 
 /// A browser's report of what it plays, as Den Web sends it to den-remux and den-remux passes on in
@@ -62,12 +62,17 @@ impl ClientPlayable {
     /// Go `(*ClientPlayable).cost`: applies den-remux's own reading of scout's attributes (what it copies,
     /// what it converts, what it won't open).
     pub(crate) fn cost(&self, s: RawStream, a: StreamAttributes) -> i64 {
-        if a.three_d || !remux_opens(&s) {
+        self.cost_ref(&s, a)
+    }
+
+    /// Borrowed form used while ranking streams held by the result set.
+    pub(crate) fn cost_ref(&self, s: &RawStream, a: StreamAttributes) -> i64 {
+        if a.three_d || !remux_opens(s) {
             return NEVER_PLAYS_COST;
         }
         // An MPEG-TS or AVI is transcoded whatever its codec, MPEG-4 Part 2 and MPEG-2 among them, and its audio
         // converted with it.
-        if remux_converts(&s) {
+        if remux_converts(s) {
             return VIDEO_CONVERTED_COST + AUDIO_CONVERTED_COST;
         }
         let mut cost = 0;
@@ -162,7 +167,7 @@ const REMUX_REFUSED_EXT: [&str; 7] = [".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", 
 
 /// Go `remuxOpens`.
 fn remux_opens(s: &RawStream) -> bool {
-    if container_of(s.clone()) == "webm" {
+    if container_of_ref(s) == "webm" {
         return false;
     }
     let name = str::to_lowercase(&s.title);
@@ -172,10 +177,10 @@ fn remux_opens(s: &RawStream) -> bool {
 /// Whether den-remux transcodes the release for its container: an MPEG-TS or AVI has no index to cut a copy on.
 fn remux_converts(s: &RawStream) -> bool {
     let name = str::to_lowercase(&s.title);
-    container_of(s.clone()) == "avi" || name.ends_with(".ts") || name.ends_with(".avi")
+    container_of_ref(s) == "avi" || name.ends_with(".ts") || name.ends_with(".avi")
 }
 
 /// Go `webReady`: whether a browser can play the release as it is served (an https MP4).
 pub(crate) fn web_ready(s: &RawStream, url: &str) -> bool {
-    url.starts_with("https://") && container_of(s.clone()) == "mp4"
+    url.starts_with("https://") && container_of_ref(s) == "mp4"
 }

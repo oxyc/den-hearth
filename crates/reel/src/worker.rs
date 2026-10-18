@@ -24,7 +24,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -34,6 +34,10 @@ use crate::config::Config;
 /// (~1.3s once warm) and inside `direct`'s own patience, so a stuck worker costs one slow request and
 /// then goes away rather than holding the lock for everyone behind it.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A normal flattened resolver answer is a few KiB. This leaves ample room for a large format
+/// ladder without allowing a worker that forgets its newline to grow one request for 30 seconds.
+pub(crate) const REPLY_MAX_BYTES: usize = 256 * 1024;
 
 /// How long a worker may sit unasked before it is shut down.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -58,6 +62,7 @@ struct Reply {
 
 struct Resident {
     child: Child,
+    pgid: Option<u32>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     /// When it last answered, so `reap_idle` can tell whether anyone still wants it.
@@ -173,12 +178,12 @@ impl Worker {
             // The pipe broke, or it answered with something unreadable: it is not a worker any more.
             Ok(Err(why)) => {
                 crate::log_limited("worker lost", || format!("{label}: {why}"));
-                stop(held.take());
+                stop(held.take()).await;
                 None
             }
             Err(_) => {
                 eprintln!("{label}: no answer for {vid} in {patience:?}; restarting it");
-                stop(held.take());
+                stop(held.take()).await;
                 None
             }
         }
@@ -189,34 +194,40 @@ impl Worker {
         let mut held = self.held.lock().await;
         if held.as_ref().is_some_and(|r| r.used.elapsed() >= IDLE_TIMEOUT) {
             eprintln!("{}: idle for {IDLE_TIMEOUT:?}; shutting it down", self.kind.label());
-            stop(held.take());
+            stop(held.take()).await;
         }
     }
 
     /// Shut it down on the way out, so a redeploy does not leave an interpreter behind.
     pub async fn shutdown(&self) {
-        stop(self.held.lock().await.take());
+        stop(self.held.lock().await.take()).await;
     }
 }
 
 /// Start one, or `None` (said once) if it cannot be started — the caller then uses the next resolver.
 fn start(label: &'static str, program: &str, args: &[String], env: &[(&str, String)]) -> Option<Resident> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .envs(env.iter().map(|(k, v)| (*k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Inherited, not piped: a traceback belongs in the log, and nothing here drains a third pipe.
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|e| {
             crate::log_limited("worker spawn", || format!("{label}: cannot start {program} {args:?}: {e}"))
         })
         .ok()?;
+    let pgid = child.id();
+    crate::ytdlp::register_group(pgid);
     let stdin = child.stdin.take()?;
     let stdout = BufReader::new(child.stdout.take()?);
-    Some(Resident { child, stdin, stdout, used: Instant::now() })
+    Some(Resident { child, pgid, stdin, stdout, used: Instant::now() })
 }
 
 /// One reply line as the caller wants it: an answer, or what yt-dlp said about this video. The OUTER
@@ -235,18 +246,47 @@ async fn exchange(resident: &mut Resident, request: &str) -> Result<Result<Answe
     resident.stdin.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
     resident.stdin.write_all(b"\n").await.map_err(|e| e.to_string())?;
     resident.stdin.flush().await.map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    match resident.stdout.read_line(&mut line).await {
-        Ok(0) => Err("it closed its output".into()),
-        Ok(_) => read_reply(&line),
-        Err(e) => Err(e.to_string()),
+    let line = read_bounded_line(&mut resident.stdout).await?;
+    read_reply(&line)
+}
+
+/// Read one newline-delimited reply without ever retaining more than the protocol ceiling. At EOF,
+/// match `read_line` and accept a final unterminated line; an overlong unterminated stream returns as
+/// soon as byte `REPLY_MAX_BYTES + 1` is visible, causing the caller to kill and replace the worker.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String, String> {
+    let mut line = Vec::with_capacity(4096);
+    loop {
+        let available = reader.fill_buf().await.map_err(|e| e.to_string())?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Err("it closed its output".into());
+            }
+            return String::from_utf8(line).map_err(|e| e.to_string());
+        }
+        if let Some(newline) = available.iter().position(|&byte| byte == b'\n') {
+            if line.len().saturating_add(newline) > REPLY_MAX_BYTES {
+                return Err(format!("reply exceeded {REPLY_MAX_BYTES} bytes"));
+            }
+            line.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
+            return String::from_utf8(line).map_err(|e| e.to_string());
+        }
+        if line.len().saturating_add(available.len()) > REPLY_MAX_BYTES {
+            return Err(format!("reply exceeded {REPLY_MAX_BYTES} bytes without a newline"));
+        }
+        let consumed = available.len();
+        line.extend_from_slice(available);
+        reader.consume(consumed);
     }
 }
 
-/// Kill it and reap it. `kill_on_drop` covers the drop, but asking first means the process is gone
-/// before the next resolve tries to start its replacement.
-fn stop(resident: Option<Resident>) {
+/// Kill the worker's complete process group and reap its leader before a replacement is started.
+/// Resolver workers may fork runtimes of their own; killing only the direct interpreter left those
+/// descendants holding resources after timeout, malformed output, idle reap, and shutdown alike.
+async fn stop(resident: Option<Resident>) {
     if let Some(mut resident) = resident {
-        let _ = resident.child.start_kill();
+        crate::ytdlp::kill_group(resident.pgid);
+        let _ = tokio::time::timeout(Duration::from_secs(2), resident.child.wait()).await;
+        crate::ytdlp::unregister_group(resident.pgid);
     }
 }

@@ -19,7 +19,7 @@ use crate::probe::Probe;
 use crate::rank::{self, RankFilters, RawStream};
 use crate::scrape::{DoError, ScrapeQuery, Scraper};
 use crate::season::{self, TorrentFile};
-use crate::stores::{ResolveTarget, Store, StoreError, StoreStatus};
+use crate::stores::{ProviderStatus, ResolveTarget, Store, StoreError};
 
 /// A movie request: the filters a configured install sets, a release year and the title's tokens.
 pub fn rank_movie(streams: &[RawStream]) -> Vec<RawStream> {
@@ -136,8 +136,8 @@ impl Store for HeldStore {
         Ok("https://cdn.example/file.mkv".to_owned())
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
+        ProviderStatus::NotFetching
     }
 }
 
@@ -163,6 +163,7 @@ pub async fn handler_bench(streams: Vec<RawStream>) -> HandlerBench {
     let blob = crate::util::b64url_encode(&sealed);
     let streams = Arc::new(streams);
     let deps = Deps {
+        runtime: crate::runtime::ScoutRuntime::new(),
         cache: Arc::new(MemoryCache::new(64 << 20)),
         probe_client: None,
         probe_doer: None,

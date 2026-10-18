@@ -220,11 +220,7 @@ jobs:
         id: build
         env:
           METADATA: ${{ steps.bake.outputs.metadata }}
-        run: |
-          set -euo pipefail
-          digest=$(jq -r '.hearth["containerimage.digest"] // empty' <<<"$METADATA")
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest in the build metadata"; exit 1; }
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/release-metadata.sh bake-digest >> "$GITHUB_OUTPUT"
 
       - name: Prove the rebuilt image
         env:
@@ -249,10 +245,7 @@ jobs:
       # yt-dlp needs a release, and holding back an ffmpeg fix until then would leave the box worse off. A
       # finding that does not apply goes in .trivyignore with a reason.
       - name: Scan gate
-        run: |
-          set -euo pipefail
-          jq '.Results |= map(select(.Class == "os-pkgs"))' trivy.json > gate.json
-          trivy convert --severity CRITICAL --exit-code 1 --format table gate.json
+        run: bash .github/scripts/image-scan-results.sh os-only trivy.json
 
       # Report: those findings go to the repository's code scanning. Advisory — it never fails the job.
       - name: Report for code scanning

@@ -8,37 +8,38 @@ license = "MIT"
 
 [dependencies]
 # Client profiles and the address guard a play URL's non-scout hops are checked with, shared with Reel, Scout and Subtitles.
-den-upstream = { path = "../upstream" }
+den-upstream.workspace = true
 # Response builders, CORS, the request log line and the metrics bearer check, shared with Reel and Subtitles.
-den-http = { path = "../http" }
+den-http.workspace = true
 # The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file with, shared with Scout.
-den-media = { path = "../media" }
+den-media.workspace = true
+den-process.workspace = true
 # The guarded signal to ffmpeg's process group, shared with Reel.
-den-net = { path = "../net" }
+den-net.workspace = true
 # Single-threaded async runtime: the process only routes requests and watches ffmpeg, which does the
 # actual work in its own process. current_thread keeps the resident thread count (and RAM) minimal.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1"] }
-http-body-util = "0.1"
-bytes = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tokio = { workspace = true, features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio", "http1"] }
+http-body-util.workspace = true
+bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 # rustls with bundled webpki roots (ring, not aws-lc): no OpenSSL, no system CA store for our own
 # requests, and it links statically on musl.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio-util = { version = "0.7", features = ["io"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls-tls"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures-util = { workspace = true, default-features = false, features = ["std"] }
 # HMAC-SHA256 for the browser cookie and the per-session URL signature; SHA-256 for the browser keys;
 # a constant-time compare for all three.
 hmac = "0.13"
-sha2 = "0.11"
-subtle = "2"
-base64 = "0.23"
+sha2.workspace = true
+subtle.workspace = true
+base64.workspace = true
 getrandom = "0.4"
 # XChaCha20-Poly1305 for a session's restart record in scratch (`resume`), which carries the scout install and play
 # URL; the same crate scout seals its play tickets with.
-chacha20poly1305 = "0.10"
+chacha20poly1305.workspace = true
 # Parse the first Dolby Vision RPU only for the narrowly gated malformed Profile 5 case. Keeping
 # this as the library (rather than duplicating Dolby's bitstream parser) uses its validated profile verdict.
 dolby_vision = { version = "3.4", default-features = false }
@@ -48,7 +49,7 @@ rusty-chromaprint = "0.3"
 
 # SIGSTOP / SIGCONT for the ffmpeg process group, and the encoder's setpriority.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [features]
 # Forwards to the private modules' hot paths for benches/remux.rs (src/bench_api.rs). Off in every build that ships.
@@ -60,6 +61,6 @@ harness = false
 required-features = ["bench"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
 # Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
-divan = "0.1"
+divan.workspace = true

@@ -251,7 +251,7 @@ async fn stores_without_status_report_nothing() {
     for st in stores {
         let target = ResolveTarget { info_hash: H.into(), ..Default::default() };
         assert!(
-            st.status(&target).await.is_none(),
+            !st.provider_status(&target).await.is_downloading(),
             "{} claims a download status it cannot know",
             st.service().as_str()
         );

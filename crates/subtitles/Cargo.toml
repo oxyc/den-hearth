@@ -8,29 +8,31 @@ license = "MIT"
 
 [dependencies]
 # The public-address classifier resync hops are vetted with, shared with Scout and Remux.
-den-net = { path = "../net" }
+den-net.workspace = true
 # Response builders, conditional GETs, CORS, the request log line and the metrics bearer check, shared with Reel and Remux.
-den-http = { path = "../http" }
+den-http.workspace = true
 # Client profiles, the address guard, Retry-After and the per-credential pause, shared with Reel, Remux and Scout.
-den-upstream = { path = "../upstream" }
+den-upstream.workspace = true
 # The two-tier artifact cache, shared with Scout.
-den-cache = { path = "../cache" }
+den-cache.workspace = true
+# Kill complete alass/ffmpeg process groups when a request times out or is cancelled.
+den-process.workspace = true
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1"] }
-http-body-util = "0.1"
-bytes = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tokio = { workspace = true, features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio", "http1"] }
+http-body-util.workspace = true
+bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 # rustls (not OpenSSL) with bundled webpki roots → no ca-certificates juggling, static-friendly TLS.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-tokio-util = { version = "0.7", features = ["io"] }
-futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-base64 = "0.23"
+reqwest = { workspace = true, default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures-util = { workspace = true, default-features = false, features = ["std", "async-await"] }
+base64.workspace = true
 # The sealed-config keyring and the install-revocation policy, shared with Scout and Reel.
-den-seal = { path = "../seal" }
+den-seal.workspace = true
 # Subtitle files are whatever encoding the uploader's editor saved (Windows-1250/1251, ISO-8859-x,
 # UTF-16), and the player downstream drops any cue that is not UTF-8. chardetng guesses the legacy
 # encoding the way Firefox does for unlabeled pages; encoding_rs decodes it.
@@ -52,7 +54,7 @@ harness = false
 required-features = ["bench"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
 # Benchmarks, with an allocation-counting global allocator (`bench/micro.sh`).
-divan = "0.1"
-tempfile = "3"
+divan.workspace = true
+tempfile.workspace = true

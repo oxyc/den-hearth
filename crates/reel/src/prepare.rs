@@ -78,8 +78,9 @@ pub async fn handle_prepare(
                 "intent": intent,
             }),
         };
+        let cache = crate::addon::negative_cache_control(cfg.is_some(), discovered.degraded);
         let mut response = httputil::timed(
-            httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]),
+            httputil::json(StatusCode::OK, &body, &[("cache-control", cache.as_str())]),
             &discovered.timing,
         );
         add_degraded(&mut response, discovered.degraded);

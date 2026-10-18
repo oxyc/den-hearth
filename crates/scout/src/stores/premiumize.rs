@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::addbudget::{refund_unused_add, spend_add};
+use crate::addbudget::{refund_add, refund_unused_add, spend_add, RequestNotSent};
 use crate::cache::Cache;
 use crate::config::DebridService;
 use crate::scrape::Doer;
@@ -24,7 +24,7 @@ use crate::stores::torbox::CACHE_BATCH;
 use crate::stores::{
     build_request, dead_link, decode_all, decode_first, encode_form, go_query_escape, join_all, magnet_for,
     null_default, read_limited, redact_token, store_error_text, store_refused_us, unavailable, ResolveTarget,
-    Store, StoreError, StoreStatus, ERR_WOULD_ADD, MAX_STORE_BYTES,
+    Store, StoreError, ERR_WOULD_ADD, MAX_STORE_BYTES,
 };
 use crate::util::{Shape, LEAF};
 
@@ -170,11 +170,6 @@ impl Store for PremiumizeStore {
         Ok(result)
     }
 
-    /// Premiumize likewise: cached or not, with no in-between to report.
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
-    }
-
     async fn resolve(&self, t: &ResolveTarget) -> Result<String, StoreError> {
         let svc = DebridService::Premiumize;
         let cache = self.cache();
@@ -244,18 +239,28 @@ impl Store for PremiumizeStore {
         // an add per play: twenty-four episodes of a pack the account already had spent twenty-four of the
         // hourly fifty while adding nothing. So the charge is given back below the moment the answer shows
         // nothing was queued.
-        if !queued {
+        let charge = if !queued {
             // addWouldMissTheClock has no counterpart: a store takes no context, so a spent clock drops the
             // future before the charge instead of arriving at it.
-            spend_add(svc, &self.token, &t.info_hash, t.prefetch)?;
-        }
+            Some(spend_add(svc, &self.token, &t.info_hash, t.prefetch)?)
+        } else {
+            None
+        };
         let form = encode_form(&[("apikey", &self.token), ("src", &magnet_for(&t.info_hash))]);
-        let req = build_request(
+        let req = match build_request(
             reqwest::Method::POST,
             &format!("{}/transfer/directdl", self.api),
             &[("content-type", "application/x-www-form-urlencoded")],
             Some(form),
-        )?;
+        ) {
+            Ok(req) => req,
+            Err(err) => {
+                if let Some(charge) = charge {
+                    refund_add(svc, &self.token, charge, &RequestNotSent);
+                }
+                return Err(err);
+            }
+        };
         // Not for a read-only caller. The marker means "an add of OURS is out"; a NoAdd poll is reached here
         // only for a transfer already queued, where this call is the READ that discovers it finished, so it
         // has no add of its own to record.
@@ -321,8 +326,8 @@ impl Store for PremiumizeStore {
         // including releases the account already holds that directdl would have served instantly. A refused
         // magnet is a nuisance; an hour of 503 scout_busy on a working store is an outage.
         if !(200..300).contains(&status) {
-            if !queued {
-                refund_unused_add(svc, &self.token);
+            if let Some(charge) = charge {
+                refund_unused_add(svc, &self.token, charge);
             }
             // Redacted for the same reason TorBox's is: the apikey rides in directdl's form body, and this
             // text is not merely logged but PERSISTED into the refusal cache, from where the probe route
@@ -354,8 +359,8 @@ impl Store for PremiumizeStore {
             Some(body) if body.status == "success" => body,
             body => {
                 // Nothing was queued, so the charge must go back the same way the read path's does.
-                if !queued {
-                    refund_unused_add(svc, &self.token);
+                if let Some(charge) = charge {
+                    refund_unused_add(svc, &self.token, charge);
                 }
                 // Remembered, like every other answered failure on all three stores. This branch is the one
                 // that carries Premiumize's REAL refusals — it reports an unsupported magnet, an account at
@@ -434,8 +439,8 @@ impl Store for PremiumizeStore {
         // cache-check outcomes — 200, then 404, 404. That 404 is what this route calls the single failure it
         // exists to prevent, so the read-only path leaves the marker for /play to settle. The marker's own
         // TTL bounds it either way.
-        if !queued {
-            refund_unused_add(svc, &self.token);
+        if let Some(charge) = charge {
+            refund_unused_add(svc, &self.token, charge);
         }
         if !t.no_add {
             settle_queued_transfer(cache, &self.token, &t.info_hash);

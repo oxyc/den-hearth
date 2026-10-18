@@ -1,4 +1,4 @@
-//! den-subtitles — a self-hosted Stremio subtitles addon for Den in one small binary:
+//! den-subtitles — Hearth's subtitles service:
 //!
 //! 1. FETCH — OpenSubtitles, hash-matched (the app sends the file's OSHash as `videoHash`), served
 //!    from our own cache/origin so results are fast and dodge the per-IP download quota.
@@ -6,11 +6,12 @@
 //!    that survives a full film without losing sync between cue count and timing.
 //! 3. SYNC — an auto-sync ladder (hash → reference-align → alass audio VAD) so subtitles line up.
 //!
-//! Both credentials (OpenSubtitles key, LLM key) are BYOK and ride in the install URL, Keychain-
-//! stored by the app. No user credential lives in the environment.
+//! Both credentials (OpenSubtitles key, LLM key) are BYOK and ride in the combined Den install URL,
+//! Keychain-stored by the app. No user credential lives in the environment.
 
 mod addon;
 mod cache;
+mod cache_policy;
 mod config;
 mod fetch;
 mod httputil;
@@ -53,7 +54,7 @@ pub fn migration_member(state: &AppState, blob: &str) -> Option<serde_json::Valu
 
 /// The unconfigured manifest, for the combined Den addon's manifest to take Subtitles' resource from.
 pub fn unconfigured_manifest() -> serde_json::Value {
-    addon::manifest(None)
+    addon::manifest()
 }
 
 /// Lock `m`, recovering the data if a panic poisoned it. Every map behind these locks is left
@@ -77,20 +78,6 @@ pub fn release_version() -> &'static str {
         })
         .as_str()
 }
-
-/// The /configure page, embedded so the binary is self-contained.
-const CONFIGURE_PAGE: &str = include_str!("configure.html");
-
-/// The manifest and /configure change only on a redeploy. The stale-while-revalidate window lets a
-/// client answer from its copy while it re-checks, the same as every other den addon.
-const STATIC_CACHE: &str = "public, max-age=3600, stale-while-revalidate=600";
-
-/// The configured manifest: the same windows, but `private`. Its URL is the install's config segment
-/// and its body names the install (`denInstallId`), so no shared cache may keep it.
-const INSTALL_CACHE: &str = "private, max-age=3600, stale-while-revalidate=600";
-
-/// The sealing key can rotate, so its freshness window is short; the ETag still busts a stale copy.
-const KEY_CACHE: &str = "public, max-age=300";
 
 /// Consecutive OpenSubtitles failures before /health reports `degraded` (ADDON-02).
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
@@ -136,6 +123,11 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     let mut resp = match parts.method {
         // A CORS preflight is answered for any path, before routing.
         hyper::Method::OPTIONS => httputil::preflight(),
+        // These GET routes can search OpenSubtitles, spend a metered download, run ffmpeg/alass,
+        // or invoke an LLM. Body stripping happens only after routing, so HEAD must be stopped here.
+        hyper::Method::HEAD if head_requires_get(parts.uri.path()) => {
+            httputil::apply_conditional(&parts.method, &parts.headers, method_not_allowed("GET, OPTIONS"))
+        }
         // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
         // collapses to a 304. A HEAD answer never has a body (the router builds one regardless of method).
         hyper::Method::GET | hyper::Method::HEAD => {
@@ -146,7 +138,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         }
         // Every route is a read. Routing on the path alone let a POST reach the same handlers — and a
         // subtitle or translate route spends a metered download or an LLM bill.
-        _ => httputil::error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
+        _ => method_not_allowed("GET, HEAD, OPTIONS"),
     };
     // `total` closes the header on any response whose handler named its phases, in tenths of a
     // millisecond like every other den addon.
@@ -177,6 +169,24 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     resp
 }
 
+fn method_not_allowed(allow: &'static str) -> Response<Body> {
+    let mut resp = httputil::error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+    resp.headers_mut().insert(hyper::header::ALLOW, hyper::header::HeaderValue::from_static(allow));
+    resp
+}
+
+/// A translation status poll and the operational endpoints are memory/cache-only and retain HEAD.
+/// Unknown paths also retain their normal 404. Every actual search, artifact, or translation route
+/// requires GET, regardless of whether this particular request might happen to find a warm cache.
+fn head_requires_get(path: &str) -> bool {
+    let segs = split_path(path);
+    match segs.get(1).copied() {
+        Some("subtitles" | "subtitle") => true,
+        Some("translate") => !segs.last().is_some_and(|last| last.ends_with(".status")),
+        _ => false,
+    }
+}
+
 /// `den` is the combined Den addon's terms when hearth routed the request under `/den`: the config segment is
 /// that addon's, and the links answered with point back under it (`AppState::decode_config`, `addon::self_base`).
 async fn route(
@@ -199,34 +209,6 @@ async fn route(
         }
         // Prometheus text behind `METRICS_TOKEN`; 404 without it (see metrics.rs).
         "/metrics" => return metrics::handle(state, &parts.headers),
-        "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(None), STATIC_CACHE),
-        "/" | "/configure" | "/configure/" => {
-            return httputil::html(StatusCode::OK, CONFIGURE_PAGE, STATIC_CACHE)
-        }
-        // The current X25519 public key (base64) so /configure can seal the config to it; 404 when
-        // sealed configs are disabled (no key) — the page then keeps plaintext (SEALED-CONFIG.md).
-        // Both answers carry CONFIG_EPOCH, which the page stamps into every link it builds, sealed or
-        // not: a link stamped below it would be refused the moment it was built.
-        "/config-key" => {
-            // A malformed key has no public half to hand out; /configure then builds plaintext links,
-            // which are refused like every other config until the key is fixed.
-            if state.config_key_invalid {
-                return config_key_invalid_response();
-            }
-            let epoch = state.cfg.revocation.epoch();
-            return match state.config_keyring.as_ref().map(|kr| kr.current_pub_base64()) {
-                Some(pub_b64) if !pub_b64.is_empty() => httputil::json(
-                    StatusCode::OK,
-                    &serde_json::json!({"key": pub_b64, "epoch": epoch}),
-                    KEY_CACHE,
-                ),
-                _ => httputil::json(
-                    StatusCode::NOT_FOUND,
-                    &serde_json::json!({"error": "no_key", "epoch": epoch}),
-                    "no-store",
-                ),
-            };
-        }
         _ => {}
     }
 
@@ -234,22 +216,11 @@ async fn route(
     let config = segs.first().copied().unwrap_or("");
     let resource = segs.get(1).copied().unwrap_or("");
 
-    if state.key_invalid(den) && matches!(resource, "manifest.json" | "subtitles" | "subtitle" | "translate")
-    {
+    if state.key_invalid(den) && matches!(resource, "subtitles" | "subtitle" | "translate") {
         return config_key_invalid_response();
     }
 
     match resource {
-        "manifest.json" => match state.decode_config(den, config) {
-            // The ETag is over the body, and the body names the install, so one install's cached
-            // copy never answers another's If-None-Match.
-            Some(cfg) => httputil::json(StatusCode::OK, &addon::manifest(Some(&cfg)), INSTALL_CACHE),
-            None => httputil::json(
-                StatusCode::BAD_REQUEST,
-                &serde_json::json!({"error": "bad_config"}),
-                "no-store",
-            ),
-        },
         "subtitles" => {
             // /<config>/subtitles/<type>/<id>[/<extra>].json
             let (id_seg, extra) = match segs.len() {
@@ -480,8 +451,6 @@ mod tests {
     // Same fixed vector key + browser-minted sealed segment the seal/userconfig unit tests use, so the
     // HTTP layer is exercised against a real crypto_box_seal blob, not a mock.
     const VEC_PRIV_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
-    const VEC_PUB_B64: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8=";
-    const JS_SEG: &str = "Ac3WWHzRZKV9OjdSgIPaNFFhaE9UY0vwxgSO6F5Ghug1nyjlKUodEQmhhlPhX-j1KffJnpj58HPhlpePWcbnuX9GL9rGMsdki1hGXSzRG94ON_aYocvFkl9bSU2QZa8o3waeHHm9wmjLQg";
 
     fn test_state(config_key: &str) -> Arc<AppState> {
         test_state_with(config_key, "")
@@ -512,7 +481,7 @@ mod tests {
         }
     }
 
-    // Issue #8 R3: an install id as /configure mints it (bytes 0..16).
+    // Issue #8 R3: an install id as /den/configure mints it (bytes 0..16).
     const IID: &str = "AAECAwQFBgcICQoLDA0ODw";
 
     fn plain_segment(json: &str) -> String {
@@ -534,7 +503,6 @@ mod tests {
     async fn a_revoked_install_is_refused_on_every_config_route() {
         let seg = plain_segment(&format!(r#"{{"osKey":"os-test","iid":"{IID}"}}"#));
         let routes = [
-            "manifest.json",
             "subtitles/movie/tt0000001.json",
             "subtitle/42.srt",
             "translate/movie/tt0000001/Swedish.json",
@@ -561,7 +529,7 @@ mod tests {
         // The same install, not revoked, is served.
         let resp = handle_request(
             revoking_state("", "0"),
-            request(hyper::Method::GET, &format!("/{seg}/manifest.json")),
+            request(hyper::Method::GET, &format!("/{seg}/subtitles/movie/tt0000001.json")),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -575,7 +543,7 @@ mod tests {
             (r#"{"osKey":"o","ep":2}"#, StatusCode::OK),
             (r#"{"osKey":"o","ep":3}"#, StatusCode::OK),
         ] {
-            let uri = format!("/{}/manifest.json", plain_segment(json));
+            let uri = format!("/{}/subtitles/movie/tt0000001.json", plain_segment(json));
             let resp = handle_request(revoking_state("", "2"), request(hyper::Method::GET, &uri)).await;
             assert_eq!(resp.status(), want, "{json}");
         }
@@ -585,7 +553,7 @@ mod tests {
     /// is raised.
     #[tokio::test]
     async fn a_config_without_an_install_id_works_at_epoch_zero() {
-        let uri = format!("/{}/manifest.json", plain_segment(r#"{"osKey":"o"}"#));
+        let uri = format!("/{}/subtitles/movie/tt0000001.json", plain_segment(r#"{"osKey":"o"}"#));
         let resp = handle_request(revoking_state(IID, "0"), request(hyper::Method::GET, &uri)).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -689,8 +657,8 @@ mod tests {
     /// the other's configs.
     #[tokio::test]
     async fn the_den_addon_s_terms_decide_a_den_install() {
-        let manifest = |seg: String, state: Arc<AppState>, den: Option<den_seal::Addon>| async move {
-            let uri = format!("/{seg}/manifest.json");
+        let resource = |seg: String, state: Arc<AppState>, den: Option<den_seal::Addon>| async move {
+            let uri = format!("/{seg}/subtitles/movie/tt0000001.json");
             let req = match den {
                 Some(den) => den_request(&uri, den),
                 None => request(hyper::Method::GET, &uri),
@@ -700,19 +668,19 @@ mod tests {
         let own = plain_segment(&format!(r#"{{"osKey":"os-test","iid":"{IID}"}}"#));
         let ok = StatusCode::OK;
         let bad = StatusCode::BAD_REQUEST;
-        assert_eq!(manifest(combined(), revoking_state("", "0"), Some(den_terms("", "0"))).await, ok);
+        assert_eq!(resource(combined(), revoking_state("", "0"), Some(den_terms("", "0"))).await, ok);
         // Revoked, or stamped below the epoch, by the Den addon.
-        assert_eq!(manifest(combined(), revoking_state("", "0"), Some(den_terms(IID, "0"))).await, bad);
-        assert_eq!(manifest(combined(), revoking_state("", "0"), Some(den_terms("", "1"))).await, bad);
+        assert_eq!(resource(combined(), revoking_state("", "0"), Some(den_terms(IID, "0"))).await, bad);
+        assert_eq!(resource(combined(), revoking_state("", "0"), Some(den_terms("", "1"))).await, bad);
         // Revoked by Subtitles alone: a Den install is not Subtitles' to revoke.
-        assert_eq!(manifest(combined(), revoking_state(IID, "3"), Some(den_terms("", "0"))).await, ok);
+        assert_eq!(resource(combined(), revoking_state(IID, "3"), Some(den_terms("", "0"))).await, ok);
         // Neither kind of config opens as the other.
-        assert_eq!(manifest(own.clone(), revoking_state("", "0"), Some(den_terms("", "0"))).await, bad);
-        assert_eq!(manifest(combined(), revoking_state("", "0"), None).await, bad);
-        assert_eq!(manifest(own, revoking_state("", "0"), None).await, ok);
+        assert_eq!(resource(own.clone(), revoking_state("", "0"), Some(den_terms("", "0"))).await, bad);
+        assert_eq!(resource(combined(), revoking_state("", "0"), None).await, bad);
+        assert_eq!(resource(own, revoking_state("", "0"), None).await, ok);
         // A Den config without a Subtitles member.
         let reel_only = plain_segment(r#"{"reel":{"tmdbKey":"t"}}"#);
-        assert_eq!(manifest(reel_only, revoking_state("", "0"), Some(den_terms("", "0"))).await, bad);
+        assert_eq!(resource(reel_only, revoking_state("", "0"), Some(den_terms("", "0"))).await, bad);
     }
 
     #[tokio::test]
@@ -726,98 +694,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(body_string(resp).await.contains("config_key_invalid"));
         let own = plain_segment(r#"{"osKey":"o"}"#);
-        let resp =
-            handle_request(test_state(""), request(hyper::Method::GET, &format!("/{own}/manifest.json")))
-                .await;
+        let resp = handle_request(
+            test_state(""),
+            request(hyper::Method::GET, &format!("/{own}/subtitles/movie/tt0000001.json")),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    /// /configure stamps the epoch into every link, sealed or not, so both answers carry it.
-    #[tokio::test]
-    async fn config_key_carries_the_config_epoch() {
-        for (key, want) in [(VEC_PRIV_B64, StatusCode::OK), ("", StatusCode::NOT_FOUND)] {
-            let mut cfg = test_config(key, "");
-            cfg.revocation = userconfig::Revocation::from_env("", Some("4"));
-            let resp = handle_request(AppState::new(cfg), request(hyper::Method::GET, "/config-key")).await;
-            assert_eq!(resp.status(), want);
-            let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-            assert_eq!(body["epoch"], 4, "{body}");
-        }
-    }
-
-    /// Every link the page builds names its install and the epoch it was minted in, and both are
-    /// inside what gets sealed.
-    #[tokio::test]
-    async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
-        let page =
-            body_string(handle_request(test_state(""), request(hyper::Method::GET, "/configure")).await)
-                .await;
-        assert!(
-            page.contains("crypto.getRandomValues(bytes)"),
-            "the install id is not minted from the CSPRNG"
-        );
-        assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
-        assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
-        assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
-        assert!(
-            page.contains(r#"fetch(addonBase() + "/config-key""#),
-            "the config key loses the Hearth mount"
-        );
-        assert!(page.contains("location.origin + addonBase()"), "the install URL loses the Hearth mount");
-    }
-
-    /// The configured manifest names its install as `REVOKED_INSTALLS` spells it; a config without an
-    /// id, and the unconfigured manifest, carry no such field. One install's ETag never earns another
-    /// install a 304.
-    #[tokio::test]
-    async fn the_configured_manifest_names_its_install() {
-        use hyper::header::{ETAG, IF_NONE_MATCH};
-        const OTHER_IID: &str = "BAECAwQFBgcICQoLDA0ODw";
-        let manifest = |uri: String, inm: Option<HeaderValue>| async move {
-            let mut req = Request::builder().uri(uri);
-            if let Some(etag) = inm {
-                req = req.header(IF_NONE_MATCH, etag);
-            }
-            handle_request(test_state(""), req.body(()).unwrap()).await
-        };
-        let with_id =
-            format!("/{}/manifest.json", plain_segment(&format!(r#"{{"osKey":"o","iid":"{IID}"}}"#)));
-        let first = manifest(with_id, None).await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let etag = first.headers().get(ETAG).expect("an ETag").clone();
-        let body: serde_json::Value = serde_json::from_str(&body_string(first).await).unwrap();
-        assert_eq!(body["denInstallId"], IID, "{body}");
-        assert_eq!(body["denAttribution"][0]["link"], "OpenSubtitles.com", "{body}");
-
-        let without = format!("/{}/manifest.json", plain_segment(r#"{"osKey":"o"}"#));
-        for uri in [without, "/manifest.json".to_string()] {
-            let resp = manifest(uri.clone(), None).await;
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            let body = body_string(resp).await;
-            assert!(!body.contains("denInstallId"), "{uri}: {body}");
-        }
-
-        let other =
-            format!("/{}/manifest.json", plain_segment(&format!(r#"{{"osKey":"o","iid":"{OTHER_IID}"}}"#)));
-        let resp = manifest(other, Some(etag)).await;
-        assert_eq!(resp.status(), StatusCode::OK, "another install's ETag must not 304");
-        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-        assert_eq!(body["denInstallId"], OTHER_IID, "{body}");
-    }
-
-    /// The page shows the id of the link it just built, with the variable that revokes it.
-    #[tokio::test]
-    async fn configure_page_shows_the_install_id() {
-        let page =
-            body_string(handle_request(test_state(""), request(hyper::Method::GET, "/configure")).await)
-                .await;
-        for want in [
-            r#"<code id="installId"></code>"#,
-            r#"$("installId").textContent = install.iid;"#,
-            "<code>REVOKED_INSTALLS</code> to revoke just this link",
-        ] {
-            assert!(page.contains(want), "configure page lacks {want:?}");
-        }
     }
 
     async fn body_string(resp: Response<Body>) -> String {
@@ -825,156 +707,6 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
     }
-
-    // The HTTP-level mirror of den-scout's TestRoutesSealedConfig: drive the real router so a future
-    // refactor that returns the wrong status/body for the sealed, legacy, or /config-key arms fails CI.
-
-    #[tokio::test]
-    async fn config_key_serves_the_pubkey_when_keyring_set() {
-        let resp =
-            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/config-key").body(()).unwrap())
-                .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(body_string(resp).await.contains(VEC_PUB_B64), "/config-key must serve the derived pubkey");
-    }
-
-    #[tokio::test]
-    async fn config_key_404s_when_sealing_disabled() {
-        let resp =
-            handle_request(test_state(""), Request::builder().uri("/config-key").body(()).unwrap()).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health() {
-        let state = test_state("not-a-key");
-        assert!(state.config_keyring.is_none() && state.config_key_invalid);
-        assert!(startup_line(&state).contains("sealed=invalid"), "{}", startup_line(&state));
-        let plain = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-plain"}"#);
-        for seg in [plain.as_str(), JS_SEG] {
-            for tail in [
-                "manifest.json",
-                "subtitles/movie/tt0111161.json",
-                "subtitle/1.srt",
-                "translate/movie/tt0111161/fi.json",
-            ] {
-                let resp = handle_request(
-                    state.clone(),
-                    Request::builder().uri(format!("/{seg}/{tail}")).body(()).unwrap(),
-                )
-                .await;
-                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{tail}");
-                assert_eq!(resp.headers()["retry-after"], "60");
-                assert!(body_string(resp).await.contains("config_key_invalid"));
-            }
-        }
-        let key =
-            handle_request(state.clone(), Request::builder().uri("/config-key").body(()).unwrap()).await;
-        assert_eq!(key.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let health = handle_request(state, Request::builder().uri("/health").body(()).unwrap()).await;
-        let health: serde_json::Value = serde_json::from_str(&body_string(health).await).unwrap();
-        assert_eq!(health["status"], "degraded");
-        assert_eq!(health["reason"], "config_key_invalid");
-    }
-
-    #[tokio::test]
-    async fn an_unset_key_still_accepts_plaintext_and_a_malformed_prior_key_is_skipped() {
-        let state = test_state("");
-        assert!(!state.config_key_invalid);
-        assert!(startup_line(&state).contains("sealed=off"));
-        let plain = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-plain"}"#);
-        let resp = handle_request(
-            state.clone(),
-            Request::builder().uri(format!("/{plain}/manifest.json")).body(()).unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let health = handle_request(state, Request::builder().uri("/health").body(()).unwrap()).await;
-        assert!(body_string(health).await.contains(r#""status":"ok""#));
-
-        let mut cfg = test_config(VEC_PRIV_B64, "");
-        cfg.config_keys_prev = "not-a-key".to_string();
-        let state = AppState::new(cfg);
-        assert!(!state.config_key_invalid && state.config_keyring.is_some());
-        assert!(startup_line(&state).contains("sealed=on"));
-    }
-
-    #[tokio::test]
-    async fn sealed_manifest_resolves_end_to_end() {
-        let uri = format!("/{JS_SEG}/manifest.json");
-        let resp =
-            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
-        assert_eq!(resp.status(), StatusCode::OK, "a sealed URL must resolve the manifest");
-    }
-
-    #[tokio::test]
-    async fn sealed_manifest_fails_closed_without_a_keyring() {
-        let uri = format!("/{JS_SEG}/manifest.json");
-        let resp = handle_request(test_state(""), Request::builder().uri(uri).body(()).unwrap()).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "sealed URL with no key must fail closed, not open"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_plaintext_config_is_refused_while_sealing_is_on() {
-        // Every install /configure issues is sealed once a key is set, and /config-key is public: a
-        // plaintext segment is one anyone could have minted.
-        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-plain"}"#);
-        let uri = format!("/{seg}/manifest.json");
-        let resp =
-            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "a plaintext config must be refused with a key set"
-        );
-    }
-
-    #[tokio::test]
-    async fn configure_page_renders_with_the_seal_bundle() {
-        // Guards against a truncated/corrupt include_str! shipping silently (audit finding B).
-        let resp =
-            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/configure").body(()).unwrap())
-                .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let page = body_string(resp).await;
-        // `contains("DenSeal")` alone passed on a page cut to 4% of its length — the marker sits in
-        // the first few KB. The page must carry the seal implementation AND the form that uses it.
-        assert!(page.contains("DenSeal"), "the /configure page must inline the seal bundle");
-        assert!(page.contains("denSeal"), "the seal implementation itself must be present");
-        assert!(page.contains("</html>"), "the page was truncated before the end");
-        assert!(page.len() > 100_000, "the bundle looks truncated: {} bytes", page.len());
-    }
-
-    #[tokio::test]
-    async fn manifest_carries_a_strong_etag_and_honors_if_none_match() {
-        use hyper::header::{ETAG, IF_NONE_MATCH};
-        // A cacheable 200 must carry a strong (quoted, unweakened) ETag.
-        let resp = handle_request(
-            test_state(VEC_PRIV_B64),
-            Request::builder().uri("/manifest.json").body(()).unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let etag = resp.headers().get(ETAG).expect("manifest must carry an ETag").clone();
-        let etag_str = etag.to_str().unwrap().to_string();
-        assert!(etag_str.starts_with('"') && etag_str.ends_with('"'), "ETag must be quoted/strong");
-
-        // Re-request with that ETag → 304 Not Modified, no body, same validator + Cache-Control.
-        let resp = handle_request(
-            test_state(VEC_PRIV_B64),
-            Request::builder().uri("/manifest.json").header(IF_NONE_MATCH, &etag_str).body(()).unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
-        assert_eq!(resp.headers().get(ETAG).unwrap(), &etag);
-        assert!(resp.headers().get(hyper::header::CACHE_CONTROL).is_some());
-        assert!(body_string(resp).await.is_empty(), "a 304 has an empty body");
-    }
-
     #[tokio::test]
     async fn no_store_replies_carry_no_etag_and_never_304() {
         use hyper::header::{ETAG, IF_NONE_MATCH};
@@ -1115,26 +847,16 @@ mod tests {
         }
     }
 
-    /// The header is added after every path that rebuilds a response — a 304, a HEAD, an error —
-    /// so none of them can drop it.
+    /// The header is added after successful, HEAD, and error responses, so none can drop it.
     #[tokio::test]
     async fn every_reply_carries_the_wildcard_origin() {
-        use hyper::header::{ETAG, IF_NONE_MATCH};
-        let ok = handle_request(test_state(""), request(hyper::Method::GET, "/manifest.json")).await;
+        let ok = handle_request(test_state(""), request(hyper::Method::GET, "/health")).await;
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(ok.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
-        let etag = ok.headers().get(ETAG).unwrap().clone();
-
-        let not_modified = handle_request(
-            test_state(""),
-            Request::builder().uri("/manifest.json").header(IF_NONE_MATCH, etag).body(()).unwrap(),
-        )
-        .await;
-        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
 
         let head = handle_request(test_state(""), request(hyper::Method::HEAD, "/health")).await;
         let missing = handle_request(test_state(""), request(hyper::Method::GET, "/no/such/path")).await;
-        for resp in [not_modified, head, missing] {
+        for resp in [head, missing] {
             assert_eq!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{}", resp.status());
             // A cross-origin client reads only what is exposed, and a refusal's wait is the part it
             // most needs.
@@ -1149,10 +871,19 @@ mod tests {
     /// same JSON 404.
     #[tokio::test]
     async fn an_unknown_path_is_a_json_404() {
-        for uri in
-            ["/no/such/path", "/cfg/subtitles/movie", "/cfg/translate/movie/tt1/Swedish.txt", "/metrics"]
-        {
-            let resp = handle_request(test_state(""), request(hyper::Method::GET, uri)).await;
+        let configured_manifest = format!("/{}/manifest.json", plain_segment(r#"{"osKey":"o"}"#));
+        for uri in [
+            "/no/such/path".to_string(),
+            "/cfg/subtitles/movie".to_string(),
+            "/cfg/translate/movie/tt1/Swedish.txt".to_string(),
+            "/metrics".to_string(),
+            "/".to_string(),
+            "/configure".to_string(),
+            "/config-key".to_string(),
+            "/manifest.json".to_string(),
+            configured_manifest,
+        ] {
+            let resp = handle_request(test_state(""), request(hyper::Method::GET, &uri)).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
             assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "application/json", "{uri}");
             assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), "no-store", "{uri}");
@@ -1199,10 +930,43 @@ mod tests {
         for method in [hyper::Method::POST, hyper::Method::PUT, hyper::Method::DELETE] {
             let resp = handle_request(test_state(""), request(method.clone(), "/manifest.json")).await;
             assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(resp.headers().get(hyper::header::ALLOW).unwrap(), "GET, HEAD, OPTIONS", "{method}");
             assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), "no-store", "{method}");
             assert_eq!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{method}");
             assert_eq!(body_string(resp).await, r#"{"error":"method_not_allowed"}"#, "{method}");
         }
+    }
+
+    /// HEAD is decided before any resource handler. This is the boundary that keeps a bodyless
+    /// request from spending an OpenSubtitles credit, running sync, or invoking the LLM.
+    #[tokio::test]
+    async fn head_refuses_subtitle_work_routes_but_keeps_status_and_health() {
+        let cfg = plain_segment(r#"{"osKey":"os-test","llm":{"provider":"openai","apiKey":"llm-test"}}"#);
+        for route in [
+            "subtitles/movie/tt0000001.json",
+            "subtitle/42.srt?resync=http%3A%2F%2Fscout.test%2Fplay%2Fx",
+            "translate/movie/tt0000001/Swedish.json",
+            "translate/movie/tt0000001/Swedish.srt",
+        ] {
+            let resp =
+                handle_request(test_state(""), request(hyper::Method::HEAD, &format!("/{cfg}/{route}")))
+                    .await;
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{route}");
+            assert_eq!(resp.headers().get(hyper::header::ALLOW).unwrap(), "GET, OPTIONS", "{route}");
+            assert!(body_string(resp).await.is_empty(), "HEAD carried an error body for {route}");
+        }
+
+        let health = handle_request(test_state(""), request(hyper::Method::HEAD, "/health")).await;
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(body_string(health).await.is_empty());
+
+        let status = handle_request(
+            test_state(""),
+            request(hyper::Method::HEAD, &format!("/{cfg}/translate/movie/tt0000001/Swedish.status")),
+        )
+        .await;
+        assert_ne!(status.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(body_string(status).await.is_empty());
     }
 
     /// An error is the fleet's JSON shape, not a text body.
@@ -1214,31 +978,8 @@ mod tests {
         assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), "no-store");
         assert_eq!(body_string(resp).await, r#"{"error":"bad_file_id"}"#);
     }
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
 
-    #[tokio::test]
-    async fn static_routes_carry_the_fleet_cache_policy() {
-        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-test"}"#);
-        // The configured manifest runs with sealing off: with it on, only a sealed segment is an install.
-        let cases = [
-            ("/manifest.json".to_string(), STATIC_CACHE, VEC_PRIV_B64),
-            (format!("/{seg}/manifest.json"), INSTALL_CACHE, ""),
-            ("/configure".to_string(), STATIC_CACHE, VEC_PRIV_B64),
-            ("/config-key".to_string(), KEY_CACHE, VEC_PRIV_B64),
-        ];
-        for (uri, want, key) in cases {
-            let resp = handle_request(test_state(key), request(hyper::Method::GET, &uri)).await;
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), want, "{uri}");
-        }
-        assert_eq!(STATIC_CACHE, "public, max-age=3600, stale-while-revalidate=600");
-        assert_eq!(INSTALL_CACHE, "private, max-age=3600, stale-while-revalidate=600");
-        assert_eq!(KEY_CACHE, "public, max-age=300");
-    }
-
-    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
-
-    /// A state with a cache directory of its own. `test_config`'s is shared, and its disk tier would
-    /// carry one test's bodies into another's cold cache.
     fn isolated_state(name: &str) -> Arc<AppState> {
         let mut cfg = test_config("", "");
         cfg.cache_dir =

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use crate::config::DebridService;
 use crate::stores::pool::StorePool;
-use crate::stores::{DeadLinkError, ResolveTarget, Store, StoreError, StoreStatus, StoreUnavailableError};
+use crate::stores::{DeadLinkError, ResolveTarget, Store, StoreError, StoreUnavailableError};
 
 /// Go `H` (stores_test.go:19).
 const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -86,8 +86,8 @@ impl Store for NamedStore {
         Ok(self.link.clone())
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
+    async fn provider_status(&self, _t: &ResolveTarget) -> crate::stores::ProviderStatus {
+        crate::stores::ProviderStatus::NotFetching
     }
 }
 

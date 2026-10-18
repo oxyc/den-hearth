@@ -422,6 +422,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +566,7 @@ dependencies = [
  "quick_cache",
  "sha2",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -573,6 +583,7 @@ dependencies = [
  "den-seal",
  "den-subtitles",
  "den-sync",
+ "flate2",
  "futures-util",
  "http-body-util",
  "hyper",
@@ -615,6 +626,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "den-process"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "den-reel"
 version = "0.56.0"
 dependencies = [
@@ -623,7 +641,9 @@ dependencies = [
  "blake2 0.10.6",
  "bytes",
  "den-http",
+ "den-media",
  "den-net",
+ "den-process",
  "den-seal",
  "den-upstream",
  "divan",
@@ -651,6 +671,7 @@ dependencies = [
  "den-http",
  "den-media",
  "den-net",
+ "den-process",
  "den-upstream",
  "divan",
  "dolby_vision",
@@ -724,6 +745,7 @@ dependencies = [
  "den-cache",
  "den-http",
  "den-net",
+ "den-process",
  "den-seal",
  "den-upstream",
  "divan",
@@ -927,6 +949,16 @@ name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+
+[[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
 
 [[package]]
 name = "fnv"
@@ -1485,6 +1517,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
+ "simd-adler32",
 ]
 
 [[package]]
@@ -2150,6 +2183,12 @@ name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+
+[[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simdutf8"

@@ -32,6 +32,7 @@ mod config;
 mod httputil;
 mod job;
 mod lang;
+mod playback_request;
 mod playlist;
 mod probe;
 mod redact;
@@ -52,7 +53,7 @@ mod tests;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -62,6 +63,7 @@ use serde::Deserialize;
 pub use crate::config::Config;
 pub use crate::httputil::Body;
 pub use crate::job::kill_live_groups;
+pub use crate::playback_request::PlaybackRequest;
 use crate::session::SubFile;
 use crate::state::unix_now;
 pub use crate::state::AppState;
@@ -464,13 +466,19 @@ where
     read_body_up_to(body, 16 * 1024).await
 }
 
-/// A request body of at most `cap` bytes; `None` past it.
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A request body of at most `cap` bytes that must arrive promptly; `None` past either bound.
 async fn read_body_up_to<B>(body: B, cap: usize) -> Option<Bytes>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    http_body_util::Limited::new(body, cap).collect().await.ok().map(|c| c.to_bytes())
+    tokio::time::timeout(REQUEST_BODY_TIMEOUT, http_body_util::Limited::new(body, cap).collect())
+        .await
+        .ok()?
+        .ok()
+        .map(|collected| collected.to_bytes())
 }
 
 /// A player's report on the session `sid` (`short` for the log) — why it couldn't play it, how playing went.
@@ -722,40 +730,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let browser = browser_of(state, parts);
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Create {
-        imdb: String,
-        season: Option<u32>,
-        episode: Option<u32>,
-        filename: Option<String>,
-        scout: Option<String>,
-        #[serde(default)]
-        audio: Vec<String>,
-        audio_track: Option<usize>,
-        subtitles: Option<String>,
-        #[serde(default)]
-        subtitle_languages: Vec<String>,
-        #[serde(default)]
-        video_codecs: Vec<String>,
-        playable: Option<session::Playable>,
-        start_at: Option<f64>,
-        max_bitrate: Option<u64>,
-        /// The page's HLS player, `native` or `hls.js`: for the log, and a native player's session answers only
-        /// once its `init.mp4` is ready (`Session::prepare`).
-        player: Option<String>,
-        /// Releases not to open, by filename (`session::Want::exclude`).
-        #[serde(default)]
-        exclude: Vec<String>,
-        /// `never`: no transcode for this request (`session::Want::no_transcode`); absent lets selection take one.
-        transcode: Option<String>,
-        /// Only a copy that fits the link (`session::Want::fits_only`).
-        #[serde(default)]
-        fits_only: bool,
-        /// The sid of this caller's session this one replaces mid-film (`session::Want::replaces`).
-        replaces: Option<String>,
-    }
-    let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Create>(&b).ok()) else {
+    let Some(body) = read_body(body).await else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
@@ -764,26 +739,34 @@ where
              \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool, \"replaces\"?: \"sid\"}.",
         );
     };
-    if req.replaces.as_deref().is_some_and(|sid| !auth::is_id(sid)) {
-        return bad_request("replaces is the sid of a session this browser or install started.");
-    }
-    let no_transcode = match req.transcode.as_deref() {
-        None | Some("allow") => false,
-        Some("never") => true,
-        Some(_) => return bad_request("transcode is \"never\", or absent."),
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return bad_request("Expected a JSON playback request.");
     };
-    if req.exclude.len() > 16 || req.exclude.iter().any(|f| f.len() > 512) {
-        return bad_request("exclude is at most 16 filenames.");
+    let Some(object) = value.as_object_mut() else {
+        return bad_request("Expected a JSON playback request.");
+    };
+    let take_url =
+        |object: &mut serde_json::Map<String, serde_json::Value>, name: &str| match object.remove(name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => Ok(Some(value)),
+            Some(_) => Err(()),
+        };
+    let Ok(scout_url) = take_url(object, "scout") else {
+        return bad_request("scout must be a URL string.");
+    };
+    let Ok(subtitles_url) = take_url(object, "subtitles") else {
+        return bad_request("subtitles must be a URL string.");
+    };
+    let Ok(req) = serde_json::from_value::<PlaybackRequest>(value) else {
+        return bad_request("Expected a closed playback request with no unknown fields.");
+    };
+    if let Err(detail) = req.validate() {
+        return bad_request(detail);
     }
-    if req.start_at.is_some_and(|t| !t.is_finite() || t < 0.0) {
-        return bad_request("startAt is seconds into the title, 0 or more.");
-    }
-    if req.max_bitrate == Some(0) {
-        return bad_request("maxBitrate is bits a second, more than 0.");
-    }
+    let no_transcode = req.transcode.as_deref() == Some("never");
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
     // URL is the credential, as every addon's is. Without either there is nothing to play with.
-    let admission = match admission_of(state, parts, browser, &req.scout) {
+    let admission = match admission_of(state, parts, browser, &scout_url) {
         Some(a) => a,
         None => {
             return httputil::error(
@@ -793,41 +776,37 @@ where
             )
         }
     };
-    if !scout::is_imdb(&req.imdb) {
-        return bad_request("imdb must be an IMDb id, tt followed by digits.");
-    }
     let episode = match (req.season, req.episode) {
         (Some(s), Some(e)) => Some((s, e)),
         (None, None) => None,
         _ => return bad_request("An episode needs both season and episode."),
     };
-    let tags_ok = |tags: &[String]| tags.len() <= 8 && tags.iter().all(|l| l.len() <= 35);
-    if !tags_ok(&req.audio) || !tags_ok(&req.subtitle_languages) || !tags_ok(&req.video_codecs) {
-        return bad_request("audio, subtitleLanguages and videoCodecs are at most 8 short tags each.");
-    }
     let id = scout::title_id(&req.imdb, episode);
     // As the browser reported it, for every player. 10-bit VP9 used to be cleared for a native session because
     // nobody had played it in Apple's own player; codec lab has now done so, on an iPhone and on a Mac, and it
     // plays (oxyc/den#37).
-    let playable = req.playable;
     let rid = redact::request_id(&parts.headers);
+    let audio = req.audio.as_deref().unwrap_or_default();
+    let subtitle_languages = req.subtitle_languages.as_deref().unwrap_or_default();
+    let video_codecs = req.video_codecs.as_deref().unwrap_or_default();
+    let exclude = req.exclude.as_deref().unwrap_or_default();
     let want = session::Want {
         id: &id,
         filename: req.filename.as_deref(),
-        scout: req.scout.as_deref(),
-        audio: &req.audio,
+        scout: scout_url.as_deref(),
+        audio,
         audio_track: req.audio_track,
-        subtitles: req.subtitles.as_deref(),
-        subtitle_languages: &req.subtitle_languages,
-        video_codecs: &req.video_codecs,
-        playable: playable.as_ref(),
+        subtitles: subtitles_url.as_deref(),
+        subtitle_languages,
+        video_codecs,
+        playable: req.playable.as_ref(),
         start_at: req.start_at.unwrap_or(0.0),
         max_bitrate: req.max_bitrate,
         client: client::label(parts.headers.get(hyper::header::USER_AGENT), req.player.as_deref()),
         player: req.player.as_deref(),
-        exclude: &req.exclude,
+        exclude,
         no_transcode,
-        fits_only: req.fits_only,
+        fits_only: req.fits_only.unwrap_or(false),
         replaces: req.replaces.as_deref(),
         rid: rid.as_deref(),
     };
@@ -1098,6 +1077,7 @@ pub async fn init(cfg: Config) -> Arc<AppState> {
 /// groups that slipped between them.
 pub async fn finish(state: &Arc<AppState>) {
     state.suspend_all().await;
+    state.flush_persistence().await;
     let killed = job::kill_live_groups();
     if killed > 0 {
         eprintln!("shutdown: killed {killed} ffmpeg process group(s)");

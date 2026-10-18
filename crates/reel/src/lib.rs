@@ -1,7 +1,6 @@
-//! den-reel — the whole trailer path for Den in one small binary:
+//! den-reel — Hearth's trailer service:
 //!
-//!   1. ADDON (Den/Fusion protocol):  imdbId -> TMDB /videos (KinoCheck fallback) -> ytId
-//!      GET /manifest.json                     -> addon manifest
+//!   1. ADDON RESOURCE (through Hearth's combined manifest): imdbId -> TMDB /videos -> ytId
 //!      GET /meta/<movie|series>/<imdbId>.json -> { meta: { links:[{ trailers: <play url> }] } }
 //!
 //!   2. PLAYBACK (yt-dlp + ffmpeg proxy):  ytId -> App-Store-safe, seekable MP4
@@ -143,9 +142,6 @@ const _: () = assert!(
     IN_FLIGHT_MAX > DOWNLOAD_CONCURRENCY + PREWARM_MAX,
     "the queue has to be able to hold everything that may legitimately be running at once"
 );
-
-/// The /configure page, embedded so the binary is self-contained (seals a BYOK TMDB key into the URL).
-const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
 /// A YouTube id as it appears in a /play path or `?v=`: `[A-Za-z0-9_-]{11}`.
 ///
@@ -492,6 +488,19 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         // CORS preflight, on any path: everything here is credential-free, and a browser-based
         // client asks before it sends anything with a header of its own.
         den_http::preflight()
+    } else if parts.method == hyper::Method::HEAD && head_requires_get(parts.uri.path()) {
+        // HEAD is not a cheap probe on these routes: routing it like GET can resolve through yt-dlp,
+        // launch a speculative prewarm, or download/transcode a cold trailer. Refuse before parsing a
+        // config or capability, and run the shared HEAD finalizer so even this error has no body.
+        httputil::apply_conditional(
+            &parts.method,
+            &parts.headers,
+            httputil::json(
+                StatusCode::METHOD_NOT_ALLOWED,
+                &serde_json::json!({"error": "method_not_allowed"}),
+                &[("allow", "GET, OPTIONS"), ("cache-control", "no-store")],
+            ),
+        )
     } else if !matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) {
         // Every route here is a read. Routing on the path alone meant a POST to /play started a
         // download like a GET would.
@@ -509,7 +518,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         httputil::apply_conditional(&parts.method, &parts.headers, resp)
     };
     // Stamped here rather than in each builder, so no response can go out without it — the video,
-    // the page, a plain-text error and a 304 included. A browser that cannot read an error body
+    // a plain-text error and a 304 included. A browser that cannot read an error body
     // reports a CORS failure instead of the error.
     //
     // The debug headers readable too: Server-Timing and X-Den-Degraded. Retry-After as well, or a browser client
@@ -538,6 +547,23 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         eprintln!("{}", request_line(&parts, resp.status(), elapsed));
     }
     resp
+}
+
+/// Routes whose GET may start upstream, subprocess, or background work. HEAD is deliberately kept
+/// for the cheap operational and capability-validation routes, and an unknown path still reaches the
+/// router for its ordinary 404 rather than being misreported as a resource that merely rejects HEAD.
+fn head_requires_get(path: &str) -> bool {
+    if ["/meta/", "/prepare/", "/crop/", "/direct/", "/progressive/", "/sources/", "/hls/", "/m/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return true;
+    }
+
+    // Combined-addon discovery has one leading sealed config segment.
+    path.strip_prefix('/')
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, rest)| rest.starts_with("meta/") || rest.starts_with("prepare/"))
 }
 
 /// `<METHOD> <redacted path> <status> <ms>ms[ <sources ask>][ rid=<id>]`. The `rid` is the caller's `X-Request-Id`,
@@ -685,47 +711,6 @@ async fn route(
     if let Some(blob) = path.strip_prefix("/_internal/validate/m/s/") {
         return sources::validate_direct_capability(&state, den, blob, query);
     }
-    if path == "/manifest.json" {
-        return httputil::json(
-            StatusCode::OK,
-            &addon::manifest(None),
-            &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
-        );
-    }
-    // The /configure UI seals a BYOK TMDB key into the install URL (den-scout/docs/SEALED-CONFIG.md).
-    if path == "/" || path == "/configure" || path == "/configure/" {
-        return httputil::html(
-            StatusCode::OK,
-            CONFIGURE_PAGE,
-            &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
-        );
-    }
-    // The current X25519 public key (base64) so /configure can seal the config to it; 404 when sealed
-    // configs are disabled (no key) — the page then keeps plaintext. Five minutes, not an hour: the key
-    // rotates, and the ETag lets a revalidation after that cost nothing. Both answers carry
-    // CONFIG_EPOCH, which the page stamps into every link it builds, sealed or not: a link stamped
-    // below it would be refused the moment it was built.
-    if path == "/config-key" {
-        // A malformed key has no public half to hand out; /configure then builds plaintext links, which
-        // are refused like every other config until the key is fixed.
-        if state.config_key_invalid {
-            return config_key_invalid_response();
-        }
-        let epoch = state.cfg.revocation.epoch();
-        return match state.config_keyring.as_ref().map(|kr| kr.current_pub_base64()) {
-            Some(k) if !k.is_empty() => httputil::json(
-                StatusCode::OK,
-                &serde_json::json!({"key": k, "epoch": epoch}),
-                &[("cache-control", "public, max-age=300")],
-            ),
-            _ => httputil::json(
-                StatusCode::NOT_FOUND,
-                &serde_json::json!({"error": "no_key", "epoch": epoch}),
-                &[("cache-control", "no-store")],
-            ),
-        };
-    }
-
     // Legacy config-less discovery: /meta/(movie|series)/(.+).json — resolves with the env TMDB key.
     if let Some(rest) = path.strip_prefix("/meta/") {
         if let Some(resp) = meta_from_rest(&state, &parts.headers, den, None, rest, query).await {
@@ -740,11 +725,10 @@ async fn route(
         }
     }
 
-    // Config-scoped discovery: /<config>/manifest.json and /<config>/meta/(movie|series)/(.+).json,
-    // where <config> carries a BYOK TMDB key (sealed or legacy plaintext). The app pastes the manifest
-    // URL; Stremio then derives the /meta calls from the same base. Fail CLOSED on a bad config.
+    // Config-scoped discovery transport for the combined addon. Standalone manifest/configure/key routes
+    // no longer exist; `/den` is the sole installation surface.
     if let Some((cfg_seg, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) {
-        if rest == "manifest.json" || rest.starts_with("meta/") || rest.starts_with("prepare/") {
+        if rest.starts_with("meta/") || rest.starts_with("prepare/") {
             if terms.key_invalid {
                 return config_key_invalid_response();
             }
@@ -769,14 +753,6 @@ async fn route(
                     );
                 }
             };
-            if rest == "manifest.json" {
-                // `private`: the path carries the install's sealed key, and the body its install id.
-                return httputil::json(
-                    StatusCode::OK,
-                    &addon::manifest(cfg.iid.as_deref()),
-                    &[("cache-control", "private, max-age=3600, stale-while-revalidate=600")],
-                );
-            }
             if let Some(prepare_rest) = rest.strip_prefix("prepare/") {
                 if let Some(resp) =
                     prepare_from_rest(&state, &parts.headers, den, Some(&cfg), prepare_rest, query).await
@@ -914,7 +890,11 @@ async fn route(
     if !signature_ok(&state, &terms, &vid, query) {
         return bad_signature();
     }
-    play::handle_play(state, &parts.headers, vid).await
+    if parts.method == hyper::Method::HEAD {
+        play::handle_play_head(state, &parts.headers, vid).await
+    } else {
+        play::handle_play(state, &parts.headers, vid).await
+    }
 }
 
 /// The log condition for each way a config or a bound link is refused, so each is rate-limited apart.

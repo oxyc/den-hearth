@@ -74,17 +74,36 @@ pub struct ResolveTarget {
     pub imdb: String,
 }
 
-/// Go `statusAnswer`: three values, because "it is not being fetched" and "I could not find out" are
-/// different facts and only the first may lead to an add — collapsing them into a bool is what let a
-/// throttled account's 503 read as a definitive no.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusAnswer {
-    /// statusNo — the store answered, and it is not fetching this release. Includes a store with no status
-    /// API at all (Real-Debrid, Premiumize): they can never say more, so treating them as "unknown" would
-    /// escalate on every request and never learn anything.
-    No,
-    Downloading,
+/// The complete answer to a store status enquiry.
+///
+/// This is deliberately one value rather than the old `status` plus optional `provider_status` pair.  With
+/// two methods a transport failure could become `None` in the first method and the pool had no way to tell
+/// it from an authoritative absence.  Only `NotFetching` permits a caller to add the release.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderStatus {
+    Downloading(StoreStatus),
+    NotFetching,
     Unknown,
+}
+
+impl ProviderStatus {
+    pub fn is_downloading(&self) -> bool {
+        matches!(self, Self::Downloading(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expect_downloading(self, message: &str) -> StoreStatus {
+        match self {
+            Self::Downloading(status) => status,
+            other => panic!("{message}: {other:?}"),
+        }
+    }
+}
+
+impl From<Option<StoreStatus>> for ProviderStatus {
+    fn from(status: Option<StoreStatus>) -> Self {
+        status.map_or(Self::NotFetching, Self::Downloading)
+    }
 }
 
 /// Go `StoreStatus` — how far along a queued release is. Progress is 0…1; ETASeconds is nil unless the
@@ -190,6 +209,12 @@ pub enum StoreError {
     /// Go `errScoutSide` wrapping a `StoreUnavailableError`: a refusal scout made itself (its own add
     /// allowance), not the service. `recordRefusal` never remembers it.
     ScoutSide(StoreUnavailableError),
+    /// Scout kept the remaining hourly allowance for an interactive Play request.  This used to be
+    /// recognized by comparing `StoreUnavailableError::reason` with an English sentence.
+    PlayReserve(StoreUnavailableError),
+    /// The provider positively answered that its remembered torrent no longer exists.  Transport failures
+    /// and malformed answers must never produce this variant.
+    TorrentGone,
     /// Go `errAddInFlight` — an add for this release is already out and unanswered, so the release IS being
     /// fetched. Distinct from the hourly budget: this is per hash and per service, says nothing about the
     /// account, and its honest answer is "coming", not "refused". Reported as a 503 naming the store, the tvOS
@@ -216,6 +241,8 @@ impl fmt::Display for StoreError {
             StoreError::DeadLink(d) => d.fmt(f),
             StoreError::Unavailable(u) => u.fmt(f),
             StoreError::ScoutSide(u) => write!(f, "{}: {u}", crate::stores::refusal::ERR_SCOUT_SIDE),
+            StoreError::PlayReserve(u) => write!(f, "{}: {u}", crate::stores::refusal::ERR_SCOUT_SIDE),
+            StoreError::TorrentGone => write!(f, "dead_link: {ERR_TORRENT_GONE}"),
             StoreError::AddInFlight => f.write_str("an add for this release is already in flight"),
             StoreError::AddQueued => f.write_str("torbox queued this add behind the account's slot limit"),
             StoreError::Cancelled => f.write_str("context canceled"),
@@ -251,22 +278,10 @@ pub trait Store: Send + Sync {
     /// downloading, not dead. Without this the two are the same 404 to the client, which then blacklists a
     /// perfectly good release.
     ///
-    /// `None` when this store knows nothing about the target — which deliberately conflates "it is not being
-    /// fetched" with "I could not find out". A store that CAN tell those apart implements `status_answer` as
-    /// well, and the pool prefers that; the two stores with no status API at all cannot, and for them `None`
-    /// really is all there is to say.
-    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus>;
-
-    /// Go `statusAnswerer.StatusAnswer`, the optional, three-valued half of `status`. `None` when the store
-    /// has no such method, in which case the pool uses `status`.
-    ///
-    /// Only TorBox has a status API, so only TorBox can be UNCERTAIN: a throttled 503, an unreadable account
-    /// listing, a body that will not decode. As a plain bool every one of those read as a definitive "nobody
-    /// is fetching it", so /play queued a duplicate — more load on an account already refusing, which is the
-    /// one failure mode that feeds itself. Real-Debrid and Premiumize answer false always and mean it, so
-    /// leaving them on the bool keeps "unknown" meaning something a caller can act on.
-    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
-        None
+    /// One typed status answer. `NotFetching` is the only result that permits an add; a transport or decode
+    /// failure must be `Unknown` so it cannot be mistaken for authoritative absence.
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
+        ProviderStatus::NotFetching
     }
 
     /// Go `storeCanceller.Cancel`: the optional half of Store that can cancel (or reannounce) a release it is

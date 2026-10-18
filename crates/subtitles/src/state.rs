@@ -39,11 +39,11 @@ static PLAINTEXT_REFUSED: LogGate = LogGate::new();
 pub struct AppState {
     pub cfg: Config,
     /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
-    /// disabled (legacy plaintext still works); the current key's public half is served at `/config-key`.
+    /// disabled (legacy plaintext still works); Hearth owns the combined addon's `/den/config-key`.
     pub config_keyring: Option<Keyring>,
     /// `CONFIG_KEY` is set but malformed: install configs are refused and /health is degraded.
     pub config_key_invalid: bool,
-    /// The pooled HTTP client. `None` if TLS init failed at boot — health/manifest/configure still
+    /// The pooled HTTP client. `None` if TLS init failed at boot — health still
     /// serve; the subtitle/translate routes 503 instead of the whole process refusing to boot.
     pub http: Option<reqwest::Client>,
     pub cache: Cache,

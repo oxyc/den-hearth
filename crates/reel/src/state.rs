@@ -84,7 +84,7 @@ pub struct ResolverStats {
 pub struct AppState {
     pub cfg: Arc<Config>,
     /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
-    /// disabled (legacy plaintext still works); the current key's public half is served at `/config-key`.
+    /// disabled (legacy plaintext still works); Hearth owns the combined addon's `/den/config-key`.
     pub config_keyring: Option<Keyring>,
     /// `CONFIG_KEY` is set but malformed: install configs are refused and /health is degraded.
     pub config_key_invalid: bool,

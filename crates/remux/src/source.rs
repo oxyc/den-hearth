@@ -80,9 +80,10 @@ fn account_abandoned(
 
 /// What a session's door opens on.
 struct Entry {
-    client: reqwest::Client,
-    /// The debrid link, replaced when the session fetches a fresh one.
-    upstream: Mutex<String>,
+    /// The debrid link and the client pinned to the address vetted for it. Replaced together when
+    /// the session fetches a fresh link, so no range can pair a newly vetted URL with the old DNS
+    /// policy (or vice versa).
+    upstream: Mutex<(reqwest::Client, String)>,
     head: Bytes,
     size: u64,
     stats: Arc<Stats>,
@@ -110,8 +111,7 @@ impl Doors {
     pub fn open(&self, client: reqwest::Client, upstream: &str, head: &[u8], size: u64) -> Door {
         let token = crate::auth::random_id();
         let entry = Arc::new(Entry {
-            client,
-            upstream: Mutex::new(upstream.to_string()),
+            upstream: Mutex::new((client, upstream.to_string())),
             head: Bytes::copy_from_slice(&head[..head.len().min(size as usize)]),
             size,
             stats: self.stats.clone(),
@@ -125,7 +125,8 @@ impl Doors {
         &self.stats
     }
 
-    /// The door's URL for ffmpeg, or `None` where no loopback listener could be had, and ffmpeg reads the link itself.
+    /// The door's URL for ffmpeg, or `None` where no loopback listener could be had. Callers must
+    /// refuse remote playback in that case; the vetted upstream is never handed to ffmpeg directly.
     pub fn url(&self, door: &Door) -> Option<String> {
         let port = (*self.port.get_or_init(|| listen(self.entries.clone())))?;
         Some(format!("http://127.0.0.1:{port}/{}", door.token))
@@ -134,8 +135,8 @@ impl Doors {
 
 impl Door {
     /// Read from `upstream` from now on: a fresh debrid link for a session whose old one stopped working.
-    pub fn set_upstream(&self, upstream: &str) {
-        *self.entry.upstream.lock().unwrap_or_else(|e| e.into_inner()) = upstream.to_string();
+    pub fn set_upstream(&self, client: reqwest::Client, upstream: &str) {
+        *self.entry.upstream.lock().unwrap_or_else(|e| e.into_inner()) = (client, upstream.to_string());
     }
 
     /// Upstream bytes read through this door so far; the head it was opened with is not counted.
@@ -159,7 +160,7 @@ fn listen(entries: Arc<Mutex<HashMap<String, Arc<Entry>>>>) -> Option<u16> {
     let (port, listener) = match bound {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("source: no loopback listener, ffmpeg reads each link itself: {e}");
+            eprintln!("source: no loopback listener; remote ffmpeg input is unavailable: {e}");
             return None;
         }
     };
@@ -220,7 +221,7 @@ fn answer(entry: Option<Arc<Entry>>, req: &Request<hyper::body::Incoming>) -> Re
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header("content-range", format!("bytes */{size}"))
                 .body(crate::httputil::full(""))
-                .unwrap()
+                .unwrap();
         }
     };
     let mut resp = Response::builder()
@@ -301,9 +302,9 @@ fn fetch(entry: Arc<Entry>, start: u64, end: u64, chunks: &'static [u64]) -> Pul
             let span = to - at + 1;
             requested_by_task.fetch_add(span, Relaxed);
             entry.stats.requested.fetch_add(span, Relaxed);
-            let url = entry.upstream.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (client, url) = entry.upstream.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let sent =
-                entry.client.get(url).header(reqwest::header::RANGE, format!("bytes={at}-{to}")).send().await;
+                client.get(url).header(reqwest::header::RANGE, format!("bytes={at}-{to}")).send().await;
             let mut resp = match sent {
                 Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => r,
                 Ok(r) => {
@@ -534,8 +535,7 @@ mod tests {
     ) -> Result<Vec<u8>, ()> {
         let url = range_response(content_range, content_length, body_len).await;
         let entry = Arc::new(Entry {
-            client: reqwest::Client::new(),
-            upstream: Mutex::new(url),
+            upstream: Mutex::new((reqwest::Client::new(), url)),
             head: Bytes::new(),
             size: 1000,
             stats: Arc::new(Stats::default()),
@@ -596,13 +596,35 @@ mod tests {
         assert_eq!(get(Some("bytes=3000000-3000100")).await, (206, data[3_000_000..=3_000_100].to_vec()));
         assert_eq!(get(None).await, (200, data.to_vec()));
         assert_eq!(get(Some(&format!("bytes={}-", data.len()))).await.0, 416);
-        door.set_upstream(&format!("{base}/b"));
+        door.set_upstream(client.clone(), &format!("{base}/b"));
         assert_eq!(get(Some("bytes=2000000-2000010")).await, (206, data[2_000_000..=2_000_010].to_vec()));
         assert_eq!(counts[1].load(Relaxed), 1, "a fresh link is read from then on");
         assert_eq!(doors.stats().requested.load(Relaxed), doors.stats().consumed.load(Relaxed));
         assert_eq!(doors.stats().abandoned.load(Relaxed), 0);
         drop(door);
         assert_eq!(client.get(&url).send().await.unwrap().status().as_u16(), 404, "closed with its session");
+    }
+
+    #[tokio::test]
+    async fn refreshing_a_door_replaces_the_vetted_client_with_the_url() {
+        let (base, data, _counts) = upstream(512 * 1024).await;
+        let address: std::net::SocketAddr = base.trim_start_matches("http://").parse().unwrap();
+        let pinned_url = "http://release.invalid/a";
+        let bad = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("release.invalid", "127.0.0.1:9".parse().unwrap())
+            .build()
+            .unwrap();
+        let good = reqwest::Client::builder().no_proxy().resolve("release.invalid", address).build().unwrap();
+        let doors = Doors::default();
+        let door = doors.open(bad, pinned_url, &data[..256 * 1024], data.len() as u64);
+        door.set_upstream(good, pinned_url);
+        let url = doors.url(&door).unwrap();
+
+        let response =
+            reqwest::Client::new().get(url).header("range", "bytes=300000-300010").send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), &data[300_000..=300_010]);
     }
 
     /// A server that answers every request with a 302 to `location`.
@@ -737,8 +759,7 @@ mod tests {
         let (url, requests) = delayed_upstream(SIZE, Duration::from_millis(50)).await;
         let run = |chunks: &'static [u64]| {
             let entry = Arc::new(Entry {
-                client: reqwest::Client::new(),
-                upstream: Mutex::new(url.clone()),
+                upstream: Mutex::new((reqwest::Client::new(), url.clone())),
                 head: Bytes::new(),
                 size: SIZE,
                 stats: Arc::new(Stats::default()),

@@ -258,9 +258,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -278,179 +276,11 @@ mod tests {
 
     const HOUR: Duration = Duration::from_secs(3600);
 
-    fn unix_now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-    }
-
-    /// A cache whose disk budget is off while a test writes, so the sweep a burst past a tiny budget starts on its own
-    /// thread cannot race the explicit sweep the test is here to observe. `budget` is switched on afterwards.
+    /// Keep the engine from enforcing the final disk budget until an adapter-rank fixture is complete.
     fn unbudgeted(mem: usize, dir: &std::path::Path) -> Cache {
         let c = Cache::new(mem, Some(dir.to_path_buf()));
         c.inner.set_disk_bytes(0);
         c
-    }
-
-    #[test]
-    fn a_value_survives_a_restart_via_the_disk_tier() {
-        let dir = tmpdir("restart");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), HOUR);
-        // A fresh Cache over the same dir is what a redeploy looks like: memory empty, disk warm.
-        let c2 = Cache::new(1 << 20, Some(dir));
-        assert_eq!(c2.get("k"), Some("v".into()));
-    }
-
-    #[test]
-    fn an_expired_disk_entry_is_not_served() {
-        let dir = tmpdir("expired");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), Duration::from_secs(0));
-        assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), None);
-    }
-
-    /// The whole reason writes carry a length: a half-written file parses fine (any prefix with a newline splits into
-    /// expiry + value), so a torn write would be served as a complete value for the full TTL.
-    #[test]
-    fn a_torn_write_never_becomes_a_readable_entry() {
-        let dir = tmpdir("torn");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "the whole subtitle".into(), HOUR);
-        let path = c.disk_path("k");
-
-        // Truncate the file the way ENOSPC or a kill mid-write would. It still parses — that is the hazard — so the
-        // recorded length is what has to reject it.
-        let raw = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, &raw[..raw.len() - 6]).unwrap();
-        assert_eq!(Cache::new(1 << 20, Some(dir.clone())).get("k"), None, "served a truncated entry");
-        assert!(!path.exists(), "a torn entry should be dropped, not left to be re-read");
-
-        // A completed put must leave exactly one file: the entry. A temp left behind would be unreadable garbage that
-        // nothing ever reclaims. (The torn file was already dropped above.)
-        c.put("k".into(), "v2".into(), HOUR);
-        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
-        assert_eq!(
-            files.len(),
-            1,
-            "a put left scratch behind: {:?}",
-            files.iter().map(|f| f.file_name()).collect::<Vec<_>>()
-        );
-        assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v2".into()));
-    }
-
-    /// An entry this build cannot read is deleted, not left behind: on a persistent volume with a disk budget that is a
-    /// leak only the sweep would ever reclaim.
-    #[test]
-    fn an_unreadable_entry_is_reclaimed() {
-        let dir = tmpdir("stale");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), HOUR);
-        let path = c.disk_path("k");
-        for raw in ["999999999999\nold format, no length", "", "garbage"] {
-            std::fs::write(&path, raw).unwrap();
-            assert_eq!(Cache::new(1 << 20, Some(dir.clone())).get("k"), None, "served {raw:?}");
-            assert!(!path.exists(), "left an unreadable entry on disk: {raw:?}");
-        }
-    }
-
-    /// The names and the file format this cache has always written, spelled out independently of `den-cache`: a store
-    /// an earlier release left on the volume must open and serve. Short keys are the key's base64url; a key past 180
-    /// bytes is the base64url of its first 32 characters, `~`, and the FNV-1a-64 of the whole key.
-    #[test]
-    fn a_store_an_earlier_release_wrote_still_loads() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-        use base64::Engine;
-
-        let dir = tmpdir("legacy");
-        std::fs::create_dir_all(&dir).unwrap();
-        let old_name = |key: &str| {
-            if key.len() <= 180 {
-                B64.encode(key.as_bytes())
-            } else {
-                let head: String = key.chars().take(32).collect();
-                format!(
-                    "{}~{:016x}",
-                    B64.encode(head.as_bytes()),
-                    crate::httputil::stable_hash(key.as_bytes())
-                )
-            }
-        };
-        let long = format!("{TRANSLATE_NS}{}", "x".repeat(200));
-        let far = unix_now() + 3600;
-        for (key, value) in [
-            ("os:123", "1\n00:00:01,000 --> 00:00:02,000\nhej\n"),
-            (long.as_str(), "långt"),
-            ("source:tt1:0:0", "77"),
-        ] {
-            // `<expiry> <value-bytes>\n<value>`, the bytes of the value and not its characters.
-            std::fs::write(dir.join(old_name(key)), format!("{far} {}\n{value}", value.len())).unwrap();
-        }
-
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        assert_eq!(c.get("os:123").as_deref(), Some("1\n00:00:01,000 --> 00:00:02,000\nhej\n"));
-        assert_eq!(
-            c.get(&long).as_deref(),
-            Some("långt"),
-            "a long key's hashed name is no longer the one on disk"
-        );
-        assert_eq!(c.get("source:tt1:0:0").as_deref(), Some("77"));
-        assert!(c.ttl("source:tt1:0:0").unwrap() > Duration::from_secs(3000));
-        // And the same names are what a put writes, so nothing is orphaned by an upgrade.
-        assert_eq!(c.disk_path("os:123"), dir.join(old_name("os:123")));
-        assert_eq!(c.disk_path(&long), dir.join(old_name(&long)));
-        // Rewritten like any other put, the file keeps its name.
-        c.put("source:tt1:0:0".into(), "78".into(), HOUR);
-        assert_eq!(
-            std::fs::read_to_string(dir.join(old_name("source:tt1:0:0")))
-                .unwrap()
-                .split_once('\n')
-                .unwrap()
-                .1,
-            "78"
-        );
-    }
-
-    /// The same pin written twice in a row — once when it is chosen, once after the translation it fed — is one write.
-    #[test]
-    fn writing_the_same_value_again_costs_no_write() {
-        let dir = tmpdir("same-value");
-        let c = Cache::new(1 << 20, Some(dir));
-        let day = Duration::from_secs(60 * 60 * 24 * 180);
-        c.put("source:tt1:0:0".into(), "77".into(), day);
-        c.put("source:tt1:0:0".into(), "77".into(), day);
-        let n = c.inner.disk_counts();
-        assert_eq!((n.writes, n.skipped), (1, 1), "{n:?}");
-        c.put("source:tt1:0:0".into(), "78".into(), day);
-        assert_eq!(c.inner.disk_counts().writes, 2, "a changed value was not written");
-    }
-
-    /// The disk tier has to be bounded too. Memory's cap never touched it, and lazy expiry needs
-    /// someone to re-request the exact key — which search entries, keyed by a per-file hash, never
-    /// get. Expired entries go first; if that isn't enough, the oldest do.
-    #[test]
-    fn the_sweep_bounds_the_disk_tier() {
-        let dir = tmpdir("sweep");
-        // Budget fits one entry, so after the expired one is dropped the oldest must still go.
-        let c = unbudgeted(60, &dir);
-        c.put("expired".into(), "x".repeat(40), Duration::from_secs(0));
-        c.put("old".into(), "x".repeat(40), HOUR);
-        std::thread::sleep(Duration::from_millis(5));
-        c.put("new".into(), "x".repeat(40), HOUR);
-
-        let expired_path = c.disk_path("expired");
-        let old_path = c.disk_path("old");
-        c.inner.set_disk_bytes(60);
-        c.sweep();
-        // Both branches must have run: dropping the expired entry alone left the store under budget, so this test used
-        // to return before the eviction loop it exists to cover.
-        assert!(!old_path.exists(), "the eviction loop did not run — the oldest entry survived");
-        // Assert the FILE is gone, not that `get` misses — a read expires lazily, so a `get` returning None passes
-        // whether or not the sweep did anything at all.
-        assert!(!expired_path.exists(), "the sweep left an expired entry on disk");
-        let fresh = Cache::new(60, Some(dir.clone()));
-        assert_eq!(fresh.get("new"), Some("x".repeat(40)), "the newest entry must survive");
-        let bytes: u64 =
-            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
-        assert!(bytes <= 60, "the sweep left {bytes} bytes on disk, over the 60 budget");
     }
 
     /// Under pressure the sweep spends the cheap entries first. Age alone made it evict in WRITE
@@ -488,130 +318,6 @@ mod tests {
         reopened.sweep();
         assert!(!reopened.disk_path(&search_key).exists());
         assert!(reopened.disk_path(&translate_key).exists());
-    }
-
-    /// A sweep must never remove a live entry while it is still under budget — evicting eagerly
-    /// would re-download subtitles the cache exists to keep.
-    #[test]
-    fn the_sweep_keeps_everything_that_fits() {
-        let dir = tmpdir("sweep-fits");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("a".into(), "aaa".into(), HOUR);
-        c.put("b".into(), "bbb".into(), HOUR);
-        c.sweep();
-        let fresh = Cache::new(1 << 20, Some(dir));
-        assert_eq!(fresh.get("a"), Some("aaa".into()));
-        assert_eq!(fresh.get("b"), Some("bbb".into()));
-    }
-
-    /// Unreadable is not expired. A redeploy that shifts the volume's uid makes every file
-    /// unreadable at once, and a sweep that reads that as "expired" deletes the entire store.
-    #[test]
-    fn the_sweep_keeps_an_entry_it_cannot_read() {
-        let dir = tmpdir("sweep-unreadable");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), HOUR);
-        let path = c.disk_path("k");
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o000);
-        std::fs::set_permissions(&path, perms).unwrap();
-
-        // Both a cache that knows the file and one that opens the directory afterwards.
-        c.sweep();
-        Cache::new(1 << 20, Some(dir.clone())).sweep();
-        assert!(path.exists(), "the sweep deleted an entry it merely could not read");
-
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o644);
-        std::fs::set_permissions(&path, perms).unwrap();
-        assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v".into()), "and it still reads");
-    }
-
-    /// A temp left by a kill between write and rename is addressed by nothing, but parses fine —
-    /// so a sweep counted it as live and could evict a real entry to make room for it.
-    #[test]
-    fn the_sweep_reclaims_leftover_temps() {
-        let dir = tmpdir("sweep-temp");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), HOUR);
-        let stray = c.disk_path("k").with_extension("t99");
-        std::fs::write(&stray, format!("{} 1\nv", unix_now() + 3600)).unwrap();
-        backdate(&stray, Duration::from_secs(2 * 3600));
-        c.sweep();
-        assert!(!stray.exists(), "a leftover temp survived the sweep");
-        assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v".into()), "the real entry stayed");
-    }
-
-    /// A write is a temp and then a rename. A sweep that unlinks the temp on sight can delete an in-flight write, which
-    /// fails the rename and makes a healthy disk report itself degraded — so a temp too young to be abandoned is left
-    /// alone.
-    #[test]
-    fn the_sweep_leaves_an_in_flight_temp_alone() {
-        let dir = tmpdir("sweep-inflight");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), HOUR);
-        let in_flight = c.disk_path("k").with_extension("t42");
-        std::fs::write(&in_flight, "half-written").unwrap();
-        c.sweep();
-        assert!(in_flight.exists(), "the sweep deleted a temp that was still being written");
-    }
-
-    /// An undatable temp must not pile up forever either: nothing else reclaims it, so it is counted toward the budget
-    /// and evicted under pressure like anything else.
-    #[test]
-    fn an_undatable_temp_is_still_bounded_by_the_budget() {
-        let dir = tmpdir("sweep-undatable-budget");
-        let c = unbudgeted(60, &dir);
-        c.put("k".into(), "x".repeat(40), HOUR);
-        let stray = c.disk_path("k").with_extension("t3");
-        std::fs::write(&stray, "x".repeat(80)).unwrap();
-        shift_mtime(&stray, SystemTime::now() + Duration::from_secs(5));
-        let entry = c.disk_path("k");
-        c.inner.set_disk_bytes(60);
-        c.sweep();
-        let bytes: u64 =
-            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
-        assert!(bytes <= 60, "an undatable temp escaped the budget: {bytes} bytes left");
-        // And it goes BEFORE live data: evicting a real subtitle to keep a scratch file of unknown provenance costs a
-        // re-download against the viewer's quota.
-        assert!(!stray.exists(), "the temp outlived the entry it displaced");
-        assert!(entry.exists(), "a live entry was evicted to make room for an undatable temp");
-    }
-
-    /// A temp whose mtime reads as being in the FUTURE — an NTP step backwards, or a filesystem that does not report
-    /// mtime — has no age. Treating an unknown age as "old enough" deletes the in-flight write the grace period exists
-    /// to protect.
-    #[test]
-    fn the_sweep_leaves_a_temp_it_cannot_date() {
-        let dir = tmpdir("sweep-undatable");
-        let c = Cache::new(1 << 20, Some(dir.clone()));
-        c.put("k".into(), "v".into(), HOUR);
-        let in_flight = c.disk_path("k").with_extension("t7");
-        std::fs::write(&in_flight, "half-written").unwrap();
-        shift_mtime(&in_flight, SystemTime::now() + Duration::from_secs(5));
-        c.sweep();
-        assert!(in_flight.exists(), "the sweep deleted a temp whose age it could not determine");
-    }
-
-    /// Push a file's modification time into the past.
-    fn backdate(path: &std::path::Path, by: Duration) {
-        shift_mtime(path, SystemTime::now() - by);
-    }
-
-    fn shift_mtime(path: &std::path::Path, when: SystemTime) {
-        let f = std::fs::File::options().write(true).open(path).unwrap();
-        f.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
-    }
-
-    #[test]
-    fn memory_is_bounded_by_bytes_and_keeps_what_is_read() {
-        let c = Cache::new(240, None);
-        c.put("hot".into(), "0123456789".into(), HOUR);
-        for i in 0..40 {
-            c.put(format!("scan{i:02}"), "0123456789".into(), HOUR);
-            assert!(c.get("hot").is_some(), "the entry read on every write was evicted at scan{i:02}");
-        }
-        assert!(c.stats().bytes <= 240, "{} bytes resident", c.stats().bytes);
     }
 
     #[test]
@@ -664,15 +370,6 @@ mod tests {
         assert!(c.get_shared("m").unwrap().stats().is_none());
     }
 
-    #[test]
-    fn a_disk_hit_repopulates_memory_as_a_shared_body() {
-        let dir = tmpdir("shared-disk");
-        Cache::new(1 << 20, Some(dir.clone())).put("k".into(), "v1".into(), HOUR);
-        let fresh = Cache::new(1 << 20, Some(dir));
-        assert_eq!(fresh.get_shared("k").unwrap().as_str(), "v1");
-        assert_eq!(fresh.get_mem("k"), Some("v1".into()), "the disk hit was not hoisted into memory");
-    }
-
     /// A memory-only entry never touches the directory, and does not leave a stale durable one behind.
     #[test]
     fn put_mem_stays_off_disk() {
@@ -693,15 +390,5 @@ mod tests {
             c.put_mem(format!("k{i}"), body.clone(), HOUR);
         }
         assert!(c.stats().bytes <= MAX_MEMORY_BYTES, "{} bytes resident", c.stats().bytes);
-    }
-
-    #[test]
-    fn an_unwritable_dir_falls_back_to_memory_only() {
-        let dir = tmpdir("file-not-dir");
-        std::fs::write(&dir, "not a directory").unwrap();
-        let c = Cache::new(1 << 20, Some(dir));
-        c.put("k".into(), "v".into(), HOUR);
-        assert_eq!(c.get("k"), Some("v".into()), "memory must still serve");
-        assert!(!c.stats().disk);
     }
 }
