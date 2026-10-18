@@ -75,6 +75,7 @@ async fn spawn_server(respond: impl Fn(&str, &str) -> Reply + Send + Sync + 'sta
 // reach a second location — the thing that costs the account.
 #[tokio::test]
 async fn an_add_is_not_replayed_to_the_redirect_target() {
+    let _budget = crate::tests::addbudget::install_budget(crate::tests::addbudget::HOUR, 50);
     crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
         for (status, name) in [(307u16, "307 temporary"), (308, "308 permanent"), (302, "302 found")] {
             let first_hop = Arc::new(AtomicI32::new(0));
