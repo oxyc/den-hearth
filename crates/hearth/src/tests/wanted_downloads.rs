@@ -270,6 +270,31 @@ async fn the_lists_and_the_search_rate_are_bounded() {
 }
 
 #[tokio::test]
+async fn den_core_decides_and_never_adds_a_release_tried_or_in_flight_again() {
+    let (hearth, fake) = plain_node();
+    let t0 = wanted::now_ms();
+    let identity = "rebecka.martinsson.s02e03.1080p.amzn.web-dl.dd+2.0.h.264-playweb.mkv";
+    fake.list("tt6189176:2:3", season_pack());
+    fake.list("tt6189176:2:4", season_pack());
+    let mut fetching = episode(3, t0);
+    fetching["inFlight"] = json!([identity]);
+    fetching["queuedAt"] = json!(t0 - DAY);
+    let mut tried = episode(4, t0);
+    tried["tried"] = json!([identity]);
+    let (status, _) = post(&hearth, &config(), json!({"items": [fetching, tried]})).await;
+    assert_eq!(status, StatusCode::OK);
+    wanted::tick(&hearth, t0 + 20 * MINUTE).await;
+    assert_eq!(fake.asked().len(), 2);
+    assert!(fake.adds().is_empty(), "added a release the row already has");
+    let (_, answer) = read(&hearth, &config()).await;
+    assert!(answer["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["state"] == "searching" && i["retries"] == 1));
+}
+
+#[tokio::test]
 async fn an_install_untouched_for_thirty_days_is_forgotten() {
     let (hearth, fake) = plain_node();
     let t0 = wanted::now_ms();

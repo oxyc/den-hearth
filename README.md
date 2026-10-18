@@ -181,8 +181,10 @@ row: its content key, IMDb id, season and episode, air date, the releases alread
 when it ran out, and the two languages the ranking reads; no library key, title or history. A POST replaces the
 install's list (empty clears it) and `GET` reads it; both answer each item as `searching` (with `nextAt`) or
 `started` (with the stream Scout listed, which the client adopts into its row). Hearth searches through the
-install's Scout on den-core's `download_retry` schedule, never before the air date, picks with den-core's
-`rank_releases` and makes the client's add (`/p/<ticket>?prefetch=1`). Bounds: 200 items an install, 32 installs, 4
+install's Scout on den-core's `download_retry` schedule, never before the air date, leaves which release (if any)
+to den-core's `download_next` — nothing tried or still in flight (`inFlight`) is added again — and makes the client's
+add (`/p/<ticket>?prefetch=1`). Items also carry `queuedAt`, for den-core's time-to-watchable pick to replace that one
+call when it lands. Bounds: 200 items an install, 32 installs, 4
 searches a minute in all; an install unread and unsent for 30 days is forgotten. The lists are in RAM, and with
 sealing on also in `hearth-wanted.json` in Scout's cache dir (mode 0600), written when a list changes or an item
 starts and otherwise at most every 15 minutes, so a redeploy keeps them. Without sealing nothing is written: a

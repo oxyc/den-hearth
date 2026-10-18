@@ -72,6 +72,12 @@ pub struct Item {
     #[serde(default)]
     pub retries: i64,
     pub since: i64,
+    /// When the download was asked for (the row's `queuedAt`, ms): the stage the pick's time-to-watchable counts from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at: Option<i64>,
+    /// Releases still being fetched for this content (a row that is not merely wanted): the pick weighs them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +100,9 @@ impl Item {
             && (0..=64).contains(&self.retries)
             && self.tried.len() <= MAX_TRIED
             && self.tried.iter().all(|t| short(t, 512))
+            && self.queued_at.is_none_or(|at| (0..=MAX_SAFE).contains(&at))
+            && self.in_flight.len() <= MAX_TRIED
+            && self.in_flight.iter().all(|t| short(t, 512))
             && language(&self.original_language)
             && language(&self.preferred_language)
     }
@@ -226,6 +235,8 @@ struct Job {
     config: String,
     item: Item,
     attempt: i64,
+    /// The row it stands for, as `download_retry` read it.
+    row: Value,
 }
 
 enum Outcome {
@@ -360,6 +371,7 @@ impl Wanted {
                         config: install.config.clone(),
                         item: tracked.item.clone(),
                         attempt,
+                        row: row(tracked),
                     };
                     due.push((at, job));
                 }
@@ -372,7 +384,7 @@ impl Wanted {
     async fn search(&self, hearth: &Hearth, job: &Job) -> Outcome {
         let item = &job.item;
         let answer = self.finder.streams(hearth, &job.config, &item.stream_id(), item.season.is_some()).await;
-        let Some((stream, identity, candidates)) = decide(answer.as_ref(), item) else {
+        let Some((stream, identity, candidates)) = decide(answer.as_ref(), &job.row) else {
             return if answer.as_ref().is_some_and(complete) {
                 Outcome::Nothing
             } else {
@@ -445,18 +457,34 @@ impl Wanted {
 
 /// `download_retry` on the row an item stands for: whether it is due, when, and which search it is.
 fn retry(tracked: &Tracked, now: i64) -> Option<(bool, i64, i64)> {
+    let answer = core(json!({"op": "download_retry", "row": row(tracked), "now": now}))?;
+    Some((answer["due"].as_bool()?, answer["at"].as_i64()?, answer["attempt"].as_i64()?))
+}
+
+/// The download row an item stands for, as den-core's rules read it: exhausted when `since` says, its search count,
+/// what was tried (a release still in flight counts too: it is never added twice), and the title facts they read.
+fn row(tracked: &Tracked) -> Value {
+    let item = &tracked.item;
     let at = json!([tracked.since, 0, "hearth"]);
-    let mut values = json!({
-        "queuedAt": {"value": {"int": tracked.since}, "at": at},
+    let mut title = serde_json::Map::new();
+    for (key, value) in [
+        ("airDate", item.air_date.map(Value::from)),
+        ("originalLanguage", item.original_language.clone().map(Value::from)),
+        ("preferredLanguage", item.preferred_language.clone().map(Value::from)),
+    ] {
+        if let Some(value) = value {
+            title.insert(key.into(), value);
+        }
+    }
+    let tried: Vec<&String> = item.tried.iter().chain(&item.in_flight).collect();
+    let values = json!({
+        "queuedAt": {"value": {"int": item.queued_at.unwrap_or(tracked.since)}, "at": at},
         "exhausted": {"value": {"bool": true}, "at": at},
         "retries": {"value": {"int": tracked.retries}, "at": at},
+        "tried": {"value": {"strings": tried}, "at": at},
+        "title": {"value": {"string": Value::Object(title).to_string()}, "at": at},
     });
-    if let Some(air) = tracked.item.air_date {
-        values["title"] = json!({"value": {"string": json!({"airDate": air}).to_string()}, "at": at});
-    }
-    let row = json!({"kind": "set", "schema": 2, "name": format!("download:{}", tracked.item.key), "values": values});
-    let answer = core(json!({"op": "download_retry", "row": row, "now": now}))?;
-    Some((answer["due"].as_bool()?, answer["at"].as_i64()?, answer["attempt"].as_i64()?))
+    json!({"kind": "set", "schema": 2, "name": format!("download:{}", item.key), "values": values})
 }
 
 /// One den-core op through its JSON contract, the one both clients call.
@@ -503,39 +531,34 @@ fn identity(url: &str, filename: Option<&str>) -> String {
     }
 }
 
-/// The release a complete answer starts (the holder's due search): the best untried release that could arrive, or
-/// with every one tried, the best of them all again; None when there is nothing to fetch or nothing is settled.
-fn decide(answer: Option<&Value>, item: &Item) -> Option<(Value, String, usize)> {
+/// The release a complete answer starts, or None when there is nothing to start or nothing is settled.
+///
+/// Which release, and whether any, is den-core's alone: Hearth hands it every release Scout listed, as the clients
+/// hand them (`{...attributes, identity}`), with the row the item stands for, and starts what it names. That call is
+/// `download_next`, the rule a client moves a download on with, so the releases tried (and any still in flight) are
+/// never started again and a dead swarm never is. When den-core's time-to-watchable pick lands (candidates, the
+/// in-flight set, stage times, `now`), it replaces this one call; the item already carries what it takes.
+fn decide(answer: Option<&Value>, row: &Value) -> Option<(Value, String, usize)> {
     let answer = answer.filter(|a| complete(a))?;
-    let mut viable: Vec<(Value, String, Value)> = Vec::new();
+    let mut listed: Vec<(Value, String)> = Vec::new();
+    let mut releases: Vec<Value> = Vec::new();
     for stream in answer["streams"].as_array()? {
         let Some(url) = stream["url"].as_str().filter(|u| ticket_path(u).is_some()) else { continue };
         let identity = identity(url, stream["behaviorHints"]["filename"].as_str());
-        let attributes = &stream["attributes"];
-        if attributes["cached"] == json!(false) && attributes["seeders"] == json!(0) {
-            continue;
-        }
-        let mut facts = attributes.as_object().cloned().unwrap_or_default();
+        let mut facts = stream["attributes"].as_object().cloned().unwrap_or_default();
         facts.insert("identity".into(), json!(identity));
-        viable.push((stream.clone(), identity, Value::Object(facts)));
+        releases.push(Value::Object(facts));
+        listed.push((stream.clone(), identity));
     }
-    let rank = |tried: &[String]| -> Option<usize> {
-        let releases: Vec<&Value> = viable.iter().map(|(_, _, facts)| facts).collect();
-        let mut request = json!({"op": "rank_releases", "releases": releases, "tried": tried});
-        if let Some(original) = &item.original_language {
-            request["original"] = json!(original);
-        }
-        if let Some(preferred) = &item.preferred_language {
-            request["preferred"] = json!(preferred);
-        }
-        core(request)?["pick"].as_u64().map(|pick| pick as usize)
-    };
-    if viable.is_empty() {
+    let resolution = if releases.is_empty() { "none" } else { "streams" };
+    let next = core(json!({
+        "op": "download_next", "row": row, "releases": releases, "resolution": resolution, "complete": true,
+    }))?;
+    if next["decision"] != "next" {
         return None;
     }
-    let pick = rank(&item.tried).or_else(|| rank(&[]))?;
-    let candidates = viable.len();
-    let (stream, identity, _) = viable.into_iter().nth(pick)?;
+    let candidates = next["candidates"].as_u64().unwrap_or(0) as usize;
+    let (stream, identity) = listed.into_iter().nth(next["index"].as_u64()? as usize)?;
     Some((stream, identity, candidates))
 }
 
@@ -702,6 +725,8 @@ mod tests {
             tried: vec!["a.mkv".into()],
             retries: 1,
             since: 1_000,
+            queued_at: Some(900),
+            in_flight: Vec::new(),
             original_language: Some("sv".into()),
             preferred_language: None,
         };
