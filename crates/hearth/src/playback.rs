@@ -357,7 +357,9 @@ fn owner_scope(hearth: &Hearth, parts: &hyper::http::request::Parts) -> String {
     "local".to_string()
 }
 
-fn validate_request(mut value: Value) -> Result<(Value, bool), ()> {
+/// The request Remux may be handed, and the two delivery flags that stay here: `directFailed` (skip the managed
+/// stream) and `directOnly` (the managed stream or a refusal, never a Remux session in its place).
+fn validate_request(mut value: Value) -> Result<(Value, bool, bool), ()> {
     const FIELDS: &[&str] = &[
         "imdb",
         "season",
@@ -376,6 +378,7 @@ fn validate_request(mut value: Value) -> Result<(Value, bool), ()> {
         "fitsOnly",
         "replaces",
         "directFailed",
+        "directOnly",
     ];
     let object = value.as_object_mut().ok_or(())?;
     if object.keys().any(|key| !FIELDS.contains(&key.as_str())) {
@@ -386,6 +389,14 @@ fn validate_request(mut value: Value) -> Result<(Value, bool), ()> {
         Some(Value::Bool(value)) => value,
         Some(_) => return Err(()),
     };
+    let direct_only = match object.remove("directOnly") {
+        None => false,
+        Some(Value::Bool(value)) => value,
+        Some(_) => return Err(()),
+    };
+    if direct_failed && direct_only {
+        return Err(());
+    }
     let imdb = object.get("imdb").and_then(Value::as_str).ok_or(())?;
     if imdb.len() < 3
         || imdb.len() > 12
@@ -442,7 +453,7 @@ fn validate_request(mut value: Value) -> Result<(Value, bool), ()> {
     }) {
         return Err(());
     }
-    Ok((value, direct_failed))
+    Ok((value, direct_failed, direct_only))
 }
 
 fn install_url(config: &str) -> String {
@@ -532,6 +543,7 @@ fn error_code(snapshot: &Snapshot) -> &'static str {
     let parsed = serde_json::from_slice::<Value>(&snapshot.body).ok();
     match parsed.as_ref().and_then(|value| value.get("error")).and_then(Value::as_str) {
         Some("bad_request") => "bad_request",
+        Some("direct_unavailable") => "direct_unavailable",
         Some("no_release") => "no_release",
         Some("idempotency_conflict") => "idempotency_conflict",
         Some("replacement_pending") => "replacement_pending",
@@ -831,9 +843,13 @@ where
         Some(parsed) => parsed,
         None => return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref()),
     };
-    let (request, direct_failed) = parsed;
-    let canonical =
-        Bytes::from(serde_json::to_vec(&json!({"request": request, "directFailed": direct_failed})).unwrap());
+    let (request, direct_failed, direct_only) = parsed;
+    let canonical = Bytes::from(
+        serde_json::to_vec(
+            &json!({"request": request, "directFailed": direct_failed, "directOnly": direct_only}),
+        )
+        .unwrap(),
+    );
     let scope = (owner_scope(hearth, &parts), scope_config.to_string(), key);
     let finalize = parts.headers.get(FINALIZE_HEADER).and_then(|value| match value.as_bytes() {
         b"commit" => Some(Finalize::Commit),
@@ -949,12 +965,15 @@ where
                 prepare_elapsed = Some(elapsed);
                 log_direct_fallback(
                     direct_failure.expect("a failed direct attempt has a reason"),
-                    remux_scout.is_some(),
+                    remux_scout.is_some() && !direct_only,
                     rid.as_deref(),
                 );
             }
         }
+        // A viewer switching to the managed stream mid-film: a Remux session started here would take the playing
+        // one's slot (its owner's share), so the switch is refused and what plays carries on.
         let mut response = match remux_scout {
+            _ if direct_only => answer(StatusCode::CONFLICT, "direct_unavailable", None),
             Some(scout) => remux(hearth, scout, remux_subtitles, parts, request).await,
             None => answer(StatusCode::BAD_GATEWAY, "playback_unavailable", None),
         };
@@ -1001,9 +1020,14 @@ mod tests {
 
     #[test]
     fn request_fields_are_closed_and_direct_failed_is_not_forwarded() {
-        let (value, failed) = validate_request(json!({"imdb": "tt1", "directFailed": true})).unwrap();
-        assert!(failed);
+        let (value, failed, only) = validate_request(json!({"imdb": "tt1", "directFailed": true})).unwrap();
+        assert!(failed && !only);
         assert_eq!(value, json!({"imdb": "tt1"}));
+        let (value, failed, only) = validate_request(json!({"imdb": "tt1", "directOnly": true})).unwrap();
+        assert!(only && !failed);
+        assert_eq!(value, json!({"imdb": "tt1"}), "directOnly is not forwarded to Remux");
+        assert!(validate_request(json!({"imdb": "tt1", "directOnly": "yes"})).is_err());
+        assert!(validate_request(json!({"imdb": "tt1", "directOnly": true, "directFailed": true})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "scout": "https://secret"})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "subtitles": "https://secret"})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "future": true})).is_err());

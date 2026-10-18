@@ -724,6 +724,31 @@ async fn a_mid_film_cast_request_still_tries_the_managed_stream_first() {
     assert_eq!(managed_attempts(&hearth), 1, "the cast request tried TorBox before Remux");
 }
 
+// Den Web's switch from a playing Remux session to TorBox asks with `directOnly`: a Remux session started in TorBox's
+// place would take the playing one's slot, so Hearth refuses rather than fall back.
+#[tokio::test]
+async fn a_direct_only_request_is_refused_rather_than_given_remux() {
+    let hearth = trusted_offline_playback_hearth();
+    let segment = plain(&config(0, &[SCOUT]));
+
+    // TorBox is tried and has nothing: the refusal names why, and no Remux answer (no_release here) comes back.
+    let body = serde_json::json!({"imdb": "tt0111161", "transcode": "never", "directOnly": true});
+    let (status, _, bytes) = response_bytes(edge_playback(&hearth, &segment, "only", body).await).await;
+    assert_eq!(managed_attempts(&hearth), 1);
+    assert_eq!(status, StatusCode::CONFLICT);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"], "direct_unavailable");
+    assert!(value["cause"].is_string(), "the managed reason is named: {value}");
+
+    // A request TorBox can't take at all is refused without an attempt.
+    let body = serde_json::json!({"imdb": "tt0111161", "audioTrack": 1, "directOnly": true});
+    let (status, _, bytes) = response_bytes(edge_playback(&hearth, &segment, "track", body).await).await;
+    assert_eq!(managed_attempts(&hearth), 1);
+    assert_eq!(status, StatusCode::CONFLICT);
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value, serde_json::json!({"error": "direct_unavailable"}));
+}
+
 #[tokio::test]
 async fn a_config_with_no_member_or_one_its_service_refuses_is_no_config() {
     let hearth = hearth_den(Limits::default(), None, den_with(None, "", "0", false));
