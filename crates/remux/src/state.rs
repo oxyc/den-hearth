@@ -530,10 +530,9 @@ impl TestWriteGate {
         }
     }
 
-    pub(crate) fn wait_entered(&self) {
-        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+    pub(crate) async fn wait_entered(&self) {
         while !self.entered.load(Acquire) {
-            released = self.ready.wait(released).unwrap_or_else(|e| e.into_inner());
+            tokio::task::yield_now().await;
         }
     }
 
@@ -1894,8 +1893,9 @@ mod tests {
         let gate = state.block_probe_write();
         let (_, info) = opened("https://debrid/probe");
         state.remember_probe(probe_key(Some(1), b"first").unwrap(), &info);
-        let wait = gate.clone();
-        tokio::task::spawn_blocking(move || wait.wait_entered()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+            .await
+            .expect("the first probe-cache write did not reach the test gate");
 
         for size in 2..=200 {
             state.remember_probe(probe_key(Some(size), b"burst").unwrap(), &info);
@@ -1917,8 +1917,9 @@ mod tests {
         let state = persistence_state();
         let gate = state.block_unplayable_write();
         state.remember_unplayable("release-1".into(), "first".into());
-        let wait = gate.clone();
-        tokio::task::spawn_blocking(move || wait.wait_entered()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+            .await
+            .expect("the first unplayable write did not reach the test gate");
 
         for n in 2..=200 {
             state.remember_unplayable(format!("release-{n}"), format!("reason-{n}"));

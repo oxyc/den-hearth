@@ -1111,14 +1111,18 @@ mod tests {
 
         let script_for_task = script.to_string_lossy().into_owned();
         let task = tokio::spawn(async move { decode(&script_for_task, "unused", 0.0, 1.0).await });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !pid_file.exists() {
+        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the fake decoder did not start");
-        let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        .expect("the fake decoder did not report its descendant pid");
         task.abort();
         let _ = task.await;
         tokio::time::timeout(Duration::from_secs(2), async {
