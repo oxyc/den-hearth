@@ -41,10 +41,16 @@ pub async fn handle_prepare(
         Some(c) => crate::sign::Binding::install(c.iid.as_deref(), c.ep, den.is_some()),
         None => crate::sign::Binding::Unbound,
     };
+    // A v2 answer names its plans relative to this request (`request_root`). A v1 answer keeps the absolute
+    // base: its embedded `../m/…` URLs resolve against `sourcesBase`.
+    let base = match contract {
+        crate::sources::Contract::V1 => discovered.base.clone(),
+        crate::sources::Contract::V2 => crate::addon::request_root(cfg.is_some()).to_owned(),
+    };
     let mut meta = crate::addon::build_meta(
         ty,
         &discovered.id,
-        &discovered.base,
+        &base,
         &discovered.yt_ids,
         state.cfg.play_secret.as_deref(),
         binding,

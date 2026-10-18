@@ -9,13 +9,15 @@ resident RAM at idle, the image weight is just the extractor toolchain.
 ```
 Den (Apple TV) ──/meta/movie/<imdbId>.json──►  addon    imdbId → TMDB → ytId
                                                   │
-                ◄──── { links:[{ trailers }] }────┘   trailers = <this host>/play/<ytId>.mp4
+                ◄──── { links:[{ trailers }] }────┘   trailers = ../../play/<ytId>.mp4 (relative)
 Den (AVPlayer) ──GET /play/<ytId>.mp4─────────►  proxy   yt-dlp + ffmpeg → cached faststart MP4
 ```
 
 Previously this was two pieces (a Cloudflare Worker addon + this proxy). They're merged, so
 there's **no Cloudflare**: the addon returns a play URL on *its own host*, so a LAN-only deploy
-works with nothing exposed.
+works with nothing exposed. The URL is relative to the `/meta` request (`../../play/<ytId>.mp4?…`, one
+`../` more under `/<config>/`), so an answer relayed to a public visitor never names the address Reel
+listens on; the client resolves it against the URL it asked. Older releases answered an absolute URL.
 
 ## Why it exists
 
@@ -190,7 +192,10 @@ and is the final fallback. Its sealed media form is `d`; the internal capability
 
 The v2 prepare envelope keeps only descriptive discovery fields (`name`, `category`, `provider`) in
 `meta.links` and adds a complete `planUrl` to every candidate. `primary` is `{ id, planUrl }`; alternates
-can therefore be fetched lazily without deriving a route. The embedded `primaryPlan` is `null` when
+can therefore be fetched lazily without deriving a route. A `planUrl` is relative to the prepare URL the
+client asked (`../../sources/<id>.json?…`, one `../` more under `/<config>/`), so an answer relayed to a
+public visitor never names the origin Reel itself was reached at; resolve it with
+`new URL(planUrl, prepareUrl)`. Older releases answered an absolute URL. The embedded `primaryPlan` is `null` when
 there is no valid primary or its preparation failed, so no downloaded capability is emitted for an
 invalid candidate.
 
@@ -245,8 +250,9 @@ while the current one shows. Knobs:
   stale-if-error=604800`: fresh for the day the server trusts a resolve, then usable for the rest of the
   week while the client re-asks (or while this server is down). `/<config>/meta` and
   `/<config>/manifest.json` send `private` instead, since the path carries the sealed key. An empty
-  result (no trailer / geo-blocked / transient) is left uncached to re-check. A body with links carries
-  `Vary: X-Forwarded-Host, X-Forwarded-Proto, Host`, the inputs its play URLs are built from.
+  result (no trailer / geo-blocked / transient) is left uncached to re-check. Its links are relative, so
+  it varies on no host. A v1 `/prepare` answer, whose `sourcesBase` is absolute, carries
+  `Vary: X-Forwarded-Host, X-Forwarded-Proto, Host`, the inputs that URL is built from.
 - `/play` sends `private, max-age=604800, immutable` with an `ETag` and `Last-Modified` taken from the
   cached file, and honours `If-Range`: a trailer evicted and downloaded again is a new file, so a range
   resumed against the old one gets the whole new file (200). `/crop`'s rect is `public, max-age=604800`
@@ -592,7 +598,7 @@ Tests: `cargo test -p den-reel` (hermetic: a fake upstream and a stubbed prober,
 ## Deploy
 
 Released, signed and deployed as part of den-hearth (the repository README and the den repo's `deploy/`).
-Play URLs are built from the host the client asked for (`http://<den-ip>:8092/play/…` on Reel's own
-listener). Add the URL `/configure` gives you, `http://<den-ip>:8092/<config>/manifest.json`, to Den
+Play URLs are relative to the request, so they land on whichever address the client asked
+(`http://<den-ip>:8092/play/…` on Reel's own listener). Add the URL `/configure` gives you, `http://<den-ip>:8092/<config>/manifest.json`, to Den
 (Settings → Plugins, or `dev-addons.json`). The config-less `/manifest.json` works only while `TMDB_KEY` is
 set, and resolves with that shared key rather than the install's own.
