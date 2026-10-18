@@ -3704,20 +3704,21 @@ async fn tor_box_status_reports_on_the_torrent_it_asked_about() {
 /// the only lookup able to rediscover a queued torrent.
 #[tokio::test]
 async fn tor_box_an_envelope_without_data_is_not_a_miss() {
+    const TOKEN: &str = "missing-listing-envelope-account";
     for body in [r#"{}"#, r#"{"success":false}"#, r#"{"success":false,"data":null}"#] {
         let cache = new_cache();
-        let s = tb("tok", doer(move |_| Ok(resp(200, body))), Some(cache.clone()));
+        let s = tb(TOKEN, doer(move |_| Ok(resp(200, body))), Some(cache.clone()));
         let _ = s.provider_status(&tgt(H)).await;
         assert!(
-            cache.get(&torrent_miss_key("tok", H)).is_none(),
+            cache.get(&torrent_miss_key(TOKEN, H)).is_none(),
             "{body} was remembered as the account not holding the torrent"
         );
     }
     // A real, readable list that lacks the hash still is one.
     let cache = new_cache();
-    let s = tb("tok", doer(|_| Ok(resp(200, r#"{"success":true,"data":[]}"#))), Some(cache.clone()));
+    let s = tb(TOKEN, doer(|_| Ok(resp(200, r#"{"success":true,"data":[]}"#))), Some(cache.clone()));
     let _ = s.provider_status(&tgt(H)).await;
-    assert!(cache.get(&torrent_miss_key("tok", H)).is_some(), "an answered miss must still be remembered");
+    assert!(cache.get(&torrent_miss_key(TOKEN, H)).is_some(), "an answered miss must still be remembered");
 }
 
 /// A refusal is a fact about the account, not the release — and the last calls of RD's chain classified

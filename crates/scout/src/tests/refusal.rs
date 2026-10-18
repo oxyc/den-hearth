@@ -304,6 +304,7 @@ fn tiered_cache_persists_and_expires() {
 // worth of the debrid's add allowance inside a single wait.
 #[tokio::test]
 async fn handle_probe_reports_without_queueing() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let resolves = Arc::new(AtomicUsize::new(0));
     let counter = resolves.clone();
     let h = new_handler(test_deps(|_| {}));
@@ -331,6 +332,7 @@ async fn handle_probe_reports_without_queueing() {
 // spent an evening being indistinguishable from one another.
 #[tokio::test]
 async fn handle_probe_distinguishes_its_answers() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let h = new_handler(test_deps(|_| {}));
     let probe = |stores: Vec<Box<dyn Store>>| {
         let h = &h;
@@ -403,11 +405,12 @@ async fn handle_probe_distinguishes_its_answers() {
 // and left unfixed twice.
 #[tokio::test]
 async fn every_store_reports_a_refusal_as_a_refusal() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let stores = [
         (
             DebridService::RealDebrid,
             Box::new(RealDebridStore {
-                token: "t".into(),
+                token: "refusal-real-debrid".into(),
                 client: answer(429, "{}"),
                 cache: None,
                 api: "https://rd.example".into(),
@@ -416,7 +419,7 @@ async fn every_store_reports_a_refusal_as_a_refusal() {
         (
             DebridService::Premiumize,
             Box::new(PremiumizeStore {
-                token: "t".into(),
+                token: "refusal-premiumize".into(),
                 client: answer(429, "{}"),
                 cache: None,
                 api: "https://pm.example".into(),
@@ -520,6 +523,7 @@ fn season_episode_of() {
 // straight through to whichever store had no memory of being turned away.
 #[tokio::test]
 async fn refusal_backoff_applies_to_every_store() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     for svc in [DebridService::RealDebrid, DebridService::Premiumize] {
         let adds = Arc::new(AtomicUsize::new(0));
         let counter = adds.clone();
@@ -528,7 +532,7 @@ async fn refusal_backoff_applies_to_every_store() {
             Ok(resp(503, r#"{"error":"busy"}"#))
         }));
         let cache = mem();
-        let store = store_for(svc, "tok", &cache, client);
+        let store = store_for(svc, "refusal-backoff-account", &cache, client);
         for i in 0..6 {
             // A client polling /play through a download.
             let err = store.resolve(&target(H)).await;
@@ -581,6 +585,7 @@ fn refusal_backoff_ignores_cancellation() {
 // resolve that queued the very torrent the probe exists to avoid queueing.
 #[tokio::test]
 async fn handle_probe_never_queues_and_says_when_it_cannot_tell() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     // A store that resolves happily UNLESS told not to add — exactly like the real ones. A fake that
     // refuses either way cannot tell "the probe asked for a read-only resolve" from "the probe let it
     // queue", which is the whole assertion.
@@ -634,6 +639,7 @@ async fn handle_probe_never_queues_and_says_when_it_cannot_tell() {
 // questions differently.
 #[tokio::test]
 async fn handle_probe_an_indeterminate_status_is_not_an_absence() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let h = new_handler(test_deps(|_| {}));
     // The cache check succeeds and honestly reports "not cached"; the status read cannot tell. Without
     // the status read, this is the ordinary 404 path — which is what the definitive case below asserts.
@@ -718,6 +724,7 @@ async fn handle_play_names_scout_not_the_debrid_for_its_own_refusals() {
 // flight — both describe a state a NoAdd caller cannot have caused.
 #[tokio::test]
 async fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let cache = mem();
     record_refusal(&*cache, DebridService::TorBox, "tok", H, &refused(DebridService::TorBox, "429"));
     note_add_attempt(&*cache, DebridService::TorBox, "tok", H);
@@ -742,6 +749,7 @@ async fn resolve_no_add_is_answered_ahead_of_the_add_guards() {
 // scout had itself just queued.
 #[tokio::test]
 async fn handle_play_an_in_flight_add_is_queued_not_refused() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let cache = mem();
     note_add_attempt(&*cache, DebridService::TorBox, "tok", H); // an add went out and was abandoned
 
@@ -841,6 +849,7 @@ fn store_pool_add_in_flight_asks_every_store() {
 // download has landed; it never learned that it had.
 #[tokio::test]
 async fn probe_a_torrent_real_debrid_already_holds_reads_as_ready() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let (token, hash) = ("rd-held", "f".repeat(40));
     let cache = mem();
     let rt = target(&hash);
@@ -1063,6 +1072,7 @@ fn premiumize_add_in_flight_an_add_in_flight_outranks_a_stale_refusal() {
 // Both routes are driven here, and the assertion is that they agree.
 #[tokio::test]
 async fn probe_and_play_agree_when_a_queued_premiumize_transfer_is_refused() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let (token, hash) = ("pm-refused", "5".repeat(40));
     let cache = mem();
     cache.put(&pm_queued_key(token, &hash), &unix_secs_ago(Duration::ZERO), QUEUED_TTL);
@@ -1128,6 +1138,7 @@ async fn probe_and_play_agree_when_a_queued_premiumize_transfer_is_refused() {
 // other four kept answering 202 for a completed transfer and the suite stayed green.
 #[tokio::test]
 async fn probe_and_play_agree_when_a_premiumize_transfer_completes() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     type CacheCheck = fn() -> Answer;
     let cases: [(&str, CacheCheck); 5] = [
         ("cache check says cached", || Ok(resp(200, r#"{"status":"success","response":[true]}"#))),
@@ -1199,6 +1210,7 @@ async fn probe_and_play_agree_when_a_premiumize_transfer_completes() {
 // while missing the store it had just widened.
 #[tokio::test]
 async fn probe_a_read_only_poll_writes_no_premiumize_add_memory() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let token = "pm-readonly";
     let hash = "1".repeat(40);
     let cache = mem();
@@ -1254,6 +1266,7 @@ async fn probe_a_read_only_poll_writes_no_premiumize_add_memory() {
 // space" and an invalid magnet arrive as HTTP 200 with status:error.
 #[tokio::test]
 async fn premiumize_a_read_only_poll_records_an_answered_refusal() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let cases = [
         ("out of space", r#"{"status":"error","message":"not enough space"}"#, 200),
         ("server error", "{}", 500),
@@ -1294,6 +1307,7 @@ async fn premiumize_a_read_only_poll_records_an_answered_refusal() {
 // same instant, for up to ninety seconds per outstanding add.
 #[tokio::test]
 async fn probe_and_play_agree_when_the_account_key_is_rejected() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let (token, hash) = ("dead-key", "0".repeat(40));
     let cache = mem();
     note_add_attempt(&*cache, DebridService::TorBox, token, &hash); // an add of ours is out
@@ -1349,6 +1363,7 @@ async fn probe_and_play_agree_when_the_account_key_is_rejected() {
 // configures one store and so cannot see this. Both are needed.
 #[tokio::test]
 async fn probe_and_play_agree_when_one_accounts_key_is_dead_and_another_is_fetching() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let (token, hash) = ("two-accounts", "b".repeat(40));
     let cache = mem();
     // TorBox's key is rejected...
@@ -1400,6 +1415,7 @@ async fn probe_and_play_agree_when_one_accounts_key_is_dead_and_another_is_fetch
 // attempt and recording the refusal) while another's connection resets, leaving its attempt marker.
 #[tokio::test]
 async fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let token = "tb-order";
     let hash = "a".repeat(40);
     let cache = mem();
@@ -1453,6 +1469,7 @@ async fn torbox_an_add_in_flight_outranks_a_refusal_recorded_meanwhile() {
 // route that pays for being wrong.
 #[tokio::test]
 async fn play_does_not_buy_a_release_another_account_already_holds() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let (token, hash) = ("prefer-held", "d".repeat(40));
     let cache = mem();
     let rt = target(&hash);
@@ -1557,6 +1574,7 @@ async fn play_does_not_buy_a_release_another_account_already_holds() {
 // play and so cannot see a marker that /play removes.
 #[tokio::test]
 async fn probe_and_play_agree_on_a_later_episode_after_premiumize_served_the_first() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let (token, hash) = ("pm-pack", "e".repeat(40));
     let cache = mem();
     cache.put(&pm_queued_key(token, &hash), &unix_secs_ago(Duration::ZERO), QUEUED_TTL);
@@ -1618,6 +1636,7 @@ async fn probe_and_play_agree_on_a_later_episode_after_premiumize_served_the_fir
 #[tokio::test]
 async fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
     use crate::stores::refusal::{held_recently, note_held};
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let token = "pm-evicted";
     let hash = "7".repeat(40);
     let cache = mem();
@@ -1671,6 +1690,7 @@ async fn premiumize_an_evicted_release_is_not_bought_back_by_read_only_polls() {
 // turning a dead torrent into a promise — that must still hold.
 #[tokio::test]
 async fn real_debrid_a_downloading_release_is_not_reported_dead() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     for (status, want_wait) in [
         ("downloading", true),
         ("magnet_conversion", true),
@@ -1744,6 +1764,7 @@ async fn real_debrid_a_downloading_release_is_not_reported_dead() {
 // the rest of the hour, and 404 is the answer that makes a client blacklist a release.
 #[tokio::test]
 async fn probe_and_play_agree_when_scouts_own_budget_is_spent() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     let token = "budget-probe_and_play_agree_when_scouts_own_budget_is_spent";
     let hash = "4".repeat(40);
     let cache = mem();
@@ -1812,6 +1833,7 @@ async fn probe_and_play_agree_when_scouts_own_budget_is_spent() {
 // which is a fuller fixture than this invariant needs.
 #[tokio::test]
 async fn probe_and_play_agree_that_an_in_flight_add_is_downloading() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
     for svc in [DebridService::TorBox, DebridService::RealDebrid, DebridService::Premiumize] {
         let cache = mem();
         note_add_attempt(&*cache, svc, "tok", H); // an add went out and nothing came back
