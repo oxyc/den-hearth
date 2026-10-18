@@ -62,10 +62,53 @@ pub fn bound_connection_buffers(stream: &impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
+/// The listening sockets the supervisor handed over (systemd socket activation: `LISTEN_PID` is this process,
+/// `LISTEN_FDS` of them from fd 3). The supervisor keeps them open while this process is replaced, so a connection
+/// made during a restart waits in the kernel queue for the next process instead of being refused. Empty when
+/// nothing was handed over.
+pub fn inherited_listeners() -> io::Result<Vec<std::net::TcpListener>> {
+    use std::os::fd::FromRawFd;
+    activation_fds(
+        std::env::var("LISTEN_PID").ok().as_deref(),
+        std::env::var("LISTEN_FDS").ok().as_deref(),
+        std::process::id(),
+    )
+    .map(|fd| {
+        // SAFETY: the activation protocol hands this process sole ownership of these fds.
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    })
+    .collect()
+}
+
+/// The fds handed to process `me`: from 3, `LISTEN_FDS` of them, when `LISTEN_PID` names it.
+fn activation_fds(listen_pid: Option<&str>, listen_fds: Option<&str>, me: u32) -> std::ops::Range<i32> {
+    const FIRST_FD: i32 = 3;
+    let (Some(pid), Some(count)) =
+        (listen_pid.and_then(|p| p.parse::<u32>().ok()), listen_fds.and_then(|c| c.parse::<i32>().ok()))
+    else {
+        return FIRST_FD..FIRST_FD;
+    };
+    if pid != me {
+        eprintln!("LISTEN_FDS is set for process {pid}, not this one ({me}); ignoring it");
+        return FIRST_FD..FIRST_FD;
+    }
+    FIRST_FD..FIRST_FD + count.max(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn the_handed_over_fds_are_taken_only_for_this_process() {
+        assert_eq!(activation_fds(Some("1"), Some("5"), 1), 3..8);
+        assert!(activation_fds(Some("2"), Some("5"), 1).is_empty(), "another process's");
+        assert!(activation_fds(None, None, 1).is_empty(), "nothing handed over");
+        assert!(activation_fds(Some("1"), Some("junk"), 1).is_empty());
+    }
 
     async fn pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

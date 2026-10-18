@@ -90,6 +90,9 @@ pub struct ManagedHlsRequest {
     pub filename: Option<String>,
     /// The same browser capability report Scout already uses for stream-list ranking.
     pub playable: Option<ClientPlayable>,
+    /// Asked for a Cast receiver, which plays TorBox's stream as it is: a release `playable` says its video would
+    /// have to be converted for is left to Remux, rather than handed over to fail on the TV.
+    pub receiver: bool,
 }
 
 /// Non-secret release metadata returned beside a managed URL.

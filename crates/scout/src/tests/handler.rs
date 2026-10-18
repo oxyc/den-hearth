@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use den_seal::Revocation;
 
 use crate::cache::{Cache, MemoryCache};
+use crate::client::ClientPlayable;
 use crate::config::{DebridService, Indexer};
 use crate::deps::Deps;
 use crate::handler::{new_handler, now_unix, Handler};
@@ -188,6 +189,62 @@ async fn managed_hls_is_title_level_and_keeps_provider_ids_inside_scout() {
     assert_eq!(targets[0].info_hash, "b".repeat(40));
     assert_eq!(targets[0].file_idx, Some(0));
     assert!(!targets[0].no_add, "managed playback must reuse the ordinary add-budgeted resolve path");
+}
+
+// A Cast receiver plays TorBox's stream as it is. A release whose video it can't take is left to Remux, which can
+// convert it or choose another; one it takes goes to the receiver as TorBox's own. In the page, nothing changes.
+#[tokio::test]
+async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
+    const UHD: &str = "Movie 2160p WEB-DL HDR10 HEVC x265";
+    let seeds = || {
+        vec![
+            RawStream {
+                info_hash: "a".repeat(40),
+                title: UHD.to_owned(),
+                size_bytes: Some(18 * GIB),
+                seeders: Some(100),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+            RawStream {
+                info_hash: "b".repeat(40),
+                title: "Movie 1080p WEB-DL x264".to_owned(),
+                size_bytes: Some(8 * GIB),
+                seeders: Some(50),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+        ]
+    };
+    let first_chromecast = ClientPlayable { h264: 41, ..Default::default() };
+    let google_tv =
+        ClientPlayable { h264: 51, hevc_main: 153, hevc_main10: 153, hdr: true, ..Default::default() };
+    let ask = |playable: &ClientPlayable, receiver: bool| ManagedHlsRequest {
+        imdb: "tt0111161".to_owned(),
+        filename: Some(UHD.to_owned()),
+        playable: Some(playable.clone()),
+        receiver,
+        ..Default::default()
+    };
+    let resolver = Arc::new(FixedManagedHls::default());
+    let inspect = resolver.clone();
+    let h = new_handler(test_deps(move |deps| {
+        deps.managed_hls = Some(resolver);
+        deps.make_scrapers =
+            Arc::new(move |_| vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]);
+    }));
+
+    let refused = h.managed_hls(&valid_blob(), &ask(&first_chromecast, true)).await;
+    assert!(matches!(refused, Err(ManagedHlsError::NotFound)), "{refused:?}");
+    assert!(inspect.targets.lock().unwrap().is_empty(), "no TorBox stream was made for it");
+
+    let cast =
+        h.managed_hls(&valid_blob(), &ask(&google_tv, true)).await.expect("a receiver that takes HEVC");
+    assert_eq!(cast.release.filename, UHD);
+
+    let in_page = h.managed_hls(&valid_blob(), &ask(&first_chromecast, false)).await.expect("the page's own");
+    assert_eq!(in_page.release.filename, UHD);
+    assert_eq!(inspect.targets.lock().unwrap().len(), 2);
 }
 
 /// The future a `FakeScraper`'s behaviour returns, so a test can answer late, hang, or fail.
