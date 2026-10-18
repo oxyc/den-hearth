@@ -5,8 +5,8 @@ use std::net::IpAddr;
 use crate::scrape::parse_stremio_streams;
 use crate::sources::MAX_SOURCE_URL;
 
-/// The household sources' client keeps what it was fixed with: thirty seconds in all, ten to connect, a pool of four
-/// idle connections for ninety seconds, its own redirect verdict, and the dial-time public-address guard (no proxy).
+/// Caller-selected source hosts retain no idle sockets; deadlines, redirect checks, and the dial-time
+/// public-address guard (no proxy) still apply.
 #[test]
 fn the_source_profile_keeps_its_timeouts_redirect_and_guard() {
     use std::time::Duration;
@@ -17,7 +17,7 @@ fn the_source_profile_keeps_its_timeouts_redirect_and_guard() {
     assert_eq!(profile.total_timeout(), Some(Duration::from_secs(30)));
     assert_eq!(profile.connect_timeout(), Some(Duration::from_secs(10)));
     assert_eq!(profile.read_idle_timeout(), None);
-    assert_eq!(profile.pool_settings(), Some((4, Duration::from_secs(90))));
+    assert_eq!(profile.pool_settings(), Some((0, Duration::ZERO)));
     assert!(matches!(profile.redirect_policy(), Redirect::Custom(_)));
     assert_eq!(profile.address_guard(), &Guard::PublicDial);
     assert_eq!(profile.user_agent_str(), None);

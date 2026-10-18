@@ -7,7 +7,7 @@
 //! report passed on in `X-Den-Playable`, and the first release that is cached on the debrid, probes cleanly and
 //! plays in the browser as it is wins; one it can only have converted is the last resort.
 
-use den_upstream::{AddressGuard, GuardError};
+use den_upstream::{AddressGuard, Guard, GuardError, Vetted};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -165,11 +165,15 @@ pub const HEAD_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone)]
 pub struct Resolved {
-    /// Where the play URL led — the debrid's link. ffmpeg reads this directly, so a seek does not
-    /// go back through scout.
+    /// Where the play URL led — the vetted debrid link read only through its pinned client and the
+    /// loopback Door. A seek does not go back through scout or hand this URL to ffmpeg.
     pub url: String,
     pub head: Vec<u8>,
     pub size: Option<u64>,
+    /// Client whose resolver is pinned to the address vetted for `url`. Every later range read and
+    /// the session door use this exact policy, rather than checking one DNS answer and dialing a
+    /// fresh one through an ordinary client.
+    pub client: reqwest::Client,
 }
 
 /// The header a scope=availability scout config asks for before it lists or plays.
@@ -216,6 +220,7 @@ impl SourceGuard {
 
     /// `Ok` when `url` may be fetched: an IP literal must be public, a name must resolve and every address it
     /// resolves to must be public.
+    #[cfg(test)]
     async fn check(&self, url: &reqwest::Url) -> Result<(), String> {
         let host = safe_host_fact(url);
         self.0.check(url).await.map_err(|refused| match refused {
@@ -225,11 +230,37 @@ impl SourceGuard {
             }
         })
     }
+
+    /// Build the release client for one already-approved hop, pinning a hostname to the address
+    /// that was judged. This closes the check-then-resolve handoff (including every later Door
+    /// range request); a permissive test build is pinned in exactly the same way.
+    async fn client(&self, url: &reqwest::Url) -> Result<reqwest::Client, String> {
+        let host = url
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .ok_or_else(|| "the play URL has no host".to_string())?;
+        let port = url.port_or_known_default().ok_or_else(|| "the play URL has no port".to_string())?;
+        let vetted = self.0.vet(host, port).await.map_err(|refused| match refused {
+            GuardError::Unresolved(_) => "the play URL's host did not resolve".to_string(),
+            GuardError::NotPublic | GuardError::Nothing => {
+                "the play URL led to a host that is not on the public internet".to_string()
+            }
+        })?;
+        let addr = match vetted {
+            Vetted::Literal(ip) => std::net::SocketAddr::new(ip, port),
+            Vetted::Resolved(addr) => addr,
+        };
+        crate::state::source_profile(crate::state::CONNECT_TIMEOUT, crate::state::SOURCE_READ_IDLE)
+            .guard(Guard::Pinned { host: host.to_string(), addr })
+            .build()
+            .map_err(|e| format!("cannot build the vetted source client: {e}"))
+    }
 }
 
 /// A bounded, non-secret host description for a guard refusal. A TorBox CDN suffix is operationally useful when
 /// its domains change; every other DNS name and every address literal stays deliberately opaque. Paths, queries,
 /// credentials and config segments never enter this function.
+#[cfg(test)]
 fn safe_host_fact(url: &reqwest::Url) -> &str {
     let Some(host) = url.host_str() else { return "missing" };
     if host.parse::<std::net::IpAddr>().is_ok() {
@@ -374,6 +405,7 @@ pub async fn resolve(
 ) -> Result<Resolved, String> {
     let mut url = reqwest::Url::parse(play_url).map_err(|_| "the play URL does not parse".to_string())?;
     let mut hops = 0;
+    let mut release_client = via.http.clone();
     let resp = loop {
         let mut headers = reqwest::header::HeaderMap::new();
         let range = format!("bytes=0-{}", HEAD_BYTES - 1);
@@ -389,8 +421,8 @@ pub async fn resolve(
             via.get_scout(&url, headers).await?
         } else {
             // Any other hop, the last one (which ffmpeg then reads) included, is checked before a byte is sent to it.
-            guard.check(&url).await?;
-            via.http
+            release_client = guard.client(&url).await?;
+            release_client
                 .get(url.clone())
                 .headers(headers)
                 .send()
@@ -449,7 +481,7 @@ pub async fn resolve(
     if range.is_some_and(|(length, _)| head.len() as u64 != length) {
         return Err("the play URL's body did not match its Content-Range".into());
     }
-    Ok(Resolved { url, head, size })
+    Ok(Resolved { url, head, size, client: release_client })
 }
 
 #[cfg(test)]
@@ -468,7 +500,9 @@ mod tests {
                 let resp = if buf[..n].starts_with(b"GET /final") {
                     "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc".to_string()
                 } else {
-                    format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    format!(
+                        "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    )
                 };
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;

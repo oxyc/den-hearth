@@ -43,7 +43,7 @@ def main():
         sys.exit(f"{BIN} is missing: cargo build --release -p den-hearth --features stub-upstreams")
     work = pathlib.Path(tempfile.mkdtemp(prefix="hearth-native."))
     stub_port, port = free_port(), free_port()
-    (work / "manifests.paths").write_text(f"/reel/manifest.json\n/subs/manifest.json\n/subs/{harness.SUBS_CFG}/manifest.json\n")
+    (work / "manifests.paths").write_text("/den/manifest.json\n/reel/health\n/subs/health\n")
     stub = subprocess.Popen([sys.executable, str(ROOT / "bench/http/stubs.py"), "--port", str(stub_port),
                              "--testdata", str(ROOT / "crates/remux/testdata")], stdout=subprocess.DEVNULL)
     env = {**os.environ, "PORT": str(port), "LOG_REQUESTS": "0", "REEL_TMDB_KEY": "bench-tmdb-key",

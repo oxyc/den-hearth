@@ -7,7 +7,7 @@ publish = false
 license = "MIT"
 
 [features]
-# Benchmark builds only: the upstream bases come from HEARTH_STUB_* (see main.rs). Never in a shipped image.
+# Benchmark builds only: the upstream bases come from HEARTH_STUB_* (see bootstrap.rs). Never in a shipped image.
 stub-upstreams = []
 
 [dependencies]
@@ -16,24 +16,26 @@ den-subtitles = { path = "../subtitles" }
 den-remux = { path = "../remux" }
 den-scout = { path = "../scout" }
 # The body type every service answers with, the JSON builders and the metrics bearer check.
-den-http = { path = "../http" }
+den-http.workspace = true
 # The combined Den addon's keys, revocation and config (`den.rs`).
-den-seal = { path = "../seal" }
+den-seal.workspace = true
 # The download rules both clients run (`download_retry`, `rank_releases`), for the searches Hearth makes for them
 # (`wanted.rs`). Pinned like den-atlas pins it; a ranking change reaches Hearth with a bump of this rev.
 den-sync = { git = "https://github.com/oxyc/den-core.git", rev = "8d975ffc259853f3d3115f6a186aea63f06c97dd" }
 # The services were written for a current_thread runtime; one process serving all of them has more to
 # do, so hearth runs a small multi-thread pool instead (HEARTH_WORKER_THREADS).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 # Scout's outbound client: the one the Go service built in cmd/den-scout/main.go.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
-http-body-util = "0.1"
-bytes = "1"
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
-base64 = "0.23"
+reqwest = { workspace = true, features = ["rustls-tls"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio", "http1", "server-graceful"] }
+http-body-util.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+base64.workspace = true
+# The large embedded configure page is gzip-compressed once, then reused for every accepting request.
+flate2 = { workspace = true, default-features = false, features = ["rust_backend"] }
 # Bound the kernel's TCP queues as well as Rust's buffers (see sock.rs): Linux otherwise autotunes them
 # to megabytes per slow reader, charged to the container's cgroup and invisible in RSS.
 socket2 = "0.6"
@@ -43,8 +45,8 @@ tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
 # Config segments, and Reel's link tags, for the Den addon's tests (`tests/den_addon.rs`).
-blake2 = "0.10"
-futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-tokio = { version = "1", features = ["test-util", "io-util"] }
+blake2.workspace = true
+futures-util = { workspace = true, features = ["std", "async-await"] }
+tokio = { workspace = true, features = ["test-util", "io-util"] }
 # The wanted lists' file, in a directory of its own (`wanted.rs`).
 tempfile = "3"

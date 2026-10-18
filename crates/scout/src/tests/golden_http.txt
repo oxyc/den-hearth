@@ -9,49 +9,45 @@
 < timing-allow-origin: *
 
 
-== configure page
+== standalone root removed
 > GET /
-< 200
+< 404
 < access-control-allow-origin: *
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< content-type: text/html; charset=utf-8
-< etag: "7c2a4dd26fbc60e4"
+< cache-control: no-store
+< content-type: application/json
 < timing-allow-origin: *
-<html: 127783 bytes, FNV-1a-64 7c2a4dd26fbc60e4>
+{"error":"not_found"}
 
-== configure revalidated
+== standalone configure removed
 > GET /configure
-> if-none-match: …
-< 304
+< 404
 < access-control-allow-origin: *
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< etag: <the tag revalidated>
+< cache-control: no-store
+< content-type: application/json
 < timing-allow-origin: *
+{"error":"not_found"}
 
-
-== configure revalidated with a weak tag
-> GET /configure/
-> if-none-match: …
-< 304
+== standalone manifest removed
+> GET /manifest.json
+< 404
 < access-control-allow-origin: *
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< etag: <the tag revalidated>
+< cache-control: no-store
+< content-type: application/json
 < timing-allow-origin: *
+{"error":"not_found"}
 
-
-== configure HEAD
-> HEAD /configure
-< 200
+== standalone config key removed
+> GET /config-key
+< 404
 < access-control-allow-origin: *
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< content-type: text/html; charset=utf-8
-< etag: <the previous response's>
+< cache-control: no-store
+< content-type: application/json
 < timing-allow-origin: *
-<html: 0 bytes, FNV-1a-64 cbf29ce484222325>
+{"error":"not_found"}
 
 == health
 > GET /health
@@ -105,82 +101,6 @@
 < content-type: application/json
 < timing-allow-origin: *
 {"error":"not_found"}
-
-== manifest
-> GET /manifest.json
-< 200
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< content-type: application/json
-< etag: "91894a767836d12f"
-< timing-allow-origin: *
-{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}
-
-== manifest revalidated
-> GET /manifest.json
-> if-none-match: …
-< 304
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< etag: <the tag revalidated>
-< timing-allow-origin: *
-
-
-== manifest revalidated, no match
-> GET /manifest.json
-> if-none-match: …
-< 200
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< content-type: application/json
-< etag: "91894a767836d12f"
-< timing-allow-origin: *
-{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}
-
-== config-key without a key
-> GET /config-key
-< 404
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: no-store
-< content-type: application/json
-< timing-allow-origin: *
-{"epoch":0,"error":"no_key"}
-
-== configured manifest
-> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/manifest.json
-< 200
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: private, max-age=3600, stale-while-revalidate=600
-< content-type: application/json
-< etag: "afd2d5c27f9ff7e4"
-< timing-allow-origin: *
-{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Cached-first, ranked, junk-filtered streams via torbox.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":false}}
-
-== configured manifest revalidated
-> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/manifest.json
-> if-none-match: …
-< 304
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: private, max-age=3600, stale-while-revalidate=600
-< etag: <the tag revalidated>
-< timing-allow-origin: *
-
-
-== configured manifest, bad config
-> GET /not-a-config/manifest.json
-< 400
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: no-store
-< content-type: application/json
-< timing-allow-origin: *
-{"error":"bad_config"}
 
 == unknown one-segment path
 > GET /nope
@@ -706,28 +626,6 @@
 < timing-allow-origin: *
 {"error":"not_found"}
 
-== config-key
-> GET /config-key
-< 200
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=300
-< content-type: application/json
-< etag: "83d99f3b543af8bb"
-< timing-allow-origin: *
-{"epoch":0,"key":"j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8="}
-
-== config-key revalidated
-> GET /config-key
-> if-none-match: …
-< 304
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=300
-< etag: <the tag revalidated>
-< timing-allow-origin: *
-
-
 == metrics, refused
 > GET /metrics
 > authorization: …
@@ -759,7 +657,7 @@
 < cache-control: no-store
 < content-type: text/plain; version=0.0.4; charset=utf-8
 < timing-allow-origin: *
-<metrics: 157 lines, first "# HELP scout_build_info The running den-scout version.">
+<metrics: 170 lines, first "# HELP scout_build_info The running den-scout version.">
 
 == list with tickets
 > GET /<sealed config>/stream/movie/tt1234567.json
@@ -950,50 +848,6 @@
 < timing-allow-origin: *
 {"detail":"CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed","reason":"config_key_invalid","status":"degraded"}
 
-== bad key: configure
-> GET /
-< 200
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< content-type: text/html; charset=utf-8
-< etag: "7c2a4dd26fbc60e4"
-< timing-allow-origin: *
-<html: 127783 bytes, FNV-1a-64 7c2a4dd26fbc60e4>
-
-== bad key: manifest
-> GET /manifest.json
-< 200
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: public, max-age=3600, stale-while-revalidate=600
-< content-type: application/json
-< etag: "91894a767836d12f"
-< timing-allow-origin: *
-{"id":"com.den.scout","version":"0.0.0-dev","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}
-
-== bad key: config-key
-> GET /config-key
-< 503
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: no-store
-< content-type: application/json
-< retry-after: 60
-< timing-allow-origin: *
-{"error":"config_key_invalid"}
-
-== bad key: configured manifest
-> GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/manifest.json
-< 503
-< access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
-< cache-control: no-store
-< content-type: application/json
-< retry-after: 60
-< timing-allow-origin: *
-{"error":"config_key_invalid"}
-
 == bad key: list
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 503
@@ -1061,8 +915,7 @@
 
 == request log
 GET /health 200 *ms rid=abc-123
-GET /manifest.json 200 *ms rid=xyz
-GET /<config>/manifest.json 200 *ms
+GET /<config> 404 *ms rid=xyz
 GET /<config>/stream/movie/tt1234567.json 200 *ms rid=abc-123
 GET /p/<ticket> 302 *ms rid=abc-123
 DELETE /p/<ticket> 410 *ms

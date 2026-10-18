@@ -11,6 +11,19 @@ scout_list_cache_total{result="miss"} 0
 scout_list_builds_total{result="ok"} 0
 scout_list_builds_total{result="partial"} 0
 scout_list_builds_total{result="degraded"} 0
+# HELP scout_list_build_admission_total Distinct stream-list build admission decisions.
+# TYPE scout_list_build_admission_total counter
+scout_list_build_admission_total{result="admitted"} 0
+scout_list_build_admission_total{result="refused"} 0
+# HELP scout_list_builds_active Distinct stream-list builds currently admitted.
+# TYPE scout_list_builds_active gauge
+scout_list_builds_active 0
+# HELP scout_scraper_request_admission_total Scraper requests admitted by the process-wide body ceiling.
+# TYPE scout_scraper_request_admission_total counter
+scout_scraper_request_admission_total 0
+# HELP scout_scraper_requests_active Scraper requests currently holding process-wide body admission.
+# TYPE scout_scraper_requests_active gauge
+scout_scraper_requests_active 0
 # HELP scout_probe_cache_total Track-probe cache lookups by outcome.
 # TYPE scout_probe_cache_total counter
 scout_probe_cache_total{result="hit"} 0

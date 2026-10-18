@@ -16,7 +16,7 @@ use crate::handler::{new_handler, Handler};
 use crate::linkmemo::{link_memo_key, LinkMemo, LINK_MEMO_MAX_ENTRIES, LINK_MEMO_TTL};
 use crate::play::{encode_play_token, PlayTarget};
 use crate::probe_fanout::ProbeJob;
-use crate::stores::{ResolveTarget, Store, StoreError, StoreStatus};
+use crate::stores::{ResolveTarget, Store, StoreError};
 
 /// Go `tallyStore`: counts every upstream-shaped call a pool can make of it, so a test can prove a memo hit
 /// made none. `resolve` is handed the 1-based number of the call.
@@ -52,9 +52,9 @@ impl Store for TallyStore {
         (self.resolve)(n)
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> crate::stores::ProviderStatus {
         self.statuses.fetch_add(1, Ordering::SeqCst);
-        None
+        crate::stores::ProviderStatus::NotFetching
     }
 }
 

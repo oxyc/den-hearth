@@ -24,10 +24,11 @@ use crate::managed_hls::{ManagedHlsError, ManagedHlsRequest, ManagedHlsResolver,
 use crate::rank::RawStream;
 use crate::scrape::{DoError, ScrapeQuery, Scraper};
 use crate::seal::{parse_seal_keyring, SealKeyring};
+use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
 use crate::stores::{
-    DeadLinkError, ResolveTarget, StatusAnswer, Store, StoreError, StoreStatus, ERR_CHECK_FAILED,
+    DeadLinkError, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus, ERR_CHECK_FAILED,
 };
-use crate::tests::mock::resp;
+use crate::tests::mock::{resp, MockDoer};
 use crate::util::b64url_encode;
 
 /// `gib` in handler_test.go.
@@ -41,13 +42,9 @@ pub(crate) const VEC_PUB_B64: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF
 pub(crate) const TICKET_CFG: &str =
     r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"cachedOnly":true"#;
 
-/// `ticket_test.go`'s `testIID` and `otherIID`: `b64urlEncode(bytesSeq(0x00|0x10, installIDBytes))`.
+/// `ticket_test.go`'s `testIID`: `b64urlEncode(bytesSeq(0x00, installIDBytes))`.
 pub(crate) fn test_iid() -> String {
     b64url_encode(&(0u8..16).collect::<Vec<u8>>())
-}
-
-pub(crate) fn other_iid() -> String {
-    b64url_encode(&(0x10u8..0x20).collect::<Vec<u8>>())
 }
 
 /// `ticket_test.go`'s `ticketKeyring`.
@@ -106,6 +103,7 @@ pub(crate) fn test_seeds() -> Vec<RawStream> {
 /// caches the first two hashes, then `over` adjusts it.
 pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
     let mut d = Deps {
+        runtime: crate::runtime::ScoutRuntime::new(),
         cache: Arc::new(MemoryCache::new(1 << 20)),
         probe_client: None,
         probe_doer: None,
@@ -304,11 +302,11 @@ impl Store for FakeStore {
         (self.resolve)()
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
         if self.status_blocks {
             std::future::pending::<()>().await;
         }
-        self.status.clone()
+        self.status.clone().into()
     }
 }
 
@@ -333,8 +331,8 @@ impl Store for CountingStore {
         self.inner.resolve(t).await
     }
 
-    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
-        self.inner.status(t).await
+    async fn provider_status(&self, t: &ResolveTarget) -> ProviderStatus {
+        self.inner.provider_status(t).await
     }
 }
 
@@ -343,12 +341,12 @@ impl Store for CountingStore {
 #[derive(Clone)]
 pub(crate) struct AnsweringStore {
     svc: DebridService,
-    answer: StatusAnswer,
+    answer: ProviderStatus,
     pub asked: Arc<AtomicI32>,
 }
 
 impl AnsweringStore {
-    pub(crate) fn new(svc: DebridService, answer: StatusAnswer) -> AnsweringStore {
+    pub(crate) fn new(svc: DebridService, answer: ProviderStatus) -> AnsweringStore {
         AnsweringStore { svc, answer, asked: Arc::new(AtomicI32::new(0)) }
     }
 }
@@ -367,13 +365,13 @@ impl Store for AnsweringStore {
         Err(dead_link("nothing here"))
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
-    }
-
-    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
         self.asked.fetch_add(1, Ordering::SeqCst);
-        Some((StoreStatus::default(), self.answer))
+        match self.answer {
+            ProviderStatus::Downloading(_) => ProviderStatus::Downloading(StoreStatus::default()),
+            ProviderStatus::NotFetching => ProviderStatus::NotFetching,
+            ProviderStatus::Unknown => ProviderStatus::Unknown,
+        }
     }
 }
 
@@ -418,14 +416,14 @@ impl Store for SlowStatusStore {
         Ok("https://cdn.example/added.mkv".to_owned())
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
         if self.status_hits.fetch_add(1, Ordering::SeqCst) < self.slow_calls {
             std::future::pending::<()>().await; // outlast the caller's budget, exactly as a slow account listing does
         }
         if self.never_downloading {
-            return None;
+            return ProviderStatus::NotFetching;
         }
-        Some(StoreStatus { progress: 0.4, ..StoreStatus::default() })
+        ProviderStatus::Downloading(StoreStatus { progress: 0.4, ..StoreStatus::default() })
     }
 }
 
@@ -456,8 +454,8 @@ impl<S: Store> Store for CountingResolveStore<S> {
         self.inner.resolve(t).await
     }
 
-    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
-        self.inner.status(t).await
+    async fn provider_status(&self, t: &ResolveTarget) -> ProviderStatus {
+        self.inner.provider_status(t).await
     }
 }
 
@@ -480,12 +478,8 @@ impl Store for SharedStore {
         self.0.resolve(t).await
     }
 
-    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
-        self.0.status(t).await
-    }
-
-    async fn status_answer(&self, t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
-        self.0.status_answer(t).await
+    async fn provider_status(&self, t: &ResolveTarget) -> ProviderStatus {
+        self.0.provider_status(t).await
     }
 
     async fn cancel(
@@ -606,33 +600,14 @@ pub(crate) fn first_play_path(body: &str, marker: &str) -> String {
 }
 
 #[tokio::test]
-async fn routes_pages_and_manifest() {
+async fn routes_expose_resources_but_not_standalone_installation() {
     let h = new_handler(test_deps(|_| {}));
-    let r = get(&h, "/configure", &[]).await;
-    let b = body_str(&r);
-    assert!(
-        r.status() == 200
-            && b.contains("Den Scout")
-            && b.contains("DenSeal")
-            && hdr(&r, "cache-control") == crate::handler::STATIC_CACHE,
-        "configure: {} cc={:?}",
-        r.status(),
-        hdr(&r, "cache-control")
-    );
     let r = get(&h, "/health", &[]).await;
     assert!(r.status() == 200 && hdr(&r, "cache-control") == crate::handler::NO_STORE, "health");
-    let r = get(&h, "/manifest.json", &[]).await;
-    assert!(
-        r.status() == 200 && body_str(&r).contains(r#""configurationRequired":true"#),
-        "unconfigured manifest: {}",
-        body_str(&r)
-    );
-    let r = get(&h, &format!("/{}/manifest.json", valid_blob()), &[]).await;
-    assert!(
-        r.status() == 200 && body_str(&r).contains(r#""configurationRequired":false"#),
-        "configured manifest"
-    );
-    assert_eq!(get(&h, "/@@@/manifest.json", &[]).await.status(), 400, "bad config");
+    for path in ["/", "/configure", "/config-key", "/manifest.json"] {
+        assert_eq!(get(&h, path, &[]).await.status(), 404, "obsolete standalone route {path}");
+    }
+    assert_eq!(get(&h, &format!("/{}/manifest.json", valid_blob()), &[]).await.status(), 404);
     assert_eq!(get(&h, &format!("/{}/bogus", valid_blob()), &[]).await.status(), 404, "unknown resource");
 }
 
@@ -649,40 +624,24 @@ async fn routes_sealed_config() {
     let seg = b64url_encode(&framed);
     let h = new_handler(test_deps(|d| d.seal_keyring = Some(Arc::new(kr))));
 
-    // /config-key serves the current public key so a client can seal to it.
-    let r = get(&h, "/config-key", &[]).await;
-    assert!(
-        r.status() == 200 && body_str(&r).contains(VEC_PUB_B64),
-        "config-key: {} {}",
-        r.status(),
-        body_str(&r)
-    );
-    // A SEALED URL resolves manifest + streams identically to the plaintext blob.
-    let r = get(&h, &format!("/{seg}/manifest.json"), &[]).await;
-    assert!(
-        r.status() == 200 && body_str(&r).contains(r#""configurationRequired":false"#),
-        "sealed manifest: {} {}",
-        r.status(),
-        body_str(&r)
-    );
+    // A SEALED URL resolves resources identically to the plaintext blob.
     let r = get(&h, &format!("/{seg}/stream/movie/tt1234567.json"), &[]).await;
     assert!(r.status() == 200 && streams_len(&r) == 2, "sealed stream: {} n={}", r.status(), streams_len(&r));
-    // Fail CLOSED: a sealed URL against a handler with no keyring → 400; /config-key → 404.
+    // Fail CLOSED: a sealed URL against a handler with no keyring.
     let no_key = new_handler(test_deps(|_| {}));
     assert_eq!(
-        get(&no_key, &format!("/{seg}/manifest.json"), &[]).await.status(),
+        get(&no_key, &format!("/{seg}/stream/movie/tt1234567.json"), &[]).await.status(),
         400,
         "sealed with no keyring"
     );
-    assert_eq!(get(&no_key, "/config-key", &[]).await.status(), 404, "config-key without keyring");
     // With a keyring configured, plaintext is refused: every issued install is sealed then.
     assert_eq!(
-        get(&h, &format!("/{}/manifest.json", valid_blob()), &[]).await.status(),
+        get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(),
         400,
         "plaintext with a keyring"
     );
     assert_eq!(
-        get(&no_key, &format!("/{}/manifest.json", valid_blob()), &[]).await.status(),
+        get(&no_key, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await.status(),
         200,
         "plaintext with no keyring"
     );
@@ -703,7 +662,7 @@ async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health
     let sealed = sealed_config(&kr, &format!("{TICKET_CFG}}}"));
     let h = new_handler(test_deps(|d| d.config_key_invalid = true));
     for seg in [valid_blob(), sealed] {
-        for tail in ["manifest.json", "stream/movie/tt1234567.json", "play/x", "availability"] {
+        for tail in ["stream/movie/tt1234567.json", "play/x", "availability"] {
             let r = get(&h, &format!("/{seg}/{tail}"), &[]).await;
             assert_eq!(r.status(), 503, "{tail}");
             assert_eq!(r.headers()["retry-after"], "60");
@@ -711,7 +670,6 @@ async fn a_malformed_config_key_refuses_every_install_config_and_degrades_health
         }
     }
     assert_eq!(get(&h, "/p/ticket", &[]).await.status(), 503, "a play ticket");
-    assert_eq!(get(&h, "/config-key", &[]).await.status(), 503, "no pubkey to hand out");
     let r = get(&h, "/health", &[]).await;
     assert!(
         body_str(&r).contains(r#""reason":"config_key_invalid""#)
@@ -734,77 +692,6 @@ async fn a_negative_install_epoch_is_refused() {
     assert!(!h.admit_install(&config), "a negative epoch must be refused");
 }
 
-/// The configured manifest names its install as REVOKED_INSTALLS spells it; a config without an id, and the
-/// unconfigured manifest, carry no such field. The ETag is over the body, so one install's validator never
-/// earns another install a 304.
-#[tokio::test]
-async fn manifest_names_the_install() {
-    let kr = ticket_keyring();
-    let with_id = sealed_config(&kr, &format!(r#"{TICKET_CFG},"iid":"{}"}}"#, test_iid()));
-    let other = sealed_config(&kr, &format!(r#"{TICKET_CFG},"iid":"{}"}}"#, other_iid()));
-    let without = sealed_config(&kr, &format!("{TICKET_CFG}}}"));
-    let h = new_handler(test_deps(|d| d.seal_keyring = Some(Arc::new(ticket_keyring()))));
-
-    let install_id = |r: &http::Response<Vec<u8>>| -> serde_json::Value {
-        let m: serde_json::Value = serde_json::from_slice(r.body()).expect("the manifest is JSON");
-        m.get("denInstallId").cloned().unwrap_or(serde_json::Value::Null)
-    };
-    let first = get(&h, &format!("/{with_id}/manifest.json"), &[]).await;
-    assert!(
-        first.status() == 200 && install_id(&first) == test_iid(),
-        "with an iid: {} {}",
-        first.status(),
-        body_str(&first)
-    );
-    for (name, path) in
-        [("no iid", format!("/{without}/manifest.json")), ("unconfigured", "/manifest.json".to_owned())]
-    {
-        let r = get(&h, &path, &[]).await;
-        assert!(
-            r.status() == 200 && !body_str(&r).contains("denInstallId"),
-            "{name}: {} {}",
-            r.status(),
-            body_str(&r)
-        );
-    }
-    let etag = hdr(&first, "etag");
-    let r = get(&h, &format!("/{other}/manifest.json"), &[("If-None-Match", &etag)]).await;
-    assert!(
-        r.status() == 200 && install_id(&r) == other_iid(),
-        "another install with the first one's ETag: {} {}",
-        r.status(),
-        body_str(&r)
-    );
-}
-
-/// A configured manifest's URL is the install credential, so it is never cached where anyone else could be
-/// handed it; the config-less routes stay publicly cacheable.
-#[tokio::test]
-async fn manifest_configured_is_private_and_the_rest_public() {
-    let h = new_handler(test_deps(|_| {}));
-    let cases = [
-        (format!("/{}/manifest.json", valid_blob()), "private, max-age=3600, stale-while-revalidate=600"),
-        ("/manifest.json".to_owned(), "public, max-age=3600, stale-while-revalidate=600"),
-        ("/configure".to_owned(), "public, max-age=3600, stale-while-revalidate=600"),
-    ];
-    for (path, want) in cases {
-        let r = get(&h, &path, &[]).await;
-        assert!(
-            r.status() == 200 && hdr(&r, "cache-control") == want,
-            "{path}: {} cache-control {:?}, want {want:?}",
-            r.status(),
-            hdr(&r, "cache-control")
-        );
-        // A revalidation answers with the same header.
-        let again = get(&h, &path, &[("If-None-Match", &hdr(&r, "etag"))]).await;
-        assert!(
-            hdr(&again, "cache-control") == want,
-            "{path} 304: cache-control {:?}, want {want:?}",
-            hdr(&again, "cache-control")
-        );
-    }
-}
-
 /// ETags are 64-bit: sixteen hex digits, quoted.
 #[test]
 fn etag_is64_bit() {
@@ -820,24 +707,6 @@ fn etag_is64_bit() {
         );
     }
     assert_ne!(crate::handler::etag_for("a"), crate::handler::etag_for("b"), "two bodies share an etag");
-}
-
-/// /configure shows the id of the link it just built, with the variable that revokes it.
-#[tokio::test]
-async fn configure_page_shows_the_install_id() {
-    let h = new_handler(test_deps(|_| {}));
-    let page = body_str(&get(&h, "/configure", &[]).await);
-    for want in [
-        r#"<code id="installId"></code>"#,
-        "lastInstallID = config.iid;",
-        r#"$("installId").textContent = lastInstallID;"#,
-        "<code>REVOKED_INSTALLS</code> to revoke just this link",
-        r#"fetch(addonBase() + "/config-key""#,
-        r#"fetch(addonBase() + "/validate""#,
-        "location.origin + addonBase()",
-    ] {
-        assert!(page.contains(want), "configure page lacks {want:?}");
-    }
 }
 
 #[tokio::test]
@@ -917,14 +786,7 @@ async fn routes_reject_non_read_methods() {
     assert_eq!(resolves.load(Ordering::SeqCst), 1, "a non-GET verb reached the debrid");
 
     // Every other route is a plain read: POST is refused, HEAD is served.
-    for path in [
-        "/".to_owned(),
-        "/configure".to_owned(),
-        "/health".to_owned(),
-        "/manifest.json".to_owned(),
-        format!("/{}/manifest.json", valid_blob()),
-        format!("/{}/stream/movie/tt1234567.json", valid_blob()),
-    ] {
+    for path in ["/health".to_owned(), format!("/{}/stream/movie/tt1234567.json", valid_blob())] {
         assert_eq!(method(&h, http::Method::POST, &path, &[]).await.status(), 405, "POST {path}");
         assert_eq!(method(&h, http::Method::HEAD, &path, &[]).await.status(), 200, "HEAD {path}");
     }
@@ -957,9 +819,9 @@ async fn cors() {
         );
     }
     for (m, path, code) in [
-        (http::Method::GET, "/manifest.json", 200),
+        (http::Method::GET, "/manifest.json", 404),
         (http::Method::GET, "/health", 200),
-        (http::Method::GET, "/@@@/manifest.json", 400),
+        (http::Method::GET, "/@@@/manifest.json", 404),
         (http::Method::GET, "/nope", 404),
         (http::Method::POST, "/health", 405),
     ] {
@@ -1037,10 +899,11 @@ async fn server_timing() {
 #[tokio::test]
 async fn routes_etag_and_singleflight() {
     let h = new_handler(test_deps(|_| {}));
-    let first = get(&h, &format!("/{}/manifest.json", valid_blob()), &[]).await;
+    let resource = format!("/{}/stream/movie/tt1234567.json", valid_blob());
+    let first = get(&h, &resource, &[]).await;
     let etag = hdr(&first, "etag");
     assert!(!etag.is_empty(), "no etag");
-    let second = get(&h, &format!("/{}/manifest.json", valid_blob()), &[("If-None-Match", &etag)]).await;
+    let second = get(&h, &resource, &[("If-None-Match", &etag)]).await;
     assert!(
         second.status() == 304 && second.body().is_empty(),
         "expected 304 empty, got {} len={}",
@@ -1269,6 +1132,243 @@ async fn stream_a_client_disconnect_does_not_cancel_the_shared_build() {
         seen_by_scraper.lock().expect("the lock").is_some(),
         "the scrape did not run to its end after the client disconnected — the build is riding the request context, so a cancelled leader yields a partial list that is cached and served to every singleflight follower"
     );
+}
+
+/// The cold-build ceiling is owned by ScoutRuntime, so it applies across every hosted handler, is checked
+/// before a distinct flight is installed, and does not stop a caller joining an already-admitted key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_list_admission_is_process_wide_and_same_key_still_joins() {
+    let runtime = crate::runtime::ScoutRuntime::new_with_list_build_limit(1);
+    let entered = Arc::new(AtomicI32::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let make = || {
+        let runtime = runtime.clone();
+        let (entered, release) = (entered.clone(), release.clone());
+        test_deps(move |d| {
+            d.runtime = runtime.clone();
+            d.make_scrapers = Arc::new(move |_| {
+                let (entered, release) = (entered.clone(), release.clone());
+                vec![fake_scraper("torrentio", move || {
+                    let (entered, release) = (entered.clone(), release.clone());
+                    Box::pin(async move {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        release.acquire_owned().await.unwrap().forget();
+                        Ok(test_seeds())
+                    })
+                })]
+            });
+        })
+    };
+    let first_handler = Arc::new(new_handler(make()));
+    let second_handler = new_handler(make());
+    let same = format!("/{}/stream/movie/tt9000001.json", valid_blob());
+    let leader = tokio::spawn({
+        let h = first_handler.clone();
+        let path = same.clone();
+        async move { get(&h, &path, &[]).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while entered.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted build did not start");
+
+    let joiner = tokio::spawn({
+        let h = first_handler.clone();
+        let path = same.clone();
+        async move { get(&h, &path, &[]).await }
+    });
+    tokio::task::yield_now().await;
+
+    // A distinct key on another handler shares the same bound and receives one stable, retryable refusal.
+    let refused_path = format!("/{}/stream/movie/tt9000002.json", valid_blob());
+    let refused = get(&second_handler, &refused_path, &[]).await;
+    assert_eq!(refused.status(), 503);
+    assert_eq!(hdr(&refused, "retry-after"), "1");
+    assert_eq!(hdr(&refused, "cache-control"), crate::handler::NO_STORE);
+    let refusal: serde_json::Value = serde_json::from_slice(refused.body()).unwrap();
+    assert_eq!(refusal, serde_json::json!({"error":"scout_busy","detail":"list_build_limit"}));
+    assert_eq!(entered.load(Ordering::SeqCst), 1, "a refused key spawned work");
+
+    release.add_permits(1);
+    assert_eq!(leader.await.unwrap().status(), 200);
+    assert_eq!(joiner.await.unwrap().status(), 200);
+    assert_eq!(entered.load(Ordering::SeqCst), 1, "the same-key caller started a second build");
+
+    // The refusal installed neither a flight nor a negative cache entry; once the first slot returns, that exact
+    // key is admitted and builds normally.
+    release.add_permits(1);
+    assert_eq!(get(&second_handler, &refused_path, &[]).await.status(), 200);
+    assert_eq!(entered.load(Ordering::SeqCst), 2, "the refused key did not build on retry");
+}
+
+/// Each handler retains its full source fan-out, but all of those branches take permits from the runtime's one
+/// fair scraper-body gate. The barrier holds the first wave in `scrape`, making the observed peak deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scraper_request_ceiling_is_shared_across_handlers() {
+    struct Active(Arc<AtomicI32>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    const LIMIT: usize = 3;
+    const SOURCES_PER_HANDLER: usize = 4;
+    let runtime = crate::runtime::ScoutRuntime::new_with_limits(16, LIMIT);
+    let active = Arc::new(AtomicI32::new(0));
+    let peak = Arc::new(AtomicI32::new(0));
+    let arrivals = Arc::new(AtomicI32::new(0));
+    let first_wave = Arc::new(tokio::sync::Barrier::new(LIMIT + 1));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+    let make = || {
+        let runtime = runtime.clone();
+        let (active, peak, arrivals, first_wave, release) = (
+            active.clone(),
+            peak.clone(),
+            arrivals.clone(),
+            first_wave.clone(),
+            release.clone(),
+        );
+        test_deps(move |d| {
+            d.runtime = runtime.clone();
+            d.scrape_timeout = Duration::from_secs(3);
+            d.make_scrapers = Arc::new(move |_| {
+                (0..SOURCES_PER_HANDLER)
+                    .map(|_| {
+                        let (active, peak, arrivals, first_wave, release) = (
+                            active.clone(),
+                            peak.clone(),
+                            arrivals.clone(),
+                            first_wave.clone(),
+                            release.clone(),
+                        );
+                        fake_scraper("torrentio", move || {
+                            let (active, peak, arrivals, first_wave, release) = (
+                                active.clone(),
+                                peak.clone(),
+                                arrivals.clone(),
+                                first_wave.clone(),
+                                release.clone(),
+                            );
+                            Box::pin(async move {
+                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                let _active = Active(active);
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                if arrivals.fetch_add(1, Ordering::SeqCst) < LIMIT as i32 {
+                                    first_wave.wait().await;
+                                }
+                                release.acquire_owned().await.unwrap().forget();
+                                Ok(Vec::new())
+                            })
+                        })
+                    })
+                    .collect()
+            });
+        })
+    };
+    let first = Arc::new(new_handler(make()));
+    let second = Arc::new(new_handler(make()));
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let request = |handler: Arc<Handler>, imdb: &'static str| {
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            get(&handler, &format!("/{}/stream/movie/{imdb}.json", valid_blob()), &[]).await
+        })
+    };
+    let one = request(first, "tt9300001");
+    let two = request(second, "tt9300002");
+    start.wait().await;
+
+    tokio::time::timeout(Duration::from_secs(1), first_wave.wait())
+        .await
+        .expect("the shared scraper ceiling was not filled");
+    assert_eq!(active.load(Ordering::SeqCst), LIMIT as i32);
+    assert_eq!(peak.load(Ordering::SeqCst), LIMIT as i32, "handlers used independent scraper gates");
+    assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), LIMIT as i64);
+
+    release.add_permits(SOURCES_PER_HANDLER * 2);
+    assert_eq!(one.await.unwrap().status(), 200);
+    assert_eq!(two.await.unwrap().status(), 200);
+    assert_eq!(peak.load(Ordering::SeqCst), LIMIT as i32);
+    assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime.metrics().scraper_request_admitted.load(Ordering::SeqCst),
+        (SOURCES_PER_HANDLER * 2) as i64,
+        "every source branch should eventually retain its per-list fan-out"
+    );
+}
+
+/// Canceled unique misses cannot leave more detached builds than the runtime admits. Slots return when those
+/// builds finish, and a refused key is absent from both the flight map and cache, so it can succeed on retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_list_many_cancelled_unique_misses_recover_after_saturation() {
+    const LIMIT: usize = 2;
+    let runtime = crate::runtime::ScoutRuntime::new_with_list_build_limit(LIMIT);
+    let runtime_for_handler = runtime.clone();
+    let entered = Arc::new(AtomicI32::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (en, rel) = (entered.clone(), release.clone());
+    let h = Arc::new(new_handler(test_deps(move |d| {
+        d.runtime = runtime_for_handler.clone();
+        d.make_scrapers = Arc::new(move |_| {
+            let (en, rel) = (en.clone(), rel.clone());
+            vec![fake_scraper("torrentio", move || {
+                let (en, rel) = (en.clone(), rel.clone());
+                Box::pin(async move {
+                    en.fetch_add(1, Ordering::SeqCst);
+                    rel.acquire_owned().await.unwrap().forget();
+                    Ok(test_seeds())
+                })
+            })]
+        });
+    })));
+
+    let mut cancelled = Vec::new();
+    for i in 0..64 {
+        let h = h.clone();
+        let path = format!("/{}/stream/movie/tt{:07}.json", valid_blob(), 9_100_000 + i);
+        cancelled.push(tokio::spawn(async move { get(&h, &path, &[]).await }));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while entered.load(Ordering::SeqCst) < LIMIT as i32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the build ceiling was not reached");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    for request in cancelled {
+        request.abort();
+    }
+    assert_eq!(entered.load(Ordering::SeqCst), LIMIT as i32, "unique misses exceeded the ceiling");
+    assert_eq!(
+        runtime.metrics().list_build_active.load(Ordering::SeqCst),
+        LIMIT as i64,
+        "canceling request tasks canceled or leaked admitted work"
+    );
+    assert!(
+        runtime.metrics().list_build_refused.load(Ordering::SeqCst) > 0,
+        "the cancellation flood never exercised refusal"
+    );
+
+    release.add_permits(LIMIT);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.metrics().list_build_active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed detached builds did not return their slots");
+
+    release.add_permits(1);
+    let retry = get(&h, &format!("/{}/stream/movie/tt9200001.json", valid_blob()), &[]).await;
+    assert_eq!(retry.status(), 200, "the runtime did not recover after slots were released");
+    assert_eq!(entered.load(Ordering::SeqCst), LIMIT as i32 + 1);
 }
 
 #[tokio::test]
@@ -2490,9 +2590,9 @@ async fn handle_play_the_escalation_re_asks_only_the_store_that_could_not_answer
     // Go TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer: the escalation re-asks only the store
     // that could not answer. Three reads happen: poll, escalation, post-failure. Only the escalation is narrowed.
     let stores = vec![
-        AnsweringStore::new(DebridService::RealDebrid, StatusAnswer::No),
-        AnsweringStore::new(DebridService::TorBox, StatusAnswer::Unknown),
-        AnsweringStore::new(DebridService::Premiumize, StatusAnswer::No),
+        AnsweringStore::new(DebridService::RealDebrid, ProviderStatus::NotFetching),
+        AnsweringStore::new(DebridService::TorBox, ProviderStatus::Unknown),
+        AnsweringStore::new(DebridService::Premiumize, ProviderStatus::NotFetching),
     ];
     let handles = stores.iter().map(|s| s.asked.clone()).collect::<Vec<_>>();
     let h = new_handler(test_deps(move |d| {
@@ -2620,14 +2720,9 @@ impl Store for LifetimeStore {
         }
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
         outlast(&self.status_lived).await;
-        None
-    }
-
-    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
-        outlast(&self.status_lived).await;
-        Some((StoreStatus::default(), StatusAnswer::Unknown))
+        ProviderStatus::Unknown
     }
 }
 
@@ -2803,6 +2898,42 @@ async fn play_status_timeout_does_not_add() {
     );
     assert_eq!(resolves.load(Ordering::SeqCst), 0, "a timed-out status read still queued the torrent");
     assert_eq!(hits.load(Ordering::SeqCst), 2, "status calls: the short read, then the definitive one");
+}
+
+#[tokio::test]
+async fn play_held_real_debrid_transport_failure_is_uncertain_and_never_adds() {
+    let hash = "d".repeat(40);
+    let target = ResolveTarget { info_hash: hash.clone(), ..Default::default() };
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    cache.put(&rd_torrent_key("rd", &hash, &target), "torrent-id", Duration::from_secs(3600));
+    let added = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_add = added.clone();
+    let client: Arc<dyn crate::scrape::Doer> = Arc::new(MockDoer(move |request: reqwest::Request| {
+        if request.url().path().contains("addMagnet") {
+            saw_add.store(true, Ordering::SeqCst);
+        }
+        Err(Box::new(std::io::Error::other("transport failed")) as DoError)
+    }));
+    let handler = new_handler(test_deps(move |deps| {
+        let cache = cache.clone();
+        let client = client.clone();
+        deps.make_stores = Arc::new(move |_| {
+            vec![Box::new(RealDebridStore {
+                token: "rd".to_owned(),
+                client: client.clone(),
+                cache: Some(cache.clone()),
+                api: REAL_DEBRID_API.to_owned(),
+            })]
+        });
+    }));
+    handler.set_status_budget(Duration::from_millis(150));
+    let token =
+        crate::play::encode_play_token(&crate::play::PlayTarget { info_hash: hash, ..Default::default() });
+    let config = blob(r#"{"debrid":[{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"]}"#);
+    let response = get(&handler, &format!("/{config}/play/{token}"), &[]).await;
+    assert_eq!(response.status(), 503, "{}", body_str(&response));
+    assert!(body_str(&response).contains("status_unavailable"));
+    assert!(!added.load(Ordering::SeqCst), "transport uncertainty queued a duplicate torrent");
 }
 
 #[tokio::test]

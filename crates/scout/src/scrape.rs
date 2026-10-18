@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderValue, ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::time::Instant as TokioInstant;
 
 use crate::cache::Cache;
 use crate::config::{Config, Indexer, CONFIG_PATH_INDEXERS};
@@ -765,7 +766,7 @@ fn log_indexer_skip_once(id: &Indexer, env_var: &str) {
     }
     emit(&format!(
         "{} needs a per-install config URL and has none — not querying it. Set {env_var} to the address from that \
-         addon's /configure page.",
+         Den addon's /den/configure page.",
         id.0
     ));
 }
@@ -942,10 +943,17 @@ fn millis(d: Duration) -> i64 {
 /// cancels it.
 ///
 /// `prepare` runs first and OUTSIDE the timeout: Go builds its scrapers, minting included, before this budget starts.
-async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, timeout: Duration) -> ScrapeAttempt {
+async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, deadline: TokioInstant) -> ScrapeAttempt {
     sc.prepare().await;
     let start = Instant::now();
-    let answer = tokio::time::timeout(timeout, sc.scrape(q)).await;
+    // Admission covers only a real upstream request: settled cache hits and same-question singleflight followers
+    // never consume it. Its FIFO wait is part of the list build's absolute budget, and the owned guard covers the
+    // response read/decode inside `scrape` until every raw body byte can be released.
+    let Some(_admission) = crate::runtime::current_runtime().admit_scraper_request_until(deadline).await else {
+        metrics().indexer_result(&sc.id().0, false, 0);
+        return ScrapeAttempt::failed(Arc::new(DeadlineExceeded));
+    };
+    let answer = tokio::time::timeout_at(deadline, sc.scrape(q)).await;
     let (streams, err) = match answer {
         Ok(Ok(streams)) => (streams, None),
         Ok(Err(err)) => (Vec::new(), Some(SharedError::from(err))),
@@ -965,7 +973,8 @@ async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, timeout: Duration) -> ScrapeAtte
 ///
 /// One upstream question per provider identity and title at a time. The settled-answer cache collapses later
 /// requests, but without this gate every list variant that missed it concurrently still reached the indexer.
-static ANSWER_FLIGHTS: DetachedFlight<ScrapeAttempt> = DetachedFlight::new("indexer answer");
+static ANSWER_FLIGHTS: std::sync::LazyLock<DetachedFlight<ScrapeAttempt>> =
+    std::sync::LazyLock::new(|| DetachedFlight::new("indexer answer"));
 
 /// The shared question: the request under its own timeout, detached from every caller. A page leaving stops
 /// waiting, but does not cancel useful work for another page, and the answer warms the cache whoever is still there
@@ -973,7 +982,7 @@ static ANSWER_FLIGHTS: DetachedFlight<ScrapeAttempt> = DetachedFlight::new("inde
 async fn ask_shared(
     sc: Arc<dyn Scraper>,
     q: ScrapeQuery,
-    timeout: Duration,
+    deadline: TokioInstant,
     cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> ScrapeAttempt {
@@ -981,7 +990,7 @@ async fn ask_shared(
     if let Some(streams) = kept_answer(cache.as_deref(), &*sc, &q) {
         return ScrapeAttempt { streams, err: None, cached: true, latency_ms: 0, observed_at: None };
     }
-    let attempt = ask(&*sc, &q, timeout).await;
+    let attempt = ask(&*sc, &q, deadline).await;
     if attempt.err.is_none() {
         keep_answer(cache.as_deref(), ttl, &*sc, &q, &attempt.streams);
     }
@@ -993,7 +1002,7 @@ async fn ask_shared(
 async fn scrape_one_cached(
     sc: &Arc<dyn Scraper>,
     q: &ScrapeQuery,
-    timeout: Duration,
+    deadline: TokioInstant,
     cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> ScrapeAttempt {
@@ -1001,7 +1010,7 @@ async fn scrape_one_cached(
         return ScrapeAttempt { streams, err: None, cached: true, latency_ms: 0, observed_at: None };
     }
     let Some(key) = answer_cache_key(&**sc, q) else {
-        let attempt = ask(&**sc, q, timeout).await;
+        let attempt = ask(&**sc, q, deadline).await;
         if attempt.err.is_none() {
             keep_answer(cache.as_deref(), ttl, &**sc, q, &attempt.streams);
         }
@@ -1012,7 +1021,7 @@ async fn scrape_one_cached(
     // Cached answers are decoded for each caller. Preserve that ownership for a shared live answer too: later
     // phases annotate RawStream values with cache and probe facts (the flight hands each waiter its own clone).
     let (answer, _shared) =
-        ANSWER_FLIGHTS.run(&key, move || ask_shared(task_sc, task_q, timeout, cache, ttl)).await;
+        ANSWER_FLIGHTS.run(&key, move || ask_shared(task_sc, task_q, deadline, cache, ttl)).await;
     let Some(mut attempt) = answer else {
         // The task panicked.
         return ScrapeAttempt::failed(Arc::new(std::io::Error::other("the scrape ended without an answer")));
@@ -1048,6 +1057,7 @@ pub(crate) struct ScrapeResult {
 }
 
 /// Go `scrapeCovered` is scrapeAllCached keeping each source's report.
+#[cfg(test)]
 pub(crate) async fn scrape_covered(
     scrapers: &[Arc<dyn Scraper>],
     q: &ScrapeQuery,
@@ -1055,8 +1065,24 @@ pub(crate) async fn scrape_covered(
     cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> ScrapeResult {
+    scrape_covered_until(scrapers, q, timeout, TokioInstant::now() + timeout, cache, ttl).await
+}
+
+/// `scrape_covered` under an existing list-build deadline. Every fan-out branch is created immediately, retaining
+/// per-list concurrency, while the shared runtime decides which requests may buffer bodies at once.
+pub(crate) async fn scrape_covered_until(
+    scrapers: &[Arc<dyn Scraper>],
+    q: &ScrapeQuery,
+    timeout: Duration,
+    build_deadline: TokioInstant,
+    cache: Option<Arc<dyn Cache>>,
+    ttl: Duration,
+) -> ScrapeResult {
+    // Keep the existing per-source budget, but never let it extend beyond the whole build's clock. Because this
+    // deadline is made before any permit can be awaited, queue time is charged to both budgets.
+    let deadline = (TokioInstant::now() + timeout).min(build_deadline);
     let attempts =
-        join_all(scrapers.iter().map(|sc| scrape_one_cached(sc, q, timeout, cache.clone(), ttl)).collect())
+        join_all(scrapers.iter().map(|sc| scrape_one_cached(sc, q, deadline, cache.clone(), ttl)).collect())
             .await;
     let mut all: Vec<RawStream> = Vec::new();
     let mut reports: Vec<SourceReport> = Vec::with_capacity(scrapers.len());

@@ -30,6 +30,8 @@ pub const LEGACY_SCOUT_BASE: &str = "http://den-hearth.invalid/scout";
 pub const LEGACY_SUBS_BASE: &str = "http://den-hearth.invalid/subs";
 
 const MAX_BODY: usize = 16 * 1024;
+/// A client must finish sending the small playback command before it can occupy operation/replay state.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 // Remux's session answer names every segment as `[start, bytes]`, about 20 bytes each, so it grows with the film:
 // a 2.6-hour film's 1,224 segments came to ~25 KiB and broke the old 16 KiB ceiling. This one holds ~6 hours.
 const MAX_ANSWER: usize = 256 * 1024;
@@ -45,6 +47,26 @@ const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 const FINALIZE_HEADER: &str = "x-den-playback-finalize";
 const FINALIZATION_PROTOCOL_HEADER: &str = "x-den-playback-finalization";
+
+#[derive(Debug, PartialEq, Eq)]
+enum BodyReadError {
+    Invalid,
+    Timeout,
+}
+
+async fn read_body<B>(body: B) -> Result<Bytes, BodyReadError>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match tokio::time::timeout(BODY_READ_TIMEOUT, http_body_util::Limited::new(body, MAX_BODY).collect())
+        .await
+    {
+        Ok(Ok(body)) => Ok(body.to_bytes()),
+        Ok(Err(_)) => Err(BodyReadError::Invalid),
+        Err(_) => Err(BodyReadError::Timeout),
+    }
+}
 
 #[derive(Clone)]
 struct Snapshot {
@@ -360,30 +382,7 @@ fn owner_scope(hearth: &Hearth, parts: &hyper::http::request::Parts) -> String {
 /// The request Remux may be handed, and the two delivery flags that stay here: `directFailed` (skip the managed
 /// stream) and `directOnly` (the managed stream or a refusal, never a Remux session in its place).
 fn validate_request(mut value: Value) -> Result<(Value, bool, bool), ()> {
-    const FIELDS: &[&str] = &[
-        "imdb",
-        "season",
-        "episode",
-        "filename",
-        "audio",
-        "audioTrack",
-        "subtitleLanguages",
-        "videoCodecs",
-        "playable",
-        "startAt",
-        "maxBitrate",
-        "player",
-        "exclude",
-        "transcode",
-        "fitsOnly",
-        "replaces",
-        "directFailed",
-        "directOnly",
-    ];
     let object = value.as_object_mut().ok_or(())?;
-    if object.keys().any(|key| !FIELDS.contains(&key.as_str())) {
-        return Err(());
-    }
     let direct_failed = match object.remove("directFailed") {
         None => false,
         Some(Value::Bool(value)) => value,
@@ -397,63 +396,10 @@ fn validate_request(mut value: Value) -> Result<(Value, bool, bool), ()> {
     if direct_failed && direct_only {
         return Err(());
     }
-    let imdb = object.get("imdb").and_then(Value::as_str).ok_or(())?;
-    if imdb.len() < 3
-        || imdb.len() > 12
-        || !imdb.starts_with("tt")
-        || !imdb[2..].bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(());
-    }
-    let integer = |name: &str| -> Result<Option<u64>, ()> {
-        match object.get(name) {
-            None => Ok(None),
-            Some(value) => value.as_u64().filter(|value| *value <= u32::MAX as u64).map(Some).ok_or(()),
-        }
-    };
-    let season = integer("season")?;
-    let episode = integer("episode")?;
-    if season.is_some() != episode.is_some() {
-        return Err(());
-    }
-    if object.get("filename").is_some_and(|value| !value.is_string())
-        || object.get("player").is_some_and(|value| !value.is_string())
-        || object.get("replaces").is_some_and(|value| !value.is_string())
-        || object.get("audioTrack").is_some_and(|value| value.as_u64().is_none())
-        || object.get("fitsOnly").is_some_and(|value| !value.is_boolean())
-        || object.get("playable").is_some_and(|value| !value.is_object())
-    {
-        return Err(());
-    }
-    if object
-        .get("startAt")
-        .is_some_and(|value| value.as_f64().is_none_or(|value| !value.is_finite() || value < 0.0))
-        || object.get("maxBitrate").is_some_and(|value| value.as_u64().is_none_or(|value| value == 0))
-    {
-        return Err(());
-    }
-    if object.get("transcode").is_some_and(|value| !matches!(value.as_str(), Some("allow" | "never"))) {
-        return Err(());
-    }
-    for name in ["audio", "subtitleLanguages", "videoCodecs"] {
-        if object.get(name).is_some_and(|value| {
-            value.as_array().is_none_or(|values| {
-                values.len() > 8
-                    || values.iter().any(|value| value.as_str().is_none_or(|value| value.len() > 35))
-            })
-        }) {
-            return Err(());
-        }
-    }
-    if object.get("exclude").is_some_and(|value| {
-        value.as_array().is_none_or(|values| {
-            values.len() > 16
-                || values.iter().any(|value| value.as_str().is_none_or(|value| value.len() > 512))
-        })
-    }) {
-        return Err(());
-    }
-    Ok((value, direct_failed, direct_only))
+    let request: den_remux::PlaybackRequest = serde_json::from_value(value).map_err(|_| ())?;
+    request.validate().map_err(|_| ())?;
+    let request = serde_json::to_value(request).map_err(|_| ())?;
+    Ok((request, direct_failed, direct_only))
 }
 
 fn install_url(config: &str) -> String {
@@ -835,9 +781,14 @@ where
         return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref());
     };
     let (parts, body) = req.into_parts();
-    let body = match http_body_util::Limited::new(body, MAX_BODY).collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(_) => return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref()),
+    let body = match read_body(body).await {
+        Ok(body) => body,
+        Err(BodyReadError::Invalid) => {
+            return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref())
+        }
+        Err(BodyReadError::Timeout) => {
+            return refuse(StatusCode::REQUEST_TIMEOUT, "request_timeout", None, rid.as_deref())
+        }
     };
     let parsed = match serde_json::from_slice(&body).ok().and_then(|value| validate_request(value).ok()) {
         Some(parsed) => parsed,
@@ -1012,10 +963,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct NeverBody;
+
+    impl hyper::body::Body for NeverBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
 
     async fn body(response: Response<Body>) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_incomplete_playback_body_has_its_own_deadline() {
+        assert_eq!(read_body(NeverBody).await, Err(BodyReadError::Timeout));
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub struct Opened {
 
 /// Read the path segment `blob` down to its JSON: base64url, then open the seal. Fails CLOSED: a sealed
 /// segment with no keyring, or one no key opens, is `Undecodable`; and with a keyring every install
-/// `/configure` issues is sealed (its public key is public, so a plaintext config is one anyone could have
+/// `/den/configure` issues is sealed (its public key is public, so a plaintext config is one anyone could have
 /// minted), so a plaintext segment is `Plaintext`. Without a keyring plaintext is the only form there is.
 pub fn open_segment(keyring: Option<&Keyring>, blob: &str) -> Result<Opened, Rejected> {
     let data = den_net::b64url_decode(blob).map_err(|_| Rejected::Undecodable)?;

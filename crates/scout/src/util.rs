@@ -112,19 +112,13 @@ fn fold_eq(name: &str, key: &str) -> bool {
     name.chars().map(fold).eq(key.chars().map(fold))
 }
 
-/// A key for work shared between callers, in a TEST build scoped to the runtime the caller is on.
+/// A key for work shared between callers, scoped to the owning `ScoutRuntime` in every build.
 ///
-/// Go's tests run one at a time and share the package's flights and batchers; cargo runs ours in parallel, each on
-/// its own runtime, so two tests that use the same token or title would otherwise join each other's work. Scoping by
-/// runtime id partitions them. A release build has one runtime and returns the key unchanged.
-#[cfg(test)]
+/// Process-wide flights are shared by every hosted Scout instance. The owner namespace prevents independent
+/// instances with equal provider credentials or titles from joining work whose detached task carries another
+/// owner's budget and metrics, while clones of one owner continue to coalesce.
 pub(crate) fn scoped(key: &str) -> String {
-    format!("{}:{key}", tokio::runtime::Handle::current().id())
-}
-
-#[cfg(not(test))]
-pub(crate) fn scoped(key: &str) -> String {
-    key.to_owned()
+    format!("{}:{key}", crate::runtime::current_runtime().id())
 }
 
 /// Go `singleflight.Group.DoChan`: concurrent callers of one key share one run of the work and its answer, and the
@@ -142,7 +136,7 @@ pub(crate) fn scoped(key: &str) -> String {
 /// closure that panics re-raises on a bare goroutine nothing can recover, so each of these jobs recovers its own,
 /// counts it, and abandons the work.
 pub(crate) struct DetachedFlight<T> {
-    calls: std::sync::Mutex<std::collections::BTreeMap<String, Call<T>>>,
+    calls: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Call<T>>>>,
     /// What the work is, for the log line a panic writes. Always a literal, so it is a fixed vocabulary for the
     /// limiter's key.
     what: &'static str,
@@ -157,19 +151,37 @@ struct Call<T> {
 /// Forgets a flight's key when its task ends, however it ends (a runtime shutting down drops the task mid-flight):
 /// a key left behind would have every later caller join a question nobody is asking.
 struct ForgetKey<T: 'static> {
-    flight: &'static DetachedFlight<T>,
+    calls: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Call<T>>>>,
     key: String,
 }
 
 impl<T> Drop for ForgetKey<T> {
     fn drop(&mut self) {
-        self.flight.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.key);
+        self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.key);
     }
 }
 
 impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
-    pub(crate) const fn new(what: &'static str) -> Self {
-        DetachedFlight { calls: std::sync::Mutex::new(std::collections::BTreeMap::new()), what }
+    pub(crate) fn new(what: &'static str) -> Self {
+        DetachedFlight {
+            calls: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            what,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joiners(&self, key: &str) -> Option<usize> {
+        let key = scoped(key);
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|call| call.dups.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active(&self) -> usize {
+        self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Runs `make()` for the first caller of `key`; a caller that arrives while it is in flight waits for the same
@@ -178,60 +190,99 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
     /// `result.Shared`: the run was handed to more than one caller. Every caller of such a run sees it, the one
     /// that started the work included (`c.dups > 0` is read when the answer goes out), so a run shared by two
     /// callers is reported twice.
-    pub(crate) async fn run<F, Fut>(&'static self, key: &str, make: F) -> (Option<T>, bool)
+    pub(crate) async fn run<F, Fut>(&self, key: &str, make: F) -> (Option<T>, bool)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        self.run_inner(key, None, make)
+            .await
+            .expect("an unbounded detached flight cannot be refused")
+    }
+
+    /// Like [`Self::run`], but a new key is installed only when `admission` has a permit immediately available.
+    /// An existing key is checked first and can always be joined, including while every permit is in use. `None`
+    /// means this distinct key was refused; a completed or panicked admitted run is the tuple inside `Some`.
+    pub(crate) async fn run_admitted<F, Fut>(
+        &self,
+        key: &str,
+        admission: &std::sync::Arc<tokio::sync::Semaphore>,
+        make: F,
+    ) -> Option<(Option<T>, bool)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        self.run_inner(key, Some(admission), make).await
+    }
+
+    async fn run_inner<F, Fut>(
+        &self,
+        key: &str,
+        admission: Option<&std::sync::Arc<tokio::sync::Semaphore>>,
+        make: F,
+    ) -> Option<(Option<T>, bool)>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T> + Send + 'static,
     {
         let key = scoped(key);
-        let (mut rx, dups) = {
+        let (mut rx, dups, leader) = {
             let mut calls = self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match calls.get(&key) {
                 Some(call) => {
                     call.dups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    (call.answer.clone(), call.dups.clone())
+                    (call.answer.clone(), call.dups.clone(), None)
                 }
                 None => {
+                    let permit = match admission {
+                        Some(slots) => Some(std::sync::Arc::clone(slots).try_acquire_owned().ok()?),
+                        None => None,
+                    };
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     let dups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     calls.insert(key.clone(), Call { answer: rx.clone(), dups: dups.clone() });
-                    let work = make();
-                    let forget = ForgetKey { flight: self, key };
-                    tokio::spawn(async move {
-                        let answer = match tokio::spawn(work).await {
-                            Ok(answer) => Some(answer),
-                            Err(e) => {
-                                if e.is_panic() {
-                                    crate::metrics::metrics()
-                                        .background_panic
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    crate::loglimit::log_limited(
-                                        &format!("panic:{}", self.what),
-                                        &format!(
-                                            "{} panicked, abandoning it: {}",
-                                            self.what,
-                                            panic_text(e.into_panic())
-                                        ),
-                                    );
-                                }
-                                None
-                            }
-                        };
-                        drop(forget);
-                        let _ = tx.send(Some(answer));
-                    });
-                    (rx, dups)
+                    (rx, dups, Some((tx, permit, key.clone())))
                 }
             }
         };
+        if let Some((tx, permit, key)) = leader {
+            // Constructing the future is outside the map lock. If `make` itself panics, these guards still
+            // remove the key and return the permit without deadlocking on the mutex being unwound.
+            let forget = ForgetKey { calls: self.calls.clone(), key };
+            let work = make();
+            let what = self.what;
+            let runtime = crate::runtime::current_runtime();
+            tokio::spawn(crate::runtime::scope(runtime.clone(), async move {
+                // Admission belongs to detached work, not to the request that happened to create it.
+                let _permit = permit;
+                let answer = match tokio::spawn(crate::runtime::scope(runtime, work)).await {
+                    Ok(answer) => Some(answer),
+                    Err(e) => {
+                        if e.is_panic() {
+                            crate::metrics::metrics()
+                                .background_panic
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::loglimit::log_limited(
+                                &format!("panic:{what}"),
+                                &format!("{} panicked, abandoning it: {}", what, panic_text(e.into_panic())),
+                            );
+                        }
+                        None
+                    }
+                };
+                drop(forget);
+                let _ = tx.send(Some(answer));
+            }));
+        }
         let Ok(answered) = rx.wait_for(|v| v.is_some()).await else {
-            return (None, dups.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            return Some((None, dups.load(std::sync::atomic::Ordering::SeqCst) > 0));
         };
         let answer = (*answered).clone().flatten();
         drop(answered);
         // A joiner is counted in `dups` before the work can finish, and the key is forgotten before the answer is
         // published, so the count is final by now.
-        (answer, dups.load(std::sync::atomic::Ordering::SeqCst) > 0)
+        Some((answer, dups.load(std::sync::atomic::Ordering::SeqCst) > 0))
     }
 }
 

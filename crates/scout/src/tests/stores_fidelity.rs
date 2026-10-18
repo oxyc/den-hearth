@@ -59,8 +59,10 @@ fn calls(endpoint: &str, outcome: &str) -> i64 {
         .unwrap_or_else(|| panic!("no series {series}"))
 }
 
-static FLIGHT: DetachedFlight<u32> = DetachedFlight::new("test flight");
-static LONE_FLIGHT: DetachedFlight<u32> = DetachedFlight::new("test lone flight");
+static FLIGHT: std::sync::LazyLock<DetachedFlight<u32>> =
+    std::sync::LazyLock::new(|| DetachedFlight::new("test flight"));
+static LONE_FLIGHT: std::sync::LazyLock<DetachedFlight<u32>> =
+    std::sync::LazyLock::new(|| DetachedFlight::new("test lone flight"));
 
 // singleflight's `Result.Shared` is `c.dups > 0`, read when the answer goes out, so EVERY caller of a run that was
 // handed to more than one caller sees it, the caller that started the work included. The leader used to be told

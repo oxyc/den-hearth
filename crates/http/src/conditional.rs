@@ -34,7 +34,10 @@ pub fn etag_of(bytes: &[u8]) -> String {
 /// ETag matches. Our ETags are strong, but the comparison is weak (§13.1.2): the `W/` prefix is stripped from both
 /// sides, so a proxy that weakened it (Cloudflare does, when it compresses) still gets its 304.
 pub fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
-    let strong = |tag: &str| tag.trim().trim_start_matches("W/").to_owned();
+    fn strong(tag: &str) -> &str {
+        let tag = tag.trim();
+        tag.strip_prefix("W/").unwrap_or(tag)
+    }
     let etag = strong(etag);
     if_none_match.split(',').any(|tag| tag.trim() == "*" || strong(tag) == etag)
 }

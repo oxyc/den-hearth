@@ -27,7 +27,7 @@ use crate::stores::refusal::{
 };
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
-    dead_link, DeadLinkError, ResolveTarget, StatusAnswer, Store, StoreError, StoreStatus,
+    dead_link, DeadLinkError, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus,
     StoreUnavailableError, ERR_CHECK_FAILED, ERR_WOULD_ADD,
 };
 
@@ -131,7 +131,7 @@ pub(crate) struct Scripted {
     resolve: Arc<dyn Fn(&ResolveTarget) -> Result<String, StoreError> + Send + Sync>,
     status: Option<StoreStatus>,
     /// The three-valued answer, when the store gives one (Go `answeringStore`).
-    answer: Option<StatusAnswer>,
+    answer: Option<ProviderStatus>,
 }
 
 impl Scripted {
@@ -175,7 +175,7 @@ impl Scripted {
         self
     }
 
-    pub(crate) fn answer(mut self, answer: StatusAnswer) -> Scripted {
+    pub(crate) fn answer(mut self, answer: ProviderStatus) -> Scripted {
         self.answer = Some(answer);
         self
     }
@@ -201,14 +201,14 @@ impl Store for Scripted {
         (self.resolve)(t)
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        self.status.clone()
-    }
-
-    async fn status_answer(&self, _t: &ResolveTarget) -> Option<(StoreStatus, StatusAnswer)> {
-        // Deliberately disagrees with `status`, which a store with an answer never reports: that is the only way a
-        // test can tell which one the pool consulted.
-        self.answer.map(|a| (StoreStatus { progress: 0.5, ..Default::default() }, a))
+    async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
+        match self.answer.clone() {
+            Some(ProviderStatus::Downloading(_)) => {
+                ProviderStatus::Downloading(StoreStatus { progress: 0.5, ..Default::default() })
+            }
+            Some(answer) => answer,
+            None => self.status.clone().into(),
+        }
     }
 }
 
@@ -640,7 +640,7 @@ async fn handle_probe_an_indeterminate_status_is_not_an_absence() {
     let uncertain = Scripted::new(DebridService::TorBox)
         .check(&[("abc", false)])
         .resolve_with(|_| Err(dead_link("not held")))
-        .answer(StatusAnswer::Unknown);
+        .answer(ProviderStatus::Unknown);
     let rec = h
         .handle_probe(
             &probe_config(),
@@ -663,7 +663,7 @@ async fn handle_probe_an_indeterminate_status_is_not_an_absence() {
 
     // The same fixture answering DEFINITIVELY still 404s, or the branch above would just be a blanket 503
     // and the route would never report an absence at all.
-    let definitive = uncertain.answer(StatusAnswer::No);
+    let definitive = uncertain.answer(ProviderStatus::NotFetching);
     let rec = h
         .handle_probe(&probe_config(), &StorePool { stores: vec![Box::new(definitive)] }, &target("abc"))
         .await;
@@ -684,9 +684,10 @@ async fn handle_probe_an_indeterminate_status_is_not_an_absence() {
 // already in flight) go through this path.
 #[tokio::test]
 async fn handle_play_names_scout_not_the_debrid_for_its_own_refusals() {
-    let _budget = install_budget(HOUR, 0); // nothing left this hour
+    let budget = install_budget(HOUR, 0); // nothing left this hour
     let cache = mem();
     let h = route_handler(&cache, torbox("tok", &cache, answer(200, r#"{"data":[]}"#)));
+    h.install_test_budget(budget.budget());
     let rec = get(
         &h,
         &format!(
@@ -1745,11 +1746,6 @@ async fn real_debrid_a_downloading_release_is_not_reported_dead() {
 async fn probe_and_play_agree_when_scouts_own_budget_is_spent() {
     let token = "budget-probe_and_play_agree_when_scouts_own_budget_is_spent";
     let hash = "4".repeat(40);
-    // Spend the account's allowance the way a busy hour does.
-    for _ in 0..ADD_BUDGET_LIMIT {
-        global_add_budget().take(&budget_account(DebridService::TorBox, token), false);
-    }
-
     let cache = mem();
     // The upstream must answer DEFINITIVELY, or the probe stops at "a store could not answer"
     // and both routes return 503 for unrelated reasons — which is a green test that proves
@@ -1762,6 +1758,9 @@ async fn probe_and_play_agree_when_scouts_own_budget_is_spent() {
         Ok(resp(200, r#"{"success":true,"data":[]}"#))
     }));
     let h = route_handler(&cache, torbox(token, &cache, client));
+    for _ in 0..ADD_BUDGET_LIMIT {
+        h.test_add_budget().take(&budget_account(DebridService::TorBox, token), false);
+    }
     let tb_blob = blob(&format!(
         r#"{{"debrid":[{{"service":"torbox","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#
     ));

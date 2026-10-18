@@ -460,7 +460,7 @@ mod tests {
             in_process(&hearth, "http://127.0.0.1:8080/cfg/stream/movie/tt1.json", None).await;
         assert_eq!(status, 503);
         assert!(String::from_utf8_lossy(&body).contains("server_busy"), "{body:?}");
-        let (status, _, _) = in_process(&hearth, "http://localhost:8090/scout/manifest.json", None).await;
+        let (status, _, _) = in_process(&hearth, "http://localhost:8090/scout/health", None).await;
         assert_eq!(status, 200, "the control lane still answers, through the main listener's /scout");
     }
 

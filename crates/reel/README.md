@@ -100,15 +100,13 @@ candidate to `ghcr.io/oxyc/den-reel`, and the newest tag is rebuilt weekly for s
 
 ## Routes
 
+Reel is installed only through Hearth's `/den/configure` page and combined `/den` manifest. Its old standalone
+install routes (`/`, `/configure`, `/config-key`, `/manifest.json`, and `/<config>/manifest.json`) return 404;
+the configured resource routes below remain available to the combined addon.
+
 ```
-GET /configure                            →  the page that seals a BYOK key into an install URL
-GET /config-key                           →  the public key /configure seals against, and CONFIG_EPOCH
-GET /<config>/manifest.json               →  addon manifest for a sealed install (add THIS to Den),
-                                             with "denInstallId": the install's id, when it has one;
-                                             400 bad_config if undecodable or revoked
 GET /<config>/meta/<type>/<imdbId>.json    →  as below, resolved with that install's own key
 GET /<config>/prepare/<type>/<id>.json     →  as below, with install-bound source capabilities
-GET /manifest.json                       →  manifest with no config (uses the TMDB_KEY fallback)
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url>,
                                                                  sources: <sources url> } ] } }
 GET /prepare/<movie|series>/<id>.json     →  discovery + the primary trailer's source ladder;
@@ -250,7 +248,8 @@ while the current one shows. Knobs:
   stale-if-error=604800`: fresh for the day the server trusts a resolve, then usable for the rest of the
   week while the client re-asks (or while this server is down). `/<config>/meta` and
   `/<config>/manifest.json` send `private` instead, since the path carries the sealed key. An empty
-  result (no trailer / geo-blocked / transient) is left uncached to re-check. Its links are relative, so
+  authoritative result is cached only for the negative-resolution TTL; a transient failure is left
+  uncached so the client re-checks. Links are relative, so
   it varies on no host. A v1 `/prepare` answer, whose `sourcesBase` is absolute, carries
   `Vary: X-Forwarded-Host, X-Forwarded-Proto, Host`, the inputs that URL is built from.
 - `/play` sends `private, max-age=604800, immutable` with an `ETag` and `Last-Modified` taken from the
@@ -559,10 +558,10 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CONFIG_KEY` | — | sealed config-in-URL: base64 32-byte X25519 private key. Set it and `/configure` seals a BYOK TMDB key into the install URL (`crypto_box_seal`) so no discovery key lives on the server. Generate: `head -c 32 /dev/urandom \| base64` — and **back it up** (losing it breaks sealed installs). Unset = sealed disabled, legacy plaintext URLs still work. See `den-scout/docs/SEALED-CONFIG.md`. |
+| `CONFIG_KEY` | — | sealed config-in-URL: base64 32-byte X25519 private key used by Hearth's combined `/den/configure` flow. Generate: `head -c 32 /dev/urandom \| base64` — and **back it up** (losing it breaks sealed installs). Unset = sealed disabled, legacy plaintext resource URLs still work. See `den-scout/docs/SEALED-CONFIG.md`. |
 | `CONFIG_KEYS_PREV` | — | comma-separated prior keys for rotation (old sealed URLs keep decrypting). **Rotation is not revocation:** because old links keep opening, rotating `CONFIG_KEY` does nothing to a leaked link — use `REVOKED_INSTALLS` / `CONFIG_EPOCH`. |
-| `REVOKED_INSTALLS` | — | comma-separated install ids refused outright. Every `/configure` link carries one (`iid`, 16 random bytes as 22 base64url characters) inside the sealed config; a malformed entry is skipped with a warning. A refusal is the same 400 `bad_config` an undecodable segment gets, logged as `bad_config: … refused — install revoked (iid=<first 6 chars>…)`. `/configure` shows each link's id when it builds it, and the configured manifest carries it as `denInstallId`. With `PLAY_SECRET` set, the trailer links an install was handed are revoked too (see `PLAY_SECRET`). |
-| `CONFIG_EPOCH` | `0` | links stamped with an `ep` below this are refused (`install epoch too old`); raise it to revoke every existing link without rotating `CONFIG_KEY`. Links from before install ids existed count as `0`. `/config-key` hands the current value to `/configure`, which stamps it into new links. Not a non-negative integer → warned and enforced as `0`. |
+| `REVOKED_INSTALLS` | — | comma-separated install ids refused outright. Every combined `/den/configure` link carries one (`iid`, 16 random bytes as 22 base64url characters) inside the sealed config; a malformed entry is skipped with a warning. A refusal is the same 400 `bad_config` an undecodable segment gets. With `PLAY_SECRET` set, the trailer links an install was handed are revoked too (see `PLAY_SECRET`). |
+| `CONFIG_EPOCH` | `0` | links stamped with an `ep` below this are refused (`install epoch too old`); raise it to revoke every existing link without rotating `CONFIG_KEY`. Links from before install ids existed count as `0`. Hearth's combined configuration flow stamps the current value into new links. Not a non-negative integer → warned and enforced as `0`. |
 | `PLAY_SECRET` | — | sign the play URLs. Set it and `/meta` emits `…/play/<id>.mp4?s=<tag>&i=<iid>&e=<ep>` (keyed BLAKE2b over the id and the install id and epoch of the config that asked; the config-less `/meta` emits `?s=<tag>` bound to no install), which `/play` then requires. The install is signed, so editing `i`/`e` breaks the tag, and `/play` and `/crop` check it against `REVOKED_INSTALLS`, `CONFIG_EPOCH` and `REQUIRE_INSTALL_ID`: a revoked install's links get the same 403 `bad_signature` as a bad tag, logged as `bad_signature: link for <id> refused — install revoked (iid=<first 6 chars>…)`. Without it, `/play` and `/crop` will extract and cache any YouTube id anyone asks for, which matters the moment the instance is reachable off-LAN. **Unset by default. On an existing install, turn it on together with `PLAY_SIGNING_GRACE_UNTIL`** — a `/meta` response can stand in a client's cache for up to 7 days, so on its own it strands already-issued unsigned URLs for that long. Any string. `/crop` takes the same query (the tag does not cover the path, so a client can carry the one from the play URL across) but an unsigned `/crop` is answered `letterboxed:false` rather than refused — it is a hint, and the download behind it is what the gate protects. Releases up to 0.12 signed the id alone; those tags are accepted only while `PLAY_SIGNING_GRACE_UNTIL` is ahead. |
 | `PLAY_SECRETS_PREV` | — | comma-separated prior play secrets, accepted when verifying and never used to sign. Rotate through it for the same reason `CONFIG_KEYS_PREV` exists: clients hold signed URLs for up to 7 days, so rotating without it is a week of 403s. |
 | `PLAY_SIGNING_GRACE_UNTIL` | — | the switch-over for `PLAY_SECRET`: an RFC 3339 timestamp with an offset, e.g. `2026-09-17T12:00:00Z`. `/meta` signs from the start, but until this moment a `/play` or `/crop` with **no** `s` is still served, so the unsigned URLs clients cached before signing keep playing — and so is one whose `s` covers the id alone, as releases up to 0.12 signed it, so upgrading does not strand the signed URLs clients hold. **Upgrading a signed install from ≤0.12: keep this at least 7 days past the upgrade.** Those URLs name no install, so a revocation cannot reach them until the grace ends. Any other wrong `s` is refused throughout. **Set it together with `PLAY_SECRET`, to now + 7 days** (`date -u -d +7days +%Y-%m-%dT%H:%M:%SZ`), and **remove it once it has passed**. Each id served this way is logged once (`play signing grace: served <id> without a tag` / `… on a tag from before install binding`), so the stragglers are visible, and the startup line reads `play_signing=grace(until=…)`. A value that doesn't parse is logged and ignored, so signing is enforced at once. Ignored without `PLAY_SECRET`. |
@@ -599,6 +598,6 @@ Tests: `cargo test -p den-reel` (hermetic: a fake upstream and a stubbed prober,
 
 Released, signed and deployed as part of den-hearth (the repository README and the den repo's `deploy/`).
 Play URLs are relative to the request, so they land on whichever address the client asked
-(`http://<den-ip>:8092/play/…` on Reel's own listener). Add the URL `/configure` gives you, `http://<den-ip>:8092/<config>/manifest.json`, to Den
-(Settings → Plugins, or `dev-addons.json`). The config-less `/manifest.json` works only while `TMDB_KEY` is
-set, and resolves with that shared key rather than the install's own.
+(`http://<den-ip>:8092/play/…` on Reel's own listener). Install and manage Reel through Hearth's
+combined `/den/configure` page; the Reel listener is a
+resource and operational boundary, not an addon installation surface.

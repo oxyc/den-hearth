@@ -22,7 +22,7 @@ use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -101,6 +101,8 @@ struct State {
 /// What the cache knows about one file in its directory, so it never has to open a file to learn it.
 #[derive(Clone, Copy)]
 struct Meta {
+    /// Identity of this particular committed file. It changes on every rename, even when expiry and size do not.
+    generation: u64,
     /// Unix seconds, from the file's first line.
     expires: i64,
     size: u64,
@@ -131,6 +133,9 @@ pub(crate) struct Disk {
     pub(crate) stats: DiskStats,
     index: Mutex<Index>,
     hasher: DefaultHashBuilder,
+    next_generation: AtomicU64,
+    /// 0 idle, 1 sweeping, 2 sweeping with one coalesced follow-up requested.
+    burst_sweep: AtomicU8,
 }
 
 /// A file read back: the bytes, where the value starts in them, and when it expires.
@@ -138,6 +143,7 @@ pub(crate) struct Loaded {
     raw: Vec<u8>,
     start: usize,
     pub expires: i64,
+    pub generation: u64,
 }
 
 impl Loaded {
@@ -178,6 +184,8 @@ impl Disk {
             stats: DiskStats::default(),
             index: Mutex::new(Index::new()),
             hasher: DefaultHashBuilder::default(),
+            next_generation: AtomicU64::new(1),
+            burst_sweep: AtomicU8::new(0),
         };
         if !unusable {
             // One walk of the directory does both jobs: it builds the index (a file the index does not know is read
@@ -256,7 +264,7 @@ impl Disk {
         // opening it.
         let meta = self.index().get(&name).copied()?;
         if now_s >= meta.expires {
-            self.retire(&name);
+            self.retire_generation(&name, meta.generation);
             return None;
         }
         let raw = fs::read(self.dir.join(&name));
@@ -267,7 +275,10 @@ impl Disk {
                 // The file went after the index was told about it. The sweep only walks files that exist, so nothing
                 // else would ever drop this entry, and every get would repeat the failed read.
                 if e.kind() == io::ErrorKind::NotFound {
-                    self.index().remove(&name);
+                    let mut idx = self.index();
+                    if idx.get(&name).is_some_and(|m| m.generation == meta.generation) {
+                        idx.remove(&name);
+                    }
                 }
                 return None;
             }
@@ -280,16 +291,21 @@ impl Disk {
         let Some(h) = intact else {
             // Expired, torn, or in a format this cache does not read. All are unusable, and an unreadable file left in
             // place is never reclaimed by anything.
-            self.retire(&name);
+            self.retire_generation(&name, meta.generation);
             return None;
         };
-        Some((name, Loaded { start: h.end, expires: h.expires, raw }))
+        // A rename may have happened while the file was being read. Never let bytes from the superseded generation
+        // repopulate memory or teach the new generation the old fingerprint.
+        if self.index().get(&name).is_none_or(|m| m.generation != meta.generation) {
+            return None;
+        }
+        Some((name, Loaded { start: h.end, expires: h.expires, generation: meta.generation, raw }))
     }
 
     /// Records that this process has seen `value` as the file's content, so the same put later writes nothing.
-    pub(crate) fn remember(&self, name: &str, value: &str) {
+    pub(crate) fn remember(&self, name: &str, generation: u64, value: &str) {
         let fp = self.fingerprint(value);
-        if let Some(m) = self.index().get_mut(name) {
+        if let Some(m) = self.index().get_mut(name).filter(|m| m.generation == generation) {
             m.value = Some(fp);
         }
     }
@@ -337,16 +353,31 @@ impl Disk {
         let mut body = String::with_capacity(header.len() + value.len());
         body.push_str(&header);
         body.push_str(value);
-        if let Err((op, e)) = write_entry(&self.dir, &self.dir.join(name), &body) {
+        let tmp = match write_temp(&self.dir, &body) {
+            Ok(tmp) => tmp,
+            Err((op, e)) => {
+                self.stats.write_failures.fetch_add(1, Ordering::Relaxed);
+                self.disable_writes(op, &e);
+                return false;
+            }
+        };
+        // The rename and its index commit are one namespace transaction with retire and sweep eviction. The temp
+        // write stays outside the lock, so unrelated reads and the expensive part of concurrent writes do not queue.
+        let mut idx = self.index();
+        if let Err(e) = fs::rename(&tmp, self.dir.join(name)) {
+            drop(idx);
+            let _ = fs::remove_file(&tmp);
             self.stats.write_failures.fetch_add(1, Ordering::Relaxed);
-            self.disable_writes(op, &e);
+            self.disable_writes("rename", &e);
             return false;
         }
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
         self.stats.bytes_written.fetch_add(body.len() as u64, Ordering::Relaxed);
-        self.index().insert(
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        idx.insert(
             name.to_owned(),
             Meta {
+                generation,
                 expires,
                 size: body.len() as u64,
                 written: now,
@@ -354,6 +385,7 @@ impl Disk {
                 rank: (self.cost)(key),
             },
         );
+        drop(idx);
         self.note_written(body.len())
     }
 
@@ -376,15 +408,61 @@ impl Disk {
     /// Removes the file for `name`, if the index knows one: a key that was never written costs no syscall. Removal is
     /// best-effort; a failure disables persistence rather than let the stale file come back.
     pub(crate) fn retire(&self, name: &str) {
-        if self.index().remove(name).is_none() {
+        let mut idx = self.index();
+        if !idx.contains_key(name) {
             return;
         }
         self.stats.unlink();
         match fs::remove_file(self.dir.join(name)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => self.disable("retire durable entry", &e),
+            Ok(()) => {
+                idx.remove(name);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                idx.remove(name);
+            }
+            Err(e) => {
+                // Keep a tombstone in the index so the next sweep retries the unlink instead of rediscovering the
+                // still-fresh stale file as live when it re-enables persistence.
+                if let Some(meta) = idx.get_mut(name) {
+                    meta.expires = 0;
+                }
+                drop(idx);
+                self.disable("retire durable entry", &e);
+            }
         }
+    }
+
+    fn retire_generation(&self, name: &str, generation: u64) {
+        let mut idx = self.index();
+        if idx.get(name).is_none_or(|m| m.generation != generation) {
+            return;
+        }
+        self.stats.unlink();
+        match fs::remove_file(self.dir.join(name)) {
+            Ok(()) => {
+                idx.remove(name);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                idx.remove(name);
+            }
+            Err(e) => {
+                if let Some(meta) = idx.get_mut(name) {
+                    meta.expires = 0;
+                }
+                drop(idx);
+                self.disable("retire durable entry", &e);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation_for(&self, key: &str) -> Option<u64> {
+        self.index().get(&self.naming.file_name(key)).map(|m| m.generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_generation_for_test(&self, key: &str, generation: u64) {
+        self.retire_generation(&self.naming.file_name(key), generation);
     }
 
     pub(crate) fn remove(&self, key: &str) {
@@ -412,6 +490,7 @@ impl Disk {
             .map_or(0, |h| h.expires);
         let rank = self.naming.key_prefix(name).map_or(0, |k| (self.cost)(&k));
         Some(Meta {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
             expires,
             size: info.len(),
             written: info.modified().unwrap_or(UNIX_EPOCH),
@@ -420,10 +499,29 @@ impl Disk {
         })
     }
 
+    pub(crate) fn request_burst_sweep(&self) -> bool {
+        let mut state = self.burst_sweep.load(Ordering::Acquire);
+        loop {
+            let next = if state == 0 { 1 } else { 2 };
+            match self.burst_sweep.compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(previous) => return previous == 0,
+                Err(current) => state = current,
+            }
+        }
+    }
+
     pub(crate) fn sweep_after_burst(&self, now: SystemTime) {
-        let n = self.sweep(now);
-        if n > 0 {
-            (self.log)(&format!("swept {n} cache entries after a write burst"));
+        loop {
+            let n = self.sweep(now);
+            if n > 0 {
+                (self.log)(&format!("swept {n} cache entries after a write burst"));
+            }
+            let requested = self.burst_sweep.swap(0, Ordering::AcqRel);
+            if requested != 2
+                || self.burst_sweep.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err()
+            {
+                break;
+            }
         }
     }
 
@@ -444,10 +542,12 @@ impl Disk {
                 st.off = false;
                 st.write_off = false;
             }
+            // Claim only the bytes that existed when this sweep began. Puts during the directory walk accumulate
+            // toward the next coalesced sweep instead of being erased at the end.
+            st.written = 0;
         }
         self.stats.readdirs.fetch_add(1, Ordering::Relaxed);
         let Ok(entries) = fs::read_dir(&self.dir) else {
-            self.lock().written = 0;
             return 0;
         };
         let now_unix = unix_secs(now);
@@ -462,11 +562,13 @@ impl Disk {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if self.naming.is_entry(&name) {
-                let known = self.index().get(&name).copied();
+                let mut idx = self.index();
+                let known = idx.get(&name).copied();
                 let Some(meta) = known.or_else(|| self.scan_entry(&name, &path)) else { continue };
                 if known.is_none() {
-                    self.index().insert(name.clone(), meta);
+                    idx.insert(name.clone(), meta);
                 }
+                drop(idx);
                 if meta.expires > now_unix {
                     live_bytes += meta.size as i64;
                     live.push((name, meta));
@@ -475,13 +577,19 @@ impl Disk {
                 // Removed under the lock, and only if the entry is still the one judged: a put that rewrote it since
                 // the listing was read has a later expiry and must keep its file.
                 let mut idx = self.index();
-                if idx.get(&name).is_some_and(|m| m.expires != meta.expires) {
+                if idx.get(&name).is_some_and(|m| m.generation != meta.generation) {
                     continue;
                 }
-                idx.remove(&name);
                 self.stats.unlink();
-                if fs::remove_file(&path).is_ok() {
-                    removed += 1;
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        idx.remove(&name);
+                        removed += 1;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        idx.remove(&name);
+                    }
+                    Err(_) => {}
                 }
             } else if name.starts_with(".tmp-") || self.naming.is_legacy_temp(&name) {
                 // A temp file outlives its put only if the process died between create and rename. The grace period
@@ -507,6 +615,7 @@ impl Disk {
                     _ => {
                         live_bytes += info.len() as i64;
                         let meta = Meta {
+                            generation: 0,
                             expires: i64::MAX,
                             size: info.len(),
                             written: UNIX_EPOCH,
@@ -518,8 +627,6 @@ impl Disk {
                 }
             }
         }
-        self.lock().written = 0;
-
         // Expiry alone is not a ceiling; it is a schedule. Cheapest to rebuild first, then oldest: age alone is the
         // wrong question, since a hit never touches the file and a use-every-evening entry looks as old as one read
         // once and abandoned.
@@ -532,9 +639,21 @@ impl Disk {
             if live_bytes <= max_bytes {
                 break;
             }
-            self.index().remove(name);
+            if meta.generation == 0 {
+                self.stats.unlink();
+                if fs::remove_file(self.dir.join(name)).is_ok() {
+                    live_bytes -= meta.size as i64;
+                    removed += 1;
+                }
+                continue;
+            }
+            let mut idx = self.index();
+            if idx.get(name).is_none_or(|current| current.generation != meta.generation) {
+                continue;
+            }
             self.stats.unlink();
             if fs::remove_file(self.dir.join(name)).is_ok() {
+                idx.remove(name);
                 live_bytes -= meta.size as i64;
                 removed += 1;
             }
@@ -559,15 +678,15 @@ fn parse_header(raw: &[u8], accept_unframed: bool) -> Option<Header> {
     }
 }
 
-/// `body` is written to a `.tmp-` file beside `dest` and renamed over it, so a half-written entry read after a crash
-/// is never served. The error names the step that failed, for `disable`.
-fn write_entry(dir: &Path, dest: &Path, body: &str) -> Result<(), (&'static str, io::Error)> {
+/// Writes `body` to a unique temp file beside the eventual destination. Its caller serializes the rename with index
+/// mutation, so a half-written entry is never served and retirement cannot unlink a newer generation.
+fn write_temp(dir: &Path, body: &str) -> Result<PathBuf, (&'static str, io::Error)> {
     let tmp = dir.join(temp_name());
     let mut file =
         OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|e| ("create temp", e))?;
     let written = file.write_all(body.as_bytes()).map_err(|e| ("write", e));
     drop(file);
-    let result = written.and_then(|()| fs::rename(&tmp, dest).map_err(|e| ("rename", e)));
+    let result = written.map(|()| tmp.clone());
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }

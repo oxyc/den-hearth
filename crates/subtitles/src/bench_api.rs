@@ -28,5 +28,5 @@ pub fn etag_of(bytes: &[u8]) -> String {
 }
 
 pub fn manifest() -> serde_json::Value {
-    crate::addon::manifest(None)
+    crate::addon::manifest()
 }

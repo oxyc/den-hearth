@@ -139,8 +139,8 @@ pub fn classify(target: &Target, method: &Method) -> Class {
         Target::Subs(_) => bulk(None),
         Target::Remux(path) if remux_control(path, method) => control,
         Target::Remux(path) => bulk(remux_media(path).then_some(MediaClass::Remux)),
-        // A resource is admitted exactly as the same path on its service's own mount; the addon's own pages,
-        // key and manifests are answered from no upstream, like each service's.
+        // A resource is admitted exactly as the same path on its service's own mount. The addon's small key
+        // and manifest answers are control; its much larger configure document is deliberately bulk below.
         Target::Den(route) => match route {
             Route::Scout(path) => classify(&Target::Scout(path.clone()), method),
             Route::Subs(path) => classify(&Target::Subs(path.clone()), method),
@@ -152,40 +152,24 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             // Up to three public-key decryptions: never consume the reserved control lane under abuse.
             Route::Migrate if *method == Method::OPTIONS => control,
             Route::Migrate => bulk(None),
-            Route::Configure | Route::Manifest | Route::ConfigKey | Route::Installed(_) if read => control,
+            // The configure document embeds the browser seal implementation and is about 148 KiB. Slow or
+            // stampeding setup clients must not consume the positions reserved for health and metrics.
+            Route::Configure if read => bulk(None),
+            Route::Manifest | Route::ConfigKey | Route::Installed(_) if read => control,
             _ => bulk(None),
         },
     }
 }
 
-/// Scout's static answers, none of which touch an indexer or a debrid service: the configure page, the
-/// probes, the unconfigured manifest, the sealing key, and a configured install's `/<config>/manifest.json`
-/// (which only opens the config). `/<config>/stream`, `/play`, `/account` and `/p/<ticket>` are bulk.
+/// Scout's retained operational probes. Resource and ticket work is bulk; obsolete install routes are
+/// intentionally not granted a reserved slot merely to return 404.
 fn scout_control(path: &str) -> bool {
-    if matches!(
-        path,
-        "/" | "/configure" | "/configure/" | "/health" | "/metrics" | "/manifest.json" | "/config-key"
-    ) {
-        return true;
-    }
-    config_manifest(path)
+    matches!(path, "/health" | "/metrics")
 }
 
-/// Reel's static answers, like Scout's and Subtitles': the probes, the manifests (an installed one included, which
-/// only opens its config), the configure page, the sealing key, and the cheap capability check.
+/// Reel's retained probes and cheap capability check.
 fn reel_control(path: &str) -> bool {
-    matches!(
-        path,
-        "/health" | "/metrics" | "/manifest.json" | "/config-key" | "/" | "/configure" | "/configure/"
-    ) || path.starts_with("/_internal/validate/m/s/")
-        || config_manifest(path)
-}
-
-/// `/<config>/manifest.json`.
-fn config_manifest(path: &str) -> bool {
-    path.strip_prefix('/')
-        .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, tail)| tail == "manifest.json")
+    matches!(path, "/health" | "/metrics") || path.starts_with("/_internal/validate/m/s/")
 }
 
 /// Reel's streamed bodies: a trailer file, a progressive MP4, and HLS / direct-media segments. Both the
@@ -199,10 +183,7 @@ fn reel_media(path: &str) -> bool {
 }
 
 fn subs_control(path: &str) -> bool {
-    if matches!(path, "/health" | "/metrics" | "/manifest.json") {
-        return true;
-    }
-    config_manifest(path)
+    matches!(path, "/health" | "/metrics")
 }
 
 fn remux_control(path: &str, method: &Method) -> bool {
@@ -252,23 +233,12 @@ mod tests {
         for (target, method) in [
             (Target::Health, Method::GET),
             (Target::Metrics, Method::GET),
-            (Target::Scout("/".into()), Method::GET),
-            (Target::Scout("/configure".into()), Method::GET),
             (Target::Scout("/health".into()), Method::GET),
             (Target::Scout("/metrics".into()), Method::GET),
-            (Target::Scout("/manifest.json".into()), Method::GET),
-            (Target::Scout("/config-key".into()), Method::GET),
-            (Target::Scout("/CONFIG/manifest.json".into()), Method::GET),
             (Target::Scout("/CONFIG/stream/movie/tt1.json".into()), Method::OPTIONS),
             (Target::Reel("/health".into()), Method::GET),
-            (Target::Reel("/manifest.json".into()), Method::GET),
-            (Target::Reel("/".into()), Method::GET),
-            (Target::Reel("/configure".into()), Method::GET),
-            (Target::Reel("/CONFIG/manifest.json".into()), Method::GET),
             (Target::Remux("/health".into()), Method::GET),
             (Target::Reel("/_internal/validate/m/s/blob".into()), Method::GET),
-            (Target::Subs("/manifest.json".into()), Method::GET),
-            (Target::Subs("/CONFIG/manifest.json".into()), Method::GET),
             (Target::Remux("/remux/health".into()), Method::GET),
             (Target::Remux("/metrics".into()), Method::GET),
             (Target::Remux("/remux/s/sid/sig/heartbeat".into()), Method::POST),
@@ -288,9 +258,20 @@ mod tests {
             (Target::Scout("/p/ticket".into()), Method::DELETE),
             (Target::Scout("/validate".into()), Method::POST),
             (Target::Scout("/CONFIG/availability".into()), Method::POST),
+            (Target::Scout("/".into()), Method::GET),
+            (Target::Scout("/configure".into()), Method::GET),
+            (Target::Scout("/manifest.json".into()), Method::GET),
+            (Target::Scout("/config-key".into()), Method::GET),
+            (Target::Scout("/CONFIG/manifest.json".into()), Method::GET),
             (Target::Scout("/manifest.json".into()), Method::POST),
             (Target::Reel("/something-new".into()), Method::GET),
+            (Target::Reel("/manifest.json".into()), Method::GET),
+            (Target::Reel("/".into()), Method::GET),
+            (Target::Reel("/configure".into()), Method::GET),
+            (Target::Reel("/CONFIG/manifest.json".into()), Method::GET),
             (Target::Reel("/meta/movie/tt1.json".into()), Method::GET),
+            (Target::Subs("/manifest.json".into()), Method::GET),
+            (Target::Subs("/CONFIG/manifest.json".into()), Method::GET),
             (Target::Subs("/CONFIG/subtitles/movie/tt1.json".into()), Method::GET),
             (Target::Subs("/manifest.json".into()), Method::POST),
             (Target::Remux("/remux/session".into()), Method::POST),
@@ -300,6 +281,7 @@ mod tests {
             (Target::Remux("/remux/s/sid/sig/heartbeat".into()), Method::GET),
             (Target::Remux("/remux/admin/kill".into()), Method::POST),
             (Target::Den(Route::Guest), Method::POST),
+            (Target::Den(Route::Configure), Method::GET),
         ] {
             assert_eq!(class(target, method.clone()).0, Bulk, "{method}");
         }
@@ -484,11 +466,12 @@ mod tests {
         }
         assert_eq!(class(target("/den/play/x.mp4"), get.clone()), (Lane::Bulk, Some(MediaClass::Reel)));
         assert_eq!(class(target("/den/CFG/stream/movie/tt1.json"), get.clone()), (Lane::Bulk, None));
-        for path in
-            ["/den", "/den/configure", "/den/manifest.json", "/den/config-key", "/den/CFG/manifest.json"]
-        {
+        for path in ["/den/manifest.json", "/den/config-key", "/den/CFG/manifest.json"] {
             assert_eq!(class(target(path), get.clone()).0, Lane::Control, "{path}");
             assert_eq!(class(target(path), Method::POST).0, Lane::Bulk, "{path}");
+        }
+        for path in ["/den", "/den/configure"] {
+            assert_eq!(class(target(path), get.clone()).0, Lane::Bulk, "{path}");
         }
         assert_eq!(class(target("/den/nope/nope"), get).0, Lane::Bulk);
     }

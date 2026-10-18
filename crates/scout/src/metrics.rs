@@ -8,15 +8,14 @@
 //! answered, buildStreamList knew whether the list was degraded or partial, probeTop knew whether the key
 //! was warm — so this adds observation, not work.
 //!
-//! Package-level rather than threaded through, because the interesting events happen in free functions
-//! (scrapeAll) as much as on the handler, and passing a collector into all of them would be a much larger
-//! change than the counters justify. Atomics only: these sit on the request path and must not allocate or
-//! contend. The Prometheus text is written with `den_http::prom`, as every den addon writes its own.
+//! The collector belongs to `ScoutRuntime`; a runtime scope lets free functions and detached provider work
+//! reach the same injected counters without giving each handler a subtly different view. Atomics only: these
+//! sit on the request path and must not allocate or contend. The Prometheus text is written with
+//! `den_http::prom`, as every den addon writes its own.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-#[cfg(not(test))]
-use std::sync::LazyLock;
+use std::sync::Arc;
 
 use den_http::prom;
 
@@ -81,6 +80,11 @@ pub struct MetricSet {
     pub build_ok: AtomicI64,
     pub build_partial: AtomicI64,
     pub build_degraded: AtomicI64,
+    pub list_build_admitted: AtomicI64,
+    pub list_build_refused: AtomicI64,
+    pub list_build_active: AtomicI64,
+    pub scraper_request_admitted: AtomicI64,
+    pub scraper_request_active: AtomicI64,
 
     pub probe_cache_hit: AtomicI64,
     pub probe_cache_miss: AtomicI64,
@@ -142,6 +146,11 @@ pub fn new_metric_set() -> MetricSet {
         build_ok: AtomicI64::new(0),
         build_partial: AtomicI64::new(0),
         build_degraded: AtomicI64::new(0),
+        list_build_admitted: AtomicI64::new(0),
+        list_build_refused: AtomicI64::new(0),
+        list_build_active: AtomicI64::new(0),
+        scraper_request_admitted: AtomicI64::new(0),
+        scraper_request_active: AtomicI64::new(0),
         probe_cache_hit: AtomicI64::new(0),
         probe_cache_miss: AtomicI64::new(0),
         background_panic: AtomicI64::new(0),
@@ -169,28 +178,9 @@ pub fn new_metric_set() -> MetricSet {
     }
 }
 
-#[cfg(not(test))]
-static METRICS: LazyLock<MetricSet> = LazyLock::new(new_metric_set);
-
-// A TEST build keeps the counters per thread, as the add budget does (addbudget.rs). Go's tests run one at a time
-// and assert on DELTAS of the process-wide counters, which holds only when nothing else is counting meanwhile;
-// cargo runs ours in parallel. Each test runs on its own thread (and a `#[tokio::test]` keeps all its tasks
-// there), so the counters it reads are the ones it fed.
-#[cfg(test)]
-thread_local! {
-    static METRICS: &'static MetricSet = Box::leak(Box::new(new_metric_set()));
-}
-
 /// Go's package-level `metrics`.
-pub fn metrics() -> &'static MetricSet {
-    #[cfg(not(test))]
-    {
-        &METRICS
-    }
-    #[cfg(test)]
-    {
-        METRICS.with(|m| *m)
-    }
+pub fn metrics() -> Arc<MetricSet> {
+    crate::runtime::current_runtime().metrics()
 }
 
 /// Panics recovered on a background task, for a test to compare before and after.
@@ -304,6 +294,37 @@ impl MetricSet {
                 (r#"result="partial""#.to_owned(), ld(&self.build_partial)),
                 (r#"result="degraded""#.to_owned(), ld(&self.build_degraded)),
             ],
+        );
+        counter(
+            &mut b,
+            "scout_list_build_admission_total",
+            "Distinct stream-list build admission decisions.",
+            &[
+                (r#"result="admitted""#.to_owned(), ld(&self.list_build_admitted)),
+                (r#"result="refused""#.to_owned(), ld(&self.list_build_refused)),
+            ],
+        );
+        prom::series(
+            &mut b,
+            "scout_list_builds_active",
+            "gauge",
+            "Distinct stream-list builds currently admitted.",
+            "",
+            ld(&self.list_build_active),
+        );
+        counter(
+            &mut b,
+            "scout_scraper_request_admission_total",
+            "Scraper requests admitted by the process-wide body ceiling.",
+            &[(String::new(), ld(&self.scraper_request_admitted))],
+        );
+        prom::series(
+            &mut b,
+            "scout_scraper_requests_active",
+            "gauge",
+            "Scraper requests currently holding process-wide body admission.",
+            "",
+            ld(&self.scraper_request_active),
         );
         counter(
             &mut b,

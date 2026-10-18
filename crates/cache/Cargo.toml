@@ -8,10 +8,14 @@ license = "MIT"
 
 [dependencies]
 # The memory tier: sharded and byte-weighted, so a hit does not queue behind a write and the budget is bytes.
-quick_cache = "0.6"
+quick_cache.workspace = true
 # Entry file names (url-safe base64 of the key, or of its SHA-256).
-base64 = "0.23"
-sha2 = "0.11"
+base64.workspace = true
+sha2.workspace = true
+# A disk operation reached from Hearth's multi-thread runtime uses `block_in_place`: the calling
+# thread finishes the indivisible cache mutation while Tokio lends its core-worker role to another
+# thread. Current-thread runtimes and ordinary synchronous callers keep the direct path.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

@@ -4,8 +4,6 @@
 //! is `den-cache`, shared with Subtitles; this is Scout's seat on it: the hashed file names, the ten-minute persistence
 //! floor, and the hourly sweep.
 
-#[cfg(test)]
-use std::fmt::Display;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,12 +118,6 @@ impl TieredCache {
         }
     }
 
-    /// Go `disable`: turns the disk tier off after a failure, and logs why.
-    #[cfg(test)]
-    pub(crate) fn disable(&self, op: &str, err: &dyn Display) {
-        self.inner.disable_disk(op, err);
-    }
-
     #[cfg(test)]
     pub(crate) fn disabled(&self) -> bool {
         !self.inner.disk_enabled()
@@ -137,7 +129,7 @@ impl TieredCache {
         self.inner.disk_bytes()
     }
 
-    #[cfg(any(test, feature = "bench"))]
+    #[cfg(feature = "bench")]
     pub(crate) fn set_max_bytes(&self, bytes: i64) {
         self.inner.set_disk_bytes(bytes);
     }

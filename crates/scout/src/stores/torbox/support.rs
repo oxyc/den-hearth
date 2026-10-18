@@ -2,13 +2,14 @@
 //! sentinel errors it raises, the readers for the JSON shapes it decodes the way Go's `encoding/json` does, and the
 //! detached single-flight its shared reads run through.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
 
 use crate::config::DebridService;
-use crate::stores::{dead_link, unavailable, StoreError, ERR_TORRENT_GONE, ERR_WOULD_ADD};
+use crate::metrics::MetricSet;
+use crate::stores::{dead_link, unavailable, StoreError, ERR_WOULD_ADD};
 use crate::util::{fold_json_keys, Shape};
 
 /// A poisoned lock still holds consistent state here (every edit finishes before anything can panic).
@@ -17,7 +18,7 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(crate) fn torrent_gone() -> StoreError {
-    dead_link(ERR_TORRENT_GONE)
+    StoreError::TorrentGone
 }
 
 /// Go `errWouldAdd`: a NoAdd target could only be resolved by queueing the torrent, so it was not resolved.
@@ -107,17 +108,33 @@ pub(crate) fn string_or_empty(v: Option<&Value>) -> Result<String, ()> {
 // --- concurrency ---
 
 /// Adds one to a gauge while it lives (Go's `Add(1)` and a deferred `Add(-1)`).
-pub(super) struct GaugeGuard(&'static AtomicI64);
+pub(super) enum Gauge {
+    StatusActive,
+    StatusWaiters,
+}
+
+pub(super) struct GaugeGuard {
+    metrics: std::sync::Arc<MetricSet>,
+    gauge: Gauge,
+}
 
 impl GaugeGuard {
-    pub(super) fn new(gauge: &'static AtomicI64) -> GaugeGuard {
-        gauge.fetch_add(1, Ordering::Relaxed);
-        GaugeGuard(gauge)
+    pub(super) fn new(metrics: std::sync::Arc<MetricSet>, gauge: Gauge) -> GaugeGuard {
+        match gauge {
+            Gauge::StatusActive => &metrics.torbox_status_active,
+            Gauge::StatusWaiters => &metrics.torbox_status_waiters,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        GaugeGuard { metrics, gauge }
     }
 }
 
 impl Drop for GaugeGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        match self.gauge {
+            Gauge::StatusActive => &self.metrics.torbox_status_active,
+            Gauge::StatusWaiters => &self.metrics.torbox_status_waiters,
+        }
+        .fetch_sub(1, Ordering::Relaxed);
     }
 }

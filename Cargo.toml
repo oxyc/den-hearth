@@ -2,6 +2,43 @@
 resolver = "2"
 members = ["crates/*"]
 
+# Versions shared across members live here; each crate keeps its own feature selection beside the code that needs it.
+[workspace.dependencies]
+base64 = "0.23"
+async-trait = "0.1"
+blake2 = "0.10"
+bytes = "1"
+chacha20poly1305 = "0.10"
+crypto_box = "0.9"
+divan = "0.1"
+fastrand = "2"
+flate2 = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+hkdf = "0.13"
+http = "1"
+http-body-util = "0.1"
+httpdate = "1"
+hyper = "1"
+hyper-util = "0.1"
+libc = "0.2"
+quick_cache = "0.6"
+reqwest = { version = "0.12", default-features = false }
+serde = "1"
+serde_json = "1"
+sha2 = "0.11"
+subtle = "2"
+tempfile = "3"
+tokio = "1"
+tokio-util = "0.7"
+
+den-cache = { path = "crates/cache" }
+den-http = { path = "crates/http" }
+den-media = { path = "crates/media" }
+den-net = { path = "crates/net" }
+den-process = { path = "crates/process" }
+den-seal = { path = "crates/seal" }
+den-upstream = { path = "crates/upstream" }
+
 # Line tables are all a panic backtrace needs; dropping variable-level DWARF cuts the clean build's CPU time by
 # about a fifth (BENCHMARKS.md, "Test-suite speed"). Attach a debugger with `--config profile.dev.debug=2`.
 [profile.dev]

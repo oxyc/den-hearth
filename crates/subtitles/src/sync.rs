@@ -57,6 +57,10 @@ const TIER2_MIN_PROBE_CUES: usize = 5;
 const TIER2_MAX_SHIFT_MS: i64 = 120_000;
 const TIER2_SAMPLE_LEAD_MS: u64 = 30_000;
 const TIER2_SHIFT_AGREEMENT_MS: i64 = 250;
+// SIGKILL should make the direct child waitable immediately. Bound the wait anyway: cleanup must
+// never turn a request timeout into a second unbounded hang in the unlikely event the platform does
+// not deliver or report the signal promptly.
+const PROCESS_REAP_GRACE: Duration = Duration::from_secs(2);
 
 struct AudioBatch {
     start_ms: u64,
@@ -386,18 +390,30 @@ impl SyncTools {
         args: &[&str],
         budget: Duration,
     ) -> Result<std::process::ExitStatus, String> {
-        let child = Command::new(bin)
+        let mut command = Command::new(bin);
+        command
             .args(args)
             .stdin(Stdio::null())
+            // These tools communicate through scratch files, not their output streams. Null keeps
+            // capture strictly bounded at zero bytes and leaves no inherited pipe for a descendant
+            // to hold open after its leader exits.
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true) // a timed-out/cancelled request kills the subprocess with the task
-            .spawn()
-            .map_err(|e| format!("spawn {bin}: {e}"))?;
-        match timeout(budget, wait(child)).await {
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
+        let mut child = ProcessGroup::new(child);
+        match timeout(budget, child.wait()).await {
             Ok(Ok(status)) => Ok(status),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(format!("{bin} timed out")),
+            Ok(Err(e)) => Err(format!("wait {bin}: {e}")),
+            Err(_) => {
+                child.kill();
+                // Reap the leader before returning. Process-group SIGKILL also terminates every
+                // descendant; with no captured pipes there is no post-kill drain to wait for.
+                let _ = timeout(PROCESS_REAP_GRACE, child.wait()).await;
+                Err(format!("{bin} timed out"))
+            }
         }
     }
 
@@ -657,8 +673,59 @@ fn canonical_srt(body: &str, name: &str) -> Result<String, String> {
     Ok(crate::srt::serialize(&cues))
 }
 
-async fn wait(mut child: tokio::process::Child) -> Result<std::process::ExitStatus, String> {
-    child.wait().await.map_err(|e| format!("wait: {e}"))
+/// Own one process-group leader across every exit path. Dropping the request future cannot run an
+/// async destructor, so cancellation synchronously kills the whole group and hands the leader to a
+/// tiny background waiter. Normal completion and explicit timeout reap it inline instead.
+struct ProcessGroup {
+    child: Option<tokio::process::Child>,
+    pgid: Option<u32>,
+    signalled: bool,
+}
+
+impl ProcessGroup {
+    fn new(child: tokio::process::Child) -> Self {
+        let pgid = child.id();
+        Self { child: Some(child), pgid, signalled: false }
+    }
+
+    fn kill(&mut self) {
+        if !self.signalled {
+            self.signalled = true;
+        } else {
+            return;
+        }
+        if let Some(pgid) = self.pgid {
+            den_process::kill_group(pgid);
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.as_mut().expect("process group already reaped").wait().await;
+        // `Child::wait` is cancellation-safe. Once it returns, stop any descendant that outlived
+        // the leader and surrender the numeric group immediately: after reap the pid may be reused.
+        if status.is_ok() {
+            self.kill();
+            self.child.take();
+            self.pgid = None;
+        }
+        status
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else { return };
+        self.kill();
+        self.pgid = None;
+        // A ProcessGroup exists only while `run` is being polled by Tokio, so cancellation has a
+        // runtime available. If shutdown has already torn it down, Child's kill_on_drop remains the
+        // last-resort leader kill; the group signal above has already covered descendants.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
 }
 
 // Exercise the process orchestration (spawn → arg contract → read back → cleanup) against fake
@@ -703,6 +770,42 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    async fn wait_for_pid(path: &std::path::Path) -> u32 {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(body) = tokio::fs::read_to_string(path).await {
+                    if let Ok(pid) = body.trim().parse() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant never reported its pid")
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("inspect descendant process");
+        // A zombie is already dead; it cannot retain CPU, memory mappings, descriptors, or keep
+        // writing an output file while its new parent gets around to collecting the status.
+        output.status.success()
+            && output.stdout.iter().copied().find(|byte| !byte.is_ascii_whitespace()).is_some_and(|b| b != b'Z')
+    }
+
+    async fn assert_process_stopped(pid: u32) {
+        timeout(Duration::from_secs(2), async {
+            while process_is_running(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("descendant {pid} survived process-group cleanup"));
+    }
+
     fn tools(dir: &std::path::Path, alass: String) -> SyncTools {
         SyncTools { alass, ffmpeg: "ffmpeg".into(), work_dir: dir.to_path_buf() }
     }
@@ -710,6 +813,77 @@ mod tests {
     /// A real cue, because the tiers now have to return something that parses as a subtitle.
     const SUB: &str = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
     const REF: &str = "1\n00:00:03,000 --> 00:00:04,000\nreference\n";
+
+    #[tokio::test]
+    async fn a_timed_out_tool_kills_its_descendants_before_returning() {
+        let dir = work_dir("process-timeout");
+        let descendant = dir.join("descendant-pid");
+        let bin = fake_bin(
+            &dir,
+            "forking-tool",
+            &format!("sleep 30 & child=$!; echo $child > '{}'; wait $child", descendant.to_string_lossy()),
+        )
+        .await;
+        let task_bin = bin.clone();
+        let task_dir = dir.clone();
+        let task = tokio::spawn(async move {
+            tools(&task_dir, task_bin.clone()).run(&task_bin, &[], Duration::from_secs(1)).await
+        });
+        let pid = wait_for_pid(&descendant).await;
+        let result = task.await.expect("timeout runner panicked");
+        assert!(result.unwrap_err().contains("timed out"));
+        assert_process_stopped(pid).await;
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_normally_exiting_tool_cannot_leave_a_descendant_running() {
+        let dir = work_dir("process-normal-exit");
+        let descendant = dir.join("descendant-pid");
+        let bin = fake_bin(
+            &dir,
+            "fork-and-exit",
+            &format!("sleep 30 & child=$!; echo $child > '{}'; exit 0", descendant.to_string_lossy()),
+        )
+        .await;
+        let status = tools(&dir, bin.clone())
+            .run(&bin, &[], Duration::from_secs(2))
+            .await
+            .expect("normally exiting runner failed");
+        assert!(status.success());
+        let pid = wait_for_pid(&descendant).await;
+        assert_process_stopped(pid).await;
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_tool_kills_descendants_and_the_next_run_recovers() {
+        let dir = work_dir("process-cancel");
+        let descendant = dir.join("descendant-pid");
+        let bin = fake_bin(
+            &dir,
+            "forking-tool",
+            &format!("sleep 30 & child=$!; echo $child > '{}'; wait $child", descendant.to_string_lossy()),
+        )
+        .await;
+        let task_bin = bin.clone();
+        let task_dir = dir.clone();
+        let task = tokio::spawn(async move {
+            tools(&task_dir, task_bin.clone()).run(&task_bin, &[], Duration::from_secs(30)).await
+        });
+        let pid = wait_for_pid(&descendant).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_process_stopped(pid).await;
+
+        let healthy = fake_bin(&dir, "healthy-tool", "exit 0").await;
+        assert!(tools(&dir, healthy.clone())
+            .run(&healthy, &[], Duration::from_secs(1))
+            .await
+            .expect("runner did not recover after cancellation")
+            .success());
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
 
     #[tokio::test]
     async fn tier1_success_returns_synced_output_and_removes_temps() {

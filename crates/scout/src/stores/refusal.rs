@@ -15,7 +15,7 @@ use crate::stores::pool::StorePool;
 use crate::stores::torbox::TORBOX_API;
 use crate::stores::{
     dead_link, error_chain_text, is_cancellation_error, ResolveTarget, StoreError, StoreUnavailableError,
-    ERR_CHECK_FAILED, ERR_TORRENT_GONE, RESOLVE_CACHE_TTL,
+    ERR_CHECK_FAILED, RESOLVE_CACHE_TTL,
 };
 use crate::util::key_hash;
 
@@ -369,13 +369,13 @@ pub(crate) fn describe(err: &StoreError) -> String {
 /// Go `errTorrentGone`: the service answered, and said it has no such torrent. The ONLY evidence that a
 /// remembered torrent id is stale.
 pub(crate) fn is_torrent_gone(err: &StoreError) -> bool {
-    matches!(err, StoreError::DeadLink(d) if d.reason == ERR_TORRENT_GONE)
+    matches!(err, StoreError::TorrentGone)
 }
 
 /// Go `errors.As(err, &unavailable)`: the `StoreUnavailableError` an error is or wraps.
 pub(crate) fn as_unavailable(err: &StoreError) -> Option<&StoreUnavailableError> {
     match err {
-        StoreError::Unavailable(u) | StoreError::ScoutSide(u) => Some(u),
+        StoreError::Unavailable(u) | StoreError::ScoutSide(u) | StoreError::PlayReserve(u) => Some(u),
         _ => None,
     }
 }
@@ -651,7 +651,7 @@ pub(crate) fn record_refusal(
     // TORRENT, not the service declining. Remembered as a refusal it blocked the re-buy that fact exists
     // to trigger.
     if is_cancellation(err)
-        || matches!(err, StoreError::ScoutSide(_) | StoreError::AddInFlight)
+        || matches!(err, StoreError::ScoutSide(_) | StoreError::PlayReserve(_) | StoreError::AddInFlight)
         || is_torrent_gone(err)
     {
         return;

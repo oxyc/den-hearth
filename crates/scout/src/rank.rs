@@ -8,7 +8,7 @@ use fancy_regex::{Regex as LookRegex, RegexBuilder as LookRegexBuilder};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 
-use crate::attributes::stream_attributes;
+use crate::attributes::stream_attributes_ref;
 use crate::client::ClientPlayable;
 use crate::label::MIB;
 use crate::probe::Probe;
@@ -292,16 +292,28 @@ pub(crate) fn cap_seeds(streams: &[RawStream], limit: i64) -> Vec<RawStream> {
     if limit <= 0 || streams.len() as i64 <= limit {
         return streams.to_vec();
     }
-    let mut all: Vec<(RawStream, i64, i64)> =
-        streams.iter().map(|s| (s.clone(), quality_score(s.clone()), s.seeders.unwrap_or(0))).collect();
+    // Rank references, not owned streams. This cap exists specifically for hostile/accidental
+    // multi-thousand-result scrapes; cloning every title, source and probe before throwing nearly all
+    // of them away made the safety valve itself scale with the input it was meant to contain.
+    let mut all: Vec<(usize, i64, i64)> = streams
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| (idx, quality_score_ref(s), s.seeders.unwrap_or(0)))
+        .collect();
     all.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
-    all.into_iter().take(limit as usize).map(|(s, _, _)| s).collect()
+    all.into_iter().take(limit as usize).map(|(idx, _, _)| streams[idx].clone()).collect()
 }
 
 /// Go `qualityScore`: additive, higher wins.
+#[cfg(test)]
 pub(crate) fn quality_score(s: RawStream) -> i64 {
+    quality_score_ref(&s)
+}
+
+/// Borrowed scorer used by ranking paths that already own a stream collection.
+pub(crate) fn quality_score_ref(s: &RawStream) -> i64 {
     let t = str::to_lowercase(&s.title);
-    quality_score_lower(&t, &s, junk_class_of(&t))
+    quality_score_lower(&t, s, junk_class_of(&t))
 }
 
 /// Go `qualityScoreLower`.
@@ -732,7 +744,7 @@ pub(crate) fn rank_streams_debug(
         }
         let mut score = quality_score_lower(&lower, s, junk);
         if let Some(client) = &f.client {
-            score -= client.cost(s.clone(), stream_attributes(s.clone()));
+            score -= client.cost_ref(s, stream_attributes_ref(s));
         }
         // A release whose resolution could not be read is NOT sunk, matching every hard filter here.
         if !f.prefer_resolution.is_empty() && !res.is_empty() && res != f.prefer_resolution {

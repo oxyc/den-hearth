@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::addbudget::{refund_unused_add, spend_add};
+use crate::addbudget::{refund_add, refund_unused_add, spend_add, RequestNotSent};
 use crate::cache::Cache;
 use crate::config::DebridService;
 use crate::linkcheck::{rd_size_key, size_of};
@@ -23,8 +23,8 @@ use crate::stores::refusal::{
 };
 use crate::stores::{
     build_request, dead_link, decode_first, encode_form, magnet_for, null_default, rd_fetch_state,
-    read_limited, redact_token, store_error_text, store_refused_us, unavailable, ResolveTarget, Store,
-    StoreError, StoreStatus, ERR_TORRENT_GONE, ERR_WOULD_ADD, MAX_STORE_BYTES, RESOLVE_CACHE_TTL,
+    read_limited, redact_token, store_error_text, store_refused_us, unavailable, ProviderStatus,
+    ResolveTarget, Store, StoreError, StoreStatus, ERR_WOULD_ADD, MAX_STORE_BYTES, RESOLVE_CACHE_TTL,
 };
 use crate::util::{key_hash, Shape, LEAF};
 
@@ -274,7 +274,7 @@ impl RealDebridStore {
         // stale. Anything else, including an empty file list on a torrent whose metadata has not resolved
         // yet, says nothing about whether the account has it.
         if status == 404 {
-            return Err(dead_link(ERR_TORRENT_GONE));
+            return Err(StoreError::TorrentGone);
         }
         // A refusal is a fact about the ACCOUNT, not the release — the same rule the add path already
         // follows. Mapping every non-2xx to a dead link on the READ path meant an expired key or a throttle,
@@ -482,17 +482,20 @@ impl Store for RealDebridStore {
     /// Still never invents a wait: it answers only for a torrent this account is recorded as holding, only
     /// when RD itself names a fetching status, and only while there are no links to serve. A dead, errored
     /// or virus-flagged torrent stays a failure, which is what the original note was protecting.
-    async fn status(&self, t: &ResolveTarget) -> Option<StoreStatus> {
+    async fn provider_status(&self, t: &ResolveTarget) -> ProviderStatus {
         let (id, held) = self.known_torrent(t);
         if !held {
-            return None;
+            return ProviderStatus::NotFetching;
         }
-        let info = self.info(&id).await.ok()?;
+        let info = match self.info(&id).await {
+            Ok(info) => info,
+            Err(_) => return ProviderStatus::Unknown,
+        };
         // Links present means it is ready to serve, not waiting — that is the resolve's answer, not a status.
         if !info.links.is_empty() || !rd_fetching(&info.status) {
-            return None;
+            return ProviderStatus::NotFetching;
         }
-        Some(StoreStatus {
+        ProviderStatus::Downloading(StoreStatus {
             progress: info.progress / 100.0,
             state: rd_fetch_state(&info.status).to_owned(),
             ..Default::default()
@@ -531,10 +534,25 @@ impl Store for RealDebridStore {
         }
         // addWouldMissTheClock has no counterpart here: a store takes no context, so a spent clock drops the
         // future before it reaches the charge instead of arriving at it.
-        spend_add(svc, &self.token, &t.info_hash, t.prefetch)?;
+        let charge = spend_add(svc, &self.token, &t.info_hash, t.prefetch)?;
+        let add_request = match build_request(
+            reqwest::Method::POST,
+            &format!("{}/torrents/addMagnet", self.api),
+            &[
+                ("authorization", &format!("Bearer {}", self.token)),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Some(encode_form(&[("magnet", &magnet_for(&t.info_hash))])),
+        ) {
+            Ok(request) => request,
+            Err(err) => {
+                refund_add(svc, &self.token, charge, &RequestNotSent);
+                return Err(err);
+            }
+        };
         note_add_attempt(cache, svc, &self.token, &t.info_hash);
         let mut add_resp =
-            match self.post("/torrents/addMagnet", &[("magnet", &magnet_for(&t.info_hash))]).await {
+            match self.client.do_request(add_request).await.map_err(store_error_from_do) {
                 Ok(resp) => resp,
                 Err(err) => {
                     // See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
@@ -602,7 +620,7 @@ impl Store for RealDebridStore {
         // healthy releases included. On an RD-only install that is every /play, since RD has no Status for
         // the handler to short-circuit on.
         if !(200..300).contains(&add_status) || added_id.is_empty() {
-            refund_unused_add(svc, &self.token);
+            refund_unused_add(svc, &self.token, charge);
             let detail = redact_token(&store_error_text(&raw), &self.token);
             if store_refused_us(add_status) {
                 let refused = unavailable(svc, format!("addmagnet http {add_status}{detail}"), add_status);

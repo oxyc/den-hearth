@@ -20,11 +20,12 @@ use hyper::{Request, Response, StatusCode};
 
 use den_scout::cache::Cache;
 use den_scout::deps::{
-    build_deps_shared, shared_http, shared_profile, startup_summary, GuardedClient, Settings,
+    build_deps_shared_with_runtime, shared_http, shared_profile, startup_summary, GuardedClient, Settings,
 };
 use den_scout::diskcache::{TieredCache, SWEEP_INTERVAL};
 use den_scout::handler::{new_handler, Handler};
 use den_scout::managed_hls::{ManagedHlsError, ManagedHlsRequest, ManagedHlsResult};
+use den_scout::runtime::ScoutRuntime;
 use den_scout::scrape::Doer;
 
 use crate::Body;
@@ -73,8 +74,17 @@ impl Scout {
             std::path::Path::new(&legacy.cache_dir),
         ));
         let client = client();
+        // Every handler in this Hearth process shares provider coordination, budgets, and metrics. Keeping
+        // the owner explicit prevents the mounted, legacy, combined, and local-origin handlers from silently
+        // falling back to separate or process-global state.
+        let runtime = ScoutRuntime::new();
         let deps = |settings: &Settings| {
-            build_deps_shared(settings, client.clone(), cache.clone() as Arc<dyn Cache>)
+            build_deps_shared_with_runtime(
+                settings,
+                client.clone(),
+                cache.clone() as Arc<dyn Cache>,
+                runtime.clone(),
+            )
         };
         let den_deps = |public_url: String| {
             let mut den_deps = deps(&mount);

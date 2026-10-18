@@ -257,11 +257,13 @@ pub struct Piece {
 }
 
 fn be16(b: &[u8], at: usize) -> Result<u16, Unbuilt> {
-    b.get(at..at + 2).map(|s| u16::from_be_bytes([s[0], s[1]])).ok_or_else(|| unreadable("a box ends early"))
+    let end = at.checked_add(2).ok_or_else(|| unreadable("a box offset overflows"))?;
+    b.get(at..end).map(|s| u16::from_be_bytes([s[0], s[1]])).ok_or_else(|| unreadable("a box ends early"))
 }
 
 fn be32(b: &[u8], at: usize) -> Result<u32, Unbuilt> {
-    b.get(at..at + 4)
+    let end = at.checked_add(4).ok_or_else(|| unreadable("a box offset overflows"))?;
+    b.get(at..end)
         .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
         .ok_or_else(|| unreadable("a box ends early"))
 }
@@ -282,30 +284,27 @@ struct Atom {
 /// The boxes laid end to end in `b[from..to]`. One that runs past `to` is an error, unless `open`: the
 /// first bytes of a file, or of a fragment, stop part-way through a box, and the list stops there.
 fn atoms(b: &[u8], from: usize, to: usize, open: bool) -> Result<Vec<Atom>, Unbuilt> {
-    let mut out = Vec::new();
-    let mut at = from;
-    while at + 8 <= to {
-        let kind = [b[at + 4], b[at + 5], b[at + 6], b[at + 7]];
-        let (len, body) = match be32(b, at)? {
-            0 => ((to - at) as u64, at + 8),
-            1 if open && at + 16 > to => break,
-            1 => (be64(b, at + 8)?, at + 16),
-            n => (n as u64, at + 8),
-        };
-        if len < (body - at) as u64 {
-            return Err(unreadable(format!("a {} box shorter than its header", name(&kind))));
-        }
-        let end = at as u64 + len;
-        if end > to as u64 {
-            if open {
-                break;
-            }
-            return Err(unreadable(format!("a {} box runs past its parent", name(&kind))));
-        }
-        out.push(Atom { kind, start: at, body, end: end as usize });
-        at = end as usize;
-    }
-    Ok(out)
+    let bytes = b.get(from..to).ok_or_else(|| unreadable("a box range ends outside its buffer"))?;
+    let base = u64::try_from(from).map_err(|_| unreadable("a box offset does not fit the source"))?;
+    let mode = if open { den_media::mp4::WalkMode::Prefix } else { den_media::mp4::WalkMode::Strict };
+    let walked = den_media::mp4::walk_boxes(bytes, base, mode).map_err(|e| {
+        let what = e.kind.map(|kind| format!("a {} box", name(&kind))).unwrap_or_else(|| "a box".into());
+        unreadable(format!("{what} is invalid at byte {} ({:?})", e.offset, e.reason))
+    })?;
+    walked
+        .boxes
+        .into_iter()
+        .map(|span| {
+            Ok(Atom {
+                kind: span.kind,
+                start: usize::try_from(span.start)
+                    .map_err(|_| unreadable("a box offset does not fit memory"))?,
+                body: usize::try_from(span.body)
+                    .map_err(|_| unreadable("a box offset does not fit memory"))?,
+                end: usize::try_from(span.end).map_err(|_| unreadable("a box offset does not fit memory"))?,
+            })
+        })
+        .collect()
 }
 
 fn name(kind: &[u8; 4]) -> String {

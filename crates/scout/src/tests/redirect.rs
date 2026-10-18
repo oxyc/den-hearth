@@ -75,41 +75,48 @@ async fn spawn_server(respond: impl Fn(&str, &str) -> Reply + Send + Sync + 'sta
 // reach a second location — the thing that costs the account.
 #[tokio::test]
 async fn an_add_is_not_replayed_to_the_redirect_target() {
-    for (status, name) in [(307u16, "307 temporary"), (308, "308 permanent"), (302, "302 found")] {
-        let first_hop = Arc::new(AtomicI32::new(0));
-        let replayed = Arc::new(AtomicI32::new(0));
-        let (fh, rp) = (first_hop.clone(), replayed.clone());
-        let base = spawn_server(move |method, path| match path {
-            "/torrents/createtorrent" => {
-                fh.fetch_add(1, Ordering::SeqCst);
-                (status, Some("/moved".to_owned()), "")
-            }
-            "/moved" => {
-                if method == "POST" {
-                    rp.fetch_add(1, Ordering::SeqCst);
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        for (status, name) in [(307u16, "307 temporary"), (308, "308 permanent"), (302, "302 found")] {
+            let first_hop = Arc::new(AtomicI32::new(0));
+            let replayed = Arc::new(AtomicI32::new(0));
+            let (fh, rp) = (first_hop.clone(), replayed.clone());
+            let base = spawn_server(move |method, path| match path {
+                "/torrents/createtorrent" => {
+                    fh.fetch_add(1, Ordering::SeqCst);
+                    (status, Some("/moved".to_owned()), "")
                 }
-                (200, None, r#"{"data":{"torrent_id":9}}"#)
-            }
-            _ => (200, None, r#"{"success":true,"data":[]}"#),
-        })
-        .await;
-        let token = format!("redirect-{name}");
-        let hash = "a".repeat(40);
-        let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
-        // The client the stores really use: the shared one `build_deps_shared` is handed.
-        let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
-        let s = TorBoxStore {
-            token: token.clone(),
-            cache: Some(Arc::new(MemoryCache::new(1 << 20))),
-            api: base,
-            client: Arc::new(client),
-        };
-        let _ = s.resolve(&ResolveTarget { info_hash: hash, ..ResolveTarget::default() }).await;
-        assert_eq!(replayed.load(Ordering::SeqCst), 0, "{name}: the add was re-sent to the redirect target");
-        assert_eq!(first_hop.load(Ordering::SeqCst), 1, "{name}: the add reached the original endpoint");
-        let after = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
-        assert!(before - after <= 1, "{name}: the hourly allowance moved by {}", before - after);
-    }
+                "/moved" => {
+                    if method == "POST" {
+                        rp.fetch_add(1, Ordering::SeqCst);
+                    }
+                    (200, None, r#"{"data":{"torrent_id":9}}"#)
+                }
+                _ => (200, None, r#"{"success":true,"data":[]}"#),
+            })
+            .await;
+            let token = format!("redirect-{name}");
+            let hash = "a".repeat(40);
+            let before = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+            // The client the stores really use: the shared one `build_deps_shared` is handed.
+            let client = GuardedClient::new(reqwest::Client::builder).expect("a client");
+            let s = TorBoxStore {
+                token: token.clone(),
+                cache: Some(Arc::new(MemoryCache::new(1 << 20))),
+                api: base,
+                client: Arc::new(client),
+            };
+            let _ = s.resolve(&ResolveTarget { info_hash: hash, ..ResolveTarget::default() }).await;
+            assert_eq!(
+                replayed.load(Ordering::SeqCst),
+                0,
+                "{name}: the add was re-sent to the redirect target"
+            );
+            assert_eq!(first_hop.load(Ordering::SeqCst), 1, "{name}: the add reached the original endpoint");
+            let after = global_add_budget().remaining(&budget_account(DebridService::TorBox, &token));
+            assert!(before - after <= 1, "{name}: the hourly allowance moved by {}", before - after);
+        }
+    })
+    .await;
 }
 
 // A credential in the query string must not follow a redirect off the debrid's API host — Go strips the

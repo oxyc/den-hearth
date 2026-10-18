@@ -2,16 +2,20 @@
 //!
 //! Every test here goes through the handler (`new_handler`, `test_deps`, `get`, `valid_blob`).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::cache::MemoryCache;
+use crate::config::DebridService;
 use crate::handler::{new_handler, Handler};
 use crate::stores::realdebrid::RealDebridStore;
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
-use crate::stores::Store;
+use crate::stores::{AccountSummary, ResolveTarget, Store, StoreError};
 use crate::tests::handler::{get, shared_stores, test_deps, valid_blob};
 use crate::tests::mock::{resp, MockDoer};
 
@@ -144,6 +148,83 @@ async fn account_non_torbox_service() {
         out.len() == 1 && out[0]["service"] == "realdebrid" && out[0].len() == 1,
         "account body = {out:?}, want only {{service: realdebrid}}"
     );
+}
+
+/// Three independent account reads start together, but their response lines stay in configured order.
+/// The barrier makes a sequential implementation spend the common deadline on its first read and degrade
+/// every line; the stagger after it makes completion order the reverse of output order.
+#[tokio::test]
+async fn account_reads_are_concurrent_and_keep_configured_order() {
+    #[derive(Clone)]
+    struct AccountStore {
+        service: DebridService,
+        plan: i64,
+        delay: Duration,
+        all_started: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl Store for AccountStore {
+        fn service(&self) -> DebridService {
+            self.service
+        }
+
+        async fn cache_check(&self, _hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+            Ok(HashMap::new())
+        }
+
+        async fn resolve(&self, _target: &ResolveTarget) -> Result<String, StoreError> {
+            Err(StoreError::Other("unused account test resolve".into()))
+        }
+
+        async fn account_summary(&self) -> Option<Result<AccountSummary, StoreError>> {
+            self.all_started.wait().await;
+            tokio::time::sleep(self.delay).await;
+            Some(Ok(AccountSummary {
+                plan: self.plan,
+                cooldown_until: None,
+                premium_expires_at: None,
+                active: self.plan,
+                queued: 0,
+            }))
+        }
+    }
+
+    let all_started = Arc::new(tokio::sync::Barrier::new(3));
+    let configured = [
+        (DebridService::Premiumize, 1, 30),
+        (DebridService::RealDebrid, 2, 15),
+        (DebridService::TorBox, 3, 0),
+    ];
+    let stores: Vec<AccountStore> = configured
+        .into_iter()
+        .map(|(service, plan, delay_ms)| AccountStore {
+            service,
+            plan,
+            delay: Duration::from_millis(delay_ms),
+            all_started: all_started.clone(),
+        })
+        .collect();
+    let h = new_handler(test_deps(move |d| {
+        let stores = stores.clone();
+        d.make_stores = Arc::new(move |_| {
+            stores.iter().cloned().map(|store| Box::new(store) as Box<dyn Store>).collect()
+        });
+    }));
+    h.set_status_budget(Duration::from_millis(250));
+
+    let rr = tokio::time::timeout(
+        Duration::from_secs(1),
+        get(&h, &format!("/{}/account", valid_blob()), &[]),
+    )
+    .await
+    .expect("three account reads did not meet their shared deadline");
+    let out = decode_account_body(rr.body());
+    let services: Vec<_> = out.iter().map(|account| account["service"].as_str().unwrap()).collect();
+    assert_eq!(services, ["premiumize", "realdebrid", "torbox"]);
+    assert_eq!(out[0]["plan"], "essential");
+    assert_eq!(out[1]["plan"], "pro");
+    assert_eq!(out[2]["plan"], "standard");
 }
 
 // ---- The store's AccountSummary, without the handler -------------------------------------------------------------

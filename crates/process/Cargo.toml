@@ -1,0 +1,10 @@
+[package]
+name = "den-process"
+version = "0.0.0"
+edition = "2021"
+description = "Process-group signalling and per-service live-child registries for Den services"
+publish = false
+license = "MIT"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

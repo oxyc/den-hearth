@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::addbudget::{
     budget_account, budget_remaining, budget_take, global_add_budget, refund_add, set_global_add_budget,
-    spend_add, AddBudget, RequestNotSent,
+    spend_add, AddBudget, AddCharge, RequestNotSent, SpentCharge, MAX_TRACKED_ACCOUNTS,
 };
 use crate::cache::{Cache, MemoryCache};
 use crate::config::DebridService::{self, Premiumize, RealDebrid, TorBox};
@@ -30,7 +30,7 @@ use crate::stores::torbox::support::no_file_list;
 use crate::stores::torbox::{select_file_id, RESOLVE_CACHE_TTL};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
-    redact_token, store_refused_us, ResolveTarget, Store, StoreError, StoreUnavailableError,
+    redact_token, store_refused_us, ProviderStatus, ResolveTarget, Store, StoreError, StoreUnavailableError,
     ERR_TORRENT_GONE, ERR_WOULD_ADD,
 };
 use crate::tests::mock::{resp, MockDoer};
@@ -81,6 +81,7 @@ impl Clock {
 /// the guard does the same on drop, including when a test panics. The lock keeps two tests from swapping it
 /// at once, since Rust runs tests on parallel threads and Go's do not.
 pub(crate) struct GlobalBudget {
+    current: Arc<AddBudget>,
     prev: Option<Arc<AddBudget>>,
     _serial: MutexGuard<'static, ()>,
 }
@@ -89,8 +90,15 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 pub(crate) fn install_budget(window: Duration, limit: i64) -> GlobalBudget {
     let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = set_global_add_budget(Arc::new(AddBudget::new(window, limit)));
-    GlobalBudget { prev: Some(prev), _serial: serial }
+    let current = Arc::new(AddBudget::new(window, limit));
+    let prev = set_global_add_budget(current.clone());
+    GlobalBudget { current, prev: Some(prev), _serial: serial }
+}
+
+impl GlobalBudget {
+    pub(crate) fn budget(&self) -> Arc<AddBudget> {
+        self.current.clone()
+    }
 }
 
 impl Drop for GlobalBudget {
@@ -141,6 +149,38 @@ fn add_budget_window_rolls_rather_than_resetting() {
     clock.add(Duration::from_secs(2 * 60));
     assert!(b.take("acct", false), "the oldest add aged out; one slot should be free");
     assert!(!b.take("acct", false), "only one add had aged out, but two slots were granted");
+}
+
+/// Several provider calls may be outstanding for one account at once and finish in any order. Refunding
+/// the middle call must remove ITS timestamp, not a later successful call's: otherwise the later charge
+/// inherits the middle one's earlier expiry and the rolling ceiling opens early.
+#[test]
+fn add_budget_out_of_order_refund_keeps_each_concurrent_charge_expiry() {
+    let clock = Clock::new(t0());
+    let mut b = AddBudget::new(HOUR, 3);
+    b.now = clock.now_fn();
+
+    let first = b.try_take("acct", false).expect("first outstanding call");
+    clock.add(Duration::from_secs(10));
+    let middle = b.try_take("acct", false).expect("middle outstanding call");
+    clock.add(Duration::from_secs(10));
+    let later = b.try_take("acct", false).expect("later outstanding call");
+    // The middle request answers "nothing was added" after the later request has already been admitted.
+    // Completion order differs from admission order, as concurrent provider calls routinely do.
+    b.refund("acct", middle);
+
+    // Just after the middle timestamp has aged out, the first has too, but the later successful charge
+    // is still live. Exactly two slots are available. The old pop()-based refund removed `later`, retained
+    // `middle`, and incorrectly opened all three slots here.
+    clock.add(HOUR - Duration::from_secs(9));
+    assert!(b.take("acct", false), "the first charge should have aged out");
+    assert!(b.take("acct", false), "the refunded middle charge should leave a slot");
+    assert!(!b.take("acct", false), "refunding the middle charge moved the later charge's expiry");
+
+    let live = b.spent.lock().unwrap();
+    assert!(live["acct"].iter().any(|spent| spent.charge == later));
+    assert!(!live["acct"].iter().any(|spent| spent.charge == first));
+    assert!(!live["acct"].iter().any(|spent| spent.charge == middle));
 }
 
 /// A refusal spends nothing, or a client that keeps asking would hold its own budget shut forever.
@@ -236,10 +276,10 @@ fn add_budget_forgets_accounts_whose_window_has_drained() {
     let clock = Clock::new(SystemTime::now());
     let mut b = AddBudget::new(HOUR, 50);
     b.now = clock.now_fn();
-    for i in 0..5000 {
-        b.take(&format!("torbox:{i}"), false);
+    for i in 0..MAX_TRACKED_ACCOUNTS {
+        assert!(b.take(&format!("torbox:{i}"), false));
     }
-    assert_eq!(b.spent.lock().unwrap().len(), 5000, "setup: accounts");
+    assert_eq!(b.spent.lock().unwrap().len(), MAX_TRACKED_ACCOUNTS, "setup: accounts");
 
     // An hour later every one of those windows has drained; the next caller must not inherit them.
     clock.add(2 * HOUR);
@@ -247,6 +287,108 @@ fn add_budget_forgets_accounts_whose_window_has_drained() {
     assert_eq!(b.spent.lock().unwrap().len(), 1, "map holds accounts, want just the live one");
     // And the live account still accounts correctly.
     assert_eq!(b.remaining("torbox:live"), 49, "remaining");
+}
+
+#[test]
+fn add_budget_capacity_refuses_unseen_accounts_without_resetting_known_quotas() {
+    let clock = Clock::new(t0());
+    let mut b = AddBudget::new(HOUR, 3);
+    b.now = clock.now_fn();
+    b.reserve.store(1, Ordering::SeqCst);
+    for i in 0..MAX_TRACKED_ACCOUNTS {
+        assert!(b.take(&format!("account:{i}"), false));
+    }
+    let before = b.spent.lock().unwrap().clone();
+    for i in 0..100 {
+        assert!(!b.take(&format!("new:{i}"), i % 2 == 0));
+    }
+    assert_eq!(*b.spent.lock().unwrap(), before, "a refusal must not evict or refresh live counters");
+    assert_eq!(b.remaining("new"), 0);
+    assert_eq!(b.frees_in("new", false), HOUR);
+
+    assert!(b.take("account:0", true), "known accounts retain their prefetch allowance");
+    assert!(!b.take("account:0", true), "the Play reserve still applies at capacity");
+    assert!(b.take("account:0", false));
+    assert!(!b.take("account:0", false), "capacity must not reset a known account's charges");
+    assert_eq!(b.remaining("account:0"), 0);
+    assert_eq!(b.remaining("account:1"), 2);
+    assert_eq!(b.spent.lock().unwrap().len(), MAX_TRACKED_ACCOUNTS);
+}
+
+#[test]
+fn add_budget_concurrent_accounts_cannot_exceed_tracking_capacity() {
+    let b = Arc::new(AddBudget::new(HOUR, 3));
+    {
+        let mut spent = b.spent.lock().unwrap();
+        for i in 0..MAX_TRACKED_ACCOUNTS - 1 {
+            spent.insert(
+                format!("account:{i}"),
+                vec![SpentCharge { charge: AddCharge { id: 1 }, at: SystemTime::now() }],
+            );
+        }
+    }
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|i| {
+            let (b, start) = (b.clone(), start.clone());
+            thread::spawn(move || {
+                start.wait();
+                b.take(&format!("new:{i}"), false)
+            })
+        })
+        .collect();
+    let admitted = workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>();
+    assert_eq!(admitted, 1, "exactly one slot was free");
+    assert_eq!(b.spent.lock().unwrap().len(), MAX_TRACKED_ACCOUNTS);
+}
+
+#[test]
+fn add_budget_capacity_recovers_only_when_a_whole_account_window_drains() {
+    let clock = Clock::new(t0());
+    let mut b = AddBudget::new(HOUR, 3);
+    b.now = clock.now_fn();
+    assert!(b.take("old", false));
+    clock.add(Duration::from_secs(60));
+    assert!(b.take("old", false));
+    for i in 1..MAX_TRACKED_ACCOUNTS {
+        assert!(b.take(&format!("account:{i}"), false));
+    }
+    clock.add(HOUR - Duration::from_secs(60));
+    assert!(!b.take("new", false), "one expired charge is not an expired account");
+    assert_eq!(b.remaining("old"), 2);
+    assert_eq!(b.frees_in("new", false), Duration::from_secs(60));
+    clock.add(Duration::from_secs(60));
+    assert_eq!(b.remaining("new"), 3);
+    assert_eq!(b.frees_in("new", false), Duration::ZERO);
+    assert!(b.take("new", false));
+    assert_eq!(b.spent.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn add_budget_capacity_refusal_is_scout_side_for_play_and_prefetch() {
+    let installed = install_budget(HOUR, 3);
+    let b = installed.budget();
+    {
+        let mut spent = b.spent.lock().unwrap();
+        for i in 0..MAX_TRACKED_ACCOUNTS {
+            spent.insert(
+                format!("account:{i}"),
+                vec![SpentCharge { charge: AddCharge { id: 1 }, at: SystemTime::now() }],
+            );
+        }
+    }
+    for prefetch in [false, true] {
+        match spend_add(TorBox, "unseen", H, prefetch) {
+            Err(StoreError::ScoutSide(refusal)) => {
+                assert!(refusal.reason.contains("cannot track another account"));
+            }
+            other => panic!("capacity must not be reported as a provider failure or Play reserve: {other:?}"),
+        }
+    }
+    assert_eq!(b.spent.lock().unwrap().len(), MAX_TRACKED_ACCOUNTS);
+    b.refund("account:0", AddCharge { id: 1 });
+    assert!(b.take("new", false), "a charge never sent can release its account slot");
+    assert_eq!(b.spent.lock().unwrap().len(), MAX_TRACKED_ACCOUNTS);
 }
 
 /// refundAdd must discriminate. Its whole job is telling "the request was never sent" from "the response
@@ -258,22 +400,22 @@ fn refund_add_only_for_a_request_that_was_never_sent() {
     let _budget = install_budget(HOUR, 10);
     let acct = budget_account(TorBox, "tok");
 
-    global_add_budget().take(&acct, false);
-    refund_add(TorBox, "tok", &io::Error::other("context canceled"));
+    let charge = spend_add(TorBox, "tok", H, false).unwrap();
+    refund_add(TorBox, "tok", charge, &io::Error::other("context canceled"));
     assert_eq!(
         global_add_budget().remaining(&acct),
         9,
         "a cancelled add was refunded — it had already reached the service"
     );
-    refund_add(TorBox, "tok", &io::Error::other("context deadline exceeded"));
+    refund_add(TorBox, "tok", charge, &io::Error::other("context deadline exceeded"));
     assert_eq!(global_add_budget().remaining(&acct), 9, "an expired deadline was refunded — same reason");
-    refund_add(TorBox, "tok", &io::Error::other("connection reset"));
+    refund_add(TorBox, "tok", charge, &io::Error::other("connection reset"));
     assert_eq!(
         global_add_budget().remaining(&acct),
         9,
         "a transport error was refunded; it may still have been delivered"
     );
-    refund_add(TorBox, "tok", &RequestNotSent);
+    refund_add(TorBox, "tok", charge, &RequestNotSent);
     assert_eq!(global_add_budget().remaining(&acct), 10, "a request that was never built must be refunded");
 }
 
@@ -323,7 +465,7 @@ pub(crate) fn is_add_endpoint(r: &reqwest::Request) -> bool {
 fn unavailable<T>(res: &Result<T, StoreError>) -> Option<&StoreUnavailableError> {
     match res {
         // `ScoutSide` is Go's `errScoutSide` wrapping the same `StoreUnavailableError`, which `errors.As` finds.
-        Err(StoreError::Unavailable(u) | StoreError::ScoutSide(u)) => Some(u),
+        Err(StoreError::Unavailable(u) | StoreError::ScoutSide(u) | StoreError::PlayReserve(u)) => Some(u),
         _ => None,
     }
 }
@@ -331,11 +473,12 @@ fn unavailable<T>(res: &Result<T, StoreError>) -> Option<&StoreUnavailableError>
 /// Go `errors.Is(err, errWouldAdd)` and the other `*DeadLinkError` sentinels, which are compared by reason.
 fn is_dead_reason<T>(res: &Result<T, StoreError>, reason: &str) -> bool {
     matches!(res, Err(StoreError::DeadLink(d)) if d.reason == reason)
+        || (reason == ERR_TORRENT_GONE && matches!(res, Err(StoreError::TorrentGone)))
 }
 
 /// Go `errors.As(err, &dead)` for a `*DeadLinkError`.
 fn is_dead_link<T>(res: &Result<T, StoreError>) -> bool {
-    matches!(res, Err(StoreError::DeadLink(_)))
+    matches!(res, Err(StoreError::DeadLink(_) | StoreError::TorrentGone))
 }
 
 /// Go `stubStore`: answers with a fixed error, so the pool's own precedence is what is under test.
@@ -362,8 +505,8 @@ impl Store for StubStore {
         Err(self.err.clone())
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<crate::stores::StoreStatus> {
-        None
+    async fn provider_status(&self, _t: &ResolveTarget) -> crate::stores::ProviderStatus {
+        crate::stores::ProviderStatus::NotFetching
     }
 }
 
@@ -468,6 +611,39 @@ async fn stores_refuse_to_add_once_the_budget_is_spent() {
     }
 }
 
+/// Admission precedes request construction so the budget can gate every add, but a malformed local
+/// endpoint never reaches the wire and must return its exact charge. TorBox already covered this path;
+/// keep the other two stores from silently consuming the account's hour on configuration errors.
+#[tokio::test]
+async fn request_construction_failure_refunds_real_debrid_and_premiumize() {
+    {
+        let _budget = install_budget(HOUR, 50);
+        // Real-Debrid puts the token in Authorization, where a newline is rejected before dispatch.
+        let token = "bad\ntoken";
+        let cache = new_cache();
+        let store = rd(token, doer(|_| panic!("an invalid request was dispatched")), Some(cache.clone()));
+        assert!(store.resolve(&tgt(H)).await.is_err());
+        assert_eq!(global_add_budget().remaining(&budget_account(RealDebrid, token)), 50);
+        assert!(
+            add_in_flight(&*cache, RealDebrid, token, H).is_ok(),
+            "request construction left a marker for an add that was never dispatched"
+        );
+    }
+    {
+        let _budget = install_budget(HOUR, 50);
+        // Premiumize puts its token in the body, so make the locally configured endpoint invalid.
+        let cache = new_cache();
+        let mut store = pm("tok", doer(|_| panic!("an invalid request was dispatched")), Some(cache.clone()));
+        store.api = "://invalid".to_owned();
+        assert!(store.resolve(&tgt(H)).await.is_err());
+        assert_eq!(global_add_budget().remaining(&budget_account(Premiumize, "tok")), 50);
+        assert!(
+            add_in_flight(&*cache, Premiumize, "tok", H).is_ok(),
+            "request construction left a marker for an add that was never dispatched"
+        );
+    }
+}
+
 /// A cancel storm must cost ONE add, not one per poll — and the one it costs must be counted.
 ///
 /// Both halves matter and an earlier version got each of them wrong in turn. Refunding cancelled adds
@@ -527,7 +703,7 @@ async fn add_budget_a_held_torrent_is_not_bought_again() {
     let target = ResolveTarget { file_idx: Some(0), ..tgt(H) };
     // The sequence /play actually runs: Status first — it finds the torrent in the account and remembers
     // its id — then Resolve. Resolve must use what Status learned rather than buying the torrent again.
-    assert!(store.status(&target).await.is_none(), "a finished torrent is not downloading");
+    assert!(!store.provider_status(&target).await.is_downloading(), "a finished torrent is not downloading");
     let link = store.resolve(&target).await.expect("a held torrent must resolve");
     assert!(!link.is_empty(), "a held torrent must resolve to a link");
     let n = adds.load(Ordering::SeqCst);
@@ -609,10 +785,12 @@ fn spend_add_our_ceiling_is_not_the_stores_refusal() {
 /// service:hash(token) key would make it a confirmation oracle for a guessed token.
 #[tokio::test]
 async fn health_reports_the_budget_without_naming_accounts() {
-    let _budget = install_budget(HOUR, 10);
+    let budget = install_budget(HOUR, 10);
     global_add_budget().take(&budget_account(TorBox, "secret-token"), false);
 
-    let h = crate::handler::new_handler(crate::tests::handler::test_deps(|_| {}));
+    let deps = crate::tests::handler::test_deps(|_| {});
+    deps.runtime.replace_add_budget(budget.budget());
+    let h = crate::handler::new_handler(deps);
     let body = crate::tests::handler::body_str(&crate::tests::handler::get(&h, "/health", &[]).await);
     assert!(body.contains("addBudgetRemaining"), "a spent allowance must be visible: {body}");
     assert!(
@@ -3409,7 +3587,10 @@ async fn tor_box_a_timed_out_listing_is_not_a_miss() {
     let cache = new_cache();
     let failing =
         tb("tok", doer(|_| Err(io::Error::other("deadline has elapsed").into())), Some(cache.clone()));
-    assert!(failing.status(&tgt(H)).await.is_none(), "a timed-out listing cannot report a status");
+    assert!(
+        !failing.provider_status(&tgt(H)).await.is_downloading(),
+        "a timed-out listing cannot report a status"
+    );
     assert!(
         cache.get(&torrent_miss_key("tok", H)).is_none(),
         "a timeout was remembered as the account not holding the torrent"
@@ -3427,14 +3608,14 @@ async fn tor_box_a_timed_out_listing_is_not_a_miss() {
         Some(cache.clone()),
     );
     assert!(
-        healthy.status(&tgt(H)).await.is_some(),
+        healthy.provider_status(&tgt(H)).await.is_downloading(),
         "the torrent was rediscoverable, but the miss marker suppressed the lookup"
     );
 
     // An authoritative miss — the list was read and the hash is not in it — IS still remembered.
     let other = new_cache();
     let absent = tb("tok", doer(|_| Ok(resp(200, r#"{"data":[]}"#))), Some(other.clone()));
-    let _ = absent.status(&tgt(H)).await;
+    let _ = absent.provider_status(&tgt(H)).await;
     assert!(
         other.get(&torrent_miss_key("tok", H)).is_some(),
         "an answered miss must still be remembered, or every poll re-fetches the whole list"
@@ -3449,62 +3630,72 @@ async fn tor_box_a_timed_out_listing_is_not_a_miss() {
 /// another torrent's percentage, ETA and rate.
 #[tokio::test]
 async fn tor_box_status_reports_on_the_torrent_it_asked_about() {
-    const OURS: i64 = 100;
-    let finished_other = r#"{"id":42,"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
-    let busy_other =
-        r#"{"id":42,"progress":0.43,"download_finished":false,"eta":900,"download_speed":1500000}"#;
-    let ours_busy = r#"{"id":100,"progress":0.02,"download_finished":false,"eta":60,"download_speed":10}"#;
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        const OURS: i64 = 100;
+        let finished_other = r#"{"id":42,"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
+        let busy_other =
+            r#"{"id":42,"progress":0.43,"download_finished":false,"eta":900,"download_speed":1500000}"#;
+        let ours_busy =
+            r#"{"id":100,"progress":0.02,"download_finished":false,"eta":60,"download_speed":10}"#;
 
-    let cases = [
-        ("ours behind a finished torrent", format!("{finished_other},{ours_busy}")),
-        ("ours behind a busy torrent", format!("{busy_other},{ours_busy}")),
-        ("ours last of several", format!("{finished_other},{busy_other},{ours_busy}")),
-    ];
-    for (name, entries) in cases {
+        let cases = [
+            ("ours behind a finished torrent", format!("{finished_other},{ours_busy}")),
+            ("ours behind a busy torrent", format!("{busy_other},{ours_busy}")),
+            ("ours last of several", format!("{finished_other},{busy_other},{ours_busy}")),
+        ];
+        for (name, entries) in cases {
+            let cache = new_cache();
+            cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+            let body = format!(r#"{{"data":[{entries}]}}"#);
+            let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
+            let got = s
+                .provider_status(&tgt(H))
+                .await
+                .expect_downloading("our torrent is in the list and downloading; this must report on it");
+            assert!(
+                got.progress == 0.02 && got.bytes_per_second == Some(10),
+                "{name}: reported {got:?} — that is another torrent's progress"
+            );
+        }
+
+        // A list that does not mention our torrent says nothing about it, and must not borrow an answer.
         let cache = new_cache();
         cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-        let body = format!(r#"{{"data":[{entries}]}}"#);
+        let body = format!(r#"{{"data":[{busy_other}]}}"#);
         let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
-        let got = s
-            .status(&tgt(H))
-            .await
-            .expect("our torrent is in the list and downloading; this must report on it");
         assert!(
-            got.progress == 0.02 && got.bytes_per_second == Some(10),
-            "{name}: reported {got:?} — that is another torrent's progress"
+            !s.provider_status(&tgt(H)).await.is_downloading(),
+            "reported a status for a torrent the answer never mentions"
         );
-    }
 
-    // A list that does not mention our torrent says nothing about it, and must not borrow an answer.
-    let cache = new_cache();
-    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-    let body = format!(r#"{{"data":[{busy_other}]}}"#);
-    let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
-    assert!(s.status(&tgt(H)).await.is_none(), "reported a status for a torrent the answer never mentions");
+        // The ordinary single-entry answer to a by-id query need not repeat the id, and still counts.
+        let cache = new_cache();
+        cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+        let s = tb(
+            "tok",
+            doer(|_| Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false,"eta":30}}"#))),
+            Some(cache),
+        );
+        let got = s.provider_status(&tgt(H)).await;
+        assert!(
+            matches!(&got, ProviderStatus::Downloading(g) if g.progress == 0.25),
+            "an unlabelled single entry is still ours: {got:?}"
+        );
 
-    // The ordinary single-entry answer to a by-id query need not repeat the id, and still counts.
-    let cache = new_cache();
-    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-    let s = tb(
-        "tok",
-        doer(|_| Ok(resp(200, r#"{"data":{"progress":0.25,"download_finished":false,"eta":30}}"#))),
-        Some(cache),
-    );
-    let got = s.status(&tgt(H)).await;
-    assert!(
-        matches!(&got, Some(g) if g.progress == 0.25),
-        "an unlabelled single entry is still ours: {got:?}"
-    );
-
-    // But an object naming a DIFFERENT torrent is not.
-    let cache = new_cache();
-    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-    let s = tb(
-        "tok",
-        doer(|_| Ok(resp(200, r#"{"data":{"id":42,"progress":0.9,"download_finished":false}}"#))),
-        Some(cache),
-    );
-    assert!(s.status(&tgt(H)).await.is_none(), "reported a status from an entry that names torrent 42");
+        // But an object naming a DIFFERENT torrent is not.
+        let cache = new_cache();
+        cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+        let s = tb(
+            "tok",
+            doer(|_| Ok(resp(200, r#"{"data":{"id":42,"progress":0.9,"download_finished":false}}"#))),
+            Some(cache),
+        );
+        assert!(
+            !s.provider_status(&tgt(H)).await.is_downloading(),
+            "reported a status from an entry that names torrent 42"
+        );
+    })
+    .await;
 }
 
 /// A 200 with no `data` key is TorBox's envelope missing, not the account saying it holds nothing —
@@ -3515,7 +3706,7 @@ async fn tor_box_an_envelope_without_data_is_not_a_miss() {
     for body in [r#"{}"#, r#"{"success":false}"#, r#"{"success":false,"data":null}"#] {
         let cache = new_cache();
         let s = tb("tok", doer(move |_| Ok(resp(200, body))), Some(cache.clone()));
-        let _ = s.status(&tgt(H)).await;
+        let _ = s.provider_status(&tgt(H)).await;
         assert!(
             cache.get(&torrent_miss_key("tok", H)).is_none(),
             "{body} was remembered as the account not holding the torrent"
@@ -3524,7 +3715,7 @@ async fn tor_box_an_envelope_without_data_is_not_a_miss() {
     // A real, readable list that lacks the hash still is one.
     let cache = new_cache();
     let s = tb("tok", doer(|_| Ok(resp(200, r#"{"success":true,"data":[]}"#))), Some(cache.clone()));
-    let _ = s.status(&tgt(H)).await;
+    let _ = s.provider_status(&tgt(H)).await;
     assert!(cache.get(&torrent_miss_key("tok", H)).is_some(), "an answered miss must still be remembered");
 }
 
@@ -3777,37 +3968,45 @@ async fn tor_box_the_warm_path_remembers_its_refusal() {
 /// dead_link — the client blacklists a release that is downloading right now.
 #[tokio::test]
 async fn tor_box_status_an_exact_id_beats_an_unlabelled_entry() {
-    const OURS: i64 = 42;
-    let unlabelled_finished = r#"{"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
-    let stranger_busy = r#"{"id":9,"progress":0.11,"download_finished":false,"eta":9999,"download_speed":5}"#;
-    let ours_busy = r#"{"id":42,"progress":0.5,"download_finished":false,"eta":600,"download_speed":900000}"#;
-    let cases = [
-        ("an unlabelled finished entry first", format!("{unlabelled_finished},{ours_busy}")),
-        ("a stranger downloading first", format!("{stranger_busy},{ours_busy}")),
-        ("both ahead of ours", format!("{unlabelled_finished},{stranger_busy},{ours_busy}")),
-    ];
-    for (name, entries) in cases {
+    crate::runtime::scope(crate::runtime::ScoutRuntime::new(), async {
+        const OURS: i64 = 42;
+        let unlabelled_finished = r#"{"progress":1,"download_finished":true,"eta":0,"download_speed":0}"#;
+        let stranger_busy =
+            r#"{"id":9,"progress":0.11,"download_finished":false,"eta":9999,"download_speed":5}"#;
+        let ours_busy =
+            r#"{"id":42,"progress":0.5,"download_finished":false,"eta":600,"download_speed":900000}"#;
+        let cases = [
+            ("an unlabelled finished entry first", format!("{unlabelled_finished},{ours_busy}")),
+            ("a stranger downloading first", format!("{stranger_busy},{ours_busy}")),
+            ("both ahead of ours", format!("{unlabelled_finished},{stranger_busy},{ours_busy}")),
+        ];
+        for (name, entries) in cases {
+            let cache = new_cache();
+            cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
+            let body = format!(r#"{{"data":[{entries}]}}"#);
+            let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
+            let got = s
+                .provider_status(&tgt(H))
+                .await
+                .expect_downloading("our torrent is in the list and downloading; this must report on it");
+            assert!(got.progress == 0.5, "{name}: reported {got:?} — that is another torrent's progress");
+        }
+
+        // With no exact match anywhere, an id-less entry is still the best available answer.
         let cache = new_cache();
         cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-        let body = format!(r#"{{"data":[{entries}]}}"#);
-        let s = tb("tok", doer(move |_| Ok(resp(200, &body))), Some(cache));
-        let got = s
-            .status(&tgt(H))
-            .await
-            .expect("our torrent is in the list and downloading; this must report on it");
-        assert!(got.progress == 0.5, "{name}: reported {got:?} — that is another torrent's progress");
-    }
-
-    // With no exact match anywhere, an id-less entry is still the best available answer.
-    let cache = new_cache();
-    cache.put(&torrent_id_key("tok", H), &OURS.to_string(), resolve_cache_ttl());
-    let s = tb(
-        "tok",
-        doer(|_| Ok(resp(200, r#"{"data":[{"progress":0.25,"download_finished":false}]}"#))),
-        Some(cache),
-    );
-    let got = s.status(&tgt(H)).await;
-    assert!(matches!(&got, Some(g) if g.progress == 0.25), "an unlabelled lone entry is still ours: {got:?}");
+        let s = tb(
+            "tok",
+            doer(|_| Ok(resp(200, r#"{"data":[{"progress":0.25,"download_finished":false}]}"#))),
+            Some(cache),
+        );
+        let got = s.provider_status(&tgt(H)).await;
+        assert!(
+            matches!(&got, ProviderStatus::Downloading(g) if g.progress == 0.25),
+            "an unlabelled lone entry is still ours: {got:?}"
+        );
+    })
+    .await;
 }
 
 /// A read-only caller is exempt from the gate that READS the per-release backoff, so it must not WRITE
@@ -3965,19 +4164,19 @@ async fn tor_box_the_account_listing_is_fetched_once_per_account() {
         hashes.push(repeat(&format!("{i:x}"), 40));
     }
     for h in &hashes {
-        let _ = make(fetches.clone(), bytes_out.clone()).status(&tgt(h)).await;
+        let _ = make(fetches.clone(), bytes_out.clone()).provider_status(&tgt(h)).await;
     }
     let n = fetches.load(Ordering::SeqCst);
     let b = bytes_out.load(Ordering::SeqCst);
     assert_eq!(n, 1, "fetched the account listing {n} times for {} releases ({b} bytes)", hashes.len());
     // And the answer is still right for both a hash it holds and one it does not.
     assert!(
-        make(fetches.clone(), bytes_out.clone()).status(&tgt(H)).await.is_some(),
+        make(fetches.clone(), bytes_out.clone()).provider_status(&tgt(H)).await.is_downloading(),
         "a held, downloading torrent must still be found through the memo"
     );
     let absent = "dead".repeat(10); // 40 chars, and not one of the generated single-digit hashes
     assert!(
-        make(fetches.clone(), bytes_out.clone()).status(&tgt(&absent)).await.is_none(),
+        !make(fetches.clone(), bytes_out.clone()).provider_status(&tgt(&absent)).await.is_downloading(),
         "a hash the account does not hold must not be found"
     );
 }

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use den_net::{kill_group, signal_group};
+use den_process::{kill_group, signal_group};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
@@ -617,6 +617,10 @@ impl Job {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.exit = Some(status.success());
                 self.permit = None;
+                // The leader is reaped, but an ffmpeg helper may still share its process group.
+                // Stop those descendants before surrendering the numeric id: after this point the
+                // pid is eligible for reuse and must never be signalled again.
+                kill_group(self.pid);
                 unregister_group(self.pid);
             }
         }
@@ -631,7 +635,7 @@ impl Job {
     /// this reason — one has to be had again from the same pool before this can run any more.
     pub fn pause(&mut self) {
         if self.exit.is_none() && !self.stopped {
-            signal_group(self.pid, libc::SIGSTOP);
+            signal_group(self.pid, den_process::signal::STOP);
             self.stopped = true;
             self.paused_since = Some(Instant::now());
             self.permit = None;
@@ -645,7 +649,7 @@ impl Job {
 
     pub fn resume(&mut self, permit: crate::state::ProducerPermit) {
         if self.resumable() {
-            signal_group(self.pid, libc::SIGCONT);
+            signal_group(self.pid, den_process::signal::CONTINUE);
             self.stopped = false;
             self.permit = Some(permit);
             if let Some(since) = self.paused_since.take() {
@@ -695,40 +699,108 @@ impl Drop for Job {
 
 /// Every live ffmpeg's process group, so shutdown can kill them without depending on drop order —
 /// den-reel's registry, for the same reason.
-static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
+static LIVE_GROUPS: den_process::Registry = den_process::Registry::new();
 
 pub(crate) fn register_group(pgid: u32) {
-    if pgid > 1 && pgid <= i32::MAX as u32 {
-        LIVE_GROUPS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(Default::default)
-            .insert(pgid);
-    }
+    LIVE_GROUPS.register(Some(pgid));
 }
 
 pub(crate) fn unregister_group(pgid: u32) {
-    if let Some(set) = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        set.remove(&pgid);
-    }
+    LIVE_GROUPS.unregister(Some(pgid));
 }
 
 /// SIGKILL every ffmpeg still running. Returns how many groups it signalled.
 pub fn kill_live_groups() -> usize {
-    let taken = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-    for p in &taken {
-        kill_group(*p);
-    }
-    taken.len()
+    LIVE_GROUPS.kill_all()
 }
 
 pub fn live_groups() -> usize {
-    LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len())
+    LIVE_GROUPS.len()
+}
+
+#[cfg(test)]
+pub(crate) fn is_group_live(pgid: u32) -> bool {
+    LIVE_GROUPS.contains(pgid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_normally_exiting_job_disarms_its_group_and_stops_descendants() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "den-remux-job-group-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let descendant_file = base.join("descendant.pid");
+        let script = base.join("fake-ffmpeg");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 & child=$!\necho $child > '{}'\nexit 0\n",
+                descendant_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cfg = crate::config::Config::from_env();
+        cfg.max_active_remuxes = 1;
+        let state = crate::state::AppState::new(cfg);
+        let permit = state.try_acquire_producer_slot(false).unwrap();
+        let output = base.join("output");
+        let spec = Spec {
+            input: "/ignored",
+            seek: None,
+            video: Video::Copy { tag: None, dovi: Dovi::Absent },
+            audio: 0,
+            audio_out: AudioOut::Copy,
+            text: &[],
+            dir: &output,
+        };
+        let mut job = Job::spawn(script.to_str().unwrap(), 1, 0.0, &spec, permit).unwrap();
+        let pgid = job.pid;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !descendant_file.exists() || job.poll_exit().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake job did not exit");
+        assert!(!is_group_live(pgid), "reaped job stayed registered");
+
+        let descendant: u32 = std::fs::read_to_string(&descendant_file).unwrap().trim().parse().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &descendant.to_string()])
+                    .output()
+                    .unwrap();
+                let running = output.status.success()
+                    && output
+                        .stdout
+                        .iter()
+                        .copied()
+                        .find(|byte| !byte.is_ascii_whitespace())
+                        .is_some_and(|byte| byte != b'Z');
+                if !running {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("normal job exit left its descendant alive");
+        std::fs::remove_dir_all(base).ok();
+    }
 
     #[test]
     fn a_runs_pull_line_says_how_fast_it_made_the_film_while_it_ran() {

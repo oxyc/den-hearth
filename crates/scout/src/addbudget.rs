@@ -16,9 +16,7 @@
 //! on the same account, a retry TorBox counted and we did not, an add whose response never arrived.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-#[cfg(not(test))]
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -31,6 +29,30 @@ use crate::util::key_hash;
 
 pub(crate) const ADD_BUDGET_WINDOW: Duration = Duration::from_secs(60 * 60);
 pub(crate) const ADD_BUDGET_LIMIT: i64 = 50;
+/// Distinct service/account identities with live charges. Refuse unseen accounts at capacity rather than
+/// evicting a live counter: eviction would reset the very quota this budget protects. Expired or fully
+/// refunded entries release capacity. At the normal allowance this bounds storage to 204,800 timestamps.
+pub(crate) const MAX_TRACKED_ACCOUNTS: usize = 4096;
+
+/// Identity of one admitted provider add. A refund must name the charge it is returning: removing
+/// whichever timestamp happens to be newest lets concurrent, out-of-order answers move another
+/// request's rolling-window expiry and briefly spend past the real provider ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AddCharge {
+    pub(crate) id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpentCharge {
+    pub(crate) charge: AddCharge,
+    pub(crate) at: SystemTime,
+}
+
+#[derive(Debug)]
+pub(crate) enum Refused {
+    Allowance,
+    Capacity,
+}
 /// Go `defaultPlayReserve` is how many of the window's adds a prefetch may not spend (PLAY_RESERVE_ADDS). The
 /// budget used not to care WHY an add was made, so a season download running in the background could
 /// spend the whole hour and the viewer who then pressed Play was refused. A prefetch — the binge
@@ -43,13 +65,17 @@ pub(crate) const DEFAULT_PLAY_RESERVE: i64 = 5;
 /// the ceiling it mirrors is rolling: spending the whole allowance at 10:59 and again at 11:01 is exactly
 /// the burst that trips the real limit, and a fixed bucket permits it.
 pub(crate) struct AddBudget {
-    /// Go `spent`: the add times still inside the window, per account, oldest first.
-    pub(crate) spent: Mutex<HashMap<String, Vec<SystemTime>>>,
+    /// Go `spent`: the identified add times still inside the window, per account, oldest first.
+    pub(crate) spent: Mutex<HashMap<String, Vec<SpentCharge>>>,
     pub(crate) window: Duration,
     pub(crate) limit: i64,
     /// Go `reserve` is how many adds of the window only a viewer waiting may spend; a prefetch is refused once
     /// the account's remaining allowance is at or below it.
     pub(crate) reserve: AtomicI64,
+    /// Process-unique charge identity. Exhausting this counter would require admitting 2^64 adds in
+    /// one process; fail closed instead of wrapping onto a live charge if that impossible lifetime
+    /// is ever reached.
+    next_charge: AtomicU64,
     /// Go `now`, injectable so the tests do not sleep for an hour.
     pub(crate) now: Box<dyn Fn() -> SystemTime + Send + Sync>,
 }
@@ -62,12 +88,13 @@ impl AddBudget {
             window,
             limit,
             reserve: AtomicI64::new(DEFAULT_PLAY_RESERVE),
+            next_charge: AtomicU64::new(1),
             now: Box::new(SystemTime::now),
         }
     }
 
     /// A poisoned lock still holds consistent state: every edit under it finishes before anything can panic.
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<SystemTime>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<SpentCharge>>> {
         self.spent.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -95,25 +122,49 @@ impl AddBudget {
     /// Go `addBudget.take`: records an add against the account and reports whether it is allowed. A refusal spends
     /// nothing, so the window drains normally and the next caller after it expires is served. A prefetch is refused
     /// while the reserve is all that is left; a viewer waiting spends down to zero.
+    #[cfg(test)]
     pub(crate) fn take(&self, account: &str, prefetch: bool) -> bool {
+        self.try_take(account, prefetch).is_ok()
+    }
+
+    pub(crate) fn try_take(&self, account: &str, prefetch: bool) -> Result<AddCharge, Refused> {
         let mut spent = self.lock();
         let now = (self.now)();
         let cutoff = self.cutoff(now);
         drop_drained(&mut spent, cutoff);
-        let kept = spent.entry(account.to_owned()).or_default();
-        kept.retain(|t| *t > cutoff);
-        if kept.len() as i64 >= self.ceiling(prefetch) {
-            return false;
+        if !spent.contains_key(account) && spent.len() >= MAX_TRACKED_ACCOUNTS {
+            return Err(Refused::Capacity);
         }
-        kept.push(now);
-        true
+        let ceiling = self.ceiling(prefetch);
+        if ceiling <= 0 {
+            return Err(Refused::Allowance);
+        }
+        let kept = spent.entry(account.to_owned()).or_default();
+        kept.retain(|charge| charge.at > cutoff);
+        if kept.len() as i64 >= ceiling {
+            return Err(Refused::Allowance);
+        }
+        let id = self
+            .next_charge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("the process admitted 2^64 provider adds");
+        let charge = AddCharge { id };
+        kept.push(SpentCharge { charge, at: now });
+        Ok(charge)
     }
 
-    /// Go `refund` returns the most recent charge. Only for an add that was never sent — see `refund_add`; refunding
-    /// one that merely lost its response hands back an allowance the debrid has already spent.
-    pub(crate) fn refund(&self, account: &str) {
-        if let Some(spent) = self.lock().get_mut(account) {
-            spent.pop();
+    /// Go `refund` returns this exact charge. Only for an add that was never sent — see `refund_add`; refunding
+    /// one that merely lost its response hands back an allowance the debrid has already spent. Identity matters:
+    /// provider calls finish out of order, so removing the newest charge can move another call's expiry.
+    pub(crate) fn refund(&self, account: &str, charge: AddCharge) {
+        let mut all = self.lock();
+        if let Some(spent) = all.get_mut(account) {
+            if let Some(at) = spent.iter().position(|spent| spent.charge == charge) {
+                spent.remove(at);
+            }
+            if spent.is_empty() {
+                all.remove(account);
+            }
         }
     }
 
@@ -121,7 +172,13 @@ impl AddBudget {
     pub(crate) fn remaining(&self, account: &str) -> i64 {
         let spent = self.lock();
         let cutoff = self.cutoff((self.now)());
-        let live = spent.get(account).map_or(0, |v| v.iter().filter(|t| **t > cutoff).count()) as i64;
+        if !spent.contains_key(account)
+            && spent.values().filter(|v| v.last().is_some_and(|charge| charge.at > cutoff)).count()
+                >= MAX_TRACKED_ACCOUNTS
+        {
+            return 0;
+        }
+        let live = spent.get(account).map_or(0, |v| v.iter().filter(|charge| charge.at > cutoff).count()) as i64;
         (self.limit - live).max(0)
     }
 
@@ -129,12 +186,23 @@ impl AddBudget {
     /// else until the charge holding it at its ceiling drains. What a spent budget's (or a held reserve's)
     /// Retry-After says.
     pub(crate) fn frees_in(&self, account: &str, prefetch: bool) -> Duration {
-        let spent = self.lock();
+        let mut spent = self.lock();
         let now = (self.now)();
         let cutoff = self.cutoff(now);
+        drop_drained(&mut spent, cutoff);
+        if !spent.contains_key(account) && spent.len() >= MAX_TRACKED_ACCOUNTS {
+            // An unseen account needs an entire entry to drain, not just one charge from it.
+            return spent
+                .values()
+                .filter_map(|charges| charges.last().map(|charge| charge.at))
+                .min()
+                .and_then(|last| last.checked_add(self.window))
+                .and_then(|until| until.duration_since(now).ok())
+                .unwrap_or(self.window);
+        }
         let live: Vec<SystemTime> = spent
             .get(account)
-            .map(|v| v.iter().copied().filter(|t| *t > cutoff).collect())
+            .map(|v| v.iter().map(|charge| charge.at).filter(|t| *t > cutoff).collect())
             .unwrap_or_default();
         let ceiling = self.ceiling(prefetch);
         if ceiling <= 0 {
@@ -176,9 +244,9 @@ impl AddBudget {
 /// deleted, so the map grew one key per distinct service+token ever seen and never shrank — and the token
 /// comes from the install's own config URL on an unauthenticated route, so the set of keys is not bounded
 /// by anything this process controls. `pruneMintedLocked` is the same idea two files over.
-fn drop_drained(spent: &mut HashMap<String, Vec<SystemTime>>, cutoff: SystemTime) {
+fn drop_drained(spent: &mut HashMap<String, Vec<SpentCharge>>, cutoff: SystemTime) {
     // The vector is append-only in time order, so the last entry is the newest.
-    spent.retain(|_, v| v.last().is_some_and(|newest| *newest > cutoff));
+    spent.retain(|_, v| v.last().is_some_and(|newest| newest.at > cutoff));
 }
 
 /// Go's nil-receiver `take`: a nil budget admits everything.
@@ -193,43 +261,22 @@ pub(crate) fn budget_remaining(budget: Option<&AddBudget>, account: &str) -> i64
     budget.map_or(-1, |b| b.remaining(account))
 }
 
-/// One per process, keyed by service+account, so every store built for every request shares the count.
+/// One per `ScoutRuntime`, keyed by service+account, so every store built for every request shares the count.
 ///
 /// In memory, deliberately but not costlessly: a redeploy or crash-loop resets the count while the real
 /// hourly ceiling keeps counting, so a restart hands back an allowance the service has not. The gap
 /// between this limit and the real 60 is what absorbs that, which is one more reason not to close it.
-/// A budget held on the store would be worse still — the stores are rebuilt per request.
-#[cfg(not(test))]
-static GLOBAL_ADD_BUDGET: LazyLock<Mutex<Arc<AddBudget>>> =
-    LazyLock::new(|| Mutex::new(Arc::new(AddBudget::new(ADD_BUDGET_WINDOW, ADD_BUDGET_LIMIT))));
-
-// A TEST build keeps the budget per thread instead. Go's tests run one at a time and swap `globalAddBudget` around
-// the ones that care, while cargo runs ours in parallel: a shared budget lets one test's limit of zero refuse
-// another's add, and every test that uses the token "tok" spends from the same fifty. Each test runs on its own
-// thread (and a `#[tokio::test]` keeps all its tasks there), so a thread's budget is that test's, fresh and
-// unshared, and the assertions about it need no lock.
-#[cfg(test)]
-thread_local! {
-    static GLOBAL_ADD_BUDGET: std::cell::RefCell<Arc<AddBudget>> =
-        std::cell::RefCell::new(Arc::new(AddBudget::new(ADD_BUDGET_WINDOW, ADD_BUDGET_LIMIT)));
-}
-
+/// A budget held on the store would be worse still — the stores are rebuilt per request. Hearth injects one
+/// runtime into all of its Scout handlers.
 /// Go `globalAddBudget`: one per process, keyed by service and account.
 pub(crate) fn global_add_budget() -> Arc<AddBudget> {
-    #[cfg(not(test))]
-    {
-        Arc::clone(&GLOBAL_ADD_BUDGET.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-    #[cfg(test)]
-    {
-        GLOBAL_ADD_BUDGET.with(|b| Arc::clone(&b.borrow()))
-    }
+    crate::runtime::current_runtime().add_budget()
 }
 
 /// Replaces this test thread's budget and returns the one it replaced, so a test can put it back.
 #[cfg(test)]
 pub(crate) fn set_global_add_budget(budget: Arc<AddBudget>) -> Arc<AddBudget> {
-    GLOBAL_ADD_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget))
+    crate::runtime::current_runtime().replace_add_budget(budget)
 }
 
 /// Go `SetPlayReserve` sets how many adds of the hour a prefetch may not spend. Called once at startup, from
@@ -238,9 +285,7 @@ pub fn set_play_reserve(n: i64) {
     global_add_budget().reserve.store(n, Ordering::SeqCst);
 }
 
-/// The reason a prefetch refused for the reserve carries. Go marks it with the `errPlayReserve` sentinel wrapped
-/// beside `errScoutSide`; the frozen `StoreError` has no variant for it, so `is_play_reserve` reads it back from
-/// this text.
+/// Stable wire/log wording for the typed `StoreError::PlayReserve` refusal.
 pub(crate) const PLAY_RESERVE_REASON: &str = "the rest of scout's hourly add budget is kept for Play";
 
 /// The reason a spent budget refuses a viewer with.
@@ -250,7 +295,7 @@ pub(crate) const BUDGET_SPENT_REASON: &str = "scout's own hourly add budget for 
 /// waiting. Not a spent budget and not the service refusing: /play answers it as "reserved_for_play", and the
 /// client retries after Retry-After without holding it against the release.
 pub(crate) fn is_play_reserve(err: &StoreError) -> bool {
-    matches!(err, StoreError::ScoutSide(u) if u.reason == PLAY_RESERVE_REASON)
+    matches!(err, StoreError::PlayReserve(_))
 }
 
 /// Go `spendAdd` charges one add against a service's account, or refuses. Every store calls this immediately
@@ -268,11 +313,24 @@ pub(crate) fn spend_add(
     token: &str,
     info_hash: &str,
     prefetch: bool,
-) -> Result<(), StoreError> {
-    if global_add_budget().take(&budget_account(svc, token), prefetch) {
-        return Ok(());
-    }
+) -> Result<AddCharge, StoreError> {
+    let refused = match global_add_budget().try_take(&budget_account(svc, token), prefetch) {
+        Ok(charge) => return Ok(charge),
+        Err(refused) => refused,
+    };
     let svc_name = svc.as_str();
+    if matches!(refused, Refused::Capacity) {
+        let counters = metrics();
+        let refused = if prefetch { &counters.add_refused_prefetch } else { &counters.add_refused_play };
+        refused.fetch_add(1, Ordering::Relaxed);
+        log_limited("add-budget-capacity", "scout's add budget is tracking the maximum number of accounts");
+        return Err(StoreError::ScoutSide(StoreUnavailableError {
+            service: svc,
+            reason: "scout's add budget cannot track another account until an existing window drains"
+                .to_owned(),
+            status: 0,
+        }));
+    }
     if prefetch {
         metrics().add_refused_prefetch.fetch_add(1, Ordering::Relaxed);
         log_limited(
@@ -282,7 +340,7 @@ pub(crate) fn spend_add(
                 short_hash(info_hash)
             ),
         );
-        return Err(StoreError::ScoutSide(StoreUnavailableError {
+        return Err(StoreError::PlayReserve(StoreUnavailableError {
             service: svc,
             reason: PLAY_RESERVE_REASON.to_owned(),
             status: 0,
@@ -311,12 +369,17 @@ pub(crate) fn spend_add(
 ///
 /// The problem the refund was reaching for is real (a cancelling client must not be able to lock itself
 /// out), but the answer is to stop re-adding, not to stop counting. See addAttemptKey.
-pub(crate) fn refund_add(svc: DebridService, token: &str, err: &(dyn std::error::Error + 'static)) {
+pub(crate) fn refund_add(
+    svc: DebridService,
+    token: &str,
+    charge: AddCharge,
+    err: &(dyn std::error::Error + 'static),
+) {
     // Go `errors.Is`: the marker anywhere along the chain of causes.
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cause {
         if e.is::<RequestNotSent>() {
-            global_add_budget().refund(&budget_account(svc, token));
+            global_add_budget().refund(&budget_account(svc, token), charge);
             return;
         }
         cause = e.source();
@@ -329,8 +392,8 @@ pub(crate) fn refund_add(svc: DebridService, token: &str, err: &(dyn std::error:
 /// read for one it holds, and which of those happened is only knowable from the answer. Charging first
 /// keeps the budget able to GATE the call; refunding here keeps a library of held releases from costing
 /// an add per play.
-pub(crate) fn refund_unused_add(svc: DebridService, token: &str) {
-    global_add_budget().refund(&budget_account(svc, token));
+pub(crate) fn refund_unused_add(svc: DebridService, token: &str, charge: AddCharge) {
+    global_add_budget().refund(&budget_account(svc, token), charge);
 }
 
 /// Go `errRequestNotSent` marks the one case where nothing reached the service: the request could not even be

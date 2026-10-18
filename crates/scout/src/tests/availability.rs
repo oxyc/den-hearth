@@ -14,7 +14,7 @@ use crate::handler::new_handler;
 use crate::rank::RawStream;
 use crate::scrape::{DoError, ScrapeQuery};
 use crate::seal::{seal, SealKeyring, SEALED_VERSION};
-use crate::stores::{ResolveTarget, Store, StoreError, StoreStatus};
+use crate::stores::{ResolveTarget, Store, StoreError};
 use crate::tests::handler::{
     blob, body_str, fake_scraper, get, post_json, test_deps, test_seeds, valid_blob, FakeFuture, VEC_PUB_B64,
 };
@@ -95,8 +95,8 @@ impl Store for AvailabilityCountingStore {
         Err(StoreError::Other("unused".to_owned()))
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
+    async fn provider_status(&self, _t: &ResolveTarget) -> crate::stores::ProviderStatus {
+        crate::stores::ProviderStatus::NotFetching
     }
 }
 
@@ -123,8 +123,8 @@ impl Store for AvailabilityTruthStore {
         Err(StoreError::Other("unused".to_owned()))
     }
 
-    async fn status(&self, _t: &ResolveTarget) -> Option<StoreStatus> {
-        None
+    async fn provider_status(&self, _t: &ResolveTarget) -> crate::stores::ProviderStatus {
+        crate::stores::ProviderStatus::NotFetching
     }
 }
 
@@ -291,8 +291,8 @@ async fn availability_partial_filtered_list_stays_unknown() {
     }
 }
 
-/// The scoped config answers availability — reading the verdicts the full config wrote — and its manifest, and
-/// nothing that lists or plays streams. A scope on a plaintext config, or an unknown one, is refused.
+/// The scoped config answers availability — reading the verdicts the full config wrote — and nothing that lists
+/// or plays streams. A scope on a plaintext config, or an unknown one, is refused.
 #[tokio::test]
 async fn availability_the_scoped_config() {
     let kr = crate::tests::handler::ticket_keyring();
@@ -313,7 +313,6 @@ async fn availability_the_scoped_config() {
         "available",
         "the scoped config should read the full config's verdict"
     );
-    assert_eq!(get(&h, &format!("/{scoped}/manifest.json"), &[]).await.status(), 200, "scoped manifest");
     let token = crate::play::encode_play_token(&crate::play::PlayTarget {
         info_hash: "a".repeat(40),
         ..crate::play::PlayTarget::default()

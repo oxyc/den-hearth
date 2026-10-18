@@ -18,7 +18,7 @@ use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{describe, wraps_unavailable};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
-    dead_link, join_all, short_hash, CacheTruth, ResolveTarget, StatusAnswer, Store, StoreError, StoreStatus,
+    dead_link, join_all, short_hash, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError,
     StoreUnavailableError,
 };
 
@@ -346,7 +346,10 @@ impl StorePool {
             match st.resolve(t).await {
                 Ok(link) => return Ok(link),
                 Err(err) => {
-                    if wraps_unavailable(&err) && refused.is_none() {
+                    if (wraps_unavailable(&err)
+                        || matches!(err, StoreError::Other(_) | StoreError::Cancelled))
+                        && refused.is_none()
+                    {
                         refused = Some(err);
                     }
                 }
@@ -358,63 +361,28 @@ impl StorePool {
         Err(dead_link("no holding store could resolve"))
     }
 
-    /// Go `StorePool.Status` — the first store that can say a queued release is still downloading. Only
-    /// meaningful right after a failed Resolve; `ok == false` means nobody is fetching it, i.e. genuinely dead.
-    ///
-    /// The third result is the one that matters to a caller deciding whether to ADD: it reports that at least
-    /// one store could not answer, as opposed to answering "no". Callers that will RETRY want `status_detail`
-    /// instead, which says which stores those were; this is the same question collapsed to a bool.
-    ///
-    /// Returning only (status, ok) forced handlePlay to infer doubt from its own clock, and the per-store
-    /// budget slicing below made the two questions different: store 0 can burn its slice and time out while
-    /// the pool still returns well before the caller's deadline, so "did the whole budget elapse" was false
-    /// exactly when a store had failed to answer. The caller then queued a second copy of a torrent store 0
-    /// was already fetching — the bug the escalation exists to prevent, reintroduced for every multi-account
-    /// install by the fix for a different one. The pool knows; it says so rather than leaving it to be
-    /// guessed.
-    ///
-    /// `deadline` is the caller's, which Go carries in the context: the budget the stores share.
-    pub async fn status(&self, t: &ResolveTarget, deadline: Option<Instant>) -> (StoreStatus, bool, bool) {
-        let (status, ok, unknown) = self.status_detail(t, deadline).await;
-        (status, ok, !unknown.is_empty())
-    }
-
-    /// Go `StorePool.StatusDetail` is `status`, plus WHICH stores could not answer — so a retry asks only those.
-    ///
-    /// The escalated read went back through the whole pool, and a store that answered definitively has
-    /// nothing new to say a moment later: measured through the handler on a three-account pool, one unknown
-    /// store cost NINE store reads per /play where SEVEN suffice, and each TorBox read is up to two upstream
-    /// calls. Seven rather than six because the post-failure read below still asks everyone — deliberately,
-    /// since it runs after an add may have landed and any store's answer can have changed. On a two-second
-    /// poll cadence for the length of a download, the difference is a wasted upstream read per extra account
-    /// per poll, on the path the escalation exists for — which is by definition one where something is
-    /// already struggling.
-    ///
-    /// Each store gets its own SLICE of the budget, rather than all of them sharing one deadline. Sharing it
-    /// meant the first store could spend the lot: TorBox's status walks an account listing this package
-    /// measures at ~13 MB on a large account, so with TorBox configured first, every later store was called
-    /// with an already-expired context and failed instantly. A Real-Debrid account that was actively
-    /// downloading the release was asked twice and answered neither time — the pool reported "nobody is
-    /// fetching it", and the caller queued a second copy. The store that knew the answer was in the list the
-    /// whole time. Split evenly across the stores STILL TO BE ASKED, so an early store that answers quickly
-    /// hands its unused time to the rest rather than the first one taking it all.
-    pub async fn status_detail(
+    /// Named status outcome used by new callers.  `unresolved` retains the providers that could not answer,
+    /// so a targeted retry does not lose transport uncertainty behind a default status value.
+    pub async fn status_outcome(
         &self,
         t: &ResolveTarget,
         deadline: Option<Instant>,
-    ) -> (StoreStatus, bool, Vec<&dyn Store>) {
+    ) -> PoolStatusOutcome<'_> {
         let stores: Vec<&dyn Store> = self.stores.iter().map(|s| s.as_ref()).collect();
-        status_detail_among(&stores, t, deadline).await
+        status_outcome_among(&stores, t, deadline).await
     }
 }
 
-/// `StatusDetail` over any list of the pool's stores, which is how the retry asks only the ones that could
-/// not answer: the list it was handed back.
-pub(crate) async fn status_detail_among<'a>(
+pub struct PoolStatusOutcome<'a> {
+    pub result: ProviderStatus,
+    pub unresolved: Vec<&'a dyn Store>,
+}
+
+pub(crate) async fn status_outcome_among<'a>(
     stores: &[&'a dyn Store],
     t: &ResolveTarget,
     deadline: Option<Instant>,
-) -> (StoreStatus, bool, Vec<&'a dyn Store>) {
+) -> PoolStatusOutcome<'a> {
     let mut unknown: Vec<&'a dyn Store> = Vec::new();
     for (i, st) in stores.iter().enumerate() {
         let mut share = None;
@@ -431,42 +399,36 @@ pub(crate) async fn status_detail_among<'a>(
                 // is the failure the escalation exists to prevent, reintroduced by the change that made
                 // the retry cheaper.
                 unknown.extend(stores[i..].iter().copied());
-                return (StoreStatus::default(), false, unknown);
+                return PoolStatusOutcome { result: ProviderStatus::Unknown, unresolved: unknown };
             }
             share = Some((deadline - now) / u32::try_from(stores.len() - i).unwrap_or(u32::MAX));
         }
-        // Prefer the three-valued answer where the store can give one.
-        let ask = async {
-            if let Some(answered) = st.status_answer(t).await {
-                answered
-            } else if let Some(s) = st.status(t).await {
-                (s, StatusAnswer::Downloading)
-            } else {
-                (StoreStatus::default(), StatusAnswer::No)
-            }
-        };
-        let (status, answer, cut_short) = match share {
+        let ask = st.provider_status(t);
+        let (answer, cut_short) = match share {
             Some(share) => match tokio::time::timeout(share, ask).await {
-                Ok((status, answer)) => (status, answer, false),
-                Err(_) => (StoreStatus::default(), StatusAnswer::No, true),
+                Ok(answer) => (answer, false),
+                Err(_) => (ProviderStatus::Unknown, true),
             },
-            None => {
-                let (status, answer) = ask.await;
-                (status, answer, false)
-            }
+            None => (ask.await, false),
         };
         // Two ways a store fails to answer, and both count: it said so itself (a throttled account, an
         // unreadable listing), or it was cut short by its own slice or by the caller going away. Only
         // deadlines were counted before, so a 503 read as a definitive "not downloading".
-        let late = deadline.is_some_and(|d| Instant::now() > d) && answer != StatusAnswer::Downloading;
-        if answer == StatusAnswer::Unknown || (answer != StatusAnswer::Downloading && (cut_short || late)) {
+        let late =
+            deadline.is_some_and(|d| Instant::now() > d) && !matches!(answer, ProviderStatus::Downloading(_));
+        if matches!(answer, ProviderStatus::Unknown)
+            || (!matches!(answer, ProviderStatus::Downloading(_)) && (cut_short || late))
+        {
             unknown.push(*st);
         }
-        if answer == StatusAnswer::Downloading {
-            let mut status = status;
+        if let ProviderStatus::Downloading(mut status) = answer {
             status.service = Some(st.service());
-            return (status, true, Vec::new());
+            return PoolStatusOutcome { result: ProviderStatus::Downloading(status), unresolved: Vec::new() };
         }
     }
-    (StoreStatus::default(), false, unknown)
+    if unknown.is_empty() {
+        PoolStatusOutcome { result: ProviderStatus::NotFetching, unresolved: unknown }
+    } else {
+        PoolStatusOutcome { result: ProviderStatus::Unknown, unresolved: unknown }
+    }
 }

@@ -29,11 +29,6 @@ pub fn retry_after(mut resp: Response<Body>, wait: std::time::Duration) -> Respo
     resp
 }
 
-/// HTML with the `Cache-Control` it may be kept under (and an ETag when that lets it be kept).
-pub fn html(status: StatusCode, body: &'static str, cache_control: &str) -> Response<Body> {
-    den_http::html(status, body, &[("cache-control", cache_control)])
-}
-
 /// JSON under `cache_control` (none when empty). A cacheable 200 carries an ETag; see `den_http::json`.
 pub fn json<T: Serialize + ?Sized>(status: StatusCode, value: &T, cache_control: &str) -> Response<Body> {
     if cache_control.is_empty() {
@@ -262,7 +257,7 @@ mod tests {
     }
 
     /// Clients and Cloudflare cache on these strings. The validator of a settled subtitle, of a cacheable JSON body
-    /// and of the page is FNV-1a-64 of the bytes plus their length in hex, quoted — and `no-store` has none.
+    /// is FNV-1a-64 of the bytes plus their length in hex, quoted — and `no-store` has none.
     #[test]
     fn the_validators_are_pinned() {
         let etag = |r: Response<Body>| r.headers().get(ETAG).map(|v| v.to_str().unwrap().to_string());
@@ -273,10 +268,6 @@ mod tests {
         assert_eq!(
             etag(json(StatusCode::OK, &serde_json::json!({"a": 1}), "public, max-age=60")).as_deref(),
             Some("\"9c3e82dd6fcae8b1-7\"")
-        );
-        assert_eq!(
-            etag(html(StatusCode::OK, "<p>hi</p>", "public, max-age=60")).as_deref(),
-            Some("\"2af7677882c30339-9\"")
         );
         assert_eq!(etag(json(StatusCode::OK, &serde_json::json!({"a": 1}), "no-store")), None);
         assert_eq!(etag(error(StatusCode::BAD_GATEWAY, "upstream_unavailable")), None);

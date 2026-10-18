@@ -477,6 +477,24 @@ fn drop_if_finished(state: &AppState, vid: &str) {
     }
 }
 
+/// Removes exactly the generation owned by a detached download driver, including while unwinding.
+/// Without an RAII owner, a panic in the shared future left both the map slot and its admission
+/// permit parked forever; subsequent requests joined a poisoned flight instead of retrying.
+struct DownloadFlightGuard {
+    state: Arc<AppState>,
+    vid: String,
+    generation: u64,
+}
+
+impl Drop for DownloadFlightGuard {
+    fn drop(&mut self) {
+        let mut map = self.state.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(map.get(&self.vid), Some((generation, _)) if *generation == self.generation) {
+            map.remove(&self.vid);
+        }
+    }
+}
+
 /// Download+mux a faststart MP4 for `vid`, cached. De-dupes concurrent requests via `in_flight`:
 /// the first caller creates one shared download, everyone else awaits it.
 pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<Fetched, PlayError> {
@@ -627,7 +645,7 @@ async fn fetch_trailer_inner(
                 // evicted-mid-serve retry does. Here it is ordered: anyone who can observe the
                 // result can observe the record. Runs once, because `Shared` polls the inner future
                 // once however many waiters there are.
-                Box::pin(async move {
+                let work = async move {
                     let out = download_cached(st.clone(), v.clone(), gen).await;
                     match &out {
                         Ok(_) => clear_failure(&st, &v),
@@ -653,19 +671,20 @@ async fn fetch_trailer_inner(
                     // The counters /health reads move inside the download; say so if that flipped it.
                     st.note_health();
                     out
-                })
+                };
+                Box::pin(
+                    std::panic::AssertUnwindSafe(work)
+                        .catch_unwind()
+                        .map(|result| result.unwrap_or_else(|_| Err(PlayError::panicked("trailer download")))),
+                )
             };
             let shared = fut.shared();
             map.insert(vid.clone(), (gen, shared.clone()));
             let driver = shared.clone();
-            let st = state.clone();
-            let v = vid.clone();
+            let cleanup = DownloadFlightGuard { state: state.clone(), vid: vid.clone(), generation: gen };
             tokio::spawn(async move {
+                let _cleanup = cleanup;
                 let _ = driver.await; // drive to completion even if every requester goes away
-                let mut map = st.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                if matches!(map.get(&v), Some((g, _)) if *g == gen) {
-                    map.remove(&v);
-                }
             });
             shared
         }
@@ -839,7 +858,7 @@ fn validators(size: u64, modified: SystemTime) -> (String, String) {
 /// `set_times` goes through the handle we already hold rather than opening the path again, and the
 /// `is_file` check that used to live in `fetch_trailer` comes along for free — `open` on a directory
 /// succeeds on Linux, so something has to reject it, and the fstat is right here.
-fn open_for_serve(fp: &Path, range: Option<&str>, if_range: Option<&str>) -> std::io::Result<Opened> {
+fn open_for_serve(fp: &Path, range: Option<&str>, if_range: Option<&str>, touch: bool) -> std::io::Result<Opened> {
     use std::io::{Seek, SeekFrom};
 
     let mut file = std::fs::File::open(fp)?;
@@ -851,7 +870,9 @@ fn open_for_serve(fp: &Path, range: Option<&str>, if_range: Option<&str>) -> std
     }
     // Best-effort: the LRU wants to know this was served, but failing to record it must not fail the
     // playback. See `evict_if_needed` for why the stamp matters.
-    let _ = file.set_times(std::fs::FileTimes::new().set_accessed(SystemTime::now()));
+    if touch {
+        let _ = file.set_times(std::fs::FileTimes::new().set_accessed(SystemTime::now()));
+    }
 
     let size = md.len();
     let (etag, last_modified) = validators(size, md.modified()?);
@@ -867,12 +888,16 @@ fn open_for_serve(fp: &Path, range: Option<&str>, if_range: Option<&str>) -> std
 
 /// Run [`open_for_serve`] off the runtime thread. `None` means "not servable" — usually simply not
 /// cached yet, which is the normal cold path and not worth a log line.
-async fn try_open(cfg: &Config, vid: &str, headers: &HeaderMap) -> Option<Opened> {
+async fn try_open(cfg: &Config, vid: &str, headers: &HeaderMap, touch: bool) -> Option<Opened> {
     let fp = cache_path(cfg, vid);
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
     let (range, if_range) = (header("range"), header("if-range"));
-    let opened =
-        tokio::task::spawn_blocking(move || open_for_serve(&fp, range.as_deref(), if_range.as_deref())).await;
+    let opened = tokio::task::spawn_blocking(move || {
+        // A real GET records playback in the LRU; HEAD is only a cache probe and must not keep an
+        // unwatched file hot.
+        open_for_serve(&fp, range.as_deref(), if_range.as_deref(), touch)
+    })
+    .await;
     match opened {
         Ok(Ok(o)) => Some(o),
         // A cold id is the common case and says nothing; anything else is worth seeing.
@@ -992,7 +1017,7 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
     // that is already cached — prewarm exists to make it so — and this reaches it in ONE dispatch to
     // the blocking pool. Going through `fetch_trailer` first meant a stat and an atime touch before
     // the open and fstat that actually serve, all to establish what a single open would have told us.
-    if let Some(opened) = try_open(&state.cfg, &vid, headers).await {
+    if let Some(opened) = try_open(&state.cfg, &vid, headers, true).await {
         return httputil::timed(serve_opened(opened), "cache;desc=hit");
     }
 
@@ -1008,7 +1033,7 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
             // arm is also reached by every request the failure cache answers from memory.
             Err(e) => return play_error(&state, &vid, &e),
         };
-        if let Some(opened) = try_open(&state.cfg, &vid, headers).await {
+        if let Some(opened) = try_open(&state.cfg, &vid, headers, true).await {
             return httputil::timed(serve_opened(opened), &fetched.timing());
         }
         // Retire the finished entry before retrying, or `fetch_trailer` joins it and hands back the
@@ -1018,4 +1043,17 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
         }
     }
     httputil::error(StatusCode::INTERNAL_SERVER_ERROR, "serve_failed", "The trailer could not be served.")
+}
+
+/// HEAD may describe an already-downloaded trailer, but must never turn a cache probe into a
+/// download/ffmpeg job. A miss therefore rejects HEAD and tells the caller to make an explicit GET.
+pub async fn handle_play_head(state: Arc<AppState>, headers: &HeaderMap, vid: String) -> Response<Body> {
+    match try_open(&state.cfg, &vid, headers, false).await {
+        Some(opened) => httputil::timed(serve_opened(opened), "cache;desc=hit"),
+        None => httputil::json(
+            StatusCode::METHOD_NOT_ALLOWED,
+            &serde_json::json!({"error": "method_not_allowed"}),
+            &[("allow", "GET, OPTIONS"), ("cache-control", "no-store")],
+        ),
+    }
 }

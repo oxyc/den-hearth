@@ -44,7 +44,7 @@ use futures_util::FutureExt;
 use crate::config::Config;
 use crate::httputil::{self, Body};
 use crate::state::{AppState, BoxFuture, SharedResolve};
-use crate::ytdlp::{classify, PlayError};
+use crate::ytdlp::{classify, BoundedOutputError, PlayError, RESOLVE_OUTPUT_MAX_BYTES};
 
 /// yt-dlp `--print` is a metadata round-trip, not a download; well under the probe's own backstop.
 const RESOLVE_TIMEOUT_SECS: u64 = 30;
@@ -208,9 +208,16 @@ pub async fn resolve(cfg: &Config, vid: &str, format: &str, now: u64) -> Result<
     if let Some(ea) = &cfg.ytdlp_extractor_args {
         cmd.args(["--extractor-args", ea]);
     }
-    let out = match tokio::time::timeout(Duration::from_secs(RESOLVE_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
+    let out = match crate::ytdlp::output_in_group(
+        &mut cmd,
+        Duration::from_secs(RESOLVE_TIMEOUT_SECS),
+        RESOLVE_OUTPUT_MAX_BYTES,
+        RESOLVE_OUTPUT_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(BoundedOutputError::Io(e)) => {
             return Err(PlayError {
                 status: 502,
                 reason: "extraction_failed".into(),
@@ -218,12 +225,23 @@ pub async fn resolve(cfg: &Config, vid: &str, format: &str, now: u64) -> Result<
                 detail: format!("spawn yt-dlp: {e}"),
             })
         }
-        Err(_) => {
+        Err(BoundedOutputError::TimedOut) => {
             return Err(PlayError {
                 status: 504,
                 reason: "timeout".into(),
                 message: "This trailer took too long to resolve.".into(),
                 detail: format!("yt-dlp --print exceeded {RESOLVE_TIMEOUT_SECS}s"),
+            })
+        }
+        Err(BoundedOutputError::TooLarge { stream, limit, tail }) => {
+            return Err(PlayError {
+                status: 502,
+                reason: "extraction_failed".into(),
+                message: "Could not fetch this trailer.".into(),
+                detail: format!(
+                    "yt-dlp {stream} exceeded {limit} bytes; tail: {}",
+                    crate::ytdlp::stderr_tail(&tail)
+                ),
             })
         }
     };
@@ -499,6 +517,24 @@ fn ttl_ms(answer: &Result<Direct, PlayError>, now: u64) -> u64 {
     }
 }
 
+/// Owns one map slot for the detached driver. `Shared` propagates an inner panic to whichever task
+/// happened to poll it; cleanup after `.await` therefore was not enough. Pointer identity prevents
+/// an old unwinding driver from deleting a replacement flight for the same key.
+struct DirectFlightGuard {
+    state: Arc<AppState>,
+    key: String,
+    flight: SharedResolve,
+}
+
+impl Drop for DirectFlightGuard {
+    fn drop(&mut self) {
+        let mut map = self.state.direct_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&self.key).is_some_and(|current| current.ptr_eq(&self.flight)) {
+            map.remove(&self.key);
+        }
+    }
+}
+
 /// This id's answer at `cap` (`height_cap`), from memory or from yt-dlp. `None` timing means it
 /// came from the cache.
 ///
@@ -526,11 +562,23 @@ pub(crate) async fn answer(
         if let Some(running) = map.get(&key) {
             running.clone()
         } else {
+            // Admission belongs to the self-driving resolve, and is taken before either the map
+            // entry or its detached driver exists.  Acquiring inside the future left one task per
+            // distinct key parked behind the six probe permits; a browse over arbitrary ids could
+            // therefore grow an unbounded task/map queue.  Existing keys are joined above even
+            // when every permit is occupied, while a new key is refused without spawning.
+            let Ok(probe_permit) = state.probe_sem.clone().try_acquire_owned() else {
+                return (Err(PlayError::overloaded()), Some(started.elapsed()));
+            };
             let st = state.clone();
             let v = vid.to_string();
             let k = key.clone();
             let format = cap.map(crate::config::format_ladder).unwrap_or_else(|| st.cfg.ytdlp_format.clone());
-            let fut: BoxFuture<Result<Direct, PlayError>> = Box::pin(async move {
+            let work = async move {
+                // The admitted task owns the permit.  A cancelled request only drops its clone of
+                // the shared future; the detached driver below keeps the resolve alive through
+                // cache fill and cleanup.
+                let _probe_permit = probe_permit;
                 // While YouTube is throttling this box nothing is asked — the same gate a download
                 // meets, since a resolve is an extraction too.
                 let answer = if st.youtube.remaining_ms((st.clock)()).is_some() {
@@ -539,9 +587,6 @@ pub(crate) async fn answer(
                     eprintln!("{}", resolve_cache_line(&st.cfg, "refused", "throttled", 0, &v, None));
                     Err(PlayError::throttled())
                 } else {
-                    // The permit is taken INSIDE the shared future, so waiters queue on the resolve
-                    // rather than on the budget: one permit is spent per video, not per caller.
-                    let _permit = st.probe_sem.acquire().await;
                     let started = std::time::Instant::now();
                     let rungs = crate::config::ladder_rungs(cap.unwrap_or_else(|| st.cfg.top_rung()));
                     let mut answer = extract(&st, &v, &format, &rungs, false).await;
@@ -594,16 +639,25 @@ pub(crate) async fn answer(
                 if !matches!(&answer, Err(e) if e.reason == "throttled") {
                     remember(&st, &k, (answer.clone(), now + ttl_ms(&answer, now)), now);
                 }
-                st.direct_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&k);
                 answer
-            });
+            };
+            // A panic must become a per-attempt failure instead of poisoning the shared future:
+            // every waiter sees a stable value, the permit is dropped while unwinding `work`, and
+            // the detached driver's RAII guard below removes the flight so the key can be retried.
+            let fut: BoxFuture<Result<Direct, PlayError>> = Box::pin(
+                std::panic::AssertUnwindSafe(work)
+                    .catch_unwind()
+                    .map(|result| result.unwrap_or_else(|_| Err(PlayError::panicked("direct resolve")))),
+            );
             let shared = fut.shared();
-            map.insert(key, shared.clone());
+            map.insert(key.clone(), shared.clone());
             // Driven by a task of its own, so a client that navigates away mid-resolve cannot leave
             // the entry standing with a future nobody will poll — which would wedge the id until
             // restart. Same reason the download path detaches its driver.
             let driver = shared.clone();
+            let cleanup = DirectFlightGuard { state: state.clone(), key, flight: driver.clone() };
             tokio::spawn(async move {
+                let _cleanup = cleanup;
                 let _ = driver.await;
             });
             shared

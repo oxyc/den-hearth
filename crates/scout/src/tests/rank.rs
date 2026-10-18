@@ -109,6 +109,23 @@ fn quality_score() {
     assert!(small < large, "a tiny 4k file should score below a large one");
 }
 
+// The fan-out cap ranks borrowed entries and materializes only the winners. Keep a regression for
+// the indexed reconstruction: ties must retain scrape order, and the selected stream must retain
+// its complete payload rather than only the fields used by the scorer.
+#[test]
+fn cap_seeds_reconstructs_complete_winners_in_stable_order() {
+    let mut first = rs("Movie 1080p WEB-DL", |s| s.seeders = Some(7));
+    first.source = "first-source".into();
+    first.info_hash = "first-hash".into();
+    let mut second = first.clone();
+    second.source = "second-source".into();
+    second.info_hash = "second-hash".into();
+    let junk = rs("Movie 2160p HDCAM", |s| s.seeders = Some(999));
+
+    let got = prod::cap_seeds(&[first.clone(), second, junk], 1);
+    assert_eq!(got, vec![first]);
+}
+
 #[test]
 fn junk_class_container_extension_is_not_tele_sync() {
     for title in ["Show.S01E01.ts", "Show S01E01.m2ts", "Show.S01E01.ts\n👤 12 💾 1.2 GB"] {

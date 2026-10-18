@@ -135,13 +135,15 @@ pub(crate) struct SourceClient {
     client: reqwest::Client,
 }
 
-/// The household sources' profile: thirty seconds in all and ten to connect, a small pool, the redirect verdict
-/// below, and the dial-time public-address guard (which is also what keeps the proxy out).
+/// The household sources' profile: thirty seconds in all and ten to connect, the redirect verdict below,
+/// and the dial-time public-address guard (which is also what keeps the proxy out). Hosts come from caller
+/// configs, so even a small idle pool per host can retain unbounded sockets across distinct hosts. Keep no
+/// idle connections here; the fixed upstream clients retain their own connection pools.
 pub(crate) fn source_profile() -> ClientProfile {
     ClientProfile::new()
         .total(Duration::from_secs(30))
         .connect(Duration::from_secs(10))
-        .pool(4, Duration::from_secs(90))
+        .pool(0, Duration::ZERO)
         .redirect(Redirect::Custom(follow_source_redirect))
         .guard(Guard::PublicDial)
 }

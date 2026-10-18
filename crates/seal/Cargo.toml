@@ -8,14 +8,14 @@ license = "MIT"
 
 [dependencies]
 # The lenient base64url the config segment is read with (`b64url_decode`).
-den-net = { path = "../net" }
-base64 = "0.23"
+den-net.workspace = true
+base64.workspace = true
 # `seal` = libsodium crypto_box_seal (X25519 + XSalsa20-Poly1305, blake2b nonce): `PublicKey::seal` and
 # `SecretKey::unseal` are the wire format, byte for byte.
-crypto_box = { version = "0.9", features = ["seal"] }
+crypto_box = { workspace = true, features = ["seal"] }
 # The combined Den addon's config is read as JSON to take each service's member out (`addon::slice_json`).
-serde_json = "1"
+serde_json.workspace = true
 # `Keyring::derive`: the combined addon's keys, derived from Scout's when it has none of its own. The same
 # versions Scout's play-ticket keys use.
-hkdf = "0.13"
-sha2 = "0.11"
+hkdf.workspace = true
+sha2.workspace = true

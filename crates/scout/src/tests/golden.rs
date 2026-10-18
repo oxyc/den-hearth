@@ -174,30 +174,16 @@ async fn render() -> String {
     // ---- static routes and the method gate, on a handler with no keys --------------------------------------
     let h = handler(|_| {});
     g.case("preflight on any path", &h, "OPTIONS", "/anything/at/all", &[]).await;
-    g.case("configure page", &h, "GET", "/", &[]).await;
-    let page = g.last_etag.clone();
-    g.case("configure revalidated", &h, "GET", "/configure", &[("if-none-match", &page)]).await;
-    let weak = format!("W/{page}");
-    g.case("configure revalidated with a weak tag", &h, "GET", "/configure/", &[("if-none-match", &weak)])
-        .await;
-    g.case("configure HEAD", &h, "HEAD", "/configure", &[]).await;
+    g.case("standalone root removed", &h, "GET", "/", &[]).await;
+    g.case("standalone configure removed", &h, "GET", "/configure", &[]).await;
+    g.case("standalone manifest removed", &h, "GET", "/manifest.json", &[]).await;
+    g.case("standalone config key removed", &h, "GET", "/config-key", &[]).await;
     g.case("health", &h, "GET", "/health", &[]).await;
     g.case("health HEAD", &h, "HEAD", "/health", &[]).await;
     g.case("health POST", &h, "POST", "/health", &[]).await;
     g.case("PUT on a list", &h, "PUT", &list, &[]).await;
     g.case("metrics without a token configured", &h, "GET", "/metrics", &[("authorization", "Bearer x")])
         .await;
-    g.case("manifest", &h, "GET", "/manifest.json", &[]).await;
-    let manifest = g.last_etag.clone();
-    g.case("manifest revalidated", &h, "GET", "/manifest.json", &[("if-none-match", &manifest)]).await;
-    g.case("manifest revalidated, no match", &h, "GET", "/manifest.json", &[("if-none-match", "\"nope\"")])
-        .await;
-    g.case("config-key without a key", &h, "GET", "/config-key", &[]).await;
-    g.case("configured manifest", &h, "GET", &format!("/{cfg}/manifest.json"), &[]).await;
-    let configured = g.last_etag.clone();
-    let path = format!("/{cfg}/manifest.json");
-    g.case("configured manifest revalidated", &h, "GET", &path, &[("if-none-match", &configured)]).await;
-    g.case("configured manifest, bad config", &h, "GET", "/not-a-config/manifest.json", &[]).await;
     g.case("unknown one-segment path", &h, "GET", "/nope", &[]).await;
     g.case("unknown route under a config", &h, "GET", &format!("/{cfg}/nope/x"), &[]).await;
 
@@ -326,16 +312,13 @@ async fn render() -> String {
     g.case_with_body("availability, too deep", &h, "POST", &format!("/{cfg}/x/availability"), &[], "{}")
         .await;
 
-    // ---- with keys: tickets, /config-key, /metrics, den-remux ------------------------------------------------
+    // ---- with keys: tickets, metrics, den-remux --------------------------------------------------------------
     let kr = ticket_keyring();
     let keyed = handler(|d| {
         d.seal_keyring = Some(Arc::new(ticket_keyring()));
         d.metrics_token = "metrics-token".to_owned();
         d.remux_key = "remux-key".to_owned();
     });
-    g.case("config-key", &keyed, "GET", "/config-key", &[]).await;
-    let key_tag = g.last_etag.clone();
-    g.case("config-key revalidated", &keyed, "GET", "/config-key", &[("if-none-match", &key_tag)]).await;
     g.case("metrics, refused", &keyed, "GET", "/metrics", &[("authorization", "Bearer wrong")]).await;
     g.case("metrics, bare token", &keyed, "GET", "/metrics", &[("authorization", "metrics-token")]).await;
     g.case("metrics", &keyed, "GET", "/metrics", &[("authorization", "Bearer metrics-token")]).await;
@@ -383,10 +366,6 @@ async fn render() -> String {
     let bad_key = handler(|d| d.config_key_invalid = true);
     for (name, method, path) in [
         ("bad key: health", "GET", "/health"),
-        ("bad key: configure", "GET", "/"),
-        ("bad key: manifest", "GET", "/manifest.json"),
-        ("bad key: config-key", "GET", "/config-key"),
-        ("bad key: configured manifest", "GET", &format!("/{cfg}/manifest.json") as &str),
         ("bad key: list", "GET", &list),
         ("bad key: ticket", "GET", "/p/garbage"),
         ("bad key: cancel", "DELETE", &play),
@@ -407,8 +386,7 @@ async fn render() -> String {
     let hostile = [("x-request-id", "x y=z<>")];
     for (method, path, headers) in [
         ("GET", "/health", &rid[..]),
-        ("GET", "/manifest.json", &hostile[..]),
-        ("GET", &format!("/{sealed}/manifest.json") as &str, &[][..]),
+        ("GET", "/nope", &hostile[..]),
         ("GET", &format!("{keyed_list}?debug=1&token=secret"), &rid[..]),
         ("GET", &format!("/p/{ticket}?fresh=1"), &rid[..]),
         ("DELETE", &format!("/p/{expired}"), &[][..]),
@@ -458,9 +436,10 @@ async fn every_route_answers_as_it_did_before_the_rewrite() {
 }
 
 /// The whole /metrics exposition of a fresh process, every family and label in order, pinned the same way.
-#[test]
-fn the_metrics_text_is_what_it_was() {
-    let got = crate::metrics::metrics().render(-1);
+#[tokio::test]
+async fn the_metrics_text_is_what_it_was() {
+    let runtime = crate::runtime::ScoutRuntime::new();
+    let got = crate::runtime::scope(runtime, async { crate::metrics::metrics().render(-1) }).await;
     let got = got.replace(crate::manifest::manifest_version(), "<version>");
     if std::env::var_os("SCOUT_GOLDEN_WRITE").is_some() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/golden_metrics.txt");

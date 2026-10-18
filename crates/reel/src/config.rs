@@ -161,6 +161,7 @@ pub struct Config {
     pub cache_epoch: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(test)]
 pub(crate) fn env_opt(key: &str) -> Option<String> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
@@ -338,6 +339,16 @@ impl Config {
     }
 
     pub fn from_env() -> Config {
+        Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    /// Build from an explicit lookup. Hearth uses this to give each in-process service its prefixed
+    /// namespace without mutating the process environment.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Config {
+        let env_opt = |key: &str| match get(key) {
+            Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        };
         let port = env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8092);
         let cache_dir =
             env_opt("CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| env::temp_dir().join("den-reel-cache"));
@@ -373,7 +384,7 @@ impl Config {
         // the pinned client no longer existed, and an unknown name is skipped with a warning that
         // `--no-warnings` hid.
         let ytdlp_extractor_args =
-            env::var("YTDLP_PLAYER_CLIENTS").map(|v| v.trim().to_string()).unwrap_or_default();
+            get("YTDLP_PLAYER_CLIENTS").map(|v| v.trim().to_string()).unwrap_or_default();
         let ytdlp_extractor_args = if ytdlp_extractor_args.is_empty() {
             None
         } else {
@@ -406,8 +417,8 @@ impl Config {
             // Read through `env` rather than `env_opt`, which maps an empty value to None: someone
             // writing `-e CLAP=` is reaching for the off switch and must not get baking left on.
             bake_clap: !matches!(
-                env::var("CLAP").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-                Ok("0" | "false" | "off" | "no" | "")
+                get("CLAP").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Some("0" | "false" | "off" | "no" | "")
             ),
             max_height: cap.to_string(), // normalised: a bad value falls back, never propagates
             cache_max_bytes,
@@ -435,8 +446,8 @@ impl Config {
             direct_media_concurrency,
             direct_media_idle: seconds("DIRECT_MEDIA_IDLE_SECS", 30, 300),
             direct_media_lifetime: seconds("DIRECT_MEDIA_LIFETIME_SECS", 15 * 60, 2 * 60 * 60),
-            log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
-            log_identity: log_identity_on(env::var("LOG_IDENTITY").ok().as_deref()),
+            log_requests: log_requests_on(get("LOG_REQUESTS").as_deref()),
+            log_identity: log_identity_on(get("LOG_IDENTITY").as_deref()),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,

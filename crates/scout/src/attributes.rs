@@ -260,6 +260,11 @@ fn detect_audio(t: &str) -> &'static str {
 
 /// Go `streamAttributes`: the attributes of one stream, read from its title and, when probed, the file.
 pub(crate) fn stream_attributes(s: RawStream) -> StreamAttributes {
+    stream_attributes_ref(&s)
+}
+
+/// Borrowed form for ranking and presentation paths that retain ownership of the stream.
+pub(crate) fn stream_attributes_ref(s: &RawStream) -> StreamAttributes {
     let t = str::to_lowercase(&s.title);
     let dolby_vision = RE_DOVI_ATTR.is_match(&t);
     let hdr = dolby_vision || RE_HDR_EXTRA.is_match(&t);
@@ -279,8 +284,8 @@ pub(crate) fn stream_attributes(s: RawStream) -> StreamAttributes {
         size_bytes: s.size_bytes,
         pack_size_bytes: s.pack_size_bytes,
         seeders: s.seeders,
-        cached: cached_claim(&s),
-        label: clean_label_lower(&t, &s), // reuse the title we already lowercased
+        cached: cached_claim(s),
+        label: clean_label_lower(&t, s), // reuse the title we already lowercased
         bit_depth: detect_bit_depth(&t, hdr),
         ..Default::default()
     };
@@ -366,7 +371,13 @@ fn resolution_of_width(w: i64) -> &'static str {
 
 /// Go `containerOf`: the probe's container when the file was read, else the release name's extension, else
 /// "". `notWebReady` and a browser's ranking both ask this, so they cannot disagree about a file.
+#[cfg(test)]
 pub(crate) fn container_of(s: RawStream) -> String {
+    container_of_ref(&s)
+}
+
+/// Borrowed form for callers that only need to inspect a retained stream.
+pub(crate) fn container_of_ref(s: &RawStream) -> String {
     if let Some(p) = &s.probe {
         if !p.container.is_empty() {
             return p.container.clone();

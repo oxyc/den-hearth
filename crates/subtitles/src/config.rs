@@ -47,6 +47,7 @@ pub struct Config {
     pub scout_aliases: Vec<(crate::resync::Origin, crate::resync::Origin)>,
 }
 
+#[cfg(test)]
 fn env_opt(key: &str) -> Option<String> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
@@ -62,6 +63,15 @@ pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
 
 impl Config {
     pub fn from_env() -> Config {
+        Self::from_lookup(|key| env::var(key).ok())
+    }
+
+    /// Build from an explicit lookup so an in-process host never has to rewrite global environment variables.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Config {
+        let env_opt = |key: &str| match get(key) {
+            Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        };
         let cache_dir = env_opt("CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| env::temp_dir().join("den-subtitles-cache"));
@@ -125,5 +135,18 @@ mod tests {
         assert_eq!(env_opt("DEN_SUBTITLES_TEST_ENV_OPT_TRIM").as_deref(), Some("value"));
         std::env::set_var("DEN_SUBTITLES_TEST_ENV_OPT_TRIM", "   ");
         assert_eq!(env_opt("DEN_SUBTITLES_TEST_ENV_OPT_TRIM"), None);
+    }
+
+    #[test]
+    fn config_can_be_built_from_an_explicit_lookup() {
+        let cfg = Config::from_lookup(|key| match key {
+            "PORT" => Some("9103".into()),
+            "PUBLIC_BASE_URL" => Some(" https://node.example/subs ".into()),
+            "LOG_REQUESTS" => Some("1".into()),
+            _ => None,
+        });
+        assert_eq!(cfg.port, 9103);
+        assert_eq!(cfg.public_base_url.as_deref(), Some("https://node.example/subs"));
+        assert!(cfg.log_requests);
     }
 }

@@ -459,11 +459,10 @@ async fn revoked_install_is_refused_everywhere() {
     let token =
         encode_play_token(&PlayTarget { info_hash: "a".repeat(40), file_idx: Some(0), ..Default::default() });
     let cases: Vec<(String, u16)> = vec![
-        (format!("/{revoked}/manifest.json"), 400),
         (format!("/{revoked}/stream/movie/tt7654321.json"), 400),
         (format!("/{revoked}/play/{token}"), 400),
         (revoked_ticket, 400),
-        (format!("/{live}/manifest.json"), 200),
+        (format!("/{live}/stream/movie/tt7654321.json"), 200),
         (format!("/{live}/play/{token}"), 302),
         (live_ticket, 302),
     ];
@@ -494,8 +493,7 @@ async fn revoked_install_a_config_without_an_id_still_works() {
     assert_eq!(rr.status(), 302, "legacy play: {}, want 302", rr.status());
 }
 
-// CONFIG_EPOCH refuses every config, and every ticket, minted under an older epoch — an unstamped one
-// included — and /config-key hands /configure the epoch to stamp.
+// CONFIG_EPOCH refuses every config, and every ticket, minted under an older epoch — an unstamped one included.
 #[tokio::test]
 async fn config_epoch_refuses_what_was_minted_before_it() {
     let kr = ticket_keyring();
@@ -509,11 +507,9 @@ async fn config_epoch_refuses_what_was_minted_before_it() {
     let out = LogCapture::start();
     let h = with_keyring(|d| d.revocation = revocation(&[], 2, false));
     let cases: Vec<(String, u16)> = vec![
-        (format!("/{old}/manifest.json"), 400),
         (format!("/{old}/stream/movie/tt7654321.json"), 400),
-        (format!("/{unstamped}/manifest.json"), 400),
+        (format!("/{unstamped}/stream/movie/tt7654321.json"), 400),
         (old_ticket, 400),
-        (format!("/{current}/manifest.json"), 200),
         (format!("/{current}/stream/movie/tt7654321.json"), 200),
     ];
     for (path, want) in cases {
@@ -529,8 +525,6 @@ async fn config_epoch_refuses_what_was_minted_before_it() {
             .is_match(&logs),
         "no epoch line in:\n{logs}"
     );
-    let rr = get(&h, "/config-key", &[]).await;
-    assert!(body_str(&rr).contains(r#""epoch":2"#), "/config-key: {}", body_str(&rr));
 }
 
 // REQUIRE_INSTALL_ID refuses every full config minted before install ids, keeps those that carry one, and
@@ -542,9 +536,9 @@ async fn require_install_id_refuses_only_links_without_one() {
     let without = sealed_config(&kr, &format!("{TICKET_CFG}}}"));
     let h = with_keyring(|d| d.revocation = revocation(&[], 0, true));
     let cases: Vec<(String, u16)> = vec![
-        (format!("/{without}/manifest.json"), 400),
-        (format!("/{}/manifest.json", valid_blob()), 400),
-        (format!("/{with_id}/manifest.json"), 200),
+        (format!("/{without}/stream/movie/tt7654321.json"), 400),
+        (format!("/{}/stream/movie/tt7654321.json", valid_blob()), 400),
+        (format!("/{with_id}/stream/movie/tt7654321.json"), 200),
     ];
     for (path, want) in cases {
         let name = path.replace(&without, "<no-iid>").replace(&with_id, "<iid>");
