@@ -146,6 +146,7 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Subs(path) => classify(&Target::Subs(path.clone()), method),
             Route::Reel(path) => classify(&Target::Reel(path.clone()), method),
             Route::Playback(_) => bulk(None),
+            Route::Wanted(_) => bulk(None),
             Route::Guest => bulk(None),
             Route::NotFound => bulk(None),
             // Up to three public-key decryptions: never consume the reserved control lane under abuse.
