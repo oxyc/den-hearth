@@ -125,11 +125,9 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         hyper::Method::OPTIONS => httputil::preflight(),
         // These GET routes can search OpenSubtitles, spend a metered download, run ffmpeg/alass,
         // or invoke an LLM. Body stripping happens only after routing, so HEAD must be stopped here.
-        hyper::Method::HEAD if head_requires_get(parts.uri.path()) => httputil::apply_conditional(
-            &parts.method,
-            &parts.headers,
-            method_not_allowed("GET, OPTIONS"),
-        ),
+        hyper::Method::HEAD if head_requires_get(parts.uri.path()) => {
+            httputil::apply_conditional(&parts.method, &parts.headers, method_not_allowed("GET, OPTIONS"))
+        }
         // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
         // collapses to a 304. A HEAD answer never has a body (the router builds one regardless of method).
         hyper::Method::GET | hyper::Method::HEAD => {
@@ -950,11 +948,9 @@ mod tests {
             "translate/movie/tt0000001/Swedish.json",
             "translate/movie/tt0000001/Swedish.srt",
         ] {
-            let resp = handle_request(
-                test_state(""),
-                request(hyper::Method::HEAD, &format!("/{cfg}/{route}")),
-            )
-            .await;
+            let resp =
+                handle_request(test_state(""), request(hyper::Method::HEAD, &format!("/{cfg}/{route}")))
+                    .await;
             assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{route}");
             assert_eq!(resp.headers().get(hyper::header::ALLOW).unwrap(), "GET, OPTIONS", "{route}");
             assert!(body_string(resp).await.is_empty(), "HEAD carried an error body for {route}");
@@ -966,10 +962,7 @@ mod tests {
 
         let status = handle_request(
             test_state(""),
-            request(
-                hyper::Method::HEAD,
-                &format!("/{cfg}/translate/movie/tt0000001/Swedish.status"),
-            ),
+            request(hyper::Method::HEAD, &format!("/{cfg}/translate/movie/tt0000001/Swedish.status")),
         )
         .await;
         assert_ne!(status.status(), StatusCode::METHOD_NOT_ALLOWED);

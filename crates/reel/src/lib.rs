@@ -553,18 +553,9 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
 /// for the cheap operational and capability-validation routes, and an unknown path still reaches the
 /// router for its ordinary 404 rather than being misreported as a resource that merely rejects HEAD.
 fn head_requires_get(path: &str) -> bool {
-    if [
-        "/meta/",
-        "/prepare/",
-        "/crop/",
-        "/direct/",
-        "/progressive/",
-        "/sources/",
-        "/hls/",
-        "/m/",
-    ]
-    .iter()
-    .any(|prefix| path.starts_with(prefix))
+    if ["/meta/", "/prepare/", "/crop/", "/direct/", "/progressive/", "/sources/", "/hls/", "/m/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
     {
         return true;
     }

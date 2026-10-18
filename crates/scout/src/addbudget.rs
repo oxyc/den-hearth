@@ -178,7 +178,8 @@ impl AddBudget {
         {
             return 0;
         }
-        let live = spent.get(account).map_or(0, |v| v.iter().filter(|charge| charge.at > cutoff).count()) as i64;
+        let live =
+            spent.get(account).map_or(0, |v| v.iter().filter(|charge| charge.at > cutoff).count()) as i64;
         (self.limit - live).max(0)
     }
 

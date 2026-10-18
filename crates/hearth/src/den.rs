@@ -697,11 +697,8 @@ mod tests {
         headers.insert(ACCEPT_ENCODING, "gzip".parse().unwrap());
         let etag = configure_page().response(&headers).headers()["etag"].clone();
         headers.insert("if-none-match", etag.clone());
-        let response = den_http::apply_conditional(
-            &Method::GET,
-            &headers,
-            configure_page().response(&headers),
-        );
+        let response =
+            den_http::apply_conditional(&Method::GET, &headers, configure_page().response(&headers));
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()["etag"], etag);
         assert_eq!(response.headers()["vary"], "Accept-Encoding");

@@ -949,7 +949,8 @@ async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, deadline: TokioInstant) -> Scrap
     // Admission covers only a real upstream request: settled cache hits and same-question singleflight followers
     // never consume it. Its FIFO wait is part of the list build's absolute budget, and the owned guard covers the
     // response read/decode inside `scrape` until every raw body byte can be released.
-    let Some(_admission) = crate::runtime::current_runtime().admit_scraper_request_until(deadline).await else {
+    let Some(_admission) = crate::runtime::current_runtime().admit_scraper_request_until(deadline).await
+    else {
         metrics().indexer_result(&sc.id().0, false, 0);
         return ScrapeAttempt::failed(Arc::new(DeadlineExceeded));
     };

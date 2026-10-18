@@ -310,10 +310,7 @@ mod tests {
             .expect("the first scraper request is admitted");
 
         assert!(
-            runtime
-                .admit_scraper_request_until(Instant::now() + Duration::from_millis(10))
-                .await
-                .is_none(),
+            runtime.admit_scraper_request_until(Instant::now() + Duration::from_millis(10)).await.is_none(),
             "a queued scraper request outlived its deadline"
         );
         assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 1);

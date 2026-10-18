@@ -27,9 +27,7 @@ use super::{
     CancelOutcome, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus, FETCH_QUEUED,
     FETCH_STALLED, MAX_LISTING_BYTES, MAX_STORE_BYTES,
 };
-use crate::addbudget::{
-    budget_account, global_add_budget, refund_add, spend_add, AddCharge, RequestNotSent,
-};
+use crate::addbudget::{budget_account, global_add_budget, refund_add, spend_add, AddCharge, RequestNotSent};
 use crate::cache::{Cache, CacheClass};
 use crate::config::DebridService;
 use crate::linkcheck::size_of;
@@ -1137,10 +1135,11 @@ impl TorBoxStore {
         let store = self.clone();
         let memo_key = key.clone();
         let runtime = crate::runtime::current_runtime();
-        let admitted = runtime
-            .torbox
-            .listing_flights
-            .run_admitted(&key, &runtime.torbox.listing_slots, move || async move {
+        let admitted =
+            runtime
+                .torbox
+                .listing_flights
+                .run_admitted(&key, &runtime.torbox.listing_slots, move || async move {
                     // A fetch past the shared deadline is no answer: empty, not ok, not a persistent fault.
                     let (ids, ok, persistent) =
                         tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing())
@@ -1160,8 +1159,8 @@ impl TorBoxStore {
                     let ids = Arc::new(ids);
                     put_cached_listing(store.cache.as_ref(), &memo_key, ids.clone());
                     Some(ids)
-            })
-            .await;
+                })
+                .await;
         let Some((answer, _)) = admitted else {
             // Saturation is doubt, not a fact about the account. It writes neither the listing memo nor the
             // persistent-fault marker, so this exact account can recover as soon as a slot returns.

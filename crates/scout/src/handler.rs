@@ -68,8 +68,8 @@ use crate::scrape::{scrape_covered_until, Doer, ScrapeQuery, Scraper};
 use crate::stores::pool::{has_cache_truth, status_outcome_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
 use crate::stores::{
-    join_all, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus, StoreUnavailableError,
-    FETCH_DOWNLOADING, FETCH_QUEUED,
+    join_all, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus,
+    StoreUnavailableError, FETCH_DOWNLOADING, FETCH_QUEUED,
 };
 use crate::ticket::{TicketError, TicketKeys, TICKET_ROUTE};
 use crate::util::{etag_hex, fold_json_keys, key_hash, Shape, LEAF};
@@ -1621,10 +1621,13 @@ fn write_unavailable(wait: Duration, body: &serde_json::Value) -> Resp {
 /// Stable retryable refusal for a cold list build that could not be admitted. `json_response` supplies
 /// `no-store`, so intermediaries cannot turn transient saturation into a negative cache entry.
 fn list_build_busy() -> Resp {
-    write_unavailable(Duration::from_secs(1), &json!({
-        "error": "scout_busy",
-        "detail": "list_build_limit"
-    }))
+    write_unavailable(
+        Duration::from_secs(1),
+        &json!({
+            "error": "scout_busy",
+            "detail": "list_build_limit"
+        }),
+    )
 }
 
 fn scout_busy_for(pool: &StorePool, prefetch: bool) -> Duration {

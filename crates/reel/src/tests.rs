@@ -4469,12 +4469,7 @@ async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() 
 
     let failed_upstream = FakeUpstream::new(&[], None);
     failed_upstream.fail_next();
-    let failed = build_state(
-        temp_dir(),
-        Box::new(failed_upstream),
-        always_playable(),
-        noop_prewarm(),
-    );
+    let failed = build_state(temp_dir(), Box::new(failed_upstream), always_playable(), noop_prewarm());
     let response = crate::prepare::handle_prepare(
         &failed,
         &hyper::HeaderMap::new(),
@@ -4979,12 +4974,10 @@ async fn direct_resolve_admission_bounds_churn_and_recovers_after_cancellation()
 
     for n in 0..128 {
         let id = format!("churn{n:06}");
-        let (refused, _) = tokio::time::timeout(
-            Duration::from_millis(100),
-            crate::direct::answer(&state, &id, None),
-        )
-        .await
-        .expect("a saturated distinct resolve queued instead of being refused");
+        let (refused, _) =
+            tokio::time::timeout(Duration::from_millis(100), crate::direct::answer(&state, &id, None))
+                .await
+                .expect("a saturated distinct resolve queued instead of being refused");
         assert_eq!(refused.unwrap_err().reason, "busy");
     }
     assert_eq!(state.direct_inflight.lock().unwrap().len(), 1, "refused churn left shared futures behind");

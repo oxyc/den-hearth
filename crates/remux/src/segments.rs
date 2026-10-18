@@ -1105,11 +1105,8 @@ mod tests {
         let script = base.with_extension("sh");
         let pid_file = base.with_extension("pid");
         let _ = std::fs::remove_file(&pid_file);
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", pid_file.display()),
-        )
-        .unwrap();
+        std::fs::write(&script, format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", pid_file.display()))
+            .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let script_for_task = script.to_string_lossy().into_owned();
@@ -1159,8 +1156,7 @@ mod tests {
             .expect("successful fake decoder failed");
         let leader: u32 = std::fs::read_to_string(&leader_file).unwrap().trim().parse().unwrap();
         assert!(!crate::job::is_group_live(leader), "reaped decoder stayed registered");
-        let descendant: i32 =
-            std::fs::read_to_string(&descendant_file).unwrap().trim().parse().unwrap();
+        let descendant: i32 = std::fs::read_to_string(&descendant_file).unwrap().trim().parse().unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while unsafe { libc::kill(descendant, 0) } == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;

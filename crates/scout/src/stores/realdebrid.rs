@@ -551,32 +551,31 @@ impl Store for RealDebridStore {
             }
         };
         note_add_attempt(cache, svc, &self.token, &t.info_hash);
-        let mut add_resp =
-            match self.client.do_request(add_request).await.map_err(store_error_from_do) {
-                Ok(resp) => resp,
-                Err(err) => {
-                    // See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
-                    // case, having no Status for handlePlay to rescue the answer with.
-                    if add_outcome_unknown(cache, svc, &self.token, &t.info_hash) {
-                        // Not on a cancellation. /play runs on the client's context and a focus change is enough,
-                        // so a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every
-                        // resolve of that release answered a dead link for the rest of unknownOutcomeTTL, with no
-                        // upstream call able to clear it — RD and Premiumize have no Status to rediscover the
-                        // torrent with. A deadline belongs on a service that never answered, not on a client that
-                        // hung up. This is the same guard recordRefusal applies one branch over, for the same
-                        // reason.
-                        // Nor when the add itself already judged the outcome: it returns errAddInFlight from the
-                        // body-read branch, which is not recognisably a cancellation out here, so stamping again
-                        // undid the guard one layer down.
-                        if !is_cancellation(&err) && !matches!(err, StoreError::AddInFlight) {
-                            note_unknown_outcome(cache, svc, &self.token, &t.info_hash);
-                        }
-                    } else {
-                        record_refusal(cache, svc, &self.token, &t.info_hash, &err);
+        let mut add_resp = match self.client.do_request(add_request).await.map_err(store_error_from_do) {
+            Ok(resp) => resp,
+            Err(err) => {
+                // See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
+                // case, having no Status for handlePlay to rescue the answer with.
+                if add_outcome_unknown(cache, svc, &self.token, &t.info_hash) {
+                    // Not on a cancellation. /play runs on the client's context and a focus change is enough,
+                    // so a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every
+                    // resolve of that release answered a dead link for the rest of unknownOutcomeTTL, with no
+                    // upstream call able to clear it — RD and Premiumize have no Status to rediscover the
+                    // torrent with. A deadline belongs on a service that never answered, not on a client that
+                    // hung up. This is the same guard recordRefusal applies one branch over, for the same
+                    // reason.
+                    // Nor when the add itself already judged the outcome: it returns errAddInFlight from the
+                    // body-read branch, which is not recognisably a cancellation out here, so stamping again
+                    // undid the guard one layer down.
+                    if !is_cancellation(&err) && !matches!(err, StoreError::AddInFlight) {
+                        note_unknown_outcome(cache, svc, &self.token, &t.info_hash);
                     }
-                    return Err(err);
+                } else {
+                    record_refusal(cache, svc, &self.token, &t.info_hash, &err);
                 }
-            };
+                return Err(err);
+            }
+        };
         let add_status = add_resp.status().as_u16();
         // Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
         // decoding straight off the reader left nothing for readStoreError further down.

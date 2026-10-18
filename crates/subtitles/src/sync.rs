@@ -793,7 +793,12 @@ mod tests {
         // A zombie is already dead; it cannot retain CPU, memory mappings, descriptors, or keep
         // writing an output file while its new parent gets around to collecting the status.
         output.status.success()
-            && output.stdout.iter().copied().find(|byte| !byte.is_ascii_whitespace()).is_some_and(|b| b != b'Z')
+            && output
+                .stdout
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|b| b != b'Z')
     }
 
     async fn assert_process_stopped(pid: u32) {

@@ -575,9 +575,8 @@ async fn download_once(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, Pl
         // The bounded protocol grace is over. Kill any pipe-less helper, remove the registry entry,
         // and clear the numeric pgid before metadata/classification awaits can expose it to reuse.
         group_for_work.reaped();
-        if let Some(stream) = overflow_seen
-            .or(stderr.overflow.then_some("stderr"))
-            .or(stdout.overflow.then_some("stdout"))
+        if let Some(stream) =
+            overflow_seen.or(stderr.overflow.then_some("stderr")).or(stdout.overflow.then_some("stdout"))
         {
             let tail = if stream == "stderr" { &stderr.tail } else { &stdout.tail };
             return Err(PlayError::output_too_large(stream, tail));
@@ -811,15 +810,11 @@ pub(crate) async fn output_in_group(
     if timed_out || tokio::time::Instant::now() > deadline {
         return Err(BoundedOutputError::TimedOut);
     }
-    if let Some(stream) = overflow
-        .or(stdout.overflow.then_some("stdout"))
-        .or(stderr.overflow.then_some("stderr"))
+    if let Some(stream) =
+        overflow.or(stdout.overflow.then_some("stdout")).or(stderr.overflow.then_some("stderr"))
     {
-        let (limit, tail) = if stream == "stdout" {
-            (stdout_max, stdout.tail)
-        } else {
-            (stderr_max, stderr.tail)
-        };
+        let (limit, tail) =
+            if stream == "stdout" { (stdout_max, stdout.tail) } else { (stderr_max, stderr.tail) };
         return Err(BoundedOutputError::TooLarge { stream, limit, tail });
     }
     Ok(std::process::Output { status, stdout: stdout.tail, stderr: stderr.tail })

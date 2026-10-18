@@ -213,12 +213,10 @@ async fn account_reads_are_concurrent_and_keep_configured_order() {
     }));
     h.set_status_budget(Duration::from_millis(250));
 
-    let rr = tokio::time::timeout(
-        Duration::from_secs(1),
-        get(&h, &format!("/{}/account", valid_blob()), &[]),
-    )
-    .await
-    .expect("three account reads did not meet their shared deadline");
+    let rr =
+        tokio::time::timeout(Duration::from_secs(1), get(&h, &format!("/{}/account", valid_blob()), &[]))
+            .await
+            .expect("three account reads did not meet their shared deadline");
     let out = decode_account_body(rr.body());
     let services: Vec<_> = out.iter().map(|account| account["service"].as_str().unwrap()).collect();
     assert_eq!(services, ["premiumize", "realdebrid", "torbox"]);

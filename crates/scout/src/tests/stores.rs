@@ -712,7 +712,8 @@ async fn account_listing_unique_cancellation_flood_is_bounded_and_recovers() {
     let runtime = crate::runtime::ScoutRuntime::new_with_account_listing_limit(LIMIT);
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let (arrival_tx, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
-    let client: Arc<dyn Doer> = Arc::new(ListingAdmissionDoer { release: release.clone(), arrivals: arrival_tx });
+    let client: Arc<dyn Doer> =
+        Arc::new(ListingAdmissionDoer { release: release.clone(), arrivals: arrival_tx });
     let stores: Vec<Arc<TorBoxStore>> = (0..FLOOD + LIMIT)
         .map(|i| Arc::new(tb(&format!("listing-admission-{i}"), TORBOX_API, None, client.clone())))
         .collect();

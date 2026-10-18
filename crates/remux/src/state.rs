@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{Acquire, AcqRel, Relaxed, Release}};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1050,10 +1053,7 @@ impl AppState {
 
     #[cfg(test)]
     pub(crate) fn persistence_spawn_counts(&self) -> (usize, usize) {
-        (
-            self.probe_cache_write.spawned.load(Relaxed),
-            self.unplayable_write.spawned.load(Relaxed),
-        )
+        (self.probe_cache_write.spawned.load(Relaxed), self.unplayable_write.spawned.load(Relaxed))
     }
 
     pub fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<Session>>> {
@@ -1471,9 +1471,7 @@ impl Drop for ProbeGroup {
     }
 }
 
-async fn finish_probe_capture(
-    task: &mut tokio::task::JoinHandle<ProbeCapture>,
-) -> ProbeCapture {
+async fn finish_probe_capture(task: &mut tokio::task::JoinHandle<ProbeCapture>) -> ProbeCapture {
     match tokio::time::timeout(PROBE_POST_KILL_DRAIN, &mut *task).await {
         Ok(result) => result.unwrap_or_default(),
         Err(_) => {
@@ -1507,11 +1505,8 @@ async fn grouped_probe(
         "stdout",
         overflow_tx.clone(),
     ));
-    let mut stderr = tokio::spawn(capture_probe(
-        child.stderr.take().expect("stderr was piped"),
-        "stderr",
-        overflow_tx,
-    ));
+    let mut stderr =
+        tokio::spawn(capture_probe(child.stderr.take().expect("stderr was piped"), "stderr", overflow_tx));
     let mut writer = input.map(|input| {
         let mut stdin = child.stdin.take().expect("stdin was piped");
         tokio::spawn(async move {
@@ -1521,10 +1516,14 @@ async fn grouped_probe(
     let mut group = ProbeGroup {
         pid: Some(pid),
         signalled: false,
-        tasks: [Some(stdout.abort_handle()), Some(stderr.abort_handle()), writer.as_ref().map(|w| w.abort_handle())]
-            .into_iter()
-            .flatten()
-            .collect(),
+        tasks: [
+            Some(stdout.abort_handle()),
+            Some(stderr.abort_handle()),
+            writer.as_ref().map(|w| w.abort_handle()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     };
     let deadline = tokio::time::Instant::now() + budget;
     let mut why = None;
@@ -1624,20 +1623,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_probe_overflow_kills_the_group_and_the_next_probe_recovers() {
-        let noisy = executable_script(&format!(
-            "#!/bin/sh\nhead -c {} /dev/zero\nsleep 30\n",
-            PROBE_OUTPUT_MAX + 1
-        ));
+        let noisy =
+            executable_script(&format!("#!/bin/sh\nhead -c {} /dev/zero\nsleep 30\n", PROBE_OUTPUT_MAX + 1));
         let mut cmd = tokio::process::Command::new(&noisy);
         let began = Instant::now();
         let err = grouped_probe(cmd, None, Duration::from_secs(10)).await.unwrap_err();
         assert!(err.contains("exceeded"), "{err}");
         assert!(began.elapsed() < Duration::from_secs(3), "overflow waited for the outer deadline");
 
-        let recovered_pid = std::env::temp_dir().join(format!(
-            "den-remux-recovered-probe-{}.pid",
-            std::process::id()
-        ));
+        let recovered_pid =
+            std::env::temp_dir().join(format!("den-remux-recovered-probe-{}.pid", std::process::id()));
         let _ = std::fs::remove_file(&recovered_pid);
         let recovered = executable_script(&format!(
             "#!/bin/sh\necho $$ > '{}'\nprintf recovered\n",
@@ -1884,11 +1879,8 @@ mod tests {
         state.load_unplayable();
         assert!(state.unplayable().entries.is_empty());
 
-        let oversized = vec![UnplayableEntry {
-            key: "k".repeat(UNPLAYABLE_STRING_MAX + 1),
-            at: now,
-            why: "why".into(),
-        }];
+        let oversized =
+            vec![UnplayableEntry { key: "k".repeat(UNPLAYABLE_STRING_MAX + 1), at: now, why: "why".into() }];
         assert!(Unplayable::from_json(&serde_json::to_vec(&oversized).unwrap(), now).is_err());
     }
 
@@ -1910,7 +1902,10 @@ mod tests {
 
         let bytes = read_bounded(&state.cfg.scratch_dir.join(PROBE_FILE), PROBE_FILE_MAX_BYTES).unwrap();
         let mut restored = ProbeCache::from_json(&bytes).unwrap();
-        assert!(restored.get(&probe_key(Some(200), b"burst").unwrap()).is_some(), "the newest snapshot was lost");
+        assert!(
+            restored.get(&probe_key(Some(200), b"burst").unwrap()).is_some(),
+            "the newest snapshot was lost"
+        );
     }
 
     #[tokio::test]
@@ -1928,11 +1923,8 @@ mod tests {
         gate.release();
         state.flush_persistence().await;
 
-        let bytes = read_bounded(
-            &state.cfg.scratch_dir.join(UNPLAYABLE_FILE),
-            UNPLAYABLE_FILE_MAX_BYTES,
-        )
-        .unwrap();
+        let bytes =
+            read_bounded(&state.cfg.scratch_dir.join(UNPLAYABLE_FILE), UNPLAYABLE_FILE_MAX_BYTES).unwrap();
         let restored = Unplayable::from_json(&bytes, unix_now()).unwrap();
         assert_eq!(restored.get("release-200", unix_now()).as_deref(), Some("reason-200"));
     }

@@ -636,48 +636,47 @@ async fn fetch_trailer_inner(
             return Err(PlayError::overloaded());
         } else {
             let gen = state.dl_gen.fetch_add(1, Ordering::Relaxed);
-            let fut: BoxFuture<Result<Fetched, PlayError>> = {
-                let st = state.clone();
-                let v = vid.clone();
-                // Record the verdict INSIDE the shared future, not in the driver task below. Both
-                // are woken by the same completion, so a waiter that re-entered on the driver's
-                // heels could miss a record that had not run yet — and re-enter is exactly what the
-                // evicted-mid-serve retry does. Here it is ordered: anyone who can observe the
-                // result can observe the record. Runs once, because `Shared` polls the inner future
-                // once however many waiters there are.
-                let work = async move {
-                    let out = download_cached(st.clone(), v.clone(), gen).await;
-                    match &out {
-                        Ok(_) => clear_failure(&st, &v),
-                        // A throttle is about this box, not this id, and the pause already answers
-                        // every id. Pinning it here would outlive the pause for this one video.
-                        Err(e) if e.reason == "throttled" => {}
-                        Err(e) => {
-                            // Logged HERE, once per download that actually happened, rather than at
-                            // every request that observes the result. `record_failure` drops the
-                            // stderr tail precisely so a stale extractor message is not re-logged on
-                            // every later hit — but the line itself was still being written by the
-                            // serve path, so an id inside a one-hour window produced a syscall and a
-                            // log line per request saying the same thing. Repeats are supposed to be
-                            // free; this is the last part of them that was not.
-                            // And at most once a minute per reason: in an extractor outage every
-                            // download fails the same way, and one line says it.
-                            crate::log_limited(&format!("download {}", e.reason), || {
-                                format!("[{v}] {}", e.detail)
-                            });
-                            record_failure(&st, &v, e);
+            let fut: BoxFuture<Result<Fetched, PlayError>> =
+                {
+                    let st = state.clone();
+                    let v = vid.clone();
+                    // Record the verdict INSIDE the shared future, not in the driver task below. Both
+                    // are woken by the same completion, so a waiter that re-entered on the driver's
+                    // heels could miss a record that had not run yet — and re-enter is exactly what the
+                    // evicted-mid-serve retry does. Here it is ordered: anyone who can observe the
+                    // result can observe the record. Runs once, because `Shared` polls the inner future
+                    // once however many waiters there are.
+                    let work = async move {
+                        let out = download_cached(st.clone(), v.clone(), gen).await;
+                        match &out {
+                            Ok(_) => clear_failure(&st, &v),
+                            // A throttle is about this box, not this id, and the pause already answers
+                            // every id. Pinning it here would outlive the pause for this one video.
+                            Err(e) if e.reason == "throttled" => {}
+                            Err(e) => {
+                                // Logged HERE, once per download that actually happened, rather than at
+                                // every request that observes the result. `record_failure` drops the
+                                // stderr tail precisely so a stale extractor message is not re-logged on
+                                // every later hit — but the line itself was still being written by the
+                                // serve path, so an id inside a one-hour window produced a syscall and a
+                                // log line per request saying the same thing. Repeats are supposed to be
+                                // free; this is the last part of them that was not.
+                                // And at most once a minute per reason: in an extractor outage every
+                                // download fails the same way, and one line says it.
+                                crate::log_limited(&format!("download {}", e.reason), || {
+                                    format!("[{v}] {}", e.detail)
+                                });
+                                record_failure(&st, &v, e);
+                            }
                         }
-                    }
-                    // The counters /health reads move inside the download; say so if that flipped it.
-                    st.note_health();
-                    out
+                        // The counters /health reads move inside the download; say so if that flipped it.
+                        st.note_health();
+                        out
+                    };
+                    Box::pin(std::panic::AssertUnwindSafe(work).catch_unwind().map(|result| {
+                        result.unwrap_or_else(|_| Err(PlayError::panicked("trailer download")))
+                    }))
                 };
-                Box::pin(
-                    std::panic::AssertUnwindSafe(work)
-                        .catch_unwind()
-                        .map(|result| result.unwrap_or_else(|_| Err(PlayError::panicked("trailer download")))),
-                )
-            };
             let shared = fut.shared();
             map.insert(vid.clone(), (gen, shared.clone()));
             let driver = shared.clone();
@@ -858,7 +857,12 @@ fn validators(size: u64, modified: SystemTime) -> (String, String) {
 /// `set_times` goes through the handle we already hold rather than opening the path again, and the
 /// `is_file` check that used to live in `fetch_trailer` comes along for free — `open` on a directory
 /// succeeds on Linux, so something has to reject it, and the fstat is right here.
-fn open_for_serve(fp: &Path, range: Option<&str>, if_range: Option<&str>, touch: bool) -> std::io::Result<Opened> {
+fn open_for_serve(
+    fp: &Path,
+    range: Option<&str>,
+    if_range: Option<&str>,
+    touch: bool,
+) -> std::io::Result<Opened> {
     use std::io::{Seek, SeekFrom};
 
     let mut file = std::fs::File::open(fp)?;

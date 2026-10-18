@@ -1226,13 +1226,8 @@ async fn scraper_request_ceiling_is_shared_across_handlers() {
 
     let make = || {
         let runtime = runtime.clone();
-        let (active, peak, arrivals, first_wave, release) = (
-            active.clone(),
-            peak.clone(),
-            arrivals.clone(),
-            first_wave.clone(),
-            release.clone(),
-        );
+        let (active, peak, arrivals, first_wave, release) =
+            (active.clone(), peak.clone(), arrivals.clone(), first_wave.clone(), release.clone());
         test_deps(move |d| {
             d.runtime = runtime.clone();
             d.scrape_timeout = Duration::from_secs(3);

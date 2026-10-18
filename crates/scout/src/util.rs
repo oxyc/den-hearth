@@ -195,9 +195,7 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T> + Send + 'static,
     {
-        self.run_inner(key, None, make)
-            .await
-            .expect("an unbounded detached flight cannot be refused")
+        self.run_inner(key, None, make).await.expect("an unbounded detached flight cannot be refused")
     }
 
     /// Like [`Self::run`], but a new key is installed only when `admission` has a permit immediately available.
