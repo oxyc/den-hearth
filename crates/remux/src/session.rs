@@ -1064,44 +1064,15 @@ impl Session {
         self.ensure_resolved(st).await.is_ok()
     }
 
-    /// The session's own selected audio track, as `lang::canonical` gives it — what decides whether a subtitle in
-    /// that same language is a dub's captions or a same-language accessibility track (`subs::in_context`).
-    fn audio_lang(&self) -> Option<String> {
-        self.info.audio.get(self.audio).and_then(|a| a.language.as_deref()).map(crate::lang::canonical)
-    }
-
-    /// Rendition `n`'s playlist: a segment per video segment from the release's own track where it has the better
-    /// candidate for the session's audio context (`subs::own_wins`), else the one document den-subtitles serves
-    /// spanning the film. A language with neither is the document, which serves as empty.
-    pub async fn subtitle_playlist(&self, st: &AppState, n: usize) -> String {
-        let Some(r) = self.renditions.get(n) else { return String::new() };
-        let own = match (r.own, r.den) {
-            (None, _) => false,
-            (Some(_), false) => true,
-            (Some(own_track), true) => {
-                let dub = self.audio_lang().as_deref() == Some(r.lang.as_str());
-                crate::subs::own_wins(
-                    &self.info.subtitles[own_track],
-                    self.den_best(st, n).await.as_ref(),
-                    dub,
-                )
-            }
-        };
-        match own {
-            true => playlist::subtitle_segments(&self.segments, n),
-            false => playlist::subtitle_media(self.info.duration, n),
+    /// Rendition `n`'s playlist: a segment per video segment from the release's own track where `subs::plan` chose
+    /// it, else the one document den-subtitles serves spanning the film. A language with neither is the document,
+    /// which serves as empty.
+    pub fn subtitle_playlist(&self, n: usize) -> String {
+        match self.renditions.get(n).map(|r| r.own) {
+            None => String::new(),
+            Some(Some(_)) => playlist::subtitle_segments(&self.segments, n),
+            Some(None) => playlist::subtitle_media(self.info.duration, n),
         }
-    }
-
-    /// den-subtitles' best-ranked listed entry in rendition `n`'s language — its list is already sorted best
-    /// first within each language — or `None` when it was not asked, or offers nothing in it.
-    async fn den_best(&self, st: &AppState, n: usize) -> Option<crate::subs::Entry> {
-        let (sb, r) = (self.subs.as_ref()?, self.renditions.get(n)?);
-        let mut cache = sb.cache.lock().await;
-        if cache.list.is_none() {
-            cache.list = self.list_subtitles(st, sb).await;
-        }
-        cache.list.iter().flatten().find(|e| crate::lang::canonical(&e.lang) == r.lang).cloned()
     }
 
     /// Rendition `n`'s own track over video segment `w`, once the job has read the film past it: the cues showing in
@@ -1676,6 +1647,9 @@ pub struct Want<'a> {
     pub subtitles: Option<&'a str>,
     /// Subtitle languages to offer as renditions, most wanted first.
     pub subtitle_languages: &'a [String],
+    /// The title's original language, as its catalogue names it: what tells a dub from original audio
+    /// (`subs::dub_language`). `None` is read as original audio.
+    pub original_language: Option<&'a str>,
     /// The video codecs the player takes (`h264`, `hevc`); empty is both. Without HEVC, H.264 releases
     /// are tried first and an HEVC one is transcoded on the GPU.
     pub video_codecs: &'a [String],
@@ -2308,6 +2282,7 @@ mod tests {
             audio_track: None,
             subtitles: None,
             subtitle_languages: &[],
+            original_language: None,
             video_codecs: &[],
             playable: Some(&player),
             start_at: 0.0,
@@ -2615,6 +2590,7 @@ mod tests {
             audio_track: None,
             subtitles: None,
             subtitle_languages: &[],
+            original_language: None,
             video_codecs: &[],
             playable: None,
             start_at: 0.0,

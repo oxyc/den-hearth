@@ -446,8 +446,10 @@ async fn origin_handle<B>(
         ]});
         return origin_full(200, body.to_string());
     }
-    // The same install for the release that carries its own subtitles: it has English and nothing else.
-    if path.starts_with("/subs/subtitles/movie/tt0000015/") {
+    // The same install for the releases that carry their own subtitles: it has English and nothing else.
+    if path.starts_with("/subs/subtitles/movie/tt0000015/")
+        || path.starts_with("/subs/subtitles/movie/tt0000019/")
+    {
         let body = serde_json::json!({"subtitles": [
             {"id": "1", "url": format!("http://{addr}/subs/subtitle/1.srt?lang=eng"), "lang": "eng"}
         ]});
@@ -628,6 +630,7 @@ async fn origin_handle<B>(
             "tt0000018" => "av1-sdr.mkv",
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
+            "tt0000019" => "forced-first.mkv",
             "tt0000040" => "resume40/h264.mkv",
             "tt0000041" => "resume41/h264.mkv",
             "tt0000042" => "resume42/hevc.mkv",
@@ -3014,7 +3017,10 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
     let j = r.json();
     assert_eq!(
         j["subtitles"],
-        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}])
+        serde_json::json!([
+            {"language": "en", "name": "English · OpenSubtitles"},
+            {"language": "fi", "name": "Finnish · OpenSubtitles"}
+        ])
     );
     let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
 
@@ -3135,7 +3141,10 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     assert_eq!(j["release"]["filename"], "subs.mkv");
     assert_eq!(
         j["subtitles"],
-        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}]),
+        serde_json::json!([
+            {"language": "en", "name": "English (in file)"},
+            {"language": "fi", "name": "Finnish (in file)"}
+        ]),
         "the forced Swedish track is no rendition outside a Swedish dub context"
     );
     let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
@@ -3164,7 +3173,10 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
         r.json()["subtitles"],
-        serde_json::json!([{"language": "en", "name": "English"}, {"language": "fi", "name": "Finnish"}])
+        serde_json::json!([
+            {"language": "en", "name": "English (in file)"},
+            {"language": "fi", "name": "Finnish (in file)"}
+        ])
     );
     let base = r.json()["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
@@ -3189,6 +3201,72 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     state.end_all("test").await;
 }
 
+/// The Morning Show S1E1's shape (`forced-first.mkv`): English audio, an English track titled "Forced", flagged
+/// forced and default and listed first, then the full English one. Over original English audio — the title's
+/// original language named English, or not named at all — English is the release's full track: it ties
+/// den-subtitles' plain English file and needs no download. Only a title originally in another language makes the
+/// English audio a dub, and the forced track its English. The name says where the cues come from, in the answer and
+/// in the master playlist a native player builds its own menu from.
+#[tokio::test]
+async fn english_over_original_english_audio_is_the_releases_full_track() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    for (original, track) in [("", 1), (r#","originalLanguage":"en""#, 1), (r#","originalLanguage":"sv""#, 0)]
+    {
+        let body = format!(
+            r#"{{"imdb":"tt0000019","subtitles":"{origin}/subs","subtitleLanguages":["en"]{original}}}"#
+        );
+        let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+        let j = r.json();
+        assert_eq!(
+            j["subtitles"][0],
+            serde_json::json!({"language": "en", "name": "English (in file)"}),
+            "{body}"
+        );
+        let session = state.session(j["sid"].as_str().unwrap()).unwrap();
+        assert_eq!(session.renditions[0].own, Some(track), "{body}");
+        let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+        let master = call(&state, "GET", &format!("{base}master.m3u8"), None, "").await.text();
+        assert!(master.contains("NAME=\"English (in file)\",LANGUAGE=\"en\""), "{master}");
+        let en = call(&state, "GET", &format!("{base}sub0.m3u8"), None, "").await.text();
+        assert!(en.contains("\nsub0_0.vtt\n"), "the release's own track, cut per segment: {en}");
+        state.end_all("test").await;
+    }
+}
+
+/// `forced-first.mkv` played: the English rendition's first segment carries the full track's opening cue, and none
+/// of the forced track's. Real ffmpeg, so `#[ignore]`d.
+#[tokio::test]
+#[ignore]
+async fn english_over_original_english_audio_shows_the_full_tracks_cues() {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let body = format!(r#"{{"imdb":"tt0000019","subtitles":"{origin}/subs","subtitleLanguages":["en"]}}"#);
+    let r = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let base = r.json()["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let get = |file: &str| {
+        let (state, url) = (state.clone(), format!("{base}{file}"));
+        async move { call(&state, "GET", &url, None, "").await }
+    };
+    assert_eq!(get("init.mp4").await.status, StatusCode::OK);
+    assert_eq!(get("seg0.m4s").await.status, StatusCode::OK);
+    let first = get("sub0_0.vtt").await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    assert!(first.text().contains("Hello there"), "{}", first.text());
+    let media = get("media.m3u8").await.text();
+    let mut all = String::new();
+    for i in 0..extinfs(&media).len() {
+        assert_eq!(get(&format!("seg{i}.m4s")).await.status, StatusCode::OK, "seg{i}");
+        all.push_str(&get(&format!("sub0_{i}.vtt")).await.text());
+    }
+    assert!(all.contains("The end") && !all.contains("främmande"), "{all}");
+    state.end_all("test").await;
+}
+
 /// The release's own subtitles come out of the same ffmpeg runs that copy its video, whatever order the player asks
 /// in: the first segment asked for starts a run mid-file, one behind it another from zero, and every subtitle segment
 /// then holds the cues showing in its video segment, over a cut included. Real ffmpeg, so `#[ignore]`d.
@@ -3210,7 +3288,10 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
     let j = r.json();
     assert_eq!(
         j["subtitles"],
-        serde_json::json!([{"language": "fi", "name": "Finnish"}, {"language": "en", "name": "English"}])
+        serde_json::json!([
+            {"language": "fi", "name": "Finnish (in file)"},
+            {"language": "en", "name": "English (in file)"}
+        ])
     );
     let base = j["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
     let media = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();

@@ -17,6 +17,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `av1-sdr.mkv` | AV1 in SDR: SVT-AV1's 8-bit BT.709, named with no VIDEO-RANGE; Opus audio | as `av1.mkv` | 30.008 |
 | `surround.mkv` | `h264.mkv`'s video copied, with a 5.1 AAC track (eng) and a 7.1 one (swe): converted to AAC 5.1 | as `h264.mkv` | 30.021 |
 | `subs.mkv` | `h264.mkv` with three text subtitle tracks: SRT English, ASS Finnish (an italic override) and a forced SRT Swedish. Cues sit inside a segment (1, 9, 26 s), across a cut at 13 s (12–14) and after it (14.5), so the segments 0–8, 8–13, 13–19.5, 19.5–24, 24–30 each hold a known set | as `h264.mkv` | 30.021 |
+| `forced-first.mkv` | `subs.mkv` in The Morning Show S1E1's shape: English audio first, then an English subtitle titled "Forced", flagged forced and default (`subs.mkv`'s forced Swedish cue, retagged), ahead of the full English SRT | as `h264.mkv` | 30.058 |
 | `open-gop.mkv` | Open GOPs: x265's own keyframes every 3 s are CRAs, each with three RASL leading pictures that reference the GOP before (`closed_gops` false, no `EXT-X-INDEPENDENT-SEGMENTS`) | 0, 3, 6, 9 | 12.0 |
 | `open-gop.mp4` | `open-gop.mkv` copied into MP4: the leading pictures seen in `ctts` | as `open-gop.mkv` | 12.0 |
 | `h264.ts` | MPEG-TS: H.264 with 10 s GOPs, so a run started between them has no source keyframe there; AAC eng. Its clock starts at 1.462 s (the audio), the video at 1.483 s | 0, 10, 20 (from the video's start) | 30.021 |
@@ -155,6 +156,9 @@ Dialogue: 0,0:00:20.00,0:00:22.00,Default,,0,0,0,,Hyvää yötä
 EOF
 ffmpeg -y -i h264.mkv -i eng.srt -i fin.ass -i swe.srt -map 0:v -map 0:a -map 1 -map 2 -map 3 -c copy \
   -metadata:s:s:0 language=eng -metadata:s:s:1 language=fin -metadata:s:s:2 language=swe -disposition:s:2 forced subs.mkv
+ffmpeg -y -i subs.mkv -map 0:v -map 0:a -map 0:s:2 -map 0:s:0 -c copy -metadata:s:s:0 language=eng \
+  -metadata:s:s:0 title=Forced -disposition:s:0 forced+default -metadata:s:s:1 language=eng -disposition:s:1 0 \
+  forced-first.mkv
 ```
 
 AV1 has no frame reordering, so its keyframes are its key packets as well:
