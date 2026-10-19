@@ -92,8 +92,12 @@
   button.primary { width: 100%; margin-top: 1rem; border: 0; background: var(--accent); color: var(--ink);
     font-size: .95rem; }
   button.primary:hover:not(:disabled) { background: #fff; }
+  button.primary.saved:disabled { opacity: 1; background: var(--good); color: var(--ink); }
   #out { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line); }
   #out.hidden { display: none; }
+  #out.guest-success { padding: 1rem; border: 1px solid rgba(159, 210, 175, .34); border-radius: .875rem;
+    background: rgba(159, 210, 175, .08); }
+  #out.guest-success:focus { outline: 3px solid var(--good); outline-offset: 3px; }
   #out h2 { margin: 0 0 .65rem; font-size: 1rem; }
   #url { width: 100%; padding: .75rem; border: 1px solid var(--line); border-radius: .75rem; background: var(--field);
     color: var(--text); font: .75rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
@@ -282,10 +286,10 @@
   <p class="security" id="sealStatus" role="status" aria-live="polite">Checking credential protection…</p>
   <button id="go" class="primary" type="button" disabled>Checking encryption…</button>
   <div class="err" id="err" role="alert" aria-live="assertive"></div>
-  <div id="out" class="hidden" aria-live="polite">
+  <div id="out" class="hidden" role="status" aria-live="polite" tabindex="-1">
   <h2 id="outTitle">Install link</h2>
   <textarea id="url" readonly rows="3" aria-label="Install URL"></textarea>
-  <div class="row"><button id="copy" type="button">Copy link</button></div>
+  <div class="row"><button id="copy" type="button">Copy link</button><button id="done" type="button" hidden>Close tab</button></div>
   <p class="foot" id="installMeta">Install id: <code id="installId"></code> — put this in <code>HEARTH_REVOKED_INSTALLS</code> to revoke just this link.</p>
   <p class="note" id="sealNote"></p>
   <p class="disclaimer" id="sealDisclaimer"></p>
@@ -337,9 +341,11 @@ if (DEN_GUEST) {
   $("forgetControl").hidden = true;
   $("go").textContent = "Save settings";
   $("outTitle").textContent = "Settings saved";
+  $("out").classList.add("guest-success");
+  $("done").hidden = false;
   // A guest's settings are saved to their shared access, not handed over as a link, so nothing about a link shows.
   ["url", "copy", "installMeta", "sealNote", "sealDisclaimer"].forEach(function (id) { $(id).hidden = true; });
-  $("installDirections").textContent = "Den uses them from now on.";
+  $("installDirections").textContent = "Your personal Hearth settings are active in Den. You can close this tab.";
 }
 var primaryLabel = DEN_GUEST ? "Save settings" : "Create install link";
 
@@ -748,13 +754,18 @@ function updateSummary() {
       .then(function (r) {
         if (!r.ok) throw new Error("save failed");
         saveSettings(config);
-        $("go").disabled = false;
-        $("go").textContent = primaryLabel;
         if (buildGeneration !== configGeneration) {
+          $("go").disabled = false;
+          $("go").textContent = primaryLabel;
           $("err").textContent = "Earlier settings were saved, but this form changed while saving. Save again to apply these changes.";
           return;
         }
         $("out").classList.remove("hidden");
+        $("go").disabled = true;
+        $("go").textContent = "Saved ✓";
+        $("go").classList.add("saved");
+        document.title = "Settings saved — Den";
+        $("out").focus();
       })
       .catch(function () {
         $("err").textContent = "Could not save these settings. Please try again.";
@@ -837,6 +848,12 @@ function updateSummary() {
     if (!$("out").classList.contains("hidden")) {
       $("out").classList.add("hidden");
       $("url").value = "";
+      if (DEN_GUEST) {
+        $("go").disabled = false;
+        $("go").textContent = primaryLabel;
+        $("go").classList.remove("saved");
+        document.title = "Den — Configure";
+      }
     }
   }
   $("useDefaults").addEventListener("change", syncDefaults);
@@ -863,6 +880,7 @@ function updateSummary() {
   $("go").addEventListener("click", build);
   $("test").addEventListener("click", testToken);
   $("copy").addEventListener("click", copyInstallURL);
+  $("done").addEventListener("click", function () { window.close(); });
   $("forget").addEventListener("click", function (e) {
     e.preventDefault();
     if (STORE_KEY) try { sessionStorage.removeItem(STORE_KEY); } catch (e2) {}
