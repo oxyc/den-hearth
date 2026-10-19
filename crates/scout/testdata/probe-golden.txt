@@ -28,6 +28,9 @@ remux/av1.mkv @1000: {"container":"matroska","videoCodec":"av1","audioChannels":
 remux/av1.mp4 @1048576: {"container":"mp4","videoCodec":"av1","hdrFormat":"HDR10","bitDepth":10,"width":320,"height":180,"frameRate":24.001,"audioLanguages":[],"subtitleLanguages":[],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/av1.mp4 @4096: err: no track information in the file head
 remux/av1.mp4 @1000: err: no track information in the file head
+remux/forced-first.mkv @1048576: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":["en"],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/forced-first.mkv @4096: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":["en"],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
+remux/forced-first.mkv @1000: {"container":"matroska","videoCodec":"h264","audioChannels":"2.0","bitDepth":8,"videoProfile":100,"videoLevel":12,"width":320,"height":180,"frameRate":24.0,"audioLanguages":["en","sv"],"subtitleLanguages":["en"],"untaggedAudioTracks":0,"untaggedSubtitleTracks":0}
 remux/gpu-probe.mkv @1048576: err: no track information in the file head
 remux/gpu-probe.mkv @4096: err: no track information in the file head
 remux/gpu-probe.mkv @1000: err: no track information in the file head

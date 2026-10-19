@@ -733,7 +733,7 @@ where
     let Some(body) = read_body(body).await else {
         return bad_request(
             "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
-             \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \
+             \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \"originalLanguage\"?: \"en\", \
              \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\", \"flac\", \"aac71\", \"vp9\", \"vp9Profile2\"}, \
              \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\" | \"cast\", \
              \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool, \"replaces\"?: \"sid\"}.",
@@ -798,6 +798,7 @@ where
         audio_track: req.audio_track,
         subtitles: subtitles_url.as_deref(),
         subtitle_languages,
+        original_language: req.original_language.as_deref(),
         video_codecs,
         playable: req.playable.as_ref(),
         start_at: req.start_at.unwrap_or(0.0),
@@ -886,7 +887,7 @@ where
                     })).collect::<Vec<_>>(),
                     "subtitles": s.renditions.iter().map(|r| serde_json::json!({
                         "language": r.lang,
-                        "name": lang::name(&r.lang),
+                        "name": crate::subs::name(r),
                     })).collect::<Vec<_>>(),
                 }),
                 // Read and stripped by `handle_request`'s own log line, never sent on: so the request that
@@ -990,7 +991,7 @@ where
                         httputil::text(
                             "application/vnd.apple.mpegurl",
                             &s.cache_control(),
-                            s.subtitle_playlist(state, n).await,
+                            s.subtitle_playlist(n),
                         )
                     }
                     // A found subtitle is kept for the session; an empty document is not, so a player that asks

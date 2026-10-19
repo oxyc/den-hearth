@@ -437,9 +437,10 @@ pub async fn create(
         })?;
         Some(Requested { filename: f.to_string(), why })
     });
-    // What language the session's own audio is in, so `plan()` can tell a dub's captions (forced/
-    // foreign-parts-only is right) apart from a translation subtitle (the full track is right).
+    // What language the session's own audio is in, and whether it is a dub in it, so `plan()` can tell a dub's
+    // captions (forced/foreign-parts-only is right) apart from a subtitle over original audio (the full track is).
     let audio_lang = info.audio[audio].language.as_deref().map(crate::lang::canonical);
+    let dub = crate::subs::dub_language(audio_lang.as_deref(), want.original_language);
     let head_sum = resolved.head.get(..crate::subs::HASH_CHUNK as usize).map(crate::subs::chunk_sum);
     // den-subtitles' own list for the title, fetched now — before any rendition is promised — so `plan()`
     // offers a `den: true` language only when den-subtitles can actually serve it, never one it merely
@@ -472,12 +473,19 @@ pub async fn create(
         }
         None => Vec::new(),
     };
-    let renditions =
-        crate::subs::plan(&sub_langs, sub_base.is_some(), &info.subtitles, audio_lang.as_deref(), &den_list);
+    let renditions = crate::subs::plan(
+        &sub_langs,
+        sub_base.is_some(),
+        &info.subtitles,
+        audio_lang.as_deref(),
+        dub,
+        &den_list,
+    );
     let text_tracks: Vec<usize> = renditions.iter().filter_map(|r| r.own).collect();
     let subs = sub_base.map(|base| crate::subs::Subs { base, head_sum, cache: Default::default() });
     let named: Vec<(String, String)> =
-        renditions.iter().map(|r| (r.lang.clone(), crate::lang::name(&r.lang))).collect();
+        renditions.iter().map(|r| (r.lang.clone(), crate::subs::name(r))).collect();
+    let subtitles_line = crate::subs::describe_subtitles(&info.subtitles, &renditions, dub);
     let opened_key = opened_key(&source.base, c);
     // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
     let closed_gops = transcode || info.closed_gops;
@@ -633,15 +641,7 @@ pub async fn create(
     // Answers "does this release have an embedded English track, and why wasn't it used" from the
     // log alone, on the next report — never a URL, just the release's own subtitle streams and
     // `plan()`'s verdict on each.
-    eprintln!(
-        "session {}: subtitles: {}{rid_suffix}",
-        session.short(),
-        crate::subs::describe_subtitles(
-            &session.info.subtitles,
-            &session.renditions,
-            session.audio_lang().as_deref()
-        )
-    );
+    eprintln!("session {}: subtitles: {subtitles_line}{rid_suffix}", session.short());
     eprintln!(
         "{}",
         audio_track_line(

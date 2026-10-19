@@ -23,6 +23,8 @@ pub struct PlaybackRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtitle_languages: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub video_codecs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playable: Option<Playable>,
@@ -78,6 +80,9 @@ impl PlaybackRequest {
         {
             return Err("audio, subtitleLanguages and videoCodecs are at most 8 short tags each.");
         }
+        if self.original_language.as_ref().is_some_and(|value| value.len() > 35) {
+            return Err("originalLanguage is one short language tag.");
+        }
         if self
             .exclude
             .as_ref()
@@ -116,5 +121,8 @@ mod tests {
         assert!(parse(serde_json::json!({"imdb":"tt1","season":1})).validate().is_err());
         assert!(parse(serde_json::json!({"imdb":"tt1","maxBitrate":0})).validate().is_err());
         assert!(parse(serde_json::json!({"imdb":"tt1","exclude": vec!["x"; 17]})).validate().is_err());
+        assert!(parse(serde_json::json!({"imdb":"tt1","originalLanguage":"en"})).validate().is_ok());
+        let long = "x".repeat(36);
+        assert!(parse(serde_json::json!({"imdb":"tt1","originalLanguage": long})).validate().is_err());
     }
 }

@@ -19,7 +19,8 @@ The current process and data flow are summarized in [ARCHITECTURE.md](ARCHITECTU
 ```
 POST   /remux/login                     {key} → 204 + Set-Cookie + X-Den-Browser-Token; 401 bad_key · 429 rate_limited
 POST   /remux/session                   {imdb, season?, episode?, filename?, scout?, audio?, audioTrack?,
-                                         subtitles?, subtitleLanguages?, videoCodecs?, playable?, startAt?, maxBitrate?, player?,
+                                         subtitles?, subtitleLanguages?, originalLanguage?, videoCodecs?, playable?, startAt?,
+                                         maxBitrate?, player?,
                                          exclude?, transcode?: "never", fitsOnly?, replaces?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, prebuffer, need,
@@ -124,6 +125,12 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   second past it. A seek starts another run, which writes from its own start; what earlier runs wrote stays. A cue
   that began before a run's start point, and is still showing there, is not in it. ASS/SSA lose their styling. A forced
   track (foreign-language parts only), a bitmap track (PGS, VOBSUB) and a track that names no language are not offered.
+  **Which one a language plays** is decided when the session starts, from den-subtitles' list fetched then: the
+  release's best own track (full, then SDH, then forced) where it ranks at least as well as den-subtitles' best
+  candidate, else that candidate. Each rendition is named for its source, `English (in file)` or
+  `English · OpenSubtitles`, in the answer's `subtitles` and in the master's `NAME`. `originalLanguage` is the title's
+  original language: only audio in another language is a dub, where a forced track in the audio's language is the
+  right one; unset is read as original audio, where the full track is.
 - **Video codecs.** `videoCodecs` is what the player takes (`["h264"]` for Firefox or an old
   Chromecast); empty is H.264 and HEVC. Without HEVC, H.264 releases are tried first, and an HEVC-only
   title is transcoded to H.264 on the GPU (Hardware transcode, below) — or refused up front with `no_copy` while
