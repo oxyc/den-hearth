@@ -1,7 +1,7 @@
 //! Bounded extraction of complete indexed Matroska and ISO-BMFF text subtitles from a TorBox direct-file
 //! capability.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use den_upstream::{ClientProfile, Guard, Redirect};
 use crate::loglimit::log_limited;
 
 const HEAD_BYTES: u64 = 64 * 1024;
+const MKV_HEAD_PROBES: [usize; 4] = [HEAD_BYTES as usize, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
 const MAX_ELEMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REQUESTS: usize = 4096;
@@ -27,6 +28,12 @@ const PARALLEL_BLOCKS: usize = 128;
 const MULTI_RANGE_PARTS: usize = 32;
 const MULTI_RANGE_OVERHEAD: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(8);
+
+const INPUT_UNKNOWN: u8 = 0;
+const INPUT_OTHER: u8 = 1;
+const INPUT_MKV_NO_INDEX: u8 = 2;
+const INPUT_MKV_INDEXED: u8 = 3;
+const INPUT_MP4_INDEXED: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Sidecar {
@@ -40,6 +47,7 @@ struct Reader {
     url: reqwest::Url,
     bytes: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
+    input: Arc<AtomicU8>,
 }
 
 impl Reader {
@@ -73,7 +81,18 @@ impl Reader {
             url,
             bytes: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(AtomicUsize::new(0)),
+            input: Arc::new(AtomicU8::new(INPUT_UNKNOWN)),
         })
+    }
+
+    fn input_kind(&self) -> &'static str {
+        match self.input.load(Relaxed) {
+            INPUT_OTHER => "other",
+            INPUT_MKV_NO_INDEX => "mkv_no_index",
+            INPUT_MKV_INDEXED => "mkv_indexed",
+            INPUT_MP4_INDEXED => "mp4_indexed",
+            _ => "unknown",
+        }
     }
 
     async fn range(&self, start: u64, len: usize) -> Option<(Vec<u8>, u64)> {
@@ -284,11 +303,28 @@ async fn index(
 ) -> Option<(u64, u64, u64, Vec<TextTrack>, Vec<indexed_mkv::CueTrack>, std::collections::HashMap<u64, usize>)>
 {
     // A one-byte range is not a reliable length probe on every TorBox CDN path: some valid large objects have
-    // answered `bytes 0-0/1`. Reading the actual bounded header both proves range support and supplies the
-    // object length without allowing that response quirk to make an MKV look like a one-byte file.
-    let (head, total) = reader.range(0, HEAD_BYTES as usize).await?;
-    let mut index = indexed_mkv::segment_index(&head)?;
-    if let Some(next) = index.elements.get(&mkv::SEEK_HEAD).copied().filter(|at| *at >= HEAD_BYTES) {
+    // answered `bytes 0-0/1`. Start with a small real header, then grow it only when the Segment's first
+    // complete SeekHead is farther into the file. Large muxer padding and an early large Void are both legal;
+    // treating 64 KiB as a format boundary incorrectly rejected otherwise indexed MKVs. The progressive reads
+    // remain inside the extractor's existing byte and time budgets.
+    let mut found = None;
+    for (probe, requested) in MKV_HEAD_PROBES.into_iter().enumerate() {
+        let (head, total) = reader.range(0, requested).await?;
+        if probe == 0 && !head.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+            reader.input.store(INPUT_OTHER, Relaxed);
+            return None;
+        }
+        if let Some(index) = indexed_mkv::segment_index(&head) {
+            found = Some((index, total, requested));
+            break;
+        }
+    }
+    let Some((mut index, total, head_bytes)) = found else {
+        reader.input.store(INPUT_MKV_NO_INDEX, Relaxed);
+        return None;
+    };
+    reader.input.store(INPUT_MKV_INDEXED, Relaxed);
+    if let Some(next) = index.elements.get(&mkv::SEEK_HEAD).copied().filter(|at| *at >= head_bytes as u64) {
         let (id, body) = reader.element(next, 1024 * 1024).await?;
         if id == mkv::SEEK_HEAD {
             let chained = indexed_mkv::seek_head(&body, index.payload_at)?;
@@ -559,6 +595,7 @@ async fn extract_mp4_track(reader: &Reader, total: u64, track: indexed_mp4::Text
 async fn mp4_sidecars(reader: &Reader, selected: Option<i64>) -> Vec<Sidecar> {
     let Some((_, total)) = reader.range(0, HEAD_BYTES as usize).await else { return Vec::new() };
     let Some(moov) = mp4_moov(reader, total).await else { return Vec::new() };
+    reader.input.store(INPUT_MP4_INDEXED, Relaxed);
     let Some(tracks) = indexed_mp4::text_tracks(&moov, MAX_CUES_PER_TRACK) else { return Vec::new() };
     let mut output = Vec::new();
     for track in tracks {
@@ -618,8 +655,9 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
                 log_limited(
                     &format!("managed-subtitle-sidecar-ineligible-{}", selected.unwrap_or(-1)),
                     &format!(
-                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible selected={} requests={requests} reserved_bytes={bytes}",
-                        selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
+                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible input={} selected={} requests={requests} reserved_bytes={bytes}",
+                        reader.input_kind(),
+                        selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                     ),
                 );
             } else {
@@ -638,8 +676,9 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
             log_limited(
                 &format!("managed-subtitle-sidecar-timeout-{}", selected.unwrap_or(-1)),
                 &format!(
-                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout selected={} requests={requests} reserved_bytes={bytes}",
-                    selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
+                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout input={} selected={} requests={requests} reserved_bytes={bytes}",
+                    reader.input_kind(),
+                    selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                 ),
             );
             Vec::new()
