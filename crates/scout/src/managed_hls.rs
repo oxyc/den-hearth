@@ -273,7 +273,15 @@ impl TorBoxManagedHls {
                 }
             }
         };
-        let (created, sidecars) = tokio::join!(self.create(token, torrent_id, file_id, subtitle), extract);
+        // A successful sidecar must sit beside a subtitle-free TorBox stream. Asking TorBox for the same
+        // subtitle here burns it into the video, leaving the browser to draw a second copy over it. Start the
+        // clean stream while the indexed extraction runs; only ask TorBox for its legacy selected-subtitle
+        // stream when extraction cannot produce a complete sidecar.
+        let (created, sidecars) = tokio::join!(self.create(token, torrent_id, file_id, None), extract);
+        let created = match (created, subtitle, sidecars.is_empty()) {
+            (Ok(_), Some(ordinal), true) => self.create(token, torrent_id, file_id, Some(ordinal)).await,
+            (created, _, _) => created,
+        };
         match created {
             Err(ManagedHlsError::NotFound) => {
                 store.forget_torrent_id(&target.info_hash);
