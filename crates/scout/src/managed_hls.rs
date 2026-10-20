@@ -196,7 +196,9 @@ impl TorBoxManagedHls {
             create_client,
             cache,
             probe_client,
-            subtitle_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            // One extractor may use high concurrency for tiny, sparse CDN ranges. Keeping a single global slot
+            // prevents simultaneous viewers from multiplying that bounded fan-out against TorBox.
+            subtitle_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 

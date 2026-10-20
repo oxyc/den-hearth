@@ -23,7 +23,7 @@ const MAX_CUES_PER_TRACK: usize = 2000;
 const BLOCK_PREFIX_BYTES: usize = 4096;
 const MAX_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_VTT_BYTES: usize = 2 * 1024 * 1024;
-const PARALLEL_BLOCKS: usize = 32;
+const PARALLEL_BLOCKS: usize = 128;
 const MULTI_RANGE_PARTS: usize = 32;
 const MULTI_RANGE_OVERHEAD: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(8);
@@ -425,17 +425,19 @@ async fn extract(
     if cues.is_empty() || cues.len() > MAX_CUES_PER_TRACK {
         return None;
     }
-    let cluster_ranges =
-        cues.iter().map(|cue| Some((segment.checked_add(cue.cluster)?, 16))).collect::<Option<Vec<_>>>()?;
-    let cluster_heads = read_many(reader, &cluster_ranges).await?;
+    let first_cluster = segment.checked_add(cues.first()?.cluster)?;
+    let cluster_head = reader.range(first_cluster, 16).await?.0;
+    let (cluster_id, _, cluster_header) = den_media::ebml::header(&cluster_head)?;
+    if cluster_id != mkv::CLUSTER {
+        return None;
+    }
+    // Matroska muxers encode one file's Cluster sizes with a consistent VINT width. CueRelativePosition starts
+    // after that header, so learning it once avoids one high-latency CDN request per cue. This remains fail
+    // closed: every resulting element must decode as the requested subtitle track and every indexed frame must
+    // be present before a sidecar is returned.
     let block_ranges = cues
         .iter()
-        .zip(cluster_heads)
-        .map(|(cue, head)| {
-            let (cluster_id, _, cluster_header) = den_media::ebml::header(&head)?;
-            if cluster_id != mkv::CLUSTER {
-                return None;
-            }
+        .map(|cue| {
             let at = cluster_block_position(segment, cue.cluster, cluster_header, cue.relative)?;
             let remaining = usize::try_from(total.checked_sub(at)?).ok()?;
             Some((at, remaining.min(BLOCK_PREFIX_BYTES)))
