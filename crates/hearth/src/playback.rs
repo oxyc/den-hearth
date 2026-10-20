@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
@@ -47,6 +48,12 @@ const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 const FINALIZE_HEADER: &str = "x-den-playback-finalize";
 const FINALIZATION_PROTOCOL_HEADER: &str = "x-den-playback-finalization";
+const SIDECAR_FOR: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_SIDECAR_SESSIONS: usize = 256;
+const MAX_SIDECAR_SESSIONS_PER_OWNER: usize = 32;
+const MAX_SIDECAR_SESSION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SIDECAR_OWNER_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SIDECAR_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 enum BodyReadError {
@@ -180,6 +187,14 @@ pub struct Playback {
     enabled: bool,
     records: Mutex<HashMap<(String, String, String), Record>>,
     metrics: Metrics,
+    sidecars: Mutex<HashMap<String, SidecarSession>>,
+}
+
+struct SidecarSession {
+    expires: Instant,
+    owner: String,
+    bytes: usize,
+    tracks: HashMap<i64, Arc<str>>,
 }
 
 #[derive(Default)]
@@ -230,7 +245,58 @@ impl DirectFailure {
 
 impl Playback {
     pub fn new(enabled: bool) -> Self {
-        Self { enabled, records: Mutex::new(HashMap::new()), metrics: Metrics::default() }
+        Self {
+            enabled,
+            records: Mutex::new(HashMap::new()),
+            metrics: Metrics::default(),
+            sidecars: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn put_sidecars(&self, owner: &str, tracks: HashMap<i64, Arc<str>>) -> Option<String> {
+        if tracks.is_empty() {
+            return None;
+        }
+        let bytes = tracks.values().try_fold(0usize, |total, track| total.checked_add(track.len()))?;
+        if bytes > MAX_SIDECAR_SESSION_BYTES {
+            return None;
+        }
+        let now = Instant::now();
+        let mut sessions = self.sidecars.lock().await;
+        sessions.retain(|_, session| session.expires > now);
+        if sessions.len() >= MAX_SIDECAR_SESSIONS
+            || sessions.values().filter(|session| session.owner == owner).count()
+                >= MAX_SIDECAR_SESSIONS_PER_OWNER
+            || sessions
+                .values()
+                .filter(|session| session.owner == owner)
+                .try_fold(bytes, |total, session| total.checked_add(session.bytes))?
+                > MAX_SIDECAR_OWNER_BYTES
+            || sessions.values().try_fold(bytes, |total, session| total.checked_add(session.bytes))?
+                > MAX_SIDECAR_BYTES
+        {
+            return None;
+        }
+        let mut token_bytes = [0u8; 32];
+        getrandom::fill(&mut token_bytes).expect("the OS random source is unavailable");
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+        sessions.insert(
+            token.clone(),
+            SidecarSession { expires: now + SIDECAR_FOR, owner: owner.to_owned(), bytes, tracks },
+        );
+        Some(token)
+    }
+
+    async fn get_sidecar(&self, token: &str, track: i64) -> Option<Arc<str>> {
+        if token.len() != 43
+            || !token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let mut sessions = self.sidecars.lock().await;
+        sessions.retain(|_, session| session.expires > now);
+        sessions.get(token)?.tracks.get(&track).cloned()
     }
 
     pub fn summary(&self) -> &'static str {
@@ -449,7 +515,19 @@ fn managed_request(
     })
 }
 
-fn direct_response(result: den_scout::managed_hls::ManagedHlsResult, prepare_ms: u64) -> Response<Body> {
+async fn direct_response(
+    playback: &Playback,
+    owner: &str,
+    mut result: den_scout::managed_hls::ManagedHlsResult,
+    prepare_ms: u64,
+) -> Response<Body> {
+    let bodies = result
+        .subtitles
+        .iter_mut()
+        .filter_map(|track| track.sidecar.take().map(|vtt| (track.index, Arc::<str>::from(vtt))))
+        .collect::<HashMap<_, _>>();
+    let sidecar_indexes = bodies.keys().copied().collect::<std::collections::HashSet<_>>();
+    let sidecar_token = playback.put_sidecars(owner, bodies).await;
     let subtitles = result
         .subtitles
         .iter()
@@ -462,12 +540,19 @@ fn direct_response(result: den_scout::managed_hls::ManagedHlsResult, prepare_ms:
             if let Some(codec) = track.codec.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
                 details.push(codec.to_uppercase());
             }
+            let has_sidecar = sidecar_token.is_some()
+                && sidecar_indexes.contains(&track.index)
+                && result.selected_subtitle != Some(track.index);
             json!({
-                "value": format!("torbox:{}", track.index),
+                "value": if has_sidecar { format!("torbox-sidecar:{}", track.index) } else { format!("torbox:{}", track.index) },
                 "language": language,
                 "name": name,
                 "description": details.join(" · "),
-                "torboxTrack": track.index,
+                "source": "built-in",
+                "delivery": if has_sidecar { "sidecar" } else { "torbox" },
+                "url": if has_sidecar { sidecar_token.as_ref().map(|token| format!("/den/_sidecar/{token}/{}.vtt", track.index)) } else { None },
+                "fallbackTorboxTrack": if has_sidecar { Some(track.index) } else { None },
+                "torboxTrack": if has_sidecar { None } else { Some(track.index) },
             })
         })
         .collect::<Vec<_>>();
@@ -488,6 +573,45 @@ fn direct_response(result: den_scout::managed_hls::ManagedHlsResult, prepare_ms:
     if let Ok(value) = HeaderValue::from_str(&format!("prepare;dur={prepare_ms}")) {
         response.headers_mut().insert("server-timing", value);
     }
+    stamp(&mut response);
+    response
+}
+
+/// Serves one short-lived capability URL. No install cookie is needed: possession of 256 random bits is the grant.
+pub async fn sidecar<B>(hearth: &Arc<Hearth>, token: &str, track: usize, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if !hearth.playback.enabled {
+        return den_http::not_found();
+    }
+    if req.method() == Method::OPTIONS {
+        let mut response = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("allow", "GET, HEAD, OPTIONS")
+            .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
+            .header("access-control-max-age", "86400")
+            .body(den_http::full(""))
+            .unwrap();
+        den_http::cors_stamp(response.headers_mut(), "Content-Type");
+        return response;
+    }
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return den_http::not_found();
+    }
+    let Some(vtt) = hearth.playback.get_sidecar(token, track as i64).await else {
+        return den_http::not_found();
+    };
+    let body =
+        if req.method() == Method::HEAD { Bytes::new() } else { Bytes::copy_from_slice(vtt.as_bytes()) };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/vtt; charset=utf-8")
+        .header("cache-control", "private, max-age=7200")
+        .header(CONTENT_LENGTH, vtt.len().to_string())
+        .body(den_http::full(body))
+        .unwrap();
     stamp(&mut response);
     response
 }
@@ -933,7 +1057,16 @@ where
                 {
                     Ok(Ok(result)) => {
                         hearth.playback.metrics.direct_ok.fetch_add(1, Relaxed);
-                        return (direct_response(result, started.elapsed().as_millis() as u64), true);
+                        return (
+                            direct_response(
+                                &hearth.playback,
+                                &scope.0,
+                                result,
+                                started.elapsed().as_millis() as u64,
+                            )
+                            .await,
+                            true,
+                        );
                     }
                     Ok(Err(error)) => {
                         let failure = DirectFailure::from_managed(error);
@@ -1491,6 +1624,19 @@ mod tests {
         ] {
             assert_ne!(baseline, changed);
         }
+    }
+
+    #[tokio::test]
+    async fn sidecar_capabilities_are_unforgeable_bounded_and_track_scoped() {
+        let playback = Playback::new(true);
+        let token = playback
+            .put_sidecars("owner", HashMap::from([(2, Arc::<str>::from("WEBVTT\n\ncue"))]))
+            .await
+            .unwrap();
+        assert_eq!(token.len(), 43);
+        assert_eq!(playback.get_sidecar(&token, 2).await.as_deref(), Some("WEBVTT\n\ncue"));
+        assert!(playback.get_sidecar(&token, 1).await.is_none());
+        assert!(playback.get_sidecar("not-a-capability", 2).await.is_none());
     }
 
     #[tokio::test]

@@ -125,6 +125,8 @@ where
             request,
         )
         .await
+    } else if let crate::den::Route::Sidecar(token, track) = crate::den::route(&path) {
+        playback::sidecar(hearth, &token, track, request).await
     } else {
         resource(hearth, &opened, request).await
     };

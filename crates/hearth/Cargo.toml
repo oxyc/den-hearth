@@ -34,6 +34,7 @@ bytes.workspace = true
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 base64.workspace = true
+getrandom.workspace = true
 # The large embedded configure page is gzip-compressed once, then reused for every accepting request.
 flate2 = { workspace = true, default-features = false, features = ["rust_backend"] }
 # Bound the kernel's TCP queues as well as Rust's buffers (see sock.rs): Linux otherwise autotunes them

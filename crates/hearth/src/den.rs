@@ -51,6 +51,8 @@ pub enum Route {
     Migrate,
     /// `POST /den/_guest`: Edge's authenticated guest overlay RPC.
     Guest,
+    /// A short-lived, unguessable indexed subtitle capability.
+    Sidecar(String, usize),
     /// `/den/<config>/manifest.json`, with the config segment.
     Installed(String),
     /// `/den/<config>/playback`, with the config segment. Hearth chooses the delivery path.
@@ -78,6 +80,18 @@ pub fn route(path: &str) -> Route {
         // The page's "Test token" button: a pasted token, no config.
         "/validate" => return Route::Scout(path.to_string()),
         _ => {}
+    }
+    if let Some(rest) = path.strip_prefix("/_sidecar/") {
+        let mut parts = rest.split('/');
+        let token = parts.next().unwrap_or("");
+        let track =
+            parts.next().and_then(|value| value.strip_suffix(".vtt")).and_then(|value| value.parse().ok());
+        if !token.is_empty() && parts.next().is_none() {
+            if let Some(track) = track {
+                return Route::Sidecar(token.to_owned(), track);
+            }
+        }
+        return Route::NotFound;
     }
     // The LAN relay's check of a Reel media capability, as Reel's own: only the Den addon's validate here.
     if path.starts_with("/_internal/validate/m/s/") {
@@ -288,6 +302,7 @@ impl Den {
             }
             Route::Migrate
             | Route::Guest
+            | Route::Sidecar(_, _)
             | Route::Playback(_)
             | Route::Wanted(_)
             | Route::Scout(_)

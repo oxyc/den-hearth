@@ -154,6 +154,7 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Playback(_) => bulk(None),
             Route::Wanted(_) => bulk(None),
             Route::Guest => bulk(None),
+            Route::Sidecar(_, _) => bulk(None),
             Route::NotFound => bulk(None),
             // Up to three public-key decryptions: never consume the reserved control lane under abuse.
             Route::Migrate if *method == Method::OPTIONS => control,
