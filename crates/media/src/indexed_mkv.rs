@@ -33,7 +33,7 @@ pub enum TextCodec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cue {
     pub timestamp: u64,
-    pub duration: u64,
+    pub duration: Option<u64>,
     pub cluster: u64,
     pub relative: u64,
 }
@@ -48,6 +48,7 @@ pub struct CueTrack {
 pub struct SubtitleBlock<'a> {
     pub track: u64,
     pub relative_timestamp: i16,
+    pub duration: Option<u64>,
     pub text: &'a str,
 }
 
@@ -168,11 +169,11 @@ pub fn cue_tracks(body: &[u8], max_cues: usize) -> Option<Vec<CueTrack>> {
             let number = ebml::child(position, mkv::CUE_TRACK).map(ebml::uint)?;
             let cue = Cue {
                 timestamp,
-                duration: ebml::child(position, mkv::CUE_DURATION).map(ebml::uint)?,
+                duration: ebml::child(position, mkv::CUE_DURATION).map(ebml::uint),
                 cluster: ebml::child(position, mkv::CUE_CLUSTER_POSITION).map(ebml::uint)?,
                 relative: ebml::child(position, mkv::CUE_RELATIVE_POSITION).map(ebml::uint)?,
             };
-            if number == 0 || cue.duration == 0 {
+            if number == 0 || cue.duration == Some(0) {
                 return None;
             }
             total = total.checked_add(1)?;
@@ -204,7 +205,11 @@ pub fn frame_counts(body: &[u8]) -> Option<HashMap<u64, usize>> {
             continue;
         }
         let targets = ebml::child(tag, mkv::TARGETS)?;
-        let uid = ebml::child(targets, mkv::TARGET_TRACK_UID).map(ebml::uint)?;
+        // An empty Targets (or one naming an edition/chapter/attachment) is a valid global/non-track tag.
+        // It has no bearing on per-track statistics and must not make all subtitle tracks ineligible.
+        let Some(uid) = ebml::child(targets, mkv::TARGET_TRACK_UID).map(ebml::uint) else {
+            continue;
+        };
         if uid == 0 {
             continue;
         }
@@ -228,13 +233,13 @@ pub fn frame_counts(body: &[u8]) -> Option<HashMap<u64, usize>> {
     tags.reached_end().then_some(counts)
 }
 
-fn block_payload(buf: &[u8]) -> Option<&[u8]> {
+fn block_payload(buf: &[u8]) -> Option<(&[u8], Option<u64>)> {
     let (id, header, end) = element_extent(buf)?;
     match id {
-        mkv::SIMPLE_BLOCK => buf.get(header..end),
+        mkv::SIMPLE_BLOCK => Some((buf.get(header..end)?, None)),
         mkv::BLOCK_GROUP => {
             let group = buf.get(header..end)?;
-            ebml::child(group, mkv::BLOCK)
+            Some((ebml::child(group, mkv::BLOCK)?, ebml::child(group, mkv::BLOCK_DURATION).map(ebml::uint)))
         }
         _ => None,
     }
@@ -242,7 +247,7 @@ fn block_payload(buf: &[u8]) -> Option<&[u8]> {
 
 /// Decodes one uncompressed, unlaced subtitle block at a CueRelativePosition.
 pub fn subtitle_block(buf: &[u8]) -> Option<SubtitleBlock<'_>> {
-    let block = block_payload(buf)?;
+    let (block, duration) = block_payload(buf)?;
     let first = *block.first()?;
     let width = first.leading_zeros() as usize + 1;
     if width > 8 || block.len() < width + 3 {
@@ -259,7 +264,7 @@ pub fn subtitle_block(buf: &[u8]) -> Option<SubtitleBlock<'_>> {
         return None;
     }
     let text = std::str::from_utf8(&block[width + 3..]).ok()?;
-    Some(SubtitleBlock { track, relative_timestamp: timestamp, text })
+    Some(SubtitleBlock { track, relative_timestamp: timestamp, duration, text })
 }
 
 #[cfg(test)]
@@ -276,10 +281,31 @@ mod tests {
         let mut block = e(&[0xA3], &[0x81, 0, 2, 0, b'H', b'i']);
         assert_eq!(
             subtitle_block(&block),
-            Some(SubtitleBlock { track: 1, relative_timestamp: 2, text: "Hi" })
+            Some(SubtitleBlock { track: 1, relative_timestamp: 2, duration: None, text: "Hi" })
         );
         block[5] = 0x02;
         assert_eq!(subtitle_block(&block), None);
+    }
+
+    #[test]
+    fn a_block_group_carries_the_duration_when_the_cue_does_not() {
+        let block = e(&[0xA1], &[0x81, 0, 2, 0, b'H', b'i']);
+        let duration = e(&[0x9B], &[42]);
+        let group = e(&[0xA0], &[block, duration].concat());
+        assert_eq!(
+            subtitle_block(&group),
+            Some(SubtitleBlock { track: 1, relative_timestamp: 2, duration: Some(42), text: "Hi" })
+        );
+    }
+
+    #[test]
+    fn global_tags_do_not_hide_valid_track_statistics() {
+        let global = e(&[0x73, 0x73], &e(&[0x63, 0xC0], &[]));
+        let targets = e(&[0x63, 0xC0], &e(&[0x63, 0xC5], &[9]));
+        let simple =
+            e(&[0x67, 0xC8], &[e(&[0x45, 0xA3], b"NUMBER_OF_FRAMES"), e(&[0x44, 0x87], b"2")].concat());
+        let track = e(&[0x73, 0x73], &[targets, simple].concat());
+        assert_eq!(frame_counts(&[global, track].concat()), Some(HashMap::from([(9, 2)])));
     }
 
     #[test]

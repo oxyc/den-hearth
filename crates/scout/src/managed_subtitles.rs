@@ -13,6 +13,8 @@ use den_media::indexed_mp4;
 use den_media::mkv;
 use den_upstream::{ClientProfile, Guard, Redirect};
 
+use crate::loglimit::log_limited;
+
 const HEAD_BYTES: u64 = 64 * 1024;
 const MAX_ELEMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -232,7 +234,7 @@ async fn block(
     track_number: u64,
     codec: TextCodec,
     cue: Cue,
-) -> Option<(Cue, String)> {
+) -> Option<(Cue, u64, String)> {
     let cluster_at = segment.checked_add(cue.cluster)?;
     let cluster_head = reader.range(cluster_at, 16).await?.0;
     let (cluster_id, _, cluster_header) = den_media::ebml::header(&cluster_head)?;
@@ -257,13 +259,15 @@ async fn block(
             if decoded.track != track_number {
                 return None;
             }
-            return Some((cue, clean_text(decoded.text, codec)?));
+            let duration = cue.duration.or(decoded.duration).filter(|duration| *duration > 0)?;
+            return Some((cue, duration, clean_text(decoded.text, codec)?));
         }
     };
     if decoded.track != track_number {
         return None;
     }
-    Some((cue, clean_text(decoded.text, codec)?))
+    let duration = cue.duration.or(decoded.duration).filter(|duration| *duration > 0)?;
+    Some((cue, duration, clean_text(decoded.text, codec)?))
 }
 
 async fn extract(
@@ -284,8 +288,8 @@ async fn extract(
     let rows = stream::iter(requests).buffered(PARALLEL_BLOCKS).collect::<Vec<_>>().await;
     let mut vtt = String::from("WEBVTT\n\n");
     for row in rows {
-        let (cue, text) = row?;
-        let end = cue.timestamp.checked_add(cue.duration)?;
+        let (cue, duration, text) = row?;
+        let end = cue.timestamp.checked_add(duration)?;
         vtt.push_str(&timestamp(cue.timestamp, scale)?);
         vtt.push_str(" --> ");
         vtt.push_str(&timestamp(end, scale)?);
@@ -375,12 +379,15 @@ async fn extract_mp4_track(reader: &Reader, total: u64, track: indexed_mp4::Text
     (vtt.len() > "WEBVTT\n\n".len()).then_some(Sidecar { ordinal: track.ordinal as i64, vtt })
 }
 
-async fn mp4_sidecars(reader: &Reader) -> Vec<Sidecar> {
+async fn mp4_sidecars(reader: &Reader, selected: Option<i64>) -> Vec<Sidecar> {
     let Some(total) = total_hint(reader).await else { return Vec::new() };
     let Some(moov) = mp4_moov(reader, total).await else { return Vec::new() };
     let Some(tracks) = indexed_mp4::text_tracks(&moov, MAX_CUES_PER_TRACK) else { return Vec::new() };
     let mut output = Vec::new();
     for track in tracks {
+        if selected.is_some_and(|ordinal| ordinal != track.ordinal as i64) {
+            continue;
+        }
         if let Some(sidecar) = extract_mp4_track(reader, total, track).await {
             output.push(sidecar);
         }
@@ -388,13 +395,17 @@ async fn mp4_sidecars(reader: &Reader) -> Vec<Sidecar> {
     output
 }
 
-/// Returns only tracks whose complete frame count can be proven. Any failure quietly preserves TorBox burn-in.
-pub(crate) async fn sidecars(raw_url: &str) -> Vec<Sidecar> {
+/// Returns only tracks whose complete frame count can be proven. Any failure preserves TorBox burn-in and emits
+/// bounded, credential-free diagnostics describing whether eligibility or the deadline stopped extraction.
+pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sidecar> {
     let Some(reader) = Reader::new(raw_url) else { return Vec::new() };
-    tokio::time::timeout(DEADLINE, async {
+    let result = tokio::time::timeout(DEADLINE, async {
         if let Some((total, segment, scale, tracks, cue_tracks, counts)) = index(&reader).await {
             let mut output = Vec::new();
             for track in &tracks {
+                if selected.is_some_and(|ordinal| ordinal != track.ordinal as i64) {
+                    continue;
+                }
                 let Some(cues) = cue_tracks.iter().find(|cues| cues.number == track.number) else { continue };
                 if counts.get(&track.uid).copied() != Some(cues.cues.len()) {
                     continue;
@@ -407,10 +418,35 @@ pub(crate) async fn sidecars(raw_url: &str) -> Vec<Sidecar> {
                 return output;
             }
         }
-        mp4_sidecars(&reader).await
+        mp4_sidecars(&reader, selected).await
     })
-    .await
-    .unwrap_or_default()
+    .await;
+    let requests = reader.requests.load(Relaxed);
+    let bytes = reader.bytes.load(Relaxed);
+    match result {
+        Ok(sidecars) => {
+            if sidecars.is_empty() {
+                log_limited(
+                    &format!("managed-subtitle-sidecar-ineligible-{}", selected.unwrap_or(-1)),
+                    &format!(
+                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible selected={} requests={requests} reserved_bytes={bytes}",
+                        selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
+                    ),
+                );
+            }
+            sidecars
+        }
+        Err(_) => {
+            log_limited(
+                &format!("managed-subtitle-sidecar-timeout-{}", selected.unwrap_or(-1)),
+                &format!(
+                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout selected={} requests={requests} reserved_bytes={bytes}",
+                    selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
+                ),
+            );
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
