@@ -349,9 +349,18 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
     };
     match (channels, spec.audio_out.aac_bitrate()) {
         (Some(ac), Some(rate)) => {
-            // Cut where the pictures are: the padded seek read the audio from as far back.
-            if let Some(t) = trim {
-                a.extend(["-af".to_string(), format!("atrim=start={t:.6}")]);
+            match trim {
+                // Cut where the pictures are: the padded seek read the audio from as far back.
+                Some(t) => a.extend(["-af".to_string(), format!("atrim=start={t:.6}")]),
+                // The AAC encoder primes itself with one frame, 1024 samples, which it timestamps that far before the
+                // first sample it is given. From the start of the file that is before 0: a negative tfdt, which the
+                // unsigned field cannot hold and a browser reads as 0, landing the first fragment's audio a frame late
+                // over the next one's. Handing the encoder the audio from its 1025th sample puts the priming frame
+                // where the audio starts instead. Every sample after it keeps its own timestamp, so the audio is
+                // where it was against the pictures; the first 21 ms (at 48 kHz) are the priming frame's silence.
+                // A run from a seek starts past 0 and is left as it is.
+                None if spec.seek.is_none() => a.extend(s(&["-af", "atrim=start_sample=1024"])),
+                None => {}
             }
             a.extend(s(&["-c:a", "aac", "-ac", ac, "-b:a", &format!("{}k", rate / 1000)]));
         }
@@ -960,7 +969,12 @@ mod tests {
         // From the first keyframe there is nothing to cut, and the encode's first picture is a keyframe of its own.
         let first = Spec { seek: None, video: video(false, 0.021), ..near };
         let joined = args(&first, None).join(" ");
-        assert!(!joined.contains("trim") && joined.contains("-force_key_frames 6.001,12.001,18.001,24.001 "));
+        assert!(
+            !joined.contains("trim=start=")
+                && joined.contains("-force_key_frames 6.001,12.001,18.001,24.001 ")
+        );
+        // Only the encoder's priming is cut from its audio.
+        assert!(joined.contains("-af atrim=start_sample=1024 -c:a aac"), "{joined}");
         // From the last, there is none to force.
         let last = Spec { seek: grid_seek(24.021), video: video(false, 24.021), ..first };
         assert!(!args(&last, None).join(" ").contains("-force_key_frames"));
@@ -1148,6 +1162,10 @@ mod tests {
         };
         let a = args(&spec, None);
         assert!(!a.iter().any(|x| x == "-ss" || x == "-reconnect" || x == "-tls_verify" || x == "-tag:v"));
+        // The encoder's priming frame goes where the audio starts, not before 0; a run from a seek needs no cut.
+        assert!(a.join(" ").contains("-af atrim=start_sample=1024 -c:a aac"), "{a:?}");
+        let seeking = args(&Spec { seek: seek_for(12.0), ..spec }, None);
+        assert!(!seeking.iter().any(|x| x == "-af"), "{seeking:?}");
     }
 
     #[test]
@@ -1188,7 +1206,10 @@ mod tests {
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
-        assert!(joined.contains("-c:v copy -tag:v dvh1 -strict unofficial -c:a aac"), "{joined}");
+        assert!(
+            joined.contains("-c:v copy -tag:v dvh1 -strict unofficial -af atrim=start_sample=1024 -c:a aac"),
+            "{joined}"
+        );
         assert!(!joined.contains("-bsf"), "the RPU stays: {joined}");
     }
 
