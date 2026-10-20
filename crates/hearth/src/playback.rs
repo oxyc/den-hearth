@@ -381,7 +381,7 @@ fn owner_scope(hearth: &Hearth, parts: &hyper::http::request::Parts) -> String {
 
 /// The request Remux may be handed, and the two delivery flags that stay here: `directFailed` (skip the managed
 /// stream) and `directOnly` (the managed stream or a refusal, never a Remux session in its place).
-fn validate_request(mut value: Value) -> Result<(Value, bool, bool), ()> {
+fn validate_request(mut value: Value) -> Result<(Value, bool, bool, Option<i64>), ()> {
     let object = value.as_object_mut().ok_or(())?;
     let direct_failed = match object.remove("directFailed") {
         None => false,
@@ -396,17 +396,25 @@ fn validate_request(mut value: Value) -> Result<(Value, bool, bool), ()> {
     if direct_failed && direct_only {
         return Err(());
     }
+    let subtitle = match object.remove("subtitleTrack") {
+        None => None,
+        Some(Value::Number(value)) => Some(value.as_i64().filter(|index| *index >= 0).ok_or(())?),
+        Some(_) => return Err(()),
+    };
     let request: den_remux::PlaybackRequest = serde_json::from_value(value).map_err(|_| ())?;
     request.validate().map_err(|_| ())?;
     let request = serde_json::to_value(request).map_err(|_| ())?;
-    Ok((request, direct_failed, direct_only))
+    Ok((request, direct_failed, direct_only, subtitle))
 }
 
 fn install_url(config: &str) -> String {
     format!("{DEN_ADDON_BASE}/{config}")
 }
 
-fn managed_request(request: &Value) -> Option<den_scout::managed_hls::ManagedHlsRequest> {
+fn managed_request(
+    request: &Value,
+    subtitle: Option<i64>,
+) -> Option<den_scout::managed_hls::ManagedHlsRequest> {
     let object = request.as_object()?;
     // TorBox v1 intentionally uses its default audio and has no Remux session to replace. Preserve explicit
     // track and replacement behavior by sending those requests to Remux. `transcode: "never"` is not one of them:
@@ -437,10 +445,32 @@ fn managed_request(request: &Value) -> Option<den_scout::managed_hls::ManagedHls
         filename,
         playable,
         receiver: object.get("player").and_then(Value::as_str) == Some("cast"),
+        subtitle,
     })
 }
 
 fn direct_response(result: den_scout::managed_hls::ManagedHlsResult, prepare_ms: u64) -> Response<Body> {
+    let subtitles = result
+        .subtitles
+        .iter()
+        .map(|track| {
+            let language =
+                track.language.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("und");
+            let name =
+                track.name.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or(language);
+            let mut details = vec!["Built-in".to_owned()];
+            if let Some(codec) = track.codec.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                details.push(codec.to_uppercase());
+            }
+            json!({
+                "value": format!("torbox:{}", track.index),
+                "language": language,
+                "name": name,
+                "description": details.join(" · "),
+                "torboxTrack": track.index,
+            })
+        })
+        .collect::<Vec<_>>();
     let mut response = den_http::json(
         StatusCode::OK,
         &json!({
@@ -450,6 +480,8 @@ fn direct_response(result: den_scout::managed_hls::ManagedHlsResult, prepare_ms:
                 "filename": result.release.filename,
                 "size": result.release.size,
             },
+            "subtitles": subtitles,
+            "torboxSubtitle": result.selected_subtitle,
         }),
         &[("cache-control", "no-store")],
     );
@@ -794,10 +826,11 @@ where
         Some(parsed) => parsed,
         None => return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref()),
     };
-    let (request, direct_failed, direct_only) = parsed;
+    let (request, direct_failed, direct_only, subtitle_track) = parsed;
     let canonical = Bytes::from(
         serde_json::to_vec(
-            &json!({"request": request, "directFailed": direct_failed, "directOnly": direct_only}),
+            &json!({"request": request, "directFailed": direct_failed, "directOnly": direct_only,
+                    "subtitleTrack": subtitle_track}),
         )
         .unwrap(),
     );
@@ -880,7 +913,7 @@ where
     let finalization_protocol = edge_managed
         && parts.headers.get(FINALIZATION_PROTOCOL_HEADER).is_some_and(|value| value.as_bytes() == b"1");
     let managed = edge_managed && direct_config.is_some() && !direct_failed;
-    let direct = managed_request(&request);
+    let direct = managed_request(&request, subtitle_track);
     // Kept outside the bounded future so a completed direct attempt is still available when Remux consumes the
     // rest of the overall deadline and the future is cancelled by the outer timeout.
     let mut direct_failure = None;
@@ -993,12 +1026,17 @@ mod tests {
 
     #[test]
     fn request_fields_are_closed_and_direct_failed_is_not_forwarded() {
-        let (value, failed, only) = validate_request(json!({"imdb": "tt1", "directFailed": true})).unwrap();
+        let (value, failed, only, subtitle) =
+            validate_request(json!({"imdb": "tt1", "directFailed": true})).unwrap();
         assert!(failed && !only);
+        assert_eq!(subtitle, None);
         assert_eq!(value, json!({"imdb": "tt1"}));
-        let (value, failed, only) = validate_request(json!({"imdb": "tt1", "directOnly": true})).unwrap();
+        let (value, failed, only, subtitle) =
+            validate_request(json!({"imdb": "tt1", "directOnly": true, "subtitleTrack": 3})).unwrap();
         assert!(only && !failed);
+        assert_eq!(subtitle, Some(3));
         assert_eq!(value, json!({"imdb": "tt1"}), "directOnly is not forwarded to Remux");
+        assert_eq!(managed_request(&value, subtitle).unwrap().subtitle, Some(3));
         assert!(validate_request(json!({"imdb": "tt1", "directOnly": "yes"})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "directOnly": true, "directFailed": true})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "scout": "https://secret"})).is_err());
@@ -1006,6 +1044,7 @@ mod tests {
         assert!(validate_request(json!({"imdb": "tt1", "future": true})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "startAt": -1})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "maxBitrate": 0})).is_err());
+        assert!(validate_request(json!({"imdb": "tt1", "subtitleTrack": -1})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "season": 1})).is_err());
     }
 
