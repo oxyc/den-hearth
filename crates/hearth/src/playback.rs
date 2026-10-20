@@ -43,7 +43,10 @@ const REPLAY_FOR: Duration = Duration::from_secs(120);
 // Existing Remux may spend 60 s resolving, 30 s choosing and 20 s opening an already-started candidate. This
 // outer bound stops abandoned work without shortening that retained path.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
-const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
+// Indexed subtitle extraction is deliberately bounded at 30 seconds. Keep the enclosing managed attempt wider
+// than that deadline so it can return the completed sidecar (or create TorBox's burn-in fallback) instead of
+// cancelling the extractor at ten seconds and turning an otherwise healthy direct stream into a 409.
+const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(45);
 // Match the shared outbound HTTP ceiling: an upstream cannot ask the browser to stop trying for a day.
 const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 const FINALIZE_HEADER: &str = "x-den-playback-finalize";
@@ -540,9 +543,7 @@ async fn direct_response(
             if let Some(codec) = track.codec.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
                 details.push(codec.to_uppercase());
             }
-            let has_sidecar = sidecar_token.is_some()
-                && sidecar_indexes.contains(&track.index)
-                && result.selected_subtitle != Some(track.index);
+            let has_sidecar = sidecar_token.is_some() && sidecar_indexes.contains(&track.index);
             json!({
                 "value": if has_sidecar { format!("torbox-sidecar:{}", track.index) } else { format!("torbox:{}", track.index) },
                 "language": language,
