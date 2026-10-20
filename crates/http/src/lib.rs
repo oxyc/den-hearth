@@ -11,6 +11,7 @@
 
 mod auth;
 mod conditional;
+mod range;
 mod response;
 mod text;
 
@@ -21,6 +22,7 @@ pub mod prom;
 pub use auth::{bearer_matches, metrics_authorized};
 pub use conditional::{apply_conditional, etag_of, if_none_match_matches, if_range_holds, stable_hash};
 pub use local::Local;
+pub use range::{parse_range, RangeReq};
 pub use response::{
     add_timing, cors_stamp, degraded, error, full, html, json, not_found, preflight, timed, timing,
     with_total_timing, Body, StaticBody, SERVER_TIMING, X_DEN_DEGRADED,
