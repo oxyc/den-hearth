@@ -73,11 +73,14 @@ impl Reader {
         if self.requests.fetch_add(1, Relaxed) >= MAX_REQUESTS {
             return None;
         }
-        self.bytes
-            .fetch_update(Relaxed, Relaxed, |used| {
-                used.checked_add(len).filter(|total| *total <= MAX_INDEX_BYTES)
-            })
-            .ok()?;
+        let mut used = self.bytes.load(Relaxed);
+        loop {
+            let reserved = used.checked_add(len).filter(|total| *total <= MAX_INDEX_BYTES)?;
+            match self.bytes.compare_exchange_weak(used, reserved, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
         let end = start.checked_add(u64::try_from(len).ok()?)?.checked_sub(1)?;
         let response = self
             .client
