@@ -231,7 +231,9 @@ impl TorBoxManagedHls {
         let subtitle_slot = self.subtitle_slots.clone().try_acquire_owned().ok();
         let extract = async move {
             match (direct_file, subtitle_slot) {
-                (Some(direct_file), Some(_slot)) => crate::managed_subtitles::sidecars(&direct_file).await,
+                (Some(direct_file), Some(_slot)) => {
+                    crate::managed_subtitles::sidecars(&direct_file, subtitle).await
+                }
                 (None, _) => Vec::new(),
                 _ => Vec::new(),
             }
