@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt};
-use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, RANGE};
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 
 use den_media::indexed_mkv::{self, Cue, TextCodec, TextTrack};
 use den_media::indexed_mp4;
@@ -24,6 +24,8 @@ const BLOCK_PREFIX_BYTES: usize = 4096;
 const MAX_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_VTT_BYTES: usize = 2 * 1024 * 1024;
 const PARALLEL_BLOCKS: usize = 32;
+const MULTI_RANGE_PARTS: usize = 32;
+const MULTI_RANGE_OVERHEAD: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +118,64 @@ impl Reader {
         Some((body.to_vec(), total))
     }
 
+    async fn ranges(&self, ranges: &[(u64, usize)]) -> Option<(Vec<Vec<u8>>, u64)> {
+        if ranges.is_empty() || ranges.len() > MULTI_RANGE_PARTS {
+            return None;
+        }
+        if ranges.len() == 1 {
+            let (bytes, total) = self.range(ranges[0].0, ranges[0].1).await?;
+            return Some((vec![bytes], total));
+        }
+        let requested = ranges.iter().try_fold(0usize, |sum, (_, len)| {
+            (*len > 0 && *len <= MAX_ELEMENT_BYTES).then_some(())?;
+            sum.checked_add(*len)
+        })?;
+        if self.requests.fetch_add(1, Relaxed) >= MAX_REQUESTS {
+            return None;
+        }
+        let mut used = self.bytes.load(Relaxed);
+        loop {
+            let reserved = used.checked_add(requested).filter(|total| *total <= MAX_INDEX_BYTES)?;
+            match self.bytes.compare_exchange_weak(used, reserved, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
+        let mut value = String::from("bytes=");
+        for (index, (start, len)) in ranges.iter().enumerate() {
+            let end = start.checked_add(u64::try_from(*len).ok()?)?.checked_sub(1)?;
+            if index > 0 {
+                value.push(',');
+            }
+            use std::fmt::Write as _;
+            write!(&mut value, "{start}-{end}").ok()?;
+        }
+        let response = self
+            .client
+            .get(self.url.clone())
+            .header(ACCEPT_ENCODING, "identity")
+            .header(RANGE, value)
+            .send()
+            .await
+            .ok()?;
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT || response.url() != &self.url {
+            return None;
+        }
+        if response.headers().get(CONTENT_ENCODING).is_some_and(|value| value.as_bytes() != b"identity") {
+            return None;
+        }
+        let boundary = multipart_boundary(response.headers().get(CONTENT_TYPE)?.to_str().ok()?)?;
+        let cap = requested.checked_add(MULTI_RANGE_OVERHEAD)?;
+        if response.content_length().is_none_or(|length| length > cap as u64) {
+            return None;
+        }
+        let body = response.bytes().await.ok()?;
+        if body.len() > cap {
+            return None;
+        }
+        parse_multipart_ranges(&body, &boundary, ranges)
+    }
+
     async fn element(&self, at: u64, max: usize) -> Option<(u32, Vec<u8>)> {
         let (head, total) = self.range(at, 16).await?;
         let (id, size, header) = den_media::ebml::header(&head)?;
@@ -140,12 +200,93 @@ fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {
     (parsed.0 <= parsed.1 && parsed.1 < parsed.2).then_some(parsed)
 }
 
+fn multipart_boundary(raw: &str) -> Option<Vec<u8>> {
+    let mut fields = raw.split(';');
+    if !fields.next()?.trim().eq_ignore_ascii_case("multipart/byteranges") {
+        return None;
+    }
+    let value = fields.find_map(|field| {
+        let (name, value) = field.trim().split_once('=')?;
+        name.trim().eq_ignore_ascii_case("boundary").then_some(value.trim())
+    })?;
+    let value = value.strip_prefix('"').and_then(|value| value.strip_suffix('"')).unwrap_or(value);
+    (1..=70)
+        .contains(&value.len())
+        .then_some(())
+        .filter(|_| value.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\')))?;
+    Some(value.as_bytes().to_vec())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty()).then_some(())?;
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn parse_multipart_ranges(
+    body: &[u8],
+    boundary: &[u8],
+    requested: &[(u64, usize)],
+) -> Option<(Vec<Vec<u8>>, u64)> {
+    let mut marker = Vec::with_capacity(boundary.len() + 4);
+    marker.extend_from_slice(b"--");
+    marker.extend_from_slice(boundary);
+    let mut cursor = 0usize;
+    let mut total = None;
+    let mut output = vec![None; requested.len()];
+    for _ in 0..requested.len() {
+        if cursor == 0 {
+            body.get(..marker.len()).filter(|value| *value == marker.as_slice())?;
+            cursor = marker.len();
+        } else {
+            let mut next = Vec::with_capacity(marker.len() + 2);
+            next.extend_from_slice(b"\r\n");
+            next.extend_from_slice(&marker);
+            let at = find_bytes(body.get(cursor..)?, &next)?;
+            cursor = cursor.checked_add(at)?.checked_add(next.len())?;
+        }
+        body.get(cursor..cursor + 2).filter(|value| *value == b"\r\n")?;
+        cursor += 2;
+        let headers_end = find_bytes(body.get(cursor..)?, b"\r\n\r\n")?;
+        if headers_end > 4096 {
+            return None;
+        }
+        let headers = std::str::from_utf8(body.get(cursor..cursor + headers_end)?).ok()?;
+        let content_range = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("content-range").then_some(value.trim())
+        })?;
+        let (start, end, part_total) = parse_content_range(content_range)?;
+        if total.replace(part_total).is_some_and(|value| value != part_total) {
+            return None;
+        }
+        cursor = cursor.checked_add(headers_end)?.checked_add(4)?;
+        let len = usize::try_from(end.checked_sub(start)?.checked_add(1)?).ok()?;
+        let index = requested
+            .iter()
+            .position(|(wanted_start, wanted_len)| *wanted_start == start && *wanted_len == len)?;
+        if output[index].is_some() {
+            return None;
+        }
+        output[index] = Some(body.get(cursor..cursor.checked_add(len)?)?.to_vec());
+        cursor = cursor.checked_add(len)?;
+    }
+    let mut closing = Vec::with_capacity(marker.len() + 6);
+    closing.extend_from_slice(b"\r\n");
+    closing.extend_from_slice(&marker);
+    closing.extend_from_slice(b"--");
+    body.get(cursor..cursor + closing.len()).filter(|value| *value == closing.as_slice())?;
+    let values = output.into_iter().collect::<Option<Vec<_>>>()?;
+    Some((values, total?))
+}
+
 async fn index(
     reader: &Reader,
 ) -> Option<(u64, u64, u64, Vec<TextTrack>, Vec<indexed_mkv::CueTrack>, std::collections::HashMap<u64, usize>)>
 {
-    let (head, total) =
-        reader.range(0, usize::try_from(HEAD_BYTES.min(total_hint(reader).await?)).ok()?).await?;
+    // A one-byte range is not a reliable length probe on every TorBox CDN path: some valid large objects have
+    // answered `bytes 0-0/1`. Reading the actual bounded header both proves range support and supplies the
+    // object length without allowing that response quirk to make an MKV look like a one-byte file.
+    let (head, total) = reader.range(0, HEAD_BYTES as usize).await?;
     let mut index = indexed_mkv::segment_index(&head)?;
     if let Some(next) = index.elements.get(&mkv::SEEK_HEAD).copied().filter(|at| *at >= HEAD_BYTES) {
         let (id, body) = reader.element(next, 1024 * 1024).await?;
@@ -169,11 +310,6 @@ async fn index(
     let cues = indexed_mkv::cue_tracks(&cues, tracks.len().checked_mul(MAX_CUES_PER_TRACK)?)?;
     let counts = indexed_mkv::frame_counts(&tags)?;
     Some((total, index.payload_at, scale, tracks, cues, counts))
-}
-
-// One-byte range first: unlike HEAD it proves range support and tells us the exact object length.
-async fn total_hint(reader: &Reader) -> Option<u64> {
-    reader.range(0, 1).await.map(|(_, total)| total)
 }
 
 fn clean_text(value: &str, codec: TextCodec) -> Option<String> {
@@ -233,47 +369,49 @@ fn cluster_block_position(segment: u64, cluster: u64, cluster_header: usize, rel
     segment.checked_add(cluster)?.checked_add(u64::try_from(cluster_header).ok()?)?.checked_add(relative)
 }
 
-async fn block(
-    reader: Reader,
-    segment: u64,
-    total: u64,
-    track_number: u64,
-    codec: TextCodec,
-    cue: Cue,
-) -> Option<(Cue, u64, String)> {
-    let cluster_at = segment.checked_add(cue.cluster)?;
-    let cluster_head = reader.range(cluster_at, 16).await?.0;
-    let (cluster_id, _, cluster_header) = den_media::ebml::header(&cluster_head)?;
-    if cluster_id != mkv::CLUSTER {
-        return None;
+async fn read_many(reader: &Reader, ranges: &[(u64, usize)]) -> Option<Vec<Vec<u8>>> {
+    if ranges.is_empty() {
+        return Some(Vec::new());
     }
-    // CueRelativePosition's zero is the first possible child in the Cluster, after its EBML header.
-    let at = cluster_block_position(segment, cue.cluster, cluster_header, cue.relative)?;
-    let remaining = usize::try_from(total.checked_sub(at)?).ok()?;
-    let first_len = remaining.min(BLOCK_PREFIX_BYTES);
-    let first = reader.range(at, first_len).await?.0;
-    let decoded = match indexed_mkv::subtitle_block(&first) {
-        Some(block) => block,
-        None => {
-            let (_, size, header) = den_media::ebml::header(&first)?;
-            let whole = header.checked_add(usize::try_from(size?).ok()?)?;
-            if whole <= first.len() || whole > MAX_BLOCK_BYTES || whole > remaining {
-                return None;
-            }
-            let exact = reader.range(at, whole).await?.0;
-            let decoded = indexed_mkv::subtitle_block(&exact)?;
-            if decoded.track != track_number {
-                return None;
-            }
-            let duration = cue.duration.or(decoded.duration).filter(|duration| *duration > 0)?;
-            return Some((cue, duration, clean_text(decoded.text, codec)?));
+    // A server may merge duplicate byte ranges into one multipart section. Deduplicate before asking, then
+    // restore the caller's order; repeated Cluster positions are common in Matroska cues.
+    let mut unique = Vec::with_capacity(ranges.len());
+    let mut order = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let index = unique.iter().position(|candidate| candidate == range).unwrap_or_else(|| {
+            unique.push(*range);
+            unique.len() - 1
+        });
+        order.push(index);
+    }
+    let batches = unique.chunks(MULTI_RANGE_PARTS).map(<[_]>::to_vec).collect::<Vec<_>>();
+    let first = reader.ranges(&batches[0]).await;
+    let unique_values = if let Some((first, _)) = first {
+        let reads = batches.into_iter().skip(1).map(|batch| {
+            let reader = reader.clone();
+            async move { reader.ranges(&batch).await.map(|value| value.0) }
+        });
+        let rows = stream::iter(reads).buffered(PARALLEL_BLOCKS).collect::<Vec<_>>().await;
+        let mut values = first;
+        for row in rows {
+            values.extend(row?);
         }
+        values
+    } else {
+        // Multiple ranges are optional in HTTP. Keep correctness on a CDN that supports only a single range,
+        // with the same global concurrency bound as the original extractor.
+        let reads = unique.into_iter().map(|(start, len)| {
+            let reader = reader.clone();
+            async move { reader.range(start, len).await.map(|value| value.0) }
+        });
+        stream::iter(reads)
+            .buffered(PARALLEL_BLOCKS)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Option<Vec<_>>>()?
     };
-    if decoded.track != track_number {
-        return None;
-    }
-    let duration = cue.duration.or(decoded.duration).filter(|duration| *duration > 0)?;
-    Some((cue, duration, clean_text(decoded.text, codec)?))
+    order.into_iter().map(|index| unique_values.get(index).cloned()).collect()
 }
 
 async fn extract(
@@ -287,11 +425,53 @@ async fn extract(
     if cues.is_empty() || cues.len() > MAX_CUES_PER_TRACK {
         return None;
     }
-    let requests = cues
+    let cluster_ranges =
+        cues.iter().map(|cue| Some((segment.checked_add(cue.cluster)?, 16))).collect::<Option<Vec<_>>>()?;
+    let cluster_heads = read_many(reader, &cluster_ranges).await?;
+    let block_ranges = cues
+        .iter()
+        .zip(cluster_heads)
+        .map(|(cue, head)| {
+            let (cluster_id, _, cluster_header) = den_media::ebml::header(&head)?;
+            if cluster_id != mkv::CLUSTER {
+                return None;
+            }
+            let at = cluster_block_position(segment, cue.cluster, cluster_header, cue.relative)?;
+            let remaining = usize::try_from(total.checked_sub(at)?).ok()?;
+            Some((at, remaining.min(BLOCK_PREFIX_BYTES)))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let prefixes = read_many(reader, &block_ranges).await?;
+    let decode = cues
         .into_iter()
-        .map(|cue| block(reader.clone(), segment, total, track.number, track.codec, cue))
+        .zip(block_ranges)
+        .zip(prefixes)
+        .map(|((cue, (at, _)), first)| {
+            let reader = reader.clone();
+            async move {
+                let (decoded_track, decoded_duration, text) = match indexed_mkv::subtitle_block(&first) {
+                    Some(block) => (block.track, block.duration, clean_text(block.text, track.codec)?),
+                    None => {
+                        let (_, size, header) = den_media::ebml::header(&first)?;
+                        let whole = header.checked_add(usize::try_from(size?).ok()?)?;
+                        let remaining = usize::try_from(total.checked_sub(at)?).ok()?;
+                        if whole <= first.len() || whole > MAX_BLOCK_BYTES || whole > remaining {
+                            return None;
+                        }
+                        let exact = reader.range(at, whole).await?.0;
+                        let block = indexed_mkv::subtitle_block(&exact)?;
+                        (block.track, block.duration, clean_text(block.text, track.codec)?)
+                    }
+                };
+                if decoded_track != track.number {
+                    return None;
+                }
+                let duration = cue.duration.or(decoded_duration).filter(|duration| *duration > 0)?;
+                Some((cue, duration, text))
+            }
+        })
         .collect::<Vec<_>>();
-    let rows = stream::iter(requests).buffered(PARALLEL_BLOCKS).collect::<Vec<_>>().await;
+    let rows = stream::iter(decode).buffered(PARALLEL_BLOCKS).collect::<Vec<_>>().await;
     let mut vtt = String::from("WEBVTT\n\n");
     for row in rows {
         let (cue, duration, text) = row?;
@@ -338,36 +518,25 @@ async fn mp4_moov(reader: &Reader, total: u64) -> Option<Vec<u8>> {
 }
 
 async fn extract_mp4_track(reader: &Reader, total: u64, track: indexed_mp4::TextTrack) -> Option<Sidecar> {
-    let reads = track
+    let ranges = track
         .samples
         .iter()
+        .filter(|sample| sample.size > 0)
         .map(|sample| {
-            let reader = reader.clone();
-            let sample = sample.clone();
-            async move {
-                if sample.size as usize > MAX_BLOCK_BYTES
-                    || sample.offset.checked_add(u64::from(sample.size))? > total
-                {
-                    return None;
-                }
-                let bytes = if sample.size == 0 {
-                    Vec::new()
-                } else {
-                    reader.range(sample.offset, sample.size as usize).await?.0
-                };
-                let text = if bytes.is_empty() {
-                    String::new()
-                } else {
-                    clean_text(&indexed_mp4::sample_text(track.codec, &bytes)?, TextCodec::Plain)?
-                };
-                Some((sample, text))
-            }
+            ((sample.size as usize) <= MAX_BLOCK_BYTES
+                && sample.offset.checked_add(u64::from(sample.size)).is_some_and(|end| end <= total))
+            .then_some((sample.offset, sample.size as usize))
         })
-        .collect::<Vec<_>>();
-    let rows = stream::iter(reads).buffered(PARALLEL_BLOCKS).collect::<Vec<_>>().await;
+        .collect::<Option<Vec<_>>>()?;
+    let mut reads = read_many(reader, &ranges).await?.into_iter();
     let mut vtt = String::from("WEBVTT\n\n");
-    for row in rows {
-        let (sample, text) = row?;
+    for sample in &track.samples {
+        let bytes = if sample.size == 0 { Vec::new() } else { reads.next()? };
+        let text = if bytes.is_empty() {
+            String::new()
+        } else {
+            clean_text(&indexed_mp4::sample_text(track.codec, &bytes)?, TextCodec::Plain)?
+        };
         if text.is_empty() {
             continue;
         }
@@ -386,7 +555,7 @@ async fn extract_mp4_track(reader: &Reader, total: u64, track: indexed_mp4::Text
 }
 
 async fn mp4_sidecars(reader: &Reader, selected: Option<i64>) -> Vec<Sidecar> {
-    let Some(total) = total_hint(reader).await else { return Vec::new() };
+    let Some((_, total)) = reader.range(0, HEAD_BYTES as usize).await else { return Vec::new() };
     let Some(moov) = mp4_moov(reader, total).await else { return Vec::new() };
     let Some(tracks) = indexed_mp4::text_tracks(&moov, MAX_CUES_PER_TRACK) else { return Vec::new() };
     let mut output = Vec::new();
@@ -451,6 +620,15 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
                         selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
                     ),
                 );
+            } else {
+                log_limited(
+                    &format!("managed-subtitle-sidecar-ready-{}", selected.unwrap_or(-1)),
+                    &format!(
+                        "managed HLS: indexed subtitle sidecar ready: selected={} tracks={} requests={requests} reserved_bytes={bytes}",
+                        selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
+                        sidecars.len()
+                    ),
+                );
             }
             sidecars
         }
@@ -476,6 +654,32 @@ mod tests {
         assert_eq!(parse_content_range("bytes 4-9/10"), Some((4, 9, 10)));
         assert_eq!(parse_content_range("bytes 9-4/10"), None);
         assert_eq!(parse_content_range("bytes 0-9/*"), None);
+    }
+
+    #[test]
+    fn multipart_byte_ranges_are_reordered_and_exact() {
+        let body = concat!(
+            "--den-boundary\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Range: bytes 20-22/100\r\n\r\n",
+            "two\r\n",
+            "--den-boundary\r\n",
+            "Content-Range: bytes 4-6/100\r\n\r\n",
+            "one\r\n",
+            "--den-boundary--\r\n"
+        );
+        assert_eq!(
+            parse_multipart_ranges(body.as_bytes(), b"den-boundary", &[(4, 3), (20, 3)]),
+            Some((vec![b"one".to_vec(), b"two".to_vec()], 100))
+        );
+    }
+
+    #[test]
+    fn multipart_boundaries_are_bounded() {
+        assert_eq!(multipart_boundary("multipart/byteranges; boundary=abc"), Some(b"abc".to_vec()));
+        assert_eq!(multipart_boundary("multipart/byteranges; boundary=\"abc\""), Some(b"abc".to_vec()));
+        assert_eq!(multipart_boundary("text/plain; boundary=abc"), None);
+        assert_eq!(multipart_boundary("multipart/byteranges; boundary=bad\\value"), None);
     }
 
     #[test]

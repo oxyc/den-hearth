@@ -230,11 +230,15 @@ impl TorBoxManagedHls {
 
         let subtitle_slot = self.subtitle_slots.clone().try_acquire_owned().ok();
         let extract = async move {
-            match (direct_file, subtitle_slot) {
-                (Some(direct_file), Some(_slot)) => {
+            match (direct_file, subtitle_slot, subtitle) {
+                // The metadata-only request has no selected track to attach. Extracting every track here both
+                // delays initial playback and repeats the chosen track's work when the player applies its
+                // default immediately afterwards.
+                (_, _, None) => Vec::new(),
+                (Some(direct_file), Some(_slot), Some(_)) => {
                     crate::managed_subtitles::sidecars(&direct_file, subtitle).await
                 }
-                (None, _) => {
+                (None, _, _) => {
                     report_sidecar_skipped("direct_file_unavailable", subtitle);
                     Vec::new()
                 }
