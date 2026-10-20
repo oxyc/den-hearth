@@ -303,6 +303,18 @@ impl Inner {
         let resp = self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases).await;
         let route = if query_is(req, "probe", "1") { "probe" } else { "play" };
         crate::releaselog::observe(&rt, &rid, route, start.elapsed(), &resp);
+        // A viewer's player now reads this episode straight from the debrid, past this service; the redirect is
+        // the only sign of it there is. A probe, a prefetch and a service's own read play nothing. A legacy
+        // `/<config>/play` token names no title, so only a ticket's play is reported.
+        let viewer =
+            route == "play" && !rt.prefetch && !req.headers().contains_key(den_http::X_DEN_SERVICE_READ);
+        if viewer && !rt.imdb.is_empty() && resp.status().is_redirection() {
+            if let (Some(season), Some(episode)) = (rt.season, rt.episode) {
+                if let (Ok(season), Ok(episode)) = (u32::try_from(season), u32::try_from(episode)) {
+                    self.deps.runtime.played(&rt.imdb, season, episode);
+                }
+            }
+        }
         resp
     }
 

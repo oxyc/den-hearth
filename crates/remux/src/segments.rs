@@ -20,6 +20,14 @@
 //! season's fingerprint, and every later episode is matched against that alone: one episode, one scan.
 //!
 //! One scan runs at a time, never while a transcode is running, on a bounded queue with a daily budget.
+//!
+//! Nor does a scan read an episode while a viewer plays it. A scan's two windows are ~1 GB of the release (all of
+//! its bytes there, video included), read as fast as the debrid sends them, and the player reading the same
+//! episode over the same link starved beside it (Jordskott S1E3, 2026-10-20: the scan read 1118 MB in 148 s while
+//! the TV's connection crawled at ~4 Mbit/s and froze twice). A player reads the release straight from the debrid,
+//! so the one sign of a play this process gets is Scout's play redirect (`note_play`); the play is taken to last
+//! the release's runtime after its last redirect, plus `PLAY_TAIL`. A Remux session of the episode holds a scan
+//! for as long as it lives. A held scan waits in the queue while others run, and runs once the play is over.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -422,10 +430,36 @@ const QUEUE_MAX: usize = 32;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(180);
 /// How often a scan waiting for a transcode to finish looks again.
 const TRANSCODE_WAIT: Duration = Duration::from_secs(5);
+/// How long past its runtime a play is still taken to be reading: pauses, rewinds and the start-up nothing shows.
+const PLAY_TAIL: Duration = Duration::from_secs(10 * 60);
+/// How often a scan held by a live Remux session of its episode looks again.
+const SESSION_WAIT: Duration = Duration::from_secs(60);
+/// Plays older than this are forgotten: past any runtime and its tail.
+const PLAY_MEMORY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Why a scan is put off: a viewer is playing `playing`, the episode itself or the sibling it would read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hold {
+    pub playing: Episode,
+    /// That episode's runtime: its play ends this long (plus `PLAY_TAIL`) after its last play request.
+    pub runtime: Duration,
+    /// Not before this, whatever the plays say; how a scan held by a live Remux session looks again.
+    pub not_before: tokio::time::Instant,
+}
+
+/// A scan put off by a play.
+struct Held {
+    ep: Episode,
+    hold: Hold,
+}
 
 #[derive(Default)]
 struct Inner {
     queue: VecDeque<Episode>,
+    /// Scans put off while what they would read is played.
+    held: Vec<Held>,
+    /// When a viewer last started each episode playing (Scout's play redirect).
+    plays: HashMap<Episode, tokio::time::Instant>,
     /// The scout install a queued episode was asked with, where the request named one. Memory only: an install is
     /// a credential, so it is never written to a result or a log.
     installs: HashMap<Episode, String>,
@@ -433,6 +467,23 @@ struct Inner {
     /// The UTC day `used` counts, and the episodes fingerprinted on it.
     day: u64,
     used: u32,
+}
+
+impl Inner {
+    fn is_held(&self, ep: &Episode) -> bool {
+        self.held.iter().any(|h| &h.ep == ep)
+    }
+
+    /// When the last play of `ep` stops reading, if it took `runtime`.
+    fn play_ends(&self, ep: &Episode, runtime: Duration) -> Option<tokio::time::Instant> {
+        self.plays.get(ep).map(|at| *at + runtime + PLAY_TAIL)
+    }
+
+    /// When a held scan may run.
+    fn ready_at(&self, hold: &Hold) -> tokio::time::Instant {
+        let ends = self.play_ends(&hold.playing, hold.runtime);
+        ends.map_or(hold.not_before, |ends| ends.max(hold.not_before))
+    }
 }
 
 /// The scan queue: one worker takes from it, requests add to it.
@@ -458,7 +509,7 @@ impl Segments {
         let inner = self.lock();
         if inner.running.contains(ep) {
             Some(Pending::Running)
-        } else if inner.queue.contains(ep) {
+        } else if inner.queue.contains(ep) || inner.is_held(ep) {
             Some(Pending::Queued)
         } else {
             None
@@ -472,12 +523,12 @@ impl Segments {
         if inner.running.contains(&ep) {
             return Some(Pending::Running);
         }
-        if inner.queue.contains(&ep) {
+        if inner.queue.contains(&ep) || inner.is_held(&ep) {
             return Some(Pending::Queued);
         }
         let today = unix_now() / 86_400;
         let spent = inner.day == today && inner.used >= cap;
-        if inner.queue.len() >= QUEUE_MAX || spent {
+        if inner.queue.len() + inner.held.len() >= QUEUE_MAX || spent {
             return None;
         }
         if let Some(install) = install {
@@ -500,6 +551,7 @@ impl Segments {
         if inner.used >= cap {
             // Nothing queued can run today: let those requests come again tomorrow.
             inner.queue.clear();
+            inner.held.clear();
             inner.installs.clear();
             return false;
         }
@@ -507,18 +559,79 @@ impl Segments {
         true
     }
 
+    /// Give back the unit `spend` took for a scan that was put off before it read anything.
+    fn refund(&self) {
+        let mut inner = self.lock();
+        inner.used = inner.used.saturating_sub(1);
+    }
+
+    /// A viewer has started `imdb` S`season`E`episode` playing (Scout's play redirect for it).
+    pub fn note_play(&self, imdb: &str, season: u32, episode: u32) {
+        let now = tokio::time::Instant::now();
+        let mut inner = self.lock();
+        inner.plays.retain(|_, at| now.saturating_duration_since(*at) < PLAY_MEMORY);
+        inner.plays.insert(Episode { imdb: imdb.to_string(), season, episode }, now);
+    }
+
+    /// Why `ep`, which runs `runtime`, may not be read now by a play noted here; `None` when it may.
+    fn play_hold(&self, ep: &Episode, runtime: Duration) -> Option<Hold> {
+        let now = tokio::time::Instant::now();
+        let ends = self.lock().play_ends(ep, runtime)?;
+        (ends > now).then(|| Hold { playing: ep.clone(), runtime, not_before: now })
+    }
+
+    /// Put `ep` off until `hold` is over; it keeps the install it was asked with.
+    fn defer(&self, ep: Episode, install: Option<String>, hold: Hold) {
+        let mut inner = self.lock();
+        inner.running.remove(&ep);
+        if let Some(install) = install {
+            inner.installs.insert(ep.clone(), install);
+        }
+        inner.held.push(Held { ep, hold });
+        drop(inner);
+        self.wake.notify_one();
+    }
+
+    /// The next scan to run: a held one whose play is over, else the oldest queued; waits for either.
     async fn next(&self) -> (Episode, Option<String>) {
         loop {
-            {
+            let wait = {
                 let mut inner = self.lock();
-                if let Some(ep) = inner.queue.pop_front() {
+                let now = tokio::time::Instant::now();
+                let ready = inner.held.iter().position(|h| inner.ready_at(&h.hold) <= now);
+                let ep = match ready {
+                    Some(i) => Some(inner.held.remove(i).ep),
+                    None => inner.queue.pop_front(),
+                };
+                if let Some(ep) = ep {
                     inner.running.insert(ep.clone());
                     let install = inner.installs.remove(&ep);
                     return (ep, install);
                 }
+                inner.held.iter().map(|h| inner.ready_at(&h.hold)).min()
+            };
+            match wait {
+                Some(at) => {
+                    tokio::select! {
+                        _ = self.wake.notified() => {}
+                        _ = tokio::time::sleep_until(at) => {}
+                    }
+                }
+                None => self.wake.notified().await,
             }
-            self.wake.notified().await;
         }
+    }
+
+    #[cfg(test)]
+    pub fn held_for_test(&self) -> Vec<(Episode, Hold)> {
+        self.lock().held.iter().map(|h| (h.ep.clone(), h.hold.clone())).collect()
+    }
+
+    /// The play of `ep` is over: as if its last play request were long past.
+    #[cfg(test)]
+    pub fn end_play_for_test(&self, ep: &Episode) {
+        self.lock().plays.remove(ep);
+        self.wake.notify_one();
     }
 
     #[cfg(test)]
@@ -543,9 +656,35 @@ pub async fn worker(st: Arc<AppState>) {
         while st.transcodes.load(Relaxed) > 0 {
             tokio::time::sleep(TRANSCODE_WAIT).await;
         }
-        scan(&st, &ep, install.or_else(|| st.cfg.scout_install_url.clone())).await;
-        st.segments.release(&ep);
+        let base = install.clone().or_else(|| st.cfg.scout_install_url.clone());
+        match scan(&st, &ep, base).await {
+            Some(hold) => {
+                eprintln!(
+                    "segments: {} held: {} is being played, for up to {:.0}s more",
+                    who(&st, &ep),
+                    who(&st, &hold.playing),
+                    st.segments
+                        .lock()
+                        .ready_at(&hold)
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_secs_f64(),
+                );
+                st.segments.defer(ep, install, hold);
+            }
+            None => st.segments.release(&ep),
+        }
     }
+}
+
+/// Why `ep`, which runs `runtime` seconds, may not be read now: a viewer's play of it, or a live Remux session.
+fn playing(st: &AppState, ep: &Episode, runtime: f64) -> Option<Hold> {
+    let runtime = Duration::from_secs_f64(runtime);
+    let id = ep.id();
+    if st.sessions().values().any(|s| s.imdb == id) {
+        let not_before = tokio::time::Instant::now() + SESSION_WAIT;
+        return Some(Hold { playing: ep.clone(), runtime, not_before });
+    }
+    st.segments.play_hold(ep, runtime)
 }
 
 // ---- a scan ---------------------------------------------------------------------------------------------------
@@ -556,6 +695,8 @@ enum Failure {
     NoRelease,
     /// Today's budget is spent.
     Budget,
+    /// A viewer is playing it: nothing was read past the release's head.
+    Held(Hold),
     Failed(String),
 }
 
@@ -566,15 +707,16 @@ struct Cost {
     wall: Duration,
 }
 
-/// Scan `ep` and its sibling through the scout install `base`, which is never logged.
-async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
+/// Scan `ep` and its sibling through the scout install `base`, which is never logged. `Some` when it was put off
+/// because a viewer is playing one of the two.
+async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) -> Option<Hold> {
     let scratch = &st.cfg.scratch_dir;
     if stored(scratch, ep).await.as_ref().is_some_and(current) {
-        return;
+        return None;
     }
     let Some(base) = base else {
         eprintln!("segments: {} result=failed (no scout install)", who(st, ep));
-        return;
+        return None;
     };
     let base = base.as_str();
     let mut season: Season = read_json(&season_path(scratch, ep)).await.unwrap_or_default();
@@ -582,9 +724,16 @@ async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
         season.intro = None;
         season.intro_method.clear();
     }
-    let Some((a, cost_a)) = attempt(st, ep, base).await else { return };
-    // A sibling is needed only for what the season has no fingerprint of yet.
+    let (a, cost_a) = match fingerprint_logged(st, ep, base).await {
+        Ok(got) => got,
+        Err(Failure::Held(hold)) => return Some(hold),
+        Err(_) => return None,
+    };
+    // A sibling is needed only for what the season has no fingerprint of yet. One being played is passed over for
+    // the other; when that leaves none, the scan waits for the play to end rather than store what one episode
+    // alone shows.
     let mut b: Option<(Episode, Prints, Cost)> = None;
+    let mut sibling_held = None;
     if season.intro.is_none() || season.credits.is_none() {
         for n in [ep.episode + 1, ep.episode - 1] {
             if n == 0 {
@@ -593,14 +742,21 @@ async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
             let sib = ep.next(n);
             st.segments.hold(&sib);
             let got = fingerprint_logged(st, &sib, base).await;
-            if !matches!(got, Err(Failure::NoRelease)) || n < ep.episode {
-                if let Ok((p, c)) = got {
-                    b = Some((sib.clone(), p, c));
-                }
-                st.segments.release(&sib);
-                break;
-            }
             st.segments.release(&sib);
+            match got {
+                Ok((p, c)) => {
+                    b = Some((sib.clone(), p, c));
+                    break;
+                }
+                Err(Failure::Held(hold)) => sibling_held = Some(hold),
+                Err(Failure::NoRelease) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    if b.is_none() {
+        if let Some(hold) = sibling_held {
+            return Some(hold);
         }
     }
     let before = season.clone();
@@ -614,13 +770,10 @@ async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) {
         save(st, sib, p, fb, c).await;
         st.segments.release(sib);
     }
+    None
 }
 
-/// Fingerprint `ep` for the episode a scan was asked for; a failure is logged and ends the scan.
-async fn attempt(st: &Arc<AppState>, ep: &Episode, base: &str) -> Option<(Prints, Cost)> {
-    fingerprint_logged(st, ep, base).await.ok()
-}
-
+/// Fingerprint `ep`; a failure is logged. A hold is not a failure: the worker logs it.
 async fn fingerprint_logged(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Prints, Cost), Failure> {
     let started = Instant::now();
     let got = match tokio::time::timeout(SCAN_TIMEOUT, fingerprint(st, ep, base)).await {
@@ -629,6 +782,7 @@ async fn fingerprint_logged(st: &Arc<AppState>, ep: &Episode, base: &str) -> Res
     };
     if let Err(f) = &got {
         let why = match f {
+            Failure::Held(_) => return got,
             Failure::NoRelease => "no cached release".to_string(),
             Failure::Budget => format!("today's budget of {} is spent", st.cfg.segments_daily_cap),
             Failure::Failed(why) => why.clone(),
@@ -732,6 +886,11 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
                 continue;
             }
         };
+        // Checked once the runtime is known, which the play's length is taken from: before either window is read.
+        if let Some(hold) = playing(st, ep, duration) {
+            st.segments.refund();
+            return Err(Failure::Held(hold));
+        }
         let door = st.doors.open(resolved.client.clone(), &resolved.url, &resolved.head, size);
         let Some(input) = st.doors.url(&door) else {
             return Err(Failure::Failed("no loopback door".into()));
@@ -1168,6 +1327,72 @@ mod tests {
         })
         .await
         .expect("a normally completed fingerprint decode left its descendant alive");
+    }
+
+    fn ep(n: u32) -> Episode {
+        Episode { imdb: "tt2309405".into(), season: 1, episode: n }
+    }
+
+    /// The Jordskott S1E3 shape: a 3540 s episode played from its redirect holds a scan of it for its runtime and
+    /// tail, and holds no other episode at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_play_holds_only_its_episode_for_its_runtime_and_tail() {
+        let segments = Segments::default();
+        let runtime = Duration::from_secs(3540);
+        assert_eq!(segments.play_hold(&ep(3), runtime), None, "nothing played yet");
+        segments.note_play("tt2309405", 1, 3);
+        let hold = segments.play_hold(&ep(3), runtime).expect("the episode being played is held");
+        assert_eq!(hold.playing, ep(3));
+        assert_eq!(segments.play_hold(&ep(4), runtime), None, "another episode scans while this one plays");
+        tokio::time::advance(runtime + PLAY_TAIL - Duration::from_secs(1)).await;
+        assert!(segments.play_hold(&ep(3), runtime).is_some(), "still within the play");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(segments.play_hold(&ep(3), runtime), None, "the play is over");
+    }
+
+    /// A held scan stays queued (and is reported so) while a later request for another episode runs, and is handed
+    /// out again with its install once the play is over, by its own deadline or as soon as the play ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_scan_lets_others_run_and_runs_when_the_play_is_over() {
+        let segments = Arc::new(Segments::default());
+        segments.enqueue(ep(3), 300, Some("install-3".into()));
+        let (first, install) = segments.next().await;
+        assert_eq!(first, ep(3));
+        segments.note_play("tt2309405", 1, 3);
+        let runtime = Duration::from_secs(100);
+        let hold = segments.play_hold(&ep(3), runtime).unwrap();
+        segments.defer(ep(3), install, hold);
+        assert_eq!(segments.pending(&ep(3)), Some(Pending::Queued));
+        assert_eq!(segments.enqueue(ep(3), 300, None), Some(Pending::Queued), "not queued twice");
+
+        segments.enqueue(ep(4), 300, None);
+        let began = tokio::time::Instant::now();
+        let (next, _) = segments.next().await;
+        assert_eq!((next, began.elapsed()), (ep(4), Duration::ZERO), "the next episode does not wait");
+        segments.release(&ep(4));
+
+        let (again, install) = segments.next().await;
+        assert_eq!(again, ep(3));
+        assert_eq!(install.as_deref(), Some("install-3"), "the install it was asked with is kept");
+        assert_eq!(
+            began.elapsed(),
+            runtime + PLAY_TAIL,
+            "handed out when the play's runtime and tail are over"
+        );
+
+        // Held again, and the play ends early: it is handed out then, not at the deadline.
+        segments.note_play("tt2309405", 1, 3);
+        segments.defer(ep(3), None, segments.play_hold(&ep(3), runtime).unwrap());
+        let waiter = {
+            let segments = segments.clone();
+            tokio::spawn(async move {
+                let began = tokio::time::Instant::now();
+                (segments.next().await.0, began.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        segments.end_play_for_test(&ep(3));
+        assert_eq!(waiter.await.unwrap(), (ep(3), Duration::from_secs(5)));
     }
 
     /// A deterministic stream of fingerprint points: xorshift.

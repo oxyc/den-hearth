@@ -48,6 +48,7 @@ pub struct Scout {
     /// scout's origin and in process; on the public base it would be an outside hop, and Remux refuses a LAN one.
     den_local: Handler,
     cache: Arc<TieredCache>,
+    runtime: Arc<ScoutRuntime>,
     summary: String,
 }
 
@@ -106,8 +107,14 @@ impl Scout {
             den: new_handler(den_deps(den.public_base.clone().unwrap_or_default())),
             den_local: new_handler(den_deps(crate::playback::DEN_ADDON_BASE.to_string())),
             cache,
+            runtime,
             summary,
         }
+    }
+
+    /// Report each episode a viewer starts playing through any of the four handlers to `observer`.
+    pub fn observe_plays(&self, observer: den_scout::runtime::PlayObserver) {
+        self.runtime.observe_plays(observer);
     }
 
     /// Scout's own startup line, as Go printed it.

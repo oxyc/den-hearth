@@ -28,6 +28,9 @@ pub(crate) const MAX_CONCURRENT_LIST_BUILDS: usize = 16;
 /// admission bounds keep its waiter set finite.
 pub(crate) const MAX_CONCURRENT_SCRAPER_REQUESTS: usize = 24;
 
+/// Told of each episode a viewer starts playing through a play route: its IMDb id, season and episode.
+pub type PlayObserver = Arc<dyn Fn(&str, u32, u32) + Send + Sync>;
+
 /// Explicit owner for budgets, counters, and provider coordination.
 pub struct ScoutRuntime {
     id: u64,
@@ -36,6 +39,7 @@ pub struct ScoutRuntime {
     list_builds: Arc<Semaphore>,
     scraper_requests: Arc<Semaphore>,
     pub(crate) torbox: TorboxRuntime,
+    play_observer: std::sync::OnceLock<PlayObserver>,
 }
 
 /// One admitted list build. Dropping it returns the slot even when the detached task panics or is aborted.
@@ -90,7 +94,19 @@ impl ScoutRuntime {
             list_builds: Arc::new(Semaphore::new(list_build_limit)),
             scraper_requests: Arc::new(Semaphore::new(scraper_request_limit)),
             torbox,
+            play_observer: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Report every episode play this runtime's handlers serve to `observer`. Set once; a later call is ignored.
+    pub fn observe_plays(&self, observer: PlayObserver) {
+        let _ = self.play_observer.set(observer);
+    }
+
+    pub(crate) fn played(&self, imdb: &str, season: u32, episode: u32) {
+        if let Some(observer) = self.play_observer.get() {
+            observer(imdb, season, episode);
+        }
     }
 
     /// Fair, cancellation-safe admission for one real scraper request. The caller's absolute list-build deadline

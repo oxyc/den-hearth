@@ -23,6 +23,6 @@ pub use conditional::{apply_conditional, etag_of, if_none_match_matches, if_rang
 pub use local::Local;
 pub use response::{
     add_timing, cors_stamp, degraded, error, full, html, json, not_found, preflight, timed, timing,
-    with_total_timing, Body, StaticBody, SERVER_TIMING, X_DEN_DEGRADED,
+    with_total_timing, Body, StaticBody, SERVER_TIMING, X_DEN_DEGRADED, X_DEN_SERVICE_READ,
 };
 pub use text::{percent_decode, percent_decode_path};

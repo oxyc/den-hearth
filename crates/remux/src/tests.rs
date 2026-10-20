@@ -6,7 +6,7 @@
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -389,6 +389,8 @@ static FLAKY_SUBTITLES: AtomicU32 = AtomicU32::new(0);
 /// Whether the `/p/hold/` copy of a fixture may be read past `HELD_FROM_TENTHS` of its length. Closed until a test
 /// opens it: a job reading that copy cannot reach the end of the film, so it cannot exit before the test says so.
 static HELD_COPY_OPEN: AtomicBool = AtomicBool::new(false);
+/// Bytes the file host has sent of the `metered/` copies (`tt0000021`), the whole response counted as it is sent.
+static METERED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The part of a `hold` copy, in tenths of its length, that is served at once.
 const HELD_FROM_TENTHS: usize = 9;
 
@@ -645,6 +647,9 @@ async fn origin_handle<B>(
             // Two episodes sharing an intro and end credits (testdata/README.md); there is no episode 3.
             "tt0000020:1:1" if path.contains("/stream/series/") => "segments-a.mkv",
             "tt0000020:1:2" if path.contains("/stream/series/") => "segments-b.mkv",
+            // The same two, with every byte the file host sends of them counted (`METERED_BYTES`).
+            "tt0000021:1:1" if path.contains("/stream/series/") => "metered/segments-a.mkv",
+            "tt0000021:1:2" if path.contains("/stream/series/") => "metered/segments-b.mkv",
             _ => return origin_full(200, r#"{"streams":[]}"#),
         };
         let body = serde_json::json!({"streams": [
@@ -700,6 +705,10 @@ async fn origin_handle<B>(
             .unwrap();
     }
     let Some(rest) = path.strip_prefix("/f/") else { return origin_full(404, "") };
+    let (metered, rest) = match rest.strip_prefix("metered/") {
+        Some(n) => (true, n),
+        None => (false, rest),
+    };
     let (held, rest) = match rest.strip_prefix("hold/") {
         Some(n) => (true, n),
         None => (false, rest),
@@ -735,6 +744,9 @@ async fn origin_handle<B>(
         None => (200, 0, size - 1),
     };
     let slice = Bytes::copy_from_slice(&data[start..=end]);
+    if metered {
+        METERED_BYTES.fetch_add(slice.len() as u64, Relaxed);
+    }
     let mut b = Response::builder()
         .status(status)
         .header("content-type", "video/x-matroska")
@@ -4126,6 +4138,59 @@ async fn a_scan_finds_the_intro_and_credits_two_episodes_share() {
     let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":2}"#).await;
     assert_eq!(r.json()["status"], "done");
     assert!(state.cfg.scratch_dir.join("segments/tt0000020-1.season.json").exists());
+}
+
+/// Real ffmpeg: a scan asked while a viewer plays its episode (Scout saw the play redirect) reads nothing of it past
+/// the head its play URL was opened with until the play is over, while it waits in the queue; then it scans as any
+/// other.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn a_scan_does_not_read_an_episode_while_it_is_played() {
+    let origin = origin().await;
+    let state = segments_state(&origin);
+    assert!(crate::segments::check_ffmpeg(&state.cfg.ffmpeg).await, "this ffmpeg can't write PCM to a pipe");
+    tokio::spawn(crate::segments::worker(state.clone()));
+    let played = crate::segments::Episode { imdb: "tt0000021".into(), season: 1, episode: 1 };
+    state.segments.note_play("tt0000021", 1, 1);
+    let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000021","season":1,"episode":1}"#).await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "queued".into()));
+
+    let began = Instant::now();
+    let held = loop {
+        if let Some(held) = state.segments.held_for_test().pop() {
+            break held;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "the scan was never held");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!((&held.0, &held.1.playing), (&played, &played));
+    assert!((held.1.runtime.as_secs_f64() - 200.0).abs() < 1.5, "the play lasts the release's runtime");
+    let read_while_held = METERED_BYTES.load(Relaxed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(METERED_BYTES.load(Relaxed), read_while_held, "a held scan reads nothing more");
+    assert!(
+        read_while_held <= crate::scout::HEAD_BYTES + 128 * 1024,
+        "only the head and the probe were read while the episode is played: {read_while_held} bytes"
+    );
+    let r = call(&state, "GET", "/remux/segments/tt0000021/1/1", None, "").await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "pending".into()));
+
+    state.segments.end_play_for_test(&played);
+    let began = Instant::now();
+    let found = loop {
+        let r = call(&state, "GET", "/remux/segments/tt0000021/1/1", None, "").await;
+        if r.status == StatusCode::OK {
+            break r.json();
+        }
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+        assert!(began.elapsed() < Duration::from_secs(60), "the scan never ran once the play was over");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!((found["intro"]["start"].as_f64().unwrap() - 6.0).abs() < 1.5, "{found}");
+    assert!(
+        METERED_BYTES.load(Relaxed) > 1_000_000,
+        "both episodes' windows were read once the play was over"
+    );
 }
 
 // ---- a restart --------------------------------------------------------------------------------------
