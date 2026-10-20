@@ -1251,10 +1251,12 @@ impl Inner {
                 imdb: sid.imdb.clone(),
                 ..Default::default()
             };
-            match resolver.resolve(config, &target).await {
-                Ok(url) => {
+            match resolver.resolve(config, &target, request.subtitle).await {
+                Ok(prepared) => {
                     return Ok(ManagedHlsResult {
-                        url,
+                        url: prepared.url,
+                        subtitles: prepared.subtitles,
+                        selected_subtitle: prepared.selected_subtitle,
                         release: ManagedHlsRelease {
                             label: crate::label::clean_label_lower(
                                 &str::to_lowercase(&candidate.title),

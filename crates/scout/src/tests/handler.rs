@@ -153,11 +153,16 @@ impl ManagedHlsResolver for FixedManagedHls {
         &self,
         _config: &crate::config::Config,
         target: &ResolveTarget,
-    ) -> Result<ManagedHlsUrl, ManagedHlsError> {
+        subtitle: Option<i64>,
+    ) -> Result<crate::managed_hls::ManagedHlsPrepared, ManagedHlsError> {
         self.targets.lock().unwrap().push(target.clone());
-        Ok(ManagedHlsUrl::fixture(
-            "https://test.tb-cdn.io/opaque/index.m3u8?token=secret&scrobbling_enabled=false",
-        ))
+        Ok(crate::managed_hls::ManagedHlsPrepared {
+            url: ManagedHlsUrl::fixture(
+                "https://test.tb-cdn.io/opaque/index.m3u8?token=secret&scrobbling_enabled=false",
+            ),
+            subtitles: vec![],
+            selected_subtitle: subtitle,
+        })
     }
 }
 
