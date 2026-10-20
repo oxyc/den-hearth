@@ -115,6 +115,12 @@ answers a matching `If-None-Match` with a 304. A settled `/subtitle` ETag names 
 alignment rather than hashing the bytes, so that 304 comes back without reading the cache or calling
 OpenSubtitles.
 
+A subtitle body (`.srt` or `.vtt`, proxied or translated) says `Accept-Ranges: bytes` and answers one
+byte `Range` as a file does: 206 with `Content-Range` for `bytes=a-b`, `bytes=a-` or `bytes=-n`, 416
+with `Content-Range: bytes */<length>` past its end, the whole body when `If-Range` no longer holds.
+A player probes a host with a suffix range and remembers the answer for that host and port, which the
+video's play route shares.
+
 A refusal says when to come back. The translate route's 429 `allowance_exhausted` carries
 `Retry-After` (seconds to the end of the UTC day the allowance is counted in) and the IETF draft's
 `RateLimit-Policy: "daily";q=50;w=86400` and `RateLimit: "daily";r=0;t=<seconds>`; its 502

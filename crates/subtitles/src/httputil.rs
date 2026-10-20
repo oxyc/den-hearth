@@ -2,7 +2,10 @@
 //! and the validators only they carry.
 
 use bytes::Bytes;
-use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use hyper::header::{
+    HeaderMap, HeaderValue, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    IF_NONE_MATCH, IF_RANGE, RANGE,
+};
 use hyper::{Response, StatusCode};
 use serde::Serialize;
 
@@ -79,6 +82,61 @@ fn srt_cached(body: Bytes, cache_control: &str, etag: &str) -> Response<Body> {
         .header(ETAG, etag)
         .body(full(body))
         .unwrap()
+}
+
+/// Answer one byte range of a subtitle body (RFC 9110 §14): `206` with `Content-Range` for `bytes=a-b`, `bytes=a-`
+/// or the suffix `bytes=-n`, `416` with `Content-Range: bytes */<length>` for a range wholly past the end. Every
+/// subtitle body says `Accept-Ranges: bytes`. A range whose `If-Range` no longer holds, a multi-range or malformed
+/// header, and anything that is not a subtitle body pass through whole.
+///
+/// A player learns whether a host serves ranges from what it answers, and remembers it per host and port.
+/// AetherEngine asked a subtitle here for `bytes=-65536`, got the whole body as a 200, and from then on took the
+/// video's host and port — the same — to have no suffix ranges, so every play skipped its tail prefetch.
+///
+/// Applied at the router after `to_vtt`, so the range is of the bytes actually sent.
+pub async fn ranged(resp: Response<Body>, req_headers: &HeaderMap) -> Response<Body> {
+    use http_body_util::BodyExt;
+
+    let is_subtitle = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/x-subrip") || v.starts_with("text/vtt"));
+    if resp.status() != StatusCode::OK || !is_subtitle {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    parts.headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let header = |name| req_headers.get(name).and_then(|v: &HeaderValue| v.to_str().ok());
+    let etag = parts.headers.get(ETAG).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let still = header(IF_RANGE).is_none_or(|v| den_http::if_range_holds(v, etag, ""));
+    let Some(range) = header(RANGE).filter(|_| still) else { return Response::from_parts(parts, body) };
+    // The body is a `full` buffer, already in memory, as in `to_vtt`.
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "subtitle_unavailable"),
+    };
+    let size = bytes.len() as u64;
+    match den_http::parse_range(Some(range), size) {
+        None => Response::from_parts(parts, full(bytes)),
+        Some(den_http::RangeReq::Unsatisfiable) => Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(CONTENT_RANGE, format!("bytes */{size}"))
+            .header(ACCEPT_RANGES, "bytes")
+            .header(CACHE_CONTROL, "no-store")
+            .body(full(""))
+            .unwrap(),
+        Some(den_http::RangeReq::Satisfiable { start, end }) => {
+            parts.status = StatusCode::PARTIAL_CONTENT;
+            parts.headers.insert(
+                CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+                    .expect("digits are a header value"),
+            );
+            parts.headers.remove(CONTENT_LENGTH);
+            Response::from_parts(parts, full(bytes.slice(start as usize..=end as usize)))
+        }
+    }
 }
 
 /// A strong ETag naming WHAT a body is rather than hashing its bytes, for a response whose bytes

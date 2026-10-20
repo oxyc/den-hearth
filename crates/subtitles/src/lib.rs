@@ -146,10 +146,10 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // Every reply is readable from a browser-based Stremio client. Added here, last, so the 304 and VTT paths
     // that rebuild a response keep it. Retry-After and the RateLimit pair are on refusals, and are how a browser
     // client knows when to come back. ETag is what a client that keeps its own cache sends back as
-    // If-None-Match.
+    // If-None-Match. Content-Range and Accept-Ranges are how a player reading a subtitle in parts knows what it got.
     den_http::cors_stamp(
         resp.headers_mut(),
-        "Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy, ETag",
+        "Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy, ETag, Content-Range, Accept-Ranges",
     );
     // Off by default, and then this bool is the whole cost. The path is redacted and the query left
     // out: a config segment is an install's credentials, and `?resync=` carries a stream URL. The
@@ -273,11 +273,8 @@ async fn route(
                         dub_flagged,
                     )
                     .await;
-                    if want_vtt {
-                        httputil::to_vtt(resp, &parts.headers).await
-                    } else {
-                        resp
-                    }
+                    let resp = if want_vtt { httputil::to_vtt(resp, &parts.headers).await } else { resp };
+                    httputil::ranged(resp, &parts.headers).await
                 }
                 None => httputil::error(StatusCode::BAD_REQUEST, "bad_file_id"),
             }
@@ -326,11 +323,8 @@ async fn route(
                 resync_audio,
             )
             .await;
-            if want_vtt {
-                httputil::to_vtt(resp, &parts.headers).await
-            } else {
-                resp
-            }
+            let resp = if want_vtt { httputil::to_vtt(resp, &parts.headers).await } else { resp };
+            httputil::ranged(resp, &parts.headers).await
         }
         _ => httputil::not_found(),
     }
@@ -1080,6 +1074,76 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(body_string(resp).await, SRT);
         }
+    }
+
+    /// A subtitle answers one byte range as a file does. AetherEngine probes a host with a suffix range and, given a
+    /// 200, takes the whole host and port (the video's too) to have no suffix ranges for the session.
+    #[tokio::test]
+    async fn a_subtitle_answers_a_byte_range() {
+        use hyper::header::{ACCEPT_RANGES, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
+        let seg = os_only_segment();
+        let state = isolated_state("ranges");
+        state.cache.put("os:91005".into(), SRT.into(), Duration::from_secs(60));
+        let len = SRT.len();
+        let get = |uri: String, headers: Vec<(hyper::header::HeaderName, String)>| {
+            let state = state.clone();
+            async move {
+                let mut req = Request::builder().uri(uri);
+                for (name, value) in headers {
+                    req = req.header(name, value);
+                }
+                handle_request(state, req.body(()).unwrap()).await
+            }
+        };
+        let srt = format!("/{seg}/subtitle/91005.srt");
+
+        let whole = get(srt.clone(), vec![]).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(whole.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+        assert!(whole.headers().get(CONTENT_RANGE).is_none());
+        let etag = whole.headers().get(ETAG).unwrap().to_str().unwrap().to_string();
+        assert_eq!(body_string(whole).await, SRT);
+
+        for (range, from, to) in [
+            ("bytes=-65536".to_string(), 0, len - 1),
+            ("bytes=-6".to_string(), len - 6, len - 1),
+            ("bytes=2-".to_string(), 2, len - 1),
+            ("bytes=2-9".to_string(), 2, 9),
+            (format!("bytes=5-{}", len * 10), 5, len - 1),
+        ] {
+            let resp = get(srt.clone(), vec![(RANGE, range.clone())]).await;
+            assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+            assert_eq!(
+                resp.headers().get(CONTENT_RANGE).unwrap(),
+                &format!("bytes {from}-{to}/{len}"),
+                "{range}"
+            );
+            assert_eq!(resp.headers().get(ACCEPT_RANGES).unwrap(), "bytes", "{range}");
+            assert_eq!(resp.headers().get(ETAG).unwrap(), &etag, "{range}: the representation's validator");
+            assert_eq!(body_string(resp).await, SRT[from..=to], "{range}");
+        }
+
+        let past = get(srt.clone(), vec![(RANGE, format!("bytes={len}-"))]).await;
+        assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(past.headers().get(CONTENT_RANGE).unwrap(), &format!("bytes */{len}"));
+        assert!(body_string(past).await.is_empty());
+
+        // A range of a representation the client no longer holds gets all of this one.
+        let stale = vec![(RANGE, "bytes=-6".to_string()), (IF_RANGE, "\"other\"".to_string())];
+        let resp = get(srt.clone(), stale).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, SRT);
+        let held = vec![(RANGE, "bytes=-6".to_string()), (IF_RANGE, etag.clone())];
+        assert_eq!(get(srt.clone(), held).await.status(), StatusCode::PARTIAL_CONTENT);
+
+        // The WebVTT rendering is ranged over its own bytes.
+        let vtt = format!("/{seg}/subtitle/91005.vtt");
+        let whole = body_string(get(vtt.clone(), vec![]).await).await;
+        let tail = get(vtt, vec![(RANGE, "bytes=-5".to_string())]).await;
+        assert_eq!(tail.status(), StatusCode::PARTIAL_CONTENT);
+        let n = whole.len();
+        assert_eq!(tail.headers().get(CONTENT_RANGE).unwrap(), &format!("bytes {}-{}/{n}", n - 5, n - 1));
+        assert_eq!(body_string(tail).await, whole[n - 5..]);
     }
 
     /// Tenths of a millisecond, the format every den addon's `total` uses.
