@@ -16,5 +16,7 @@
 
 pub mod codec;
 pub mod ebml;
+pub mod indexed_mkv;
+pub mod indexed_mp4;
 pub mod mkv;
 pub mod mp4;

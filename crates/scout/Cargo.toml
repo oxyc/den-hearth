@@ -42,6 +42,7 @@ hkdf.workspace = true
 # The HTTP seam (`Doer`) takes and returns reqwest's types, so a test can build a response with
 # `http::Response` and hand it over, as the Go tests do with `mockDoer`.
 reqwest = { workspace = true, default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = { workspace = true, features = ["std", "async-await"] }
 serde = { workspace = true, features = ["derive"] }
 # The handler serves `http::Request`/`http::Response`.
 http.workspace = true

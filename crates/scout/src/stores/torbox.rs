@@ -1008,12 +1008,12 @@ impl TorBoxStore {
 
     /// Resolve through the ordinary TorBox play path, including its add budget, in-flight markers, refusal
     /// backoff and file selection, but return the account-local ids to Scout's managed-HLS adapter instead of
-    /// exposing them to Hearth. The ordinary download URL is minted and discarded for now; keeping this narrow
-    /// duplication-free boundary is safer than maintaining a second add state machine beside `Store::resolve`.
+    /// exposing them to Hearth. The ordinary download URL is retained only inside Scout so the managed adapter
+    /// can attempt bounded indexed subtitle extraction; it is never serialized or logged.
     pub(crate) async fn prepare_managed_item(
         &self,
         target: &ResolveTarget,
-    ) -> Result<(i64, Option<i64>), StoreError> {
+    ) -> Result<(i64, Option<i64>, Option<String>), StoreError> {
         let resolved = <Self as Store>::resolve(self, target).await;
         let (torrent_id, known) = self.known_torrent_id(&target.info_hash);
         if !known {
@@ -1022,6 +1022,7 @@ impl TorBoxStore {
                 Ok(_) => Err(no_file_list()),
             };
         }
+        let direct = resolved.ok();
 
         // Resolve caches the exact file list it used. Read that first so managed playback does not repeat a
         // mylist call; the movie fast path intentionally caches an empty list and selects from file_idx.
@@ -1033,13 +1034,13 @@ impl TorBoxStore {
             .and_then(|raw| serde_json::from_str::<ResolveEntry>(&raw).ok())
             .filter(|entry| entry.torrent_id == torrent_id)
         {
-            return Ok((torrent_id, select_file_id(&entry.files(), target)?));
+            return Ok((torrent_id, select_file_id(&entry.files(), target)?, direct));
         }
 
         // A link request can fail after the account has accepted and named the torrent. That should not hide
         // the item from createstream; list it once and let the managed endpoint make its own readiness decision.
         let files = self.list_files(torrent_id).await?;
-        Ok((torrent_id, select_file_id(&files, target)?))
+        Ok((torrent_id, select_file_id(&files, target)?, direct))
     }
 
     /// Go `torBoxStore.findTorrentByHash` scans the account's torrent list for an infohash. TorBox reports hashes

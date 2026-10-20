@@ -121,6 +121,8 @@ pub struct ManagedHlsSubtitle {
     pub language: Option<String>,
     pub name: Option<String>,
     pub codec: Option<String>,
+    /// Complete, formatting-neutral WebVTT extracted through Matroska's index. Never an upstream capability.
+    pub sidecar: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +182,7 @@ pub struct TorBoxManagedHls {
     // Separate from Scout's normal read client: a signed playlist URL must never be replayed to a redirect
     // target. The five-second outer deadline is the total bound; the client timeout is defence in depth.
     probe_client: reqwest::Client,
+    subtitle_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl TorBoxManagedHls {
@@ -189,7 +192,12 @@ impl TorBoxManagedHls {
             .timeout(PLAYLIST_PROBE_TIMEOUT)
             .build()
             .map_err(|_| ManagedHlsError::Unavailable)?;
-        Ok(Self { create_client, cache, probe_client })
+        Ok(Self {
+            create_client,
+            cache,
+            probe_client,
+            subtitle_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+        })
     }
 
     /// Resolves Scout's ordinary target to the account-local TorBox torrent and file, then creates and probes
@@ -214,18 +222,43 @@ impl TorBoxManagedHls {
             cache: Some(self.cache.clone()),
             api: TORBOX_API.to_owned(),
         };
-        let (torrent_id, file_id) = store
+        let (torrent_id, file_id, direct_file) = store
             .prepare_managed_item(target)
             .await
             .map_err(classify_store_error)
             .map_err(report_resolution_failure)?;
 
-        match self.create(token, torrent_id, file_id, subtitle).await {
+        let subtitle_slot = self.subtitle_slots.clone().try_acquire_owned().ok();
+        let extract = async move {
+            match (direct_file, subtitle_slot) {
+                (Some(direct_file), Some(_slot)) => crate::managed_subtitles::sidecars(&direct_file).await,
+                (None, _) => Vec::new(),
+                _ => Vec::new(),
+            }
+        };
+        let (created, sidecars) = tokio::join!(self.create(token, torrent_id, file_id, subtitle), extract);
+        match created {
             Err(ManagedHlsError::NotFound) => {
                 store.forget_torrent_id(&target.info_hash);
                 Err(ManagedHlsError::NotFound)
             }
-            result => result,
+            Ok(mut prepared) => {
+                if !sidecars.is_empty() {
+                    log_limited(
+                        "managed-subtitle-sidecar-ready",
+                        &format!("managed HLS: prepared {} indexed subtitle sidecar(s)", sidecars.len()),
+                    );
+                }
+                for sidecar in sidecars {
+                    if let Some(track) =
+                        prepared.subtitles.iter_mut().find(|track| track.index == sidecar.ordinal)
+                    {
+                        track.sidecar = Some(sidecar.vtt);
+                    }
+                }
+                Ok(prepared)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -446,6 +479,7 @@ fn parse_success(
             language: track.language,
             name: track.title.or(track.language_full),
             codec: track.codec,
+            sidecar: None,
         })
         .collect();
     Ok(ManagedHlsPrepared { url, subtitles, selected_subtitle })
