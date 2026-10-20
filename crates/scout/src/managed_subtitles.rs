@@ -41,16 +41,22 @@ struct Reader {
 }
 
 impl Reader {
-    fn new(raw: &str) -> Option<Self> {
-        let url = reqwest::Url::parse(raw).ok()?;
-        if url.scheme() != "https:"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.port_or_known_default() != Some(443)
-            || url.fragment().is_some()
-        {
-            return None;
+    fn new(raw: &str) -> Result<Self, &'static str> {
+        let url = reqwest::Url::parse(raw).map_err(|_| "parse")?;
+        if url.scheme() != "https" {
+            return Err("scheme");
+        }
+        if url.host_str().is_none() {
+            return Err("host");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("credentials");
+        }
+        if url.port_or_known_default() != Some(443) {
+            return Err("port");
+        }
+        if url.fragment().is_some() {
+            return Err("fragment");
         }
         let client = ClientProfile::new()
             .connect(Duration::from_secs(3))
@@ -59,8 +65,8 @@ impl Reader {
             .guard(Guard::PublicDial)
             .pool(PARALLEL_BLOCKS, Duration::from_secs(15))
             .build()
-            .ok()?;
-        Some(Self {
+            .map_err(|_| "client")?;
+        Ok(Self {
             client,
             url,
             bytes: Arc::new(AtomicUsize::new(0)),
@@ -398,15 +404,18 @@ async fn mp4_sidecars(reader: &Reader, selected: Option<i64>) -> Vec<Sidecar> {
 /// Returns only tracks whose complete frame count can be proven. Any failure preserves TorBox burn-in and emits
 /// bounded, credential-free diagnostics describing whether eligibility or the deadline stopped extraction.
 pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sidecar> {
-    let Some(reader) = Reader::new(raw_url) else {
-        log_limited(
-            "managed-subtitle-sidecar-invalid-direct-url",
+    let reader = match Reader::new(raw_url) {
+        Ok(reader) => reader,
+        Err(url_reason) => {
+            log_limited(
+            &format!("managed-subtitle-sidecar-invalid-direct-url-{url_reason}"),
             &format!(
-                "managed HLS: indexed subtitle sidecar unavailable: outcome=skipped reason=invalid_direct_url selected={}",
+                "managed HLS: indexed subtitle sidecar unavailable: outcome=skipped reason=invalid_direct_url url_reason={url_reason} selected={}",
                 selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
             ),
         );
-        return Vec::new();
+            return Vec::new();
+        }
     };
     let result = tokio::time::timeout(DEADLINE, async {
         if let Some((total, segment, scale, tracks, cue_tracks, counts)) = index(&reader).await {
@@ -469,13 +478,27 @@ mod tests {
         assert_eq!(parse_content_range("bytes 0-9/*"), None);
     }
 
+    #[test]
+    fn direct_url_validation_reports_only_a_closed_reason() {
+        assert!(Reader::new("https://cdn.example/file.mkv?token=secret").is_ok());
+        for (url, reason) in [
+            ("not a url", "parse"),
+            ("http://cdn.example/file.mkv", "scheme"),
+            ("https://user:secret@cdn.example/file.mkv", "credentials"),
+            ("https://cdn.example:8443/file.mkv", "port"),
+            ("https://cdn.example/file.mkv#private", "fragment"),
+        ] {
+            assert_eq!(Reader::new(url).err(), Some(reason));
+        }
+    }
+
     #[tokio::test]
     async fn an_invalid_direct_url_is_reported_without_being_logged() {
         let secret = "http://user:password@example.invalid/private-file.mkv";
         let captured = crate::loglimit::Capture::start();
         assert!(sidecars(secret, Some(1)).await.is_empty());
         let log = captured.text();
-        assert!(log.contains("reason=invalid_direct_url selected=1"), "{log}");
+        assert!(log.contains("reason=invalid_direct_url url_reason=scheme selected=1"), "{log}");
         for private in ["user", "password", "example.invalid", "private-file"] {
             assert!(!log.contains(private), "log leaked {private:?}: {log}");
         }
