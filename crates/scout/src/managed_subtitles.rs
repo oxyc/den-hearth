@@ -398,7 +398,16 @@ async fn mp4_sidecars(reader: &Reader, selected: Option<i64>) -> Vec<Sidecar> {
 /// Returns only tracks whose complete frame count can be proven. Any failure preserves TorBox burn-in and emits
 /// bounded, credential-free diagnostics describing whether eligibility or the deadline stopped extraction.
 pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sidecar> {
-    let Some(reader) = Reader::new(raw_url) else { return Vec::new() };
+    let Some(reader) = Reader::new(raw_url) else {
+        log_limited(
+            "managed-subtitle-sidecar-invalid-direct-url",
+            &format!(
+                "managed HLS: indexed subtitle sidecar unavailable: outcome=skipped reason=invalid_direct_url selected={}",
+                selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
+            ),
+        );
+        return Vec::new();
+    };
     let result = tokio::time::timeout(DEADLINE, async {
         if let Some((total, segment, scale, tracks, cue_tracks, counts)) = index(&reader).await {
             let mut output = Vec::new();
@@ -458,6 +467,18 @@ mod tests {
         assert_eq!(parse_content_range("bytes 4-9/10"), Some((4, 9, 10)));
         assert_eq!(parse_content_range("bytes 9-4/10"), None);
         assert_eq!(parse_content_range("bytes 0-9/*"), None);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_direct_url_is_reported_without_being_logged() {
+        let secret = "http://user:password@example.invalid/private-file.mkv";
+        let captured = crate::loglimit::Capture::start();
+        assert!(sidecars(secret, Some(1)).await.is_empty());
+        let log = captured.text();
+        assert!(log.contains("reason=invalid_direct_url selected=1"), "{log}");
+        for private in ["user", "password", "example.invalid", "private-file"] {
+            assert!(!log.contains(private), "log leaked {private:?}: {log}");
+        }
     }
 
     #[test]

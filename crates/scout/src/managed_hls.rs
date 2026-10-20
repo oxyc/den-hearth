@@ -234,8 +234,14 @@ impl TorBoxManagedHls {
                 (Some(direct_file), Some(_slot)) => {
                     crate::managed_subtitles::sidecars(&direct_file, subtitle).await
                 }
-                (None, _) => Vec::new(),
-                _ => Vec::new(),
+                (None, _) => {
+                    report_sidecar_skipped("direct_file_unavailable", subtitle);
+                    Vec::new()
+                }
+                _ => {
+                    report_sidecar_skipped("extractor_busy", subtitle);
+                    Vec::new()
+                }
             }
         };
         let (created, sidecars) = tokio::join!(self.create(token, torrent_id, file_id, subtitle), extract);
@@ -318,6 +324,16 @@ impl TorBoxManagedHls {
         probe_playlist(&self.probe_client, &prepared.url.0).await.map_err(report_probe_failure)?;
         Ok(prepared)
     }
+}
+
+fn report_sidecar_skipped(reason: &'static str, selected: Option<i64>) {
+    log_limited(
+        &format!("managed-subtitle-sidecar-skipped-{reason}"),
+        &format!(
+            "managed HLS: indexed subtitle sidecar unavailable: outcome=skipped reason={reason} selected={}",
+            selected.map_or_else(|| "all".to_owned(), |value| value.to_string())
+        ),
+    );
 }
 
 fn report_create_failure(error: ManagedHlsError, status: Option<reqwest::StatusCode>) -> ManagedHlsError {
@@ -650,6 +666,14 @@ mod tests {
     const SUCCESS: &[u8] = include_bytes!("../testdata/torbox-stream/create-success.json");
     const NOT_FOUND: &[u8] = include_bytes!("../testdata/torbox-stream/create-item-not-found.json");
     const PLAYLIST: &[u8] = include_bytes!("../testdata/torbox-stream/media-playlist.m3u8");
+
+    #[test]
+    fn skipped_sidecar_log_names_the_reason_without_provider_details() {
+        let captured = crate::loglimit::capture(|| {
+            report_sidecar_skipped("direct_file_unavailable", Some(2));
+        });
+        assert!(captured.contains("outcome=skipped reason=direct_file_unavailable selected=2"), "{captured}");
+    }
 
     #[test]
     fn successful_fixture_is_strict_and_url_is_redacted() {
