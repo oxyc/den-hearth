@@ -11,7 +11,7 @@ use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, CONTENT_
 use den_media::indexed_mkv::{self, Cue, TextCodec, TextTrack};
 use den_media::indexed_mp4;
 use den_media::mkv;
-use den_upstream::{ClientProfile, Guard, Redirect};
+use den_upstream::{guard::is_refusal, ClientProfile, Guard, Redirect};
 
 use crate::loglimit::log_limited;
 
@@ -24,14 +24,16 @@ const MAX_CUES_PER_TRACK: usize = 2000;
 const BLOCK_PREFIX_BYTES: usize = 4096;
 const MAX_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_VTT_BYTES: usize = 2 * 1024 * 1024;
-const PARALLEL_BLOCKS: usize = 128;
+// TorBox serves these sparse reads, but a burst of 128 connections caused the CDN to shed subsequent probes.
+// Thirty-two still finishes ordinary text tracks quickly without looking like an abusive download fan-out.
+const PARALLEL_BLOCKS: usize = 32;
 const MULTI_RANGE_PARTS: usize = 32;
 const MULTI_RANGE_OVERHEAD: usize = 64 * 1024;
 // TorBox's CDN accepts the tiny single-range reads used here, but does not consistently implement multipart
 // ranges. A full subtitle track can therefore need a few hundred concurrent requests even though the payload is
 // only a few MiB. Eight seconds was enough for local fixtures but cut a real 335-cue track off mid-flight. Keep
-// the byte/request ceilings as the hard resource bounds and allow three five-second network waves plus margin.
-const DEADLINE: Duration = Duration::from_secs(20);
+// the byte/request ceilings as the hard resource bounds and allow several five-second network waves plus margin.
+const DEADLINE: Duration = Duration::from_secs(30);
 
 const INPUT_UNKNOWN: u8 = 0;
 const INPUT_OTHER: u8 = 1;
@@ -48,6 +50,10 @@ const RANGE_ENCODING: u8 = 5;
 const RANGE_CONTENT_RANGE: u8 = 6;
 const RANGE_EXTENT: u8 = 7;
 const RANGE_BODY: u8 = 8;
+const RANGE_TRANSPORT_TIMEOUT: u8 = 9;
+const RANGE_TRANSPORT_CONNECT: u8 = 10;
+const RANGE_TRANSPORT_GUARD: u8 = 11;
+const RANGE_TRANSPORT_REQUEST: u8 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Sidecar {
@@ -123,6 +129,10 @@ impl Reader {
             RANGE_CONTENT_RANGE => "content_range",
             RANGE_EXTENT => "extent",
             RANGE_BODY => "body",
+            RANGE_TRANSPORT_TIMEOUT => "transport_timeout",
+            RANGE_TRANSPORT_CONNECT => "transport_connect",
+            RANGE_TRANSPORT_GUARD => "transport_guard",
+            RANGE_TRANSPORT_REQUEST => "transport_request",
             _ => "untried",
         };
         (reason, self.range_status.load(Relaxed))
@@ -132,30 +142,50 @@ impl Reader {
         if len == 0 || len > MAX_ELEMENT_BYTES {
             return None;
         }
-        if self.requests.fetch_add(1, Relaxed) >= MAX_REQUESTS {
-            return None;
-        }
-        let mut used = self.bytes.load(Relaxed);
-        loop {
-            let reserved = used.checked_add(len).filter(|total| *total <= MAX_INDEX_BYTES)?;
-            match self.bytes.compare_exchange_weak(used, reserved, Relaxed, Relaxed) {
-                Ok(_) => break,
-                Err(actual) => used = actual,
-            }
-        }
         let end = start.checked_add(u64::try_from(len).ok()?)?.checked_sub(1)?;
-        let response = match self
-            .client
-            .get(self.url.clone())
-            .header(ACCEPT_ENCODING, "identity")
-            .header(RANGE, format!("bytes={start}-{end}"))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(_) => {
-                self.range_failure.store(RANGE_TRANSPORT, Relaxed);
+        let mut attempt = 0;
+        let response = loop {
+            if self.requests.fetch_add(1, Relaxed) >= MAX_REQUESTS {
                 return None;
+            }
+            let mut used = self.bytes.load(Relaxed);
+            loop {
+                let reserved = used.checked_add(len).filter(|total| *total <= MAX_INDEX_BYTES)?;
+                match self.bytes.compare_exchange_weak(used, reserved, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => used = actual,
+                }
+            }
+            match self
+                .client
+                .get(self.url.clone())
+                .header(ACCEPT_ENCODING, "identity")
+                .header(RANGE, format!("bytes={start}-{end}"))
+                .send()
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) => {
+                    self.range_status.store(0, Relaxed);
+                    let failure = if is_refusal(&error) {
+                        RANGE_TRANSPORT_GUARD
+                    } else if error.is_timeout() {
+                        RANGE_TRANSPORT_TIMEOUT
+                    } else if error.is_connect() {
+                        RANGE_TRANSPORT_CONNECT
+                    } else if error.is_request() {
+                        RANGE_TRANSPORT_REQUEST
+                    } else {
+                        RANGE_TRANSPORT
+                    };
+                    self.range_failure.store(failure, Relaxed);
+                    if attempt == 0 && matches!(failure, RANGE_TRANSPORT_TIMEOUT | RANGE_TRANSPORT_CONNECT) {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return None;
+                }
             }
         };
         self.range_status.store(response.status().as_u16(), Relaxed);
