@@ -27,7 +27,11 @@ const MAX_VTT_BYTES: usize = 2 * 1024 * 1024;
 const PARALLEL_BLOCKS: usize = 128;
 const MULTI_RANGE_PARTS: usize = 32;
 const MULTI_RANGE_OVERHEAD: usize = 64 * 1024;
-const DEADLINE: Duration = Duration::from_secs(8);
+// TorBox's CDN accepts the tiny single-range reads used here, but does not consistently implement multipart
+// ranges. A full subtitle track can therefore need a few hundred concurrent requests even though the payload is
+// only a few MiB. Eight seconds was enough for local fixtures but cut a real 335-cue track off mid-flight. Keep
+// the byte/request ceilings as the hard resource bounds and allow three five-second network waves plus margin.
+const DEADLINE: Duration = Duration::from_secs(20);
 
 const INPUT_UNKNOWN: u8 = 0;
 const INPUT_OTHER: u8 = 1;

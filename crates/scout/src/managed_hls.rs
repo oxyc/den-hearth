@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, CacheClass};
 use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::loglimit::log_limited;
@@ -25,6 +25,7 @@ const CREATE_STREAM_URL: &str = "https://api.torbox.app/v1/api/stream/createstre
 const CREATE_BODY_LIMIT: usize = 64 << 10;
 const PLAYLIST_BODY_LIMIT: usize = 256 << 10;
 const PLAYLIST_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBTITLE_SIDECAR_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// TorBox's published managed-stream CDN base domains. Keep this an explicit list: accepting an arbitrary
 /// `tb-cdn.*` suffix would turn TorBox's signed URL into an open redirect to a lookalike domain.
 const MANAGED_HLS_CDN_SUFFIXES: [&str; 7] =
@@ -230,17 +231,39 @@ impl TorBoxManagedHls {
             .map_err(classify_store_error)
             .map_err(report_resolution_failure)?;
 
-        let subtitle_slot = self.subtitle_slots.clone().try_acquire_owned().ok();
+        let sidecar_key = subtitle.map(|ordinal| {
+            format!(
+                "torbox-sidecar-v1:{}:{}:{ordinal}",
+                target.info_hash,
+                file_id.map_or_else(|| "single".to_owned(), |value| value.to_string())
+            )
+        });
+        let cached_sidecar = sidecar_key
+            .as_deref()
+            .and_then(|key| self.cache.get(key))
+            .and_then(|vtt| (vtt.starts_with("WEBVTT\n") && vtt.len() <= 2 * 1024 * 1024).then_some(vtt));
+        // A hit never competes for the extraction slot. This also makes switching back to a track instant after
+        // its first complete extraction, across sessions and service restarts when the configured cache persists.
+        let subtitle_slot =
+            cached_sidecar.is_none().then(|| self.subtitle_slots.clone().try_acquire_owned().ok()).flatten();
+        let cache = self.cache.clone();
         let extract = async move {
-            match (direct_file, subtitle_slot, subtitle) {
+            match (direct_file, subtitle_slot, subtitle, cached_sidecar) {
+                (_, _, Some(ordinal), Some(vtt)) => {
+                    vec![crate::managed_subtitles::Sidecar { ordinal, vtt: vtt.to_string() }]
+                }
                 // The metadata-only request has no selected track to attach. Extracting every track here both
                 // delays initial playback and repeats the chosen track's work when the player applies its
                 // default immediately afterwards.
-                (_, _, None) => Vec::new(),
-                (Some(direct_file), Some(_slot), Some(_)) => {
-                    crate::managed_subtitles::sidecars(&direct_file, subtitle).await
+                (_, _, None, _) => Vec::new(),
+                (Some(direct_file), Some(_slot), Some(_), None) => {
+                    let sidecars = crate::managed_subtitles::sidecars(&direct_file, subtitle).await;
+                    if let (Some(key), [sidecar]) = (sidecar_key.as_deref(), sidecars.as_slice()) {
+                        cache.put_class(key, &sidecar.vtt, SUBTITLE_SIDECAR_TTL, CacheClass::Durable);
+                    }
+                    sidecars
                 }
-                (None, _, _) => {
+                (None, _, _, None) => {
                     report_sidecar_skipped("direct_file_unavailable", subtitle);
                     Vec::new()
                 }
