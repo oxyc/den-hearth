@@ -68,6 +68,10 @@ pub const SERVER_TIMING: &str = "server-timing";
 /// the app can read the header without knowing which addon sent it.
 pub const X_DEN_DEGRADED: &str = "x-den-degraded";
 
+/// `X-Den-Service-Read: 1` on a play request marks a service reading the release for itself (Remux opening it for a
+/// session or an intro scan), not a viewer starting playback, so Scout does not report it as a play.
+pub const X_DEN_SERVICE_READ: &str = "x-den-service-read";
+
 /// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can fail mid-flight,
 /// full-buffer bodies never do).
 pub type Body = BoxBody<Bytes, std::io::Error>;

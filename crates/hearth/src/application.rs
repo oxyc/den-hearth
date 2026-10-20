@@ -65,6 +65,14 @@ impl Hearth {
         limits: Limits,
         options: Options,
     ) -> Arc<Self> {
+        // A viewer's player reads a release straight from the debrid; Scout's play redirect is all this process
+        // sees of it, and Remux's intro scan must not read the same episode then.
+        if let (Some(scout), Some(remux)) = (&scout, &remux) {
+            let segments = remux.segments.clone();
+            scout.observe_plays(Arc::new(move |imdb, season, episode| {
+                segments.note_play(imdb, season, episode)
+            }));
+        }
         Arc::new(Hearth {
             reel,
             subs,

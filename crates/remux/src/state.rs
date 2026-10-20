@@ -639,8 +639,8 @@ pub struct AppState {
     pub transcodes: Arc<AtomicUsize>,
     /// Each session's loopback door to its release, which its ffmpeg reads through (`source`).
     pub doors: crate::source::Doors,
-    /// Intro/credits scans: their queue and daily budget (`segments`).
-    pub segments: crate::segments::Segments,
+    /// Intro/credits scans: their queue and daily budget (`segments`). Shared, so Scout can tell it of plays.
+    pub segments: Arc<crate::segments::Segments>,
     /// Can this ffmpeg write PCM to a pipe (`segments::check_ffmpeg`)? Scanning is off without it.
     pub segments_ffmpeg: AtomicBool,
     /// One rebuild of a session from its restart record at a time (`session::revive`).
