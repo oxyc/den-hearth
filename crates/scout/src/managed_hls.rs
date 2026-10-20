@@ -93,7 +93,7 @@ pub struct ManagedHlsRequest {
     /// Asked for a Cast receiver, which plays TorBox's stream as it is: a release `playable` says its video would
     /// have to be converted for is left to Remux, rather than handed over to fail on the TV.
     pub receiver: bool,
-    /// TorBox's embedded subtitle stream index. None keeps subtitles out of the managed playlist.
+    /// TorBox's zero-based position in `metadata.subtitles`. None keeps subtitles out of the managed playlist.
     pub subtitle: Option<i64>,
 }
 
@@ -396,7 +396,8 @@ struct CreateMetadata {
 
 #[derive(Deserialize)]
 struct CreateSubtitle {
-    index: i64,
+    #[serde(rename = "index")]
+    _stream_index: i64,
     language: Option<String>,
     language_full: Option<String>,
     title: Option<String>,
@@ -436,8 +437,12 @@ fn parse_success(
         .metadata
         .subtitles
         .into_iter()
-        .map(|track| ManagedHlsSubtitle {
-            index: track.index,
+        // TorBox's own player sends the array position to `chosen_subtitle_index`. `track.index` is the
+        // underlying media stream index and can include video/audio streams, so sending it selects another
+        // subtitle (or no useful one) in multi-track files.
+        .enumerate()
+        .map(|(selection_index, track)| ManagedHlsSubtitle {
+            index: selection_index as i64,
             language: track.language,
             name: track.title.or(track.language_full),
             codec: track.codec,
@@ -635,6 +640,36 @@ mod tests {
                 .map(|prepared| prepared.selected_subtitle),
             Ok(Some(0))
         );
+    }
+
+    #[test]
+    fn subtitle_choices_are_metadata_positions_not_media_stream_indexes() {
+        let mut changed: serde_json::Value = serde_json::from_slice(SUCCESS).unwrap();
+        changed["data"]["metadata"]["subtitles"] = serde_json::json!([
+            {
+                "codec": "subrip",
+                "codec_type": "subtitle",
+                "default": false,
+                "index": 7,
+                "language": "ara",
+                "language_full": "Arabic",
+                "title": "Arabic"
+            },
+            {
+                "codec": "subrip",
+                "codec_type": "subtitle",
+                "default": false,
+                "index": 11,
+                "language": "eng",
+                "language_full": "English",
+                "title": "English"
+            }
+        ]);
+
+        let prepared = parse_success(&serde_json::to_vec(&changed).unwrap(), None).unwrap();
+        assert_eq!(prepared.subtitles[0].index, 0);
+        assert_eq!(prepared.subtitles[1].index, 1);
+        assert_eq!(prepared.subtitles[1].language.as_deref(), Some("eng"));
     }
 
     #[test]
