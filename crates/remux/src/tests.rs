@@ -936,6 +936,95 @@ fn video_packets(file: &Path) -> Vec<(f64, bool)> {
         .collect()
 }
 
+/// The boxes directly inside `b`, as `(type, body)`.
+fn mp4_boxes(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 8 <= b.len() {
+        let size = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+        let (header, size) = match size {
+            1 => (16, u64::from_be_bytes(b[at + 8..at + 16].try_into().unwrap()) as usize),
+            0 => (8, b.len() - at),
+            n => (8, n),
+        };
+        out.push((b[at + 4..at + 8].try_into().unwrap(), &b[at + header..at + size]));
+        at += size;
+    }
+    out
+}
+
+/// The first box of type `kind` inside `b`, by path.
+fn mp4_find<'a>(b: &'a [u8], path: &[&[u8; 4]]) -> Option<&'a [u8]> {
+    let (head, rest) = path.split_first()?;
+    let body = mp4_boxes(b).into_iter().find(|(t, _)| t == *head)?.1;
+    if rest.is_empty() {
+        Some(body)
+    } else {
+        mp4_find(body, rest)
+    }
+}
+
+fn be32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// Every audio fragment the segments carry, in order, as a browser's MSE reads them: `(tfdt, duration)` in the audio
+/// track's timescale. The tfdt is read as signed, so a negative one written into the unsigned field shows as such.
+fn audio_fragments(init: &[u8], segs: &[Bytes]) -> Vec<(i64, u64)> {
+    let moov = mp4_find(init, &[b"moov"]).unwrap();
+    let audio_id = mp4_boxes(moov)
+        .into_iter()
+        .filter(|(t, _)| t == b"trak")
+        .find(|(_, trak)| mp4_find(trak, &[b"mdia", b"hdlr"]).is_some_and(|h| &h[8..12] == b"soun"))
+        .map(|(_, trak)| {
+            let tkhd = mp4_find(trak, &[b"tkhd"]).unwrap();
+            be32(tkhd, if tkhd[0] == 1 { 20 } else { 12 })
+        })
+        .expect("an audio track in the init");
+    let trex_duration = mp4_boxes(mp4_find(moov, &[b"mvex"]).unwrap())
+        .into_iter()
+        .find(|(t, trex)| t == b"trex" && be32(trex, 4) == audio_id)
+        .map(|(_, trex)| be32(trex, 12));
+    let mut out = Vec::new();
+    for seg in segs {
+        for (_, moof) in mp4_boxes(seg).into_iter().filter(|(t, _)| t == b"moof") {
+            for (_, traf) in mp4_boxes(moof).into_iter().filter(|(t, _)| t == b"traf") {
+                let tfhd = mp4_find(traf, &[b"tfhd"]).unwrap();
+                if be32(tfhd, 4) != audio_id {
+                    continue;
+                }
+                let flags = be32(tfhd, 0) & 0xff_ffff;
+                // tfhd: base-data-offset and sample-description-index come before the default duration.
+                let at = 8 + if flags & 0x1 != 0 { 8 } else { 0 } + if flags & 0x2 != 0 { 4 } else { 0 };
+                let default = if flags & 0x8 != 0 { Some(be32(tfhd, at)) } else { trex_duration };
+                let tfdt = mp4_find(traf, &[b"tfdt"]).unwrap();
+                let start = match tfdt[0] {
+                    1 => i64::from_be_bytes(tfdt[4..12].try_into().unwrap()),
+                    _ => be32(tfdt, 4) as i64,
+                };
+                let mut duration = 0u64;
+                for (_, trun) in mp4_boxes(traf).into_iter().filter(|(t, _)| t == b"trun") {
+                    let tflags = be32(trun, 0) & 0xff_ffff;
+                    let mut p =
+                        8 + if tflags & 0x1 != 0 { 4 } else { 0 } + if tflags & 0x4 != 0 { 4 } else { 0 };
+                    for _ in 0..be32(trun, 4) {
+                        duration += if tflags & 0x100 != 0 {
+                            let d = be32(trun, p);
+                            p += 4;
+                            d
+                        } else {
+                            default.expect("a sample duration")
+                        } as u64;
+                        p += [0x200, 0x400, 0x800].iter().filter(|f| tflags & **f != 0).count() * 4;
+                    }
+                }
+                out.push((start, duration));
+            }
+        }
+    }
+    out
+}
+
 fn extinfs(media: &str) -> Vec<f64> {
     media
         .lines()
@@ -1114,6 +1203,12 @@ async fn end_to_end_with(
         "an out-of-order fetch should have restarted the job"
     );
     dump_session(fixture_name, &master.text(), &media, &init.body, &segs);
+
+    // The first audio fragment, as a browser's MSE reads its tfdt, starts at or after 0. A tfdt is unsigned: WebKit
+    // reads a negative one as 0, so that fragment's audio lands late, over the start of the next one, and stalls
+    // replacing what it already queued. (The joins between runs are held to at most one frame below.)
+    let fragments = audio_fragments(&init.body, &segs);
+    assert!(fragments[0].0 >= 0, "the first audio fragment starts at {} ticks", fragments[0].0);
 
     let frame = 1.0 / 24.0 + 0.002;
     let mut shifted = vec![false; n];
@@ -1429,6 +1524,75 @@ async fn av1_sdr_matroska_end_to_end() {
         &file,
     );
     assert_eq!(stream.trim(), "av1,bt709", "the init alone describes AV1 in BT.709");
+}
+
+/// A run from the start of the file re-encoding the audio to AAC, as `job::args` has it: its audio begins at or after
+/// 0 and runs on without a gap or an overlap from one GOP file to the next; it writes the init a run from a seek does,
+/// so the first run's serves both; and against the same run without the priming cut, only the first packet differs —
+/// every later one keeps its timestamp, so the audio is where it was against the pictures.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn an_aac_run_from_the_start_writes_the_seeks_init_and_no_audio_before_zero() {
+    const PRIMING: i64 = 1024;
+    for name in ["av1-sdr.mkv", "h264.mkv"] {
+        let source = testdata(name);
+        let input = source.to_str().unwrap();
+        let run = |seek: Option<f64>, cut: bool| {
+            let dir = temp_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let spec = crate::job::Spec {
+                input,
+                seek,
+                video: crate::job::Video::Copy { tag: None, dovi: crate::job::Dovi::Absent },
+                audio: 0,
+                audio_out: crate::job::AudioOut::Stereo,
+                text: &[],
+                dir: &dir,
+            };
+            let mut args = crate::job::args(&spec, None);
+            if !cut {
+                let at = args.iter().position(|a| a == "atrim=start_sample=1024").expect("the priming cut");
+                args.drain(at - 1..=at);
+            }
+            let out = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg")).args(args).output().unwrap();
+            assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+            let init = std::fs::read(dir.join("init.mp4")).unwrap();
+            let list = std::fs::read_to_string(dir.join("gops.m3u8")).unwrap();
+            let gops: Vec<Bytes> = crate::job::parse_gops(&list)
+                .iter()
+                .map(|(gop, _)| Bytes::from(std::fs::read(dir.join(gop)).unwrap()))
+                .collect();
+            (init, gops)
+        };
+        let (init, gops) = run(None, true);
+        let (seek_init, _) = run(crate::job::seek_for(12.0), true);
+        assert!(init == seek_init, "{name}: a start-of-file run wrote a different init.mp4 from a seek's");
+        let cut = audio_fragments(&init, &gops);
+        assert!(cut.len() > 1, "{name}: {cut:?}");
+        assert!(cut[0].0 >= 0, "{name}: the first audio fragment starts at {} ticks", cut[0].0);
+        for (i, w) in cut.windows(2).enumerate() {
+            assert_eq!(
+                w[1].0,
+                w[0].0 + w[0].1 as i64,
+                "{name}: audio fragment {} starts off {i}'s end",
+                i + 1
+            );
+        }
+        // The same run as it was: its priming frame one frame before the cut run's, and nothing else moved.
+        let (old_init, old_gops) = run(None, false);
+        let old = audio_fragments(&old_init, &old_gops);
+        assert_eq!(
+            cut[0].0,
+            old[0].0 + PRIMING,
+            "{name}: the first packet is not the old one's priming moved"
+        );
+        assert_eq!(
+            cut[0].0 + cut[0].1 as i64,
+            old[0].0 + old[0].1 as i64,
+            "{name}: the first fragment's end moved"
+        );
+        assert_eq!(cut[1..], old[1..], "{name}: audio after the first fragment moved");
+    }
 }
 
 /// 5.1 for a player that plays multichannel AAC: surround.mkv's 5.1 track, and its 7.1 one folded down, come out as
