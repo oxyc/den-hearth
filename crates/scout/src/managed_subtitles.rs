@@ -1,7 +1,7 @@
 //! Bounded extraction of complete indexed Matroska and ISO-BMFF text subtitles from a TorBox direct-file
 //! capability.
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +35,16 @@ const INPUT_MKV_NO_INDEX: u8 = 2;
 const INPUT_MKV_INDEXED: u8 = 3;
 const INPUT_MP4_INDEXED: u8 = 4;
 
+const RANGE_UNTRIED: u8 = 0;
+const RANGE_OK: u8 = 1;
+const RANGE_TRANSPORT: u8 = 2;
+const RANGE_STATUS: u8 = 3;
+const RANGE_REDIRECT: u8 = 4;
+const RANGE_ENCODING: u8 = 5;
+const RANGE_CONTENT_RANGE: u8 = 6;
+const RANGE_EXTENT: u8 = 7;
+const RANGE_BODY: u8 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Sidecar {
     pub(crate) ordinal: i64,
@@ -48,6 +58,8 @@ struct Reader {
     bytes: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
     input: Arc<AtomicU8>,
+    range_failure: Arc<AtomicU8>,
+    range_status: Arc<AtomicU16>,
 }
 
 impl Reader {
@@ -82,6 +94,8 @@ impl Reader {
             bytes: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(AtomicUsize::new(0)),
             input: Arc::new(AtomicU8::new(INPUT_UNKNOWN)),
+            range_failure: Arc::new(AtomicU8::new(RANGE_UNTRIED)),
+            range_status: Arc::new(AtomicU16::new(0)),
         })
     }
 
@@ -93,6 +107,21 @@ impl Reader {
             INPUT_MP4_INDEXED => "mp4_indexed",
             _ => "unknown",
         }
+    }
+
+    fn range_failure(&self) -> (&'static str, u16) {
+        let reason = match self.range_failure.load(Relaxed) {
+            RANGE_OK => "none",
+            RANGE_TRANSPORT => "transport",
+            RANGE_STATUS => "status",
+            RANGE_REDIRECT => "redirect",
+            RANGE_ENCODING => "encoding",
+            RANGE_CONTENT_RANGE => "content_range",
+            RANGE_EXTENT => "extent",
+            RANGE_BODY => "body",
+            _ => "untried",
+        };
+        (reason, self.range_status.load(Relaxed))
     }
 
     async fn range(&self, start: u64, len: usize) -> Option<(Vec<u8>, u64)> {
@@ -111,29 +140,58 @@ impl Reader {
             }
         }
         let end = start.checked_add(u64::try_from(len).ok()?)?.checked_sub(1)?;
-        let response = self
+        let response = match self
             .client
             .get(self.url.clone())
             .header(ACCEPT_ENCODING, "identity")
             .header(RANGE, format!("bytes={start}-{end}"))
             .send()
             .await
-            .ok()?;
-        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT || response.url() != &self.url {
+        {
+            Ok(response) => response,
+            Err(_) => {
+                self.range_failure.store(RANGE_TRANSPORT, Relaxed);
+                return None;
+            }
+        };
+        self.range_status.store(response.status().as_u16(), Relaxed);
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            self.range_failure.store(RANGE_STATUS, Relaxed);
+            return None;
+        }
+        if response.url() != &self.url {
+            self.range_failure.store(RANGE_REDIRECT, Relaxed);
             return None;
         }
         if response.headers().get(CONTENT_ENCODING).is_some_and(|value| value.as_bytes() != b"identity") {
+            self.range_failure.store(RANGE_ENCODING, Relaxed);
             return None;
         }
-        let (actual_start, actual_end, total) =
-            parse_content_range(response.headers().get(CONTENT_RANGE)?.to_str().ok()?)?;
+        let Some((actual_start, actual_end, total)) = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range)
+        else {
+            self.range_failure.store(RANGE_CONTENT_RANGE, Relaxed);
+            return None;
+        };
         if actual_start != start || actual_end != end || end >= total {
+            self.range_failure.store(RANGE_EXTENT, Relaxed);
             return None;
         }
-        let body = response.bytes().await.ok()?;
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(_) => {
+                self.range_failure.store(RANGE_BODY, Relaxed);
+                return None;
+            }
+        };
         if body.len() != len {
+            self.range_failure.store(RANGE_BODY, Relaxed);
             return None;
         }
+        self.range_failure.store(RANGE_OK, Relaxed);
         Some((body.to_vec(), total))
     }
 
@@ -649,13 +707,14 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
     .await;
     let requests = reader.requests.load(Relaxed);
     let bytes = reader.bytes.load(Relaxed);
+    let (range_failure, range_status) = reader.range_failure();
     match result {
         Ok(sidecars) => {
             if sidecars.is_empty() {
                 log_limited(
                     &format!("managed-subtitle-sidecar-ineligible-{}", selected.unwrap_or(-1)),
                     &format!(
-                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible input={} selected={} requests={requests} reserved_bytes={bytes}",
+                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible input={} range_failure={range_failure} range_status={range_status} selected={} requests={requests} reserved_bytes={bytes}",
                         reader.input_kind(),
                         selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                     ),
@@ -676,7 +735,7 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
             log_limited(
                 &format!("managed-subtitle-sidecar-timeout-{}", selected.unwrap_or(-1)),
                 &format!(
-                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout input={} selected={} requests={requests} reserved_bytes={bytes}",
+                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout input={} range_failure={range_failure} range_status={range_status} selected={} requests={requests} reserved_bytes={bytes}",
                     reader.input_kind(),
                     selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                 ),
