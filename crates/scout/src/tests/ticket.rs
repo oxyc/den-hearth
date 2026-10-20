@@ -372,6 +372,57 @@ async fn play_ticket_an_expired_ticket_is_gone() {
     }
 }
 
+// A viewer's play of an episode is reported to the runtime's observer, once per redirect. A probe, a prefetch and a
+// service reading the release for itself (Remux) are not plays.
+#[tokio::test]
+async fn play_ticket_a_viewers_episode_play_is_reported() {
+    let kr = ticket_keyring();
+    let tk = ticket_keys(&kr);
+    let config =
+        decode_config(Some(&kr), &sealed_config(&kr, &format!("{TICKET_CFG}}}"))).unwrap_or_default();
+    let episode = PlayTarget {
+        info_hash: "a".repeat(40),
+        file_idx: Some(0),
+        season: Some(1),
+        episode: Some(3),
+        imdb: "tt2309405".into(),
+        ..Default::default()
+    };
+    let ticket = tk.mint(&config, &episode, SystemTime::now() + Duration::from_secs(3600));
+    let movie = tk.mint(
+        &config,
+        &PlayTarget {
+            info_hash: "a".repeat(40),
+            file_idx: Some(0),
+            imdb: "tt1234567".into(),
+            ..Default::default()
+        },
+        SystemTime::now() + Duration::from_secs(3600),
+    );
+    let runtime = crate::runtime::ScoutRuntime::new();
+    let plays = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = plays.clone();
+    runtime.observe_plays(Arc::new(move |imdb: &str, season, episode| {
+        seen.lock().unwrap().push(format!("{imdb}:{season}:{episode}"))
+    }));
+    let h = with_keyring(|d| d.runtime = runtime.clone());
+
+    for (path, headers) in [
+        (format!("/p/{ticket}?probe=1"), vec![]),
+        (format!("/p/{ticket}?prefetch=1"), vec![]),
+        (format!("/p/{ticket}"), vec![(den_http::X_DEN_SERVICE_READ, "1")]),
+        (format!("/p/{movie}"), vec![]),
+    ] {
+        let rr = get(&h, &path, &headers).await;
+        assert!(rr.status() == 200 || rr.status() == 302, "{path}: {}", rr.status());
+    }
+    assert!(plays.lock().unwrap().is_empty(), "not a viewer's episode play: {:?}", plays.lock().unwrap());
+
+    let rr = get(&h, &format!("/p/{ticket}"), &[]).await;
+    assert_eq!(rr.status(), 302);
+    assert_eq!(*plays.lock().unwrap(), ["tt2309405:1:3"]);
+}
+
 // With a key set, every play URL in a list is a ticket, carries neither the config nor the token, and plays.
 #[tokio::test]
 async fn play_ticket_a_stream_list_names_tickets_that_play() {

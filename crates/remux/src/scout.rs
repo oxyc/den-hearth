@@ -411,6 +411,8 @@ pub async fn resolve(
         let range = format!("bytes=0-{}", HEAD_BYTES - 1);
         headers.insert(reqwest::header::RANGE, range.parse().expect("a range is a header value"));
         let resp = if src.is_scout(&url) {
+            // This read is this service's, not a viewer's play: an intro scan must not be held back by its own resolve.
+            headers.insert(den_http::X_DEN_SERVICE_READ, reqwest::header::HeaderValue::from_static("1"));
             // Scout itself is reached wherever it lives, and is the only place the key goes.
             if let Some(k) = src.key.as_deref() {
                 headers.insert(

@@ -270,6 +270,14 @@ deep, capped at `SEGMENTS_DAILY_CAP` fingerprinted episodes a day, and each epis
 logs one line: `segments: <tt:S:E> release=<res>/<GB> read=<MB> wall=<s> result=intro:<a-b|none> credits:<…>`, or
 `result=failed (<why>)`, with no URL.
 
+Nor does a scan read an episode a viewer is playing: its windows are ~1 GB of the release read flat out, and a player
+on the same episode starved beside it. A player reads straight from the debrid, so the sign of a play is Scout's play
+redirect for that episode (in den-hearth, where Scout is in process); the play is taken to last the release's runtime
+from its last redirect, plus 10 min. A live Remux session of the episode holds it too. Only the release's head and
+probe are read before the scan is put off (`segments: <tt:S:E> held: <tt:S:E> is being played, for up to <s>s
+more`); it stays queued (`202 queued`, `GET` → `pending`) while other episodes scan, and runs once the play is over.
+A sibling being played is passed over for the other neighbour.
+
 Measured on Apple Silicon (nixpkgs ffmpeg 9.0.1), a 10 min window of a 720p file with 640 kbit/s E-AC-3 5.1:
 ffmpeg 1.27 CPU-s (1.03 user + 0.24 sys) in 0.59 s, 28 MB peak RSS (10.9 MB footprint); fingerprinting it in-process
 about 0.4 CPU-s and 3.4 MB peak footprint for the whole test process. A typical 45 min episode decodes 14 min of
