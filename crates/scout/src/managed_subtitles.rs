@@ -29,6 +29,7 @@ const MAX_VTT_BYTES: usize = 2 * 1024 * 1024;
 const PARALLEL_BLOCKS: usize = 32;
 const MULTI_RANGE_PARTS: usize = 32;
 const MULTI_RANGE_OVERHEAD: usize = 64 * 1024;
+const RANGE_ATTEMPTS: usize = 4;
 // TorBox's CDN accepts the tiny single-range reads used here, but does not consistently implement multipart
 // ranges. A full subtitle track can therefore need a few hundred concurrent requests even though the payload is
 // only a few MiB. Eight seconds was enough for local fixtures, while a real 488-cue track needed more than the
@@ -180,9 +181,14 @@ impl Reader {
                         RANGE_TRANSPORT
                     };
                     self.range_failure.store(failure, Relaxed);
-                    if attempt == 0 && matches!(failure, RANGE_TRANSPORT_TIMEOUT | RANGE_TRANSPORT_CONNECT) {
+                    // Fresh TorBox download capabilities occasionally need more than one DNS/TLS attempt before
+                    // their CDN edge accepts sparse reads. Retries still spend the global request and byte budgets,
+                    // and the whole extractor remains subject to DEADLINE.
+                    if attempt + 1 < RANGE_ATTEMPTS
+                        && matches!(failure, RANGE_TRANSPORT_TIMEOUT | RANGE_TRANSPORT_CONNECT)
+                    {
                         attempt += 1;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
                         continue;
                     }
                     return None;
