@@ -10,6 +10,16 @@ pub(super) fn managed_candidates<'a>(
     if let Some(filename) = request.filename.as_deref().filter(|name| !name.is_empty()) {
         candidates.retain(|candidate| candidate.title == filename);
     }
+    // LG's webOS player has now shown materially wrong pictures from TorBox's managed rendition for both Dolby
+    // Vision and ordinary HDR10 sources. Keep those releases selectable: a remote viewer may have no reachable
+    // Remux, and an explicit choice must remain their choice. For automatic playback on webOS only, prefer every
+    // SDR candidate before trying an HDR/DV one. The stable sort preserves Scout's ranking inside both groups.
+    if request.filename.is_none() && request.platform.as_deref() == Some("webos") {
+        candidates.sort_by_key(|candidate| {
+            let attributes = stream_attributes((*candidate).clone());
+            attributes.hdr || attributes.dolby_vision
+        });
+    }
     // TorBox managed HLS has produced materially wrong Dolby Vision pictures on both LG webOS and iOS, while the
     // same releases through Remux play correctly. This is therefore a property of the managed rendition, not one
     // renderer: never silently trade correctness for the direct path. An automatic choice can take the next
