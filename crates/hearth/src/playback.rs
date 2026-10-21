@@ -513,6 +513,7 @@ fn managed_request(
         filename,
         playable,
         receiver: object.get("player").and_then(Value::as_str) == Some("cast"),
+        platform: object.get("platform").and_then(Value::as_str).map(str::to_owned),
         subtitle,
     })
 }

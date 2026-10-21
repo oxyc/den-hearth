@@ -250,10 +250,11 @@ async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
     assert_eq!(inspect.targets.lock().unwrap().len(), 2);
 }
 
-// TorBox's single-rendition managed HLS currently mishandles Dolby Vision. Automatic playback must choose a
-// sound non-DV release; an explicit DV choice belongs to Remux, while Atmos without DV remains eligible.
+// TorBox's single-rendition managed HLS currently mishandles Dolby Vision on LG webOS. Automatic LG playback must
+// choose a sound non-DV release; an explicit DV choice belongs to Remux, while Atmos without DV remains eligible.
+// Nothing broadens that observation into policy for Samsung or ordinary browser-native HLS.
 #[tokio::test]
-async fn managed_hls_leaves_dolby_vision_to_remux_without_penalizing_atmos() {
+async fn managed_hls_leaves_dolby_vision_to_remux_only_on_webos() {
     const DV: &str = "Show S01E01 2160p WEB-DL DDP5.1 Atmos DV HEVC";
     const ATMOS: &str = "Show S01E01 1080p WEB-DL DDP5.1 Atmos x264";
     let seeds = || {
@@ -283,18 +284,29 @@ async fn managed_hls_leaves_dolby_vision_to_remux_without_penalizing_atmos() {
         deps.make_scrapers =
             Arc::new(move |_| vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]);
     }));
-    let ask = |filename: Option<&str>| ManagedHlsRequest {
+    let ask = |filename: Option<&str>, platform: Option<&str>, receiver: bool| ManagedHlsRequest {
         imdb: "tt0111161".to_owned(),
         filename: filename.map(str::to_owned),
+        platform: platform.map(str::to_owned),
+        receiver,
         ..Default::default()
     };
 
-    let automatic = h.managed_hls(&valid_blob(), &ask(None)).await.expect("non-DV fallback");
+    let automatic =
+        h.managed_hls(&valid_blob(), &ask(None, Some("webos"), false)).await.expect("non-DV fallback");
     assert_eq!(automatic.release.filename, ATMOS, "Atmos itself remains eligible");
 
-    let explicit_dv = h.managed_hls(&valid_blob(), &ask(Some(DV))).await;
+    let explicit_dv = h.managed_hls(&valid_blob(), &ask(Some(DV), Some("webos"), false)).await;
     assert!(matches!(explicit_dv, Err(ManagedHlsError::NotFound)), "{explicit_dv:?}");
-    assert_eq!(inspect.targets.lock().unwrap().len(), 1, "TorBox was never asked for the DV file");
+
+    let samsung =
+        h.managed_hls(&valid_blob(), &ask(Some(DV), Some("tizen"), false)).await.expect("Samsung DV");
+    assert_eq!(samsung.release.filename, DV, "Samsung retains its existing TorBox path");
+    let browser = h.managed_hls(&valid_blob(), &ask(Some(DV), None, false)).await.expect("browser DV");
+    assert_eq!(browser.release.filename, DV, "ordinary native HLS retains its existing TorBox path");
+    let cast = h.managed_hls(&valid_blob(), &ask(Some(DV), Some("webos"), true)).await.expect("cast DV");
+    assert_eq!(cast.release.filename, DV, "a receiver, not webOS, renders a cast stream");
+    assert_eq!(inspect.targets.lock().unwrap().len(), 4, "only local LG DV playback skipped TorBox");
 }
 
 /// The future a `FakeScraper`'s behaviour returns, so a test can answer late, hang, or fail.

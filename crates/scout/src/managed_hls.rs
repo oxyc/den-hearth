@@ -94,6 +94,8 @@ pub struct ManagedHlsRequest {
     /// Asked for a Cast receiver, which plays TorBox's stream as it is: a release `playable` says its video would
     /// have to be converted for is left to Remux, rather than handed over to fail on the TV.
     pub receiver: bool,
+    /// The packaged TV platform, where one has identified itself. Browser-native HLS remains unspecified.
+    pub platform: Option<String>,
     /// TorBox's zero-based position in `metadata.subtitles`. None keeps subtitles out of the managed playlist.
     pub subtitle: Option<i64>,
 }
