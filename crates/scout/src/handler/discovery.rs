@@ -10,12 +10,14 @@ pub(super) fn managed_candidates<'a>(
     if let Some(filename) = request.filename.as_deref().filter(|name| !name.is_empty()) {
         candidates.retain(|candidate| candidate.title == filename);
     }
-    // TorBox managed HLS turns the source into one MPEG-TS rendition. Its Dolby Vision conversion has been
-    // observed to produce a materially wrong picture, while the same release through Remux is tone-mapped
-    // correctly. Never silently trade that correctness for the direct path: an automatic choice can take the
-    // next non-DV release, and an explicitly selected DV release falls through to Remux unchanged. Atmos alone
-    // is not a reason to refuse direct playback; it cannot account for a damaged picture.
-    candidates.retain(|candidate| !stream_attributes((*candidate).clone()).dolby_vision);
+    // TorBox managed HLS on LG webOS has been observed to produce a materially wrong Dolby Vision picture, while
+    // the same release through Remux is correct. That evidence is platform-specific: Samsung AVPlay and ordinary
+    // native-HLS browsers may handle TorBox's packaging correctly, so do not penalize them. On webOS an automatic
+    // choice can take the next non-DV release, and an explicit DV choice falls through to Remux unchanged. Atmos
+    // alone remains eligible; it cannot account for damaged picture.
+    if request.platform.as_deref() == Some("webos") && !request.receiver {
+        candidates.retain(|candidate| !stream_attributes((*candidate).clone()).dolby_vision);
+    }
     if let Some(client) = request.playable.as_ref().filter(|_| request.receiver) {
         candidates.retain(|candidate| {
             client.cost((*candidate).clone(), stream_attributes((*candidate).clone()))
