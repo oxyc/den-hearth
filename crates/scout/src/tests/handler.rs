@@ -250,6 +250,53 @@ async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
     assert_eq!(inspect.targets.lock().unwrap().len(), 2);
 }
 
+// TorBox's single-rendition managed HLS currently mishandles Dolby Vision. Automatic playback must choose a
+// sound non-DV release; an explicit DV choice belongs to Remux, while Atmos without DV remains eligible.
+#[tokio::test]
+async fn managed_hls_leaves_dolby_vision_to_remux_without_penalizing_atmos() {
+    const DV: &str = "Show S01E01 2160p WEB-DL DDP5.1 Atmos DV HEVC";
+    const ATMOS: &str = "Show S01E01 1080p WEB-DL DDP5.1 Atmos x264";
+    let seeds = || {
+        vec![
+            RawStream {
+                info_hash: "a".repeat(40),
+                title: DV.to_owned(),
+                size_bytes: Some(18 * GIB),
+                seeders: Some(100),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+            RawStream {
+                info_hash: "b".repeat(40),
+                title: ATMOS.to_owned(),
+                size_bytes: Some(8 * GIB),
+                seeders: Some(50),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+        ]
+    };
+    let resolver = Arc::new(FixedManagedHls::default());
+    let inspect = resolver.clone();
+    let h = new_handler(test_deps(move |deps| {
+        deps.managed_hls = Some(resolver);
+        deps.make_scrapers =
+            Arc::new(move |_| vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]);
+    }));
+    let ask = |filename: Option<&str>| ManagedHlsRequest {
+        imdb: "tt0111161".to_owned(),
+        filename: filename.map(str::to_owned),
+        ..Default::default()
+    };
+
+    let automatic = h.managed_hls(&valid_blob(), &ask(None)).await.expect("non-DV fallback");
+    assert_eq!(automatic.release.filename, ATMOS, "Atmos itself remains eligible");
+
+    let explicit_dv = h.managed_hls(&valid_blob(), &ask(Some(DV))).await;
+    assert!(matches!(explicit_dv, Err(ManagedHlsError::NotFound)), "{explicit_dv:?}");
+    assert_eq!(inspect.targets.lock().unwrap().len(), 1, "TorBox was never asked for the DV file");
+}
+
 /// The future a `FakeScraper`'s behaviour returns, so a test can answer late, hang, or fail.
 pub(crate) type FakeFuture = Pin<Box<dyn Future<Output = Result<Vec<RawStream>, DoError>> + Send>>;
 
