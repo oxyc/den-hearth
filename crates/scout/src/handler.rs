@@ -9,7 +9,7 @@
 mod discovery;
 mod playback;
 mod presentation;
-use discovery::managed_candidates;
+use discovery::{managed_audio_track, managed_candidates};
 #[cfg(test)]
 pub(crate) use presentation::queued_body;
 pub(crate) use presentation::{write_queued, write_queued_body};
@@ -1241,11 +1241,13 @@ impl Inner {
             )
             .await;
         for candidate in managed_candidates(&list, request)? {
+            let audio_track = managed_audio_track(candidate, &request.audio, request.audio_track);
             let target = ResolveTarget {
                 info_hash: candidate.info_hash.clone(),
                 file_idx: candidate.file_idx,
                 season: season_ptr(&sid),
                 episode: episode_ptr(&sid),
+                audio_track,
                 release_size: candidate.size_bytes.unwrap_or_default(),
                 title: candidate.title.clone(),
                 imdb: sid.imdb.clone(),
@@ -1265,6 +1267,13 @@ impl Inner {
                             filename: candidate.title.clone(),
                             size: candidate.size_bytes.filter(|size| *size > 0),
                         },
+                        audio_tracks: candidate
+                            .probe
+                            .as_ref()
+                            .filter(|probe| probe.untagged_audio == 0)
+                            .map(|probe| probe.audio.clone())
+                            .unwrap_or_default(),
+                        audio_track: audio_track.unwrap_or(0),
                     });
                 }
                 Err(ManagedHlsError::NotFound) => continue,
