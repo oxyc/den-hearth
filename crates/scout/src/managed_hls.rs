@@ -87,6 +87,10 @@ pub struct ManagedHlsRequest {
     pub imdb: String,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    /// Preferred audio languages, most wanted first. Managed HLS must not discard the same choice Remux honours.
+    pub audio: Vec<String>,
+    /// A concrete track chosen from a previous managed answer. Unlike a preference, this must be preserved.
+    pub audio_track: Option<i64>,
     /// When present, keep the user's explicit release selection instead of choosing the first ranked release.
     pub filename: Option<String>,
     /// The same browser capability report Scout already uses for stream-list ranking.
@@ -115,6 +119,9 @@ pub struct ManagedHlsResult {
     pub release: ManagedHlsRelease,
     pub subtitles: Vec<ManagedHlsSubtitle>,
     pub selected_subtitle: Option<i64>,
+    /// Container-order languages when the probe accounted for every audio track.
+    pub audio_tracks: Vec<String>,
+    pub audio_track: i64,
 }
 
 /// One embedded track TorBox found in the selected file. All strings are display metadata, never capabilities.
@@ -148,7 +155,12 @@ pub trait ManagedHlsResolver: Send + Sync {
 
 impl fmt::Debug for ManagedHlsResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ManagedHlsResult").field("url", &self.url).field("release", &self.release).finish()
+        f.debug_struct("ManagedHlsResult")
+            .field("url", &self.url)
+            .field("release", &self.release)
+            .field("audio_tracks", &self.audio_tracks)
+            .field("audio_track", &self.audio_track)
+            .finish()
     }
 }
 
@@ -279,9 +291,12 @@ impl TorBoxManagedHls {
         // subtitle here burns it into the video, leaving the browser to draw a second copy over it. Start the
         // clean stream while the indexed extraction runs; only ask TorBox for its legacy selected-subtitle
         // stream when extraction cannot produce a complete sidecar.
-        let (created, sidecars) = tokio::join!(self.create(token, torrent_id, file_id, None), extract);
+        let (created, sidecars) =
+            tokio::join!(self.create(token, torrent_id, file_id, None, target.audio_track), extract);
         let created = match (created, subtitle, sidecars.is_empty()) {
-            (Ok(_), Some(ordinal), true) => self.create(token, torrent_id, file_id, Some(ordinal)).await,
+            (Ok(_), Some(ordinal), true) => {
+                self.create(token, torrent_id, file_id, Some(ordinal), target.audio_track).await
+            }
             (created, _, _) => created,
         };
         match created {
@@ -315,8 +330,10 @@ impl TorBoxManagedHls {
         torrent_id: i64,
         file_id: Option<i64>,
         subtitle: Option<i64>,
+        audio_track: Option<i64>,
     ) -> Result<ManagedHlsPrepared, ManagedHlsError> {
-        let request = create_request(token, torrent_id, file_id, subtitle)
+        let audio_track = audio_track.unwrap_or(0);
+        let request = create_request(token, torrent_id, file_id, subtitle, audio_track)
             .map_err(report_create_failure_without_status)?;
         let mut response = match self.create_client.do_request(request).await {
             Ok(response) => response,
@@ -355,7 +372,7 @@ impl TorBoxManagedHls {
             return Err(report_create_failure(classify_failure(&body), Some(status)));
         }
 
-        let prepared = parse_success(&body, subtitle).map_err(|error| {
+        let prepared = parse_success(&body, subtitle, audio_track).map_err(|error| {
             metrics().torbox_call("createstream", false);
             report_create_failure(error, Some(status))
         })?;
@@ -440,6 +457,7 @@ fn create_request(
     torrent_id: i64,
     file_id: Option<i64>,
     subtitle: Option<i64>,
+    audio_track: i64,
 ) -> Result<reqwest::Request, ManagedHlsError> {
     let mut url = reqwest::Url::parse(CREATE_STREAM_URL).map_err(|_| ManagedHlsError::Unavailable)?;
     {
@@ -452,7 +470,9 @@ fn create_request(
         if let Some(subtitle) = subtitle {
             query.append_pair("chosen_subtitle_index", &subtitle.to_string());
         }
-        query.append_pair("chosen_audio_index", "0");
+        // Scout's ordered probe metadata lets managed playback honour the same language choice as Remux. With no
+        // reliable mapping (an untagged track shifts the indices), retain TorBox's index-zero default.
+        query.append_pair("chosen_audio_index", &audio_track.max(0).to_string());
         query.append_pair("scrobbling_enabled", "false");
     }
     let bearer = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| ManagedHlsError::Refused)?;
@@ -497,6 +517,7 @@ struct CreateSubtitle {
 fn parse_success(
     body: &[u8],
     requested_subtitle: Option<i64>,
+    requested_audio: i64,
 ) -> Result<ManagedHlsPrepared, ManagedHlsError> {
     // from_slice consumes exactly one complete JSON document. Unknown response fields remain additive, but
     // every field this adapter relies on must be present with the observed type and value.
@@ -519,7 +540,10 @@ fn parse_success(
         serde_json::Value::Number(value) => value.as_i64(),
         _ => return Err(ManagedHlsError::MalformedResponse),
     };
-    if data.audio_index != 0 || selected_subtitle != requested_subtitle || data.scrobbling_enabled {
+    if data.audio_index != requested_audio
+        || selected_subtitle != requested_subtitle
+        || data.scrobbling_enabled
+    {
         return Err(ManagedHlsError::MalformedResponse);
     }
     let url = ManagedHlsUrl(validate_hls_url(&data.hls_url)?);
@@ -716,7 +740,7 @@ mod tests {
 
     #[test]
     fn successful_fixture_is_strict_and_url_is_redacted() {
-        let prepared = parse_success(SUCCESS, None).expect("observed create response");
+        let prepared = parse_success(SUCCESS, None, 0).expect("observed create response");
         assert_eq!(prepared.url.0.host_str(), Some("flux-002.wnam.tb-cdn.io"));
         assert_eq!(format!("{:?}", prepared.url), "ManagedHlsUrl([redacted])");
         assert_eq!(prepared.subtitles.len(), 1);
@@ -725,19 +749,26 @@ mod tests {
         let mut changed: serde_json::Value = serde_json::from_slice(SUCCESS).unwrap();
         changed["data"]["hls_url"] =
             serde_json::json!("https://flux-002.wnam.tb-cdn.io/opaque/index.m3u8?token=secret");
-        assert!(parse_success(&serde_json::to_vec(&changed).unwrap(), None).is_ok());
+        assert!(parse_success(&serde_json::to_vec(&changed).unwrap(), None, 0).is_ok());
 
         changed["data"]["scrobbling_enabled"] = serde_json::Value::Bool(true);
         assert_eq!(
-            parse_success(&serde_json::to_vec(&changed).unwrap(), None),
+            parse_success(&serde_json::to_vec(&changed).unwrap(), None, 0),
             Err(ManagedHlsError::MalformedResponse)
         );
         changed["data"]["scrobbling_enabled"] = serde_json::Value::Bool(false);
         changed["data"]["subtitle_index"] = serde_json::json!(0);
         assert_eq!(
-            parse_success(&serde_json::to_vec(&changed).unwrap(), Some(0))
+            parse_success(&serde_json::to_vec(&changed).unwrap(), Some(0), 0)
                 .map(|prepared| prepared.selected_subtitle),
             Ok(Some(0))
+        );
+
+        changed["data"]["audio_index"] = serde_json::json!(2);
+        assert!(parse_success(&serde_json::to_vec(&changed).unwrap(), Some(0), 2).is_ok());
+        assert_eq!(
+            parse_success(&serde_json::to_vec(&changed).unwrap(), Some(0), 0),
+            Err(ManagedHlsError::MalformedResponse)
         );
     }
 
@@ -765,7 +796,7 @@ mod tests {
             }
         ]);
 
-        let prepared = parse_success(&serde_json::to_vec(&changed).unwrap(), None).unwrap();
+        let prepared = parse_success(&serde_json::to_vec(&changed).unwrap(), None, 0).unwrap();
         assert_eq!(prepared.subtitles[0].index, 0);
         assert_eq!(prepared.subtitles[1].index, 1);
         assert_eq!(prepared.subtitles[1].language.as_deref(), Some("eng"));
@@ -825,14 +856,14 @@ mod tests {
 
     #[test]
     fn create_request_has_only_the_safe_v1_choices() {
-        let request = create_request("secret-token", 42, Some(7), Some(3)).expect("request");
+        let request = create_request("secret-token", 42, Some(7), Some(3), 2).expect("request");
         assert_eq!(request.method(), reqwest::Method::GET);
         assert_eq!(request.url().path(), "/v1/api/stream/createstream");
         let pairs: std::collections::HashMap<_, _> = request.url().query_pairs().into_owned().collect();
         assert_eq!(pairs.get("id").map(String::as_str), Some("42"));
         assert_eq!(pairs.get("file_id").map(String::as_str), Some("7"));
         assert_eq!(pairs.get("type").map(String::as_str), Some("torrent"));
-        assert_eq!(pairs.get("chosen_audio_index").map(String::as_str), Some("0"));
+        assert_eq!(pairs.get("chosen_audio_index").map(String::as_str), Some("2"));
         assert_eq!(pairs.get("scrobbling_enabled").map(String::as_str), Some("false"));
         assert_eq!(pairs.get("chosen_subtitle_index").map(String::as_str), Some("3"));
         assert!(!request.url().as_str().contains("secret-token"));
@@ -849,7 +880,7 @@ mod tests {
         });
         let captured = crate::loglimit::Capture::start();
         assert_eq!(
-            managed.create("never-log-this-key", 123456, Some(789), None).await,
+            managed.create("never-log-this-key", 123456, Some(789), None, None).await,
             Err(ManagedHlsError::RateLimited { retry_after: Some(Duration::from_secs(37)) })
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "a throttle must not be retried");
@@ -866,7 +897,7 @@ mod tests {
             Ok(response_with_headers(503, &[("retry-after", "Sat, 06 Nov 2094 08:49:37 GMT")], "ignored"))
         });
         assert_eq!(
-            managed.create("key", 1, None, None).await,
+            managed.create("key", 1, None, None, None).await,
             Err(ManagedHlsError::RateLimited { retry_after: Some(den_upstream::MAX_RETRY_AFTER) })
         );
     }
@@ -888,11 +919,11 @@ mod tests {
         for (status, body, expected) in cases {
             let body = body.to_owned();
             let managed = adapter(move || Ok(response(status, &body)));
-            assert_eq!(managed.create("key", 1, None, None).await, Err(expected), "http {status}");
+            assert_eq!(managed.create("key", 1, None, None, None).await, Err(expected), "http {status}");
         }
 
         let managed = adapter(|| Err(Box::new(std::io::Error::other("connection refused"))));
-        assert_eq!(managed.create("key", 1, None, None).await, Err(ManagedHlsError::Transport));
+        assert_eq!(managed.create("key", 1, None, None, None).await, Err(ManagedHlsError::Transport));
     }
 
     #[tokio::test]
