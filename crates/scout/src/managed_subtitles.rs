@@ -121,6 +121,12 @@ impl Reader {
         }
     }
 
+    /// The public TorBox CDN node is useful connection diagnostics; the path and query are
+    /// capabilities and must never reach a log. `new` already proved this is an HTTPS URL with a host.
+    fn cdn_host(&self) -> &str {
+        self.url.host_str().unwrap_or("unknown")
+    }
+
     fn range_failure(&self) -> (&'static str, u16) {
         let reason = match self.range_failure.load(Relaxed) {
             RANGE_OK => "none",
@@ -755,8 +761,9 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
                 log_limited(
                     &format!("managed-subtitle-sidecar-ineligible-{}", selected.unwrap_or(-1)),
                     &format!(
-                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible input={} range_failure={range_failure} range_status={range_status} selected={} requests={requests} reserved_bytes={bytes}",
+                        "managed HLS: indexed subtitle sidecar unavailable: outcome=ineligible input={} cdn_host={} range_failure={range_failure} range_status={range_status} selected={} requests={requests} reserved_bytes={bytes}",
                         reader.input_kind(),
+                        reader.cdn_host(),
                         selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                     ),
                 );
@@ -764,7 +771,8 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
                 log_limited(
                     &format!("managed-subtitle-sidecar-ready-{}", selected.unwrap_or(-1)),
                     &format!(
-                        "managed HLS: indexed subtitle sidecar ready: selected={} tracks={} requests={requests} reserved_bytes={bytes}",
+                        "managed HLS: indexed subtitle sidecar ready: cdn_host={} selected={} tracks={} requests={requests} reserved_bytes={bytes}",
+                        reader.cdn_host(),
                         selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                         sidecars.len()
                     ),
@@ -776,8 +784,9 @@ pub(crate) async fn sidecars(raw_url: &str, selected: Option<i64>) -> Vec<Sideca
             log_limited(
                 &format!("managed-subtitle-sidecar-timeout-{}", selected.unwrap_or(-1)),
                 &format!(
-                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout input={} range_failure={range_failure} range_status={range_status} selected={} requests={requests} reserved_bytes={bytes}",
+                    "managed HLS: indexed subtitle sidecar unavailable: outcome=timeout input={} cdn_host={} range_failure={range_failure} range_status={range_status} selected={} requests={requests} reserved_bytes={bytes}",
                     reader.input_kind(),
+                    reader.cdn_host(),
                     selected.map_or_else(|| "all".to_owned(), |value| value.to_string()),
                 ),
             );
@@ -835,6 +844,15 @@ mod tests {
         ] {
             assert_eq!(Reader::new(url).err(), Some(reason));
         }
+    }
+
+    #[test]
+    fn connection_diagnostics_keep_only_the_public_cdn_host() {
+        let reader = Reader::new("https://store-079.wnam.tb-cdn.io/dld/private-file?token=account-secret")
+            .expect("valid direct URL");
+        assert_eq!(reader.cdn_host(), "store-079.wnam.tb-cdn.io");
+        assert!(!reader.cdn_host().contains("private-file"));
+        assert!(!reader.cdn_host().contains("account-secret"));
     }
 
     #[tokio::test]
