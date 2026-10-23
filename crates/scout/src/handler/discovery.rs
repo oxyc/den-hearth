@@ -10,11 +10,35 @@ pub(super) fn managed_candidates<'a>(
     if let Some(filename) = request.filename.as_deref().filter(|name| !name.is_empty()) {
         candidates.retain(|candidate| candidate.title == filename);
     }
+    // LG's webOS player has now shown materially wrong pictures from TorBox's managed rendition for both Dolby
+    // Vision and ordinary HDR10 sources. Keep those releases selectable: a remote viewer may have no reachable
+    // Remux, and an explicit choice must remain their choice. For automatic playback on webOS only, prefer every
+    // SDR candidate before trying an HDR/DV one. The stable sort preserves Scout's ranking inside both groups.
+    if request.filename.is_none() && request.platform.as_deref() == Some("webos") {
+        candidates.sort_by_key(|candidate| {
+            let attributes = stream_attributes((*candidate).clone());
+            attributes.hdr || attributes.dolby_vision
+        });
+    }
+    // TorBox managed HLS has produced materially wrong Dolby Vision pictures on both LG webOS and iOS, while the
+    // same releases through Remux play correctly. This is therefore a property of the managed rendition, not one
+    // renderer: never silently trade correctness for the direct path. An automatic choice can take the next
+    // non-DV release, and an explicitly selected DV release falls through to Remux unchanged. Atmos alone remains
+    // eligible; it cannot account for damaged picture.
+    candidates.retain(|candidate| !stream_attributes((*candidate).clone()).dolby_vision);
     if let Some(client) = request.playable.as_ref().filter(|_| request.receiver) {
         candidates.retain(|candidate| {
             client.cost((*candidate).clone(), stream_attributes((*candidate).clone()))
                 < crate::client::VIDEO_CONVERTED_COST
         });
+    }
+    // An explicit choice is an instruction, not a hint. For automatic playback, however, a release whose probe
+    // names one of the viewer's wanted languages is safer than an unknown file, and an unknown file is safer than a
+    // known mismatch. Rutracker is a deliberately narrow last-resort hint for files that have not been probed yet:
+    // it catches the real Russian-localised release that prompted this without guessing from broad tokens such as
+    // `ru`, which occur in ordinary release names.
+    if request.filename.as_deref().filter(|name| !name.is_empty()).is_none() && !request.audio.is_empty() {
+        candidates.sort_by_key(|candidate| managed_audio_rank(candidate, &request.audio));
     }
     if candidates.is_empty() {
         return Err(if list.degraded.is_empty() {
@@ -24,6 +48,52 @@ pub(super) fn managed_candidates<'a>(
         });
     }
     Ok(candidates)
+}
+
+fn wanted_language(language: &str, wanted: &[String]) -> bool {
+    let language = crate::probe::clean_lang(language.as_bytes());
+    !language.is_empty()
+        && wanted.iter().any(|wanted| crate::probe::clean_lang(wanted.as_bytes()) == language)
+}
+
+fn managed_audio_rank(stream: &RawStream, wanted: &[String]) -> u8 {
+    if let Some(probe) = &stream.probe {
+        if probe.audio.iter().any(|language| wanted_language(language, wanted)) {
+            return 0;
+        }
+        if !probe.audio.is_empty() {
+            return 3;
+        }
+    }
+    let wants_russian = wanted.iter().any(|language| crate::probe::clean_lang(language.as_bytes()) == "ru");
+    if !wants_russian && stream.title.to_ascii_lowercase().contains("rutracker") {
+        2
+    } else {
+        1
+    }
+}
+
+/// The probe keeps audio languages in container-track order. It is safe to turn that position into TorBox's index
+/// only when every preceding track was tagged; otherwise its `audio` vector is shorter than the actual track list.
+pub(super) fn managed_audio_track(
+    stream: &RawStream,
+    wanted: &[String],
+    selected: Option<i64>,
+) -> Option<i64> {
+    let probe = stream.probe.as_ref()?;
+    if probe.untagged_audio != 0 {
+        return None;
+    }
+    if let Some(selected) = selected.filter(|index| *index >= 0 && (*index as usize) < probe.audio.len()) {
+        return Some(selected);
+    }
+    wanted.iter().find_map(|wanted| {
+        probe
+            .audio
+            .iter()
+            .position(|language| wanted_language(language, std::slice::from_ref(wanted)))
+            .map(|index| index as i64)
+    })
 }
 
 impl Inner {
@@ -806,5 +876,82 @@ impl Inner {
             Some(tickets) => format!("{origin}/{TICKET_ROUTE}/{}", tickets.mint(&config, t, exp)),
             None => String::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod managed_audio_tests {
+    use super::*;
+    use crate::probe::Probe;
+
+    fn stream(title: &str, audio: &[&str], untagged_audio: i32) -> RawStream {
+        RawStream {
+            title: title.to_owned(),
+            probe: (!audio.is_empty() || untagged_audio > 0).then(|| Probe {
+                audio: audio.iter().map(|language| (*language).to_owned()).collect(),
+                untagged_audio,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn list(ranked: Vec<RawStream>) -> RankedList {
+        RankedList {
+            ranked,
+            truth: Default::default(),
+            client: None,
+            degraded: String::new(),
+            complete: true,
+            coverage: Coverage { complete: true, sources: vec![] },
+            timing: String::new(),
+        }
+    }
+
+    #[test]
+    fn automatic_managed_playback_prefers_known_wanted_audio_and_sinks_known_mismatches() {
+        let wanted = vec!["en-US".to_owned(), "sv".to_owned()];
+        let list = list(vec![
+            stream("known Russian", &["ru"], 0),
+            stream("ordinary unknown", &[], 0),
+            stream("known English", &["ru", "eng"], 0),
+            stream("Unknown.RGzsRutracker.mkv", &[], 0),
+        ]);
+        let request = ManagedHlsRequest { audio: wanted, ..Default::default() };
+
+        let candidates = managed_candidates(&list, &request).expect("candidates");
+        assert_eq!(
+            candidates.iter().map(|stream| stream.title.as_str()).collect::<Vec<_>>(),
+            ["known English", "ordinary unknown", "Unknown.RGzsRutracker.mkv", "known Russian"]
+        );
+    }
+
+    #[test]
+    fn explicit_release_is_never_replaced_for_its_language() {
+        let list = list(vec![stream("Russian choice", &["ru"], 0), stream("English", &["en"], 0)]);
+        let request = ManagedHlsRequest {
+            audio: vec!["en".to_owned()],
+            filename: Some("Russian choice".to_owned()),
+            ..Default::default()
+        };
+
+        let candidates = managed_candidates(&list, &request).expect("explicit candidate");
+        assert_eq!(
+            candidates.iter().map(|stream| stream.title.as_str()).collect::<Vec<_>>(),
+            ["Russian choice"]
+        );
+    }
+
+    #[test]
+    fn audio_track_uses_preference_order_only_when_probe_indices_are_exact() {
+        let english_second = stream("release", &["ru", "eng", "sv"], 0);
+        assert_eq!(
+            managed_audio_track(&english_second, &["en-GB".to_owned(), "sv".to_owned()], None),
+            Some(1)
+        );
+        assert_eq!(managed_audio_track(&english_second, &["en".to_owned()], Some(2)), Some(2));
+
+        let shifted = stream("release", &["ru", "en"], 1);
+        assert_eq!(managed_audio_track(&shifted, &["en".to_owned()], None), None);
     }
 }

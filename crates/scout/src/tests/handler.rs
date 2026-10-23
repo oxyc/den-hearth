@@ -250,6 +250,119 @@ async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
     assert_eq!(inspect.targets.lock().unwrap().len(), 2);
 }
 
+// TorBox's single-rendition managed HLS has produced broken Dolby Vision on multiple renderers. Automatic playback
+// must choose a sound non-DV release; an explicit DV choice belongs to Remux, while Atmos without DV remains
+// eligible. Platform and receiver changes cannot make the same damaged managed rendition safe.
+#[tokio::test]
+async fn managed_hls_leaves_dolby_vision_to_remux_on_every_renderer() {
+    const DV: &str = "Show S01E01 2160p WEB-DL DDP5.1 Atmos DV HEVC";
+    const ATMOS: &str = "Show S01E01 1080p WEB-DL DDP5.1 Atmos x264";
+    let seeds = || {
+        vec![
+            RawStream {
+                info_hash: "a".repeat(40),
+                title: DV.to_owned(),
+                size_bytes: Some(18 * GIB),
+                seeders: Some(100),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+            RawStream {
+                info_hash: "b".repeat(40),
+                title: ATMOS.to_owned(),
+                size_bytes: Some(8 * GIB),
+                seeders: Some(50),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+        ]
+    };
+    let resolver = Arc::new(FixedManagedHls::default());
+    let inspect = resolver.clone();
+    let h = new_handler(test_deps(move |deps| {
+        deps.managed_hls = Some(resolver);
+        deps.make_scrapers =
+            Arc::new(move |_| vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]);
+    }));
+    let ask = |filename: Option<&str>, platform: Option<&str>, receiver: bool| ManagedHlsRequest {
+        imdb: "tt0111161".to_owned(),
+        filename: filename.map(str::to_owned),
+        platform: platform.map(str::to_owned),
+        receiver,
+        ..Default::default()
+    };
+
+    let automatic =
+        h.managed_hls(&valid_blob(), &ask(None, Some("webos"), false)).await.expect("non-DV fallback");
+    assert_eq!(automatic.release.filename, ATMOS, "Atmos itself remains eligible");
+
+    let explicit_dv = h.managed_hls(&valid_blob(), &ask(Some(DV), Some("webos"), false)).await;
+    assert!(matches!(explicit_dv, Err(ManagedHlsError::NotFound)), "{explicit_dv:?}");
+
+    for (platform, receiver) in [(Some("tizen"), false), (None, false), (Some("webos"), true)] {
+        let direct = h.managed_hls(&valid_blob(), &ask(Some(DV), platform, receiver)).await;
+        assert!(matches!(direct, Err(ManagedHlsError::NotFound)), "{direct:?}");
+    }
+    assert_eq!(inspect.targets.lock().unwrap().len(), 1, "TorBox was asked only for the non-DV fallback");
+}
+
+// TorBox's ordinary HDR managed rendition can also look materially wrong on LG. Demote it only for automatic
+// webOS playback: remote viewers may not be able to reach Remux, so an explicit HDR choice still stays on TorBox.
+// Samsung and browser playback retain Scout's normal quality order until either renderer gives us contrary evidence.
+#[tokio::test]
+async fn managed_hls_demotes_hdr_only_for_automatic_webos_playback() {
+    const HDR: &str = "Show S01E01 2160p WEB-DL HDR10 HEVC";
+    const SDR: &str = "Show S01E01 1080p WEB-DL x264";
+    let seeds = || {
+        vec![
+            RawStream {
+                info_hash: "a".repeat(40),
+                title: HDR.to_owned(),
+                size_bytes: Some(18 * GIB),
+                seeders: Some(100),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+            RawStream {
+                info_hash: "b".repeat(40),
+                title: SDR.to_owned(),
+                size_bytes: Some(8 * GIB),
+                seeders: Some(50),
+                file_idx: Some(0),
+                ..RawStream::default()
+            },
+        ]
+    };
+    let resolver = Arc::new(FixedManagedHls::default());
+    let inspect = resolver.clone();
+    let h = new_handler(test_deps(move |deps| {
+        deps.managed_hls = Some(resolver);
+        deps.make_scrapers =
+            Arc::new(move |_| vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]);
+    }));
+    let ask = |filename: Option<&str>, platform: Option<&str>| ManagedHlsRequest {
+        imdb: "tt0111161".to_owned(),
+        filename: filename.map(str::to_owned),
+        platform: platform.map(str::to_owned),
+        ..Default::default()
+    };
+
+    let lg = h.managed_hls(&valid_blob(), &ask(None, Some("webos"))).await.expect("LG fallback");
+    assert_eq!(lg.release.filename, SDR);
+
+    let explicit = h
+        .managed_hls(&valid_blob(), &ask(Some(HDR), Some("webos")))
+        .await
+        .expect("explicit LG HDR choice stays on TorBox");
+    assert_eq!(explicit.release.filename, HDR);
+
+    for platform in [Some("tizen"), None] {
+        let normal = h.managed_hls(&valid_blob(), &ask(None, platform)).await.expect("normal quality order");
+        assert_eq!(normal.release.filename, HDR);
+    }
+    assert_eq!(inspect.targets.lock().unwrap().len(), 4);
+}
+
 /// The future a `FakeScraper`'s behaviour returns, so a test can answer late, hang, or fail.
 pub(crate) type FakeFuture = Pin<Box<dyn Future<Output = Result<Vec<RawStream>, DoError>> + Send>>;
 

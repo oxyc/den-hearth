@@ -35,6 +35,8 @@ pub struct PlaybackRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcode: Option<String>,
@@ -64,6 +66,9 @@ impl PlaybackRequest {
         }
         if !matches!(self.transcode.as_deref(), None | Some("allow" | "never")) {
             return Err("transcode is \"allow\", \"never\", or absent.");
+        }
+        if !matches!(self.platform.as_deref(), None | Some("webos" | "tizen")) {
+            return Err("platform is \"webos\", \"tizen\", or absent.");
         }
         if self.replaces.as_deref().is_some_and(|value| {
             value.len() != 22
@@ -120,6 +125,8 @@ mod tests {
         let parse = |value| serde_json::from_value::<PlaybackRequest>(value).unwrap();
         assert!(parse(serde_json::json!({"imdb":"tt1","season":1})).validate().is_err());
         assert!(parse(serde_json::json!({"imdb":"tt1","maxBitrate":0})).validate().is_err());
+        assert!(parse(serde_json::json!({"imdb":"tt1","platform":"webos"})).validate().is_ok());
+        assert!(parse(serde_json::json!({"imdb":"tt1","platform":"android"})).validate().is_err());
         assert!(parse(serde_json::json!({"imdb":"tt1","exclude": vec!["x"; 17]})).validate().is_err());
         assert!(parse(serde_json::json!({"imdb":"tt1","originalLanguage":"en"})).validate().is_ok());
         let long = "x".repeat(36);
