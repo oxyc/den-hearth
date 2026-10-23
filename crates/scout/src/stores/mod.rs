@@ -47,6 +47,8 @@ pub struct ResolveTarget {
     pub file_idx: Option<i64>,
     pub season: Option<i64>,
     pub episode: Option<i64>,
+    /// Audio-track index for a managed stream. Ordinary store resolution ignores it.
+    pub audio_track: Option<i64>,
     /// NoAdd forbids queueing the torrent: resolve it from what the account already has, or fail.
     ///
     /// A background caller cannot promise this by choosing carefully, because whether a Resolve adds is

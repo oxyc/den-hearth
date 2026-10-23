@@ -484,12 +484,13 @@ fn managed_request(
     subtitle: Option<i64>,
 ) -> Option<den_scout::managed_hls::ManagedHlsRequest> {
     let object = request.as_object()?;
-    // TorBox v1 intentionally uses its default audio and has no Remux session to replace. Preserve explicit
-    // track and replacement behavior by sending those requests to Remux. `transcode: "never"` is not one of them:
+    // A managed URL has no Remux session to replace. Preserve replacement behavior by sending those requests to
+    // Remux. Audio tracks are different: Scout has the probed container order and asks TorBox to create the selected
+    // stream. `transcode: "never"` is not one of them:
     // Den Web sends it with every change made mid-film (casting among them), and it only keeps Remux's conversion
     // from replacing what is playing. Routing it to Remux turned every cast of a TorBox stream into a Remux session.
     let excluded = object.get("exclude").and_then(Value::as_array).is_some_and(|values| !values.is_empty());
-    if object.contains_key("audioTrack") || object.contains_key("replaces") || excluded {
+    if object.contains_key("replaces") || excluded {
         return None;
     }
     let integer = |name: &str| -> Option<Option<i64>> {
@@ -506,10 +507,17 @@ fn managed_request(
         None => None,
         Some(value) => Some(value.as_str()?.to_string()),
     };
+    let audio = object
+        .get("audio")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
     Some(den_scout::managed_hls::ManagedHlsRequest {
         imdb: object.get("imdb")?.as_str()?.to_string(),
         season: integer("season")?,
         episode: integer("episode")?,
+        audio,
+        audio_track: integer("audioTrack")?,
         filename,
         playable,
         receiver: object.get("player").and_then(Value::as_str) == Some("cast"),
@@ -568,6 +576,13 @@ async fn direct_response(
             },
             "subtitles": subtitles,
             "torboxSubtitle": result.selected_subtitle,
+            "audioTrack": result.audio_track,
+            "audioTracks": result.audio_tracks.into_iter().map(|language| json!({
+                "language": language,
+                "name": Value::Null,
+                "channels": 0,
+                "commentary": false,
+            })).collect::<Vec<_>>(),
         }),
         &[("cache-control", "no-store")],
     );
@@ -1499,6 +1514,23 @@ mod tests {
         );
         let response = with_prepare_timing(response, Duration::from_millis(3));
         assert_eq!(response.headers()["server-timing"], "prepare;dur=3.0, resolve;dur=4.0");
+    }
+
+    #[test]
+    fn managed_request_keeps_audio_preferences_and_an_explicit_track() {
+        let request = managed_request(
+            &json!({
+                "imdb": "tt42",
+                "audio": ["en-US", "sv"],
+                "audioTrack": 1,
+                "player": "native"
+            }),
+            None,
+        )
+        .expect("managed request");
+
+        assert_eq!(request.audio, ["en-US", "sv"]);
+        assert_eq!(request.audio_track, Some(1));
     }
 
     #[test]
