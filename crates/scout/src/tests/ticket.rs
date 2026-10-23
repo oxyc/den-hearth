@@ -75,10 +75,22 @@ fn unix_secs(t: SystemTime) -> i64 {
 fn legacy_ticket(key: &[u8; 32], payload: &[u8]) -> String {
     let nonce = [0u8; 24];
     let aead = XChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
-    let sealed = aead.encrypt(XNonce::from_slice(&nonce), payload).expect("seal");
+    let sealed = aead.encrypt(&XNonce::from(nonce), payload).expect("seal");
     let mut out = nonce.to_vec();
     out.extend_from_slice(&sealed);
     b64url_encode(&out)
+}
+
+// Frozen with chacha20poly1305 0.10.1, the original CONFIG_KEY test seed, and an all-zero nonce.
+// Unlike a round trip, this also proves tickets issued before the dependency upgrade still open.
+#[test]
+fn play_ticket_opens_a_pre_upgrade_ciphertext() {
+    let ticket = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAv5zoIwr1-Z5uOhHekkrG3qRVGNOmjqBVWXn3pV0g5Og0QREfKd7iDPi_dfyINzio3rFLJwRHZLYeyBhX5aL8ab9lNXrwnPrLAyQDEAOW5p2WhEW24HROS-SZeRUN_1h7Hn_IXydDImzUtS4";
+    let keys = ticket_keys(&ticket_keyring());
+    let (config, target) = keys.open(ticket, UNIX_EPOCH + Duration::from_secs(1_000)).unwrap();
+    assert_eq!(target.info_hash, "a".repeat(40));
+    assert_eq!(target.file_idx, Some(0));
+    assert_eq!(config.debrid, vec![DebridAccount { service: DebridService::TorBox, token: "tb".into() }]);
 }
 
 // A ticket opens to exactly what was minted: the accounts, the target, and the install id and epoch.
