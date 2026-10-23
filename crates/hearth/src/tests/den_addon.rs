@@ -712,16 +712,16 @@ async fn a_mid_film_cast_request_still_tries_the_managed_stream_first() {
     let hearth = trusted_offline_playback_hearth();
     let segment = plain(&config(0, &[SCOUT]));
 
-    // An audio track TorBox can't choose is Remux's alone: no managed attempt.
+    // A concrete TorBox audio track stays on the managed path instead of replacing the stream with Remux.
     let track = serde_json::json!({"imdb": "tt0111161", "audioTrack": 1});
     let _ = edge_playback(&hearth, &segment, "track", track).await;
-    assert_eq!(managed_attempts(&hearth), 0);
+    assert_eq!(managed_attempts(&hearth), 1);
 
     let cast = serde_json::json!({
         "imdb": "tt0111161", "player": "cast", "transcode": "never", "filename": "Movie 2160p.mkv",
     });
     let _ = edge_playback(&hearth, &segment, "cast", cast).await;
-    assert_eq!(managed_attempts(&hearth), 1, "the cast request tried TorBox before Remux");
+    assert_eq!(managed_attempts(&hearth), 2, "the cast request tried TorBox before Remux");
 }
 
 // Den Web's switch from a playing Remux session to TorBox asks with `directOnly`: a Remux session started in TorBox's
@@ -740,13 +740,14 @@ async fn a_direct_only_request_is_refused_rather_than_given_remux() {
     assert_eq!(value["error"], "direct_unavailable");
     assert!(value["cause"].is_string(), "the managed reason is named: {value}");
 
-    // A request TorBox can't take at all is refused without an attempt.
+    // An explicit TorBox audio-track switch is also attempted and remains direct-only when it cannot be prepared.
     let body = serde_json::json!({"imdb": "tt0111161", "audioTrack": 1, "directOnly": true});
     let (status, _, bytes) = response_bytes(edge_playback(&hearth, &segment, "track", body).await).await;
-    assert_eq!(managed_attempts(&hearth), 1);
+    assert_eq!(managed_attempts(&hearth), 2);
     assert_eq!(status, StatusCode::CONFLICT);
     let value: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(value, serde_json::json!({"error": "direct_unavailable"}));
+    assert_eq!(value["error"], "direct_unavailable");
+    assert!(value["cause"].is_string(), "the managed reason is named: {value}");
 }
 
 #[tokio::test]
