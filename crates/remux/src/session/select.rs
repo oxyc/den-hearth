@@ -593,6 +593,7 @@ pub async fn create(
         }),
         producer_gate: tokio::sync::Mutex::new(()),
         wake: Notify::new(),
+        resync: Default::default(),
     });
     // Written once, before the session can be asked for anything: what a process after this one rebuilds it from.
     let record = session.record(start_at, unix_now());

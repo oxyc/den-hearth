@@ -294,7 +294,7 @@ pub(super) struct TranslationWorkflowInput<'a> {
     pub(super) want_json: bool,
     pub(super) resync_url: Option<String>,
     pub(super) resync_key: Option<String>,
-    pub(super) resync_audio: Option<u32>,
+    pub(super) resync_audio: Option<crate::sync::AudioStream>,
 }
 
 pub(super) async fn run_translation_workflow<'a>(

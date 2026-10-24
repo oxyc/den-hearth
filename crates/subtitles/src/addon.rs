@@ -850,7 +850,7 @@ pub async fn handle_subtitle_file(
     ref_id: Option<i64>,
     resync_url: Option<String>,
     resync_key: Option<String>,
-    resync_audio: Option<u32>,
+    resync_audio: Option<crate::sync::AudioStream>,
     lang: Option<&str>,
     want_vtt: bool,
     allow_sparse: bool,
@@ -1458,7 +1458,7 @@ fn resync_cache_identity(
     install_scope: &str,
     resync_url: &Option<String>,
     requested: Option<String>,
-    audio_stream: Option<u32>,
+    audio_stream: Option<crate::sync::AudioStream>,
 ) -> Option<String> {
     let url = resync_url.as_ref()?;
     let stable = requested.filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -1566,7 +1566,7 @@ pub async fn handle_translate(
     want_json: bool,
     resync_url: Option<String>,
     resync_key: Option<String>,
-    resync_audio: Option<u32>,
+    resync_audio: Option<crate::sync::AudioStream>,
 ) -> Response<Body> {
     run_translation_workflow(
         state,
@@ -1847,30 +1847,72 @@ mod tests {
         let release = "a".repeat(64);
         let ticket_a = Some("https://scout.example/p/ticket-a".into());
         let ticket_b = Some("https://scout.example/p/ticket-b".into());
-        let a = resync_cache_identity("install-a", &ticket_a, Some(release.clone()), Some(3)).unwrap();
-        let b = resync_cache_identity("install-a", &ticket_b, Some(release.clone()), Some(3)).unwrap();
+        let a = resync_cache_identity(
+            "install-a",
+            &ticket_a,
+            Some(release.clone()),
+            Some(crate::sync::AudioStream::Index(3)),
+        )
+        .unwrap();
+        let b = resync_cache_identity(
+            "install-a",
+            &ticket_b,
+            Some(release.clone()),
+            Some(crate::sync::AudioStream::Index(3)),
+        )
+        .unwrap();
         assert_eq!(
             sync_cache_key("os:5", &Some(a.clone()), None),
             sync_cache_key("os:5", &Some(b.clone()), None)
         );
 
-        let other_install = resync_cache_identity("install-b", &ticket_b, Some(release), Some(3)).unwrap();
+        let other_install = resync_cache_identity(
+            "install-b",
+            &ticket_b,
+            Some(release),
+            Some(crate::sync::AudioStream::Index(3)),
+        )
+        .unwrap();
         assert_ne!(
             sync_cache_key("os:5", &Some(other_install), None),
             sync_cache_key("os:5", &Some(b), None),
         );
 
-        let invalid = resync_cache_identity("install-a", &ticket_b, Some("not-a-digest".into()), Some(3));
+        let invalid = resync_cache_identity(
+            "install-a",
+            &ticket_b,
+            Some("not-a-digest".into()),
+            Some(crate::sync::AudioStream::Index(3)),
+        );
         assert_eq!(
             invalid,
             ticket_b.map(|url| format!("{url}#audio=3")),
             "older or malformed clients stay keyed by their exact target and audio stream"
         );
-        assert!(resync_cache_identity("install-a", &None, Some("a".repeat(64)), Some(3)).is_none());
+        assert!(resync_cache_identity(
+            "install-a",
+            &None,
+            Some("a".repeat(64)),
+            Some(crate::sync::AudioStream::Index(3))
+        )
+        .is_none());
 
-        let other_audio =
-            resync_cache_identity("install-a", &ticket_a, Some("a".repeat(64)), Some(4)).unwrap();
+        let other_audio = resync_cache_identity(
+            "install-a",
+            &ticket_a,
+            Some("a".repeat(64)),
+            Some(crate::sync::AudioStream::Index(4)),
+        )
+        .unwrap();
         assert_ne!(a, other_audio, "different audio tracks must not share an aligned subtitle");
+        let ordinal = resync_cache_identity(
+            "install-a",
+            &ticket_a,
+            Some("a".repeat(64)),
+            Some(crate::sync::AudioStream::Ordinal(3)),
+        )
+        .unwrap();
+        assert_ne!(a, ordinal, "audio-only index must not reuse an absolute-stream alignment");
     }
 }
 

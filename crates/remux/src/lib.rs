@@ -851,6 +851,7 @@ where
                     },
                     "sid": s.sid,
                     "playlist": format!("/remux/s/{}/{}/master.m3u8", s.sid, s.sig),
+                    "subtitleResync": {"supported":s.subs.is_some(),"url":format!("/remux/s/{}/{}/subtitle-resync",s.sid,s.sig)},
                     "speed": format!("/remux/s/{}/{}/speed", s.sid, s.sig),
                     // `requested`: the release the player named, when another was played, and why it was passed over.
                     "release": {
@@ -885,9 +886,13 @@ where
                         "channels": a.channels,
                         "commentary": a.commentary,
                     })).collect::<Vec<_>>(),
-                    "subtitles": s.renditions.iter().map(|r| serde_json::json!({
+                    "subtitles": s.renditions.iter().enumerate().map(|(n,r)| serde_json::json!({
                         "language": r.lang,
                         "name": crate::subs::name(r),
+                        "source":if r.den && r.own.is_none() {"opensubtitles"} else {"built-in"},
+                        "hashMatch": if r.den {serde_json::Value::Null} else {serde_json::json!(false)},
+                        "resyncSupported":r.den && r.own.is_none() && s.subs.is_some(),
+                        "rendition":n,
                     })).collect::<Vec<_>>(),
                 }),
                 // Read and stripped by `handle_request`'s own log line, never sent on: so the request that
@@ -955,6 +960,16 @@ where
             state.end_session(sid, "deleted").await;
             Response::builder().status(StatusCode::NO_CONTENT).body(httputil::full("")).unwrap()
         }
+        (&Method::POST, Some("subtitle-resync")) => {
+            if parts.uri.query().is_some() {
+                session::resync::error("invalid_selection")
+            } else {
+                match read_body_up_to(body, 1024).await.and_then(|body| serde_json::from_slice(&body).ok()) {
+                    Some(choice) => s.resync_subtitle(state, choice).await,
+                    None => session::resync::error("invalid_selection"),
+                }
+            }
+        }
         // A paused viewer's own "still here": see `Session::heartbeat`.
         (&Method::POST, Some("heartbeat")) => {
             s.heartbeat();
@@ -978,6 +993,13 @@ where
                     s.touch();
                     let text = if f == "master.m3u8" { s.master.clone() } else { s.media.clone() };
                     httputil::text("application/vnd.apple.mpegurl", &s.cache_control(), text)
+                }
+                f if session::resync::aligned_file(f).is_some() => {
+                    if parts.uri.query().is_some() {
+                        session::resync::error("invalid_selection")
+                    } else {
+                        s.aligned_subtitle(session::resync::aligned_file(f).unwrap()).await
+                    }
                 }
                 "init.mp4" => s.serve_init(state, head, &parts.headers).await,
                 _ => match session::sub_file(f).filter(|file| {

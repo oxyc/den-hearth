@@ -569,6 +569,7 @@ async fn direct_response(
         StatusCode::OK,
         &json!({
             "url": result.url.into_string(),
+            "subtitleResync": {"supported": false, "reason": "managed_delivery"},
             "release": {
                 "label": result.release.label,
                 "filename": result.release.filename,

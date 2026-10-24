@@ -62,7 +62,9 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>` and identifies the
-  audio stream currently selected in the player with `resync_audio=<AVStream index>`; the addon extracts
+  audio stream currently selected in the player with `resync_audio=<AVStream index>`. Hearth Remux uses
+  `resync_audio=a:<audio-only ordinal>`; both forms are bounded to 0–4095 and use distinct cache keys.
+  Malformed selections are rejected rather than silently aligning another audio track. The addon extracts
   one dialogue-dense 80-second mono audio batch and independently aligns each 40-second half. It
   accepts the offset when those probes agree within 250 ms. On disagreement it fetches two more
   80-second windows from dialogue-dense regions spread across the title, stitches the three reads
