@@ -37,8 +37,6 @@ pub(crate) use application::{Limits, Options};
 pub(crate) use den_http::Body;
 
 #[cfg(test)]
-use application::migration_authorized;
-#[cfg(test)]
 use bootstrap::parsed_or;
 #[cfg(test)]
 use bytes::Bytes;

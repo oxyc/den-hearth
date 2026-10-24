@@ -205,11 +205,15 @@ fn open(hearth: &Hearth, personal: Option<String>, host: Host) -> Option<Opened>
         None => None,
     };
     if host.scout.as_deref().is_some_and(|segment| {
-        hearth.scout.as_ref().and_then(|scout| scout.migration_member(segment)).is_none()
+        hearth.scout.as_ref().and_then(|scout| scout.validated_install_member(segment)).is_none()
     }) || host.subs.as_deref().is_some_and(|segment| {
-        hearth.subs.as_deref().and_then(|subs| den_subtitles::migration_member(subs, segment)).is_none()
+        hearth
+            .subs
+            .as_deref()
+            .and_then(|subs| den_subtitles::validated_install_member(subs, segment))
+            .is_none()
     }) || host.reel.as_deref().is_some_and(|segment| {
-        hearth.reel.as_deref().and_then(|reel| den_reel::migration_member(reel, segment)).is_none()
+        hearth.reel.as_deref().and_then(|reel| den_reel::validated_install_member(reel, segment)).is_none()
     }) {
         return None;
     }

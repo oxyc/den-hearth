@@ -24,7 +24,6 @@ struct Configs {
     scout_bases: Vec<inproc::Base>,
     metrics_token: Option<String>,
     managed_playback: bool,
-    legacy_migration: bool,
     wanted_file: Option<std::path::PathBuf>,
     services: services::Services,
 }
@@ -50,7 +49,6 @@ async fn run(c: Configs) -> std::io::Result<()> {
         Options {
             metrics_token: c.metrics_token,
             managed_playback: c.managed_playback,
-            legacy_migration: c.legacy_migration,
             wanted_file: c.wanted_file,
         },
     );
@@ -109,7 +107,6 @@ async fn run(c: Configs) -> std::io::Result<()> {
         eprintln!("{}", hearth.wanted.summary());
     }
     eprintln!("managed playback: {}", hearth.playback.summary());
-    eprintln!("legacy install migration: {}", if hearth.legacy_migration { "enabled" } else { "disabled" });
     eprintln!("scout in process for remux and subs at: {}", in_process.join(", "));
     // Each service's own startup line: operators read `transcode=` and the like from them.
     if let Some(reel) = &hearth.reel {
@@ -286,10 +283,6 @@ pub(crate) fn main() {
         && std::env::var("HEARTH_MANAGED_PLAYBACK")
             .ok()
             .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
-    let legacy_migration = std::env::var("HEARTH_LEGACY_MIGRATION")
-        .ok()
-        .is_some_and(|value| !value.is_empty() && value != "0" && value != "false");
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         // Disk-cache calls use `block_in_place`, not queued `spawn_blocking` jobs. Admission permits at most this many
@@ -311,7 +304,6 @@ pub(crate) fn main() {
         scout_bases,
         metrics_token,
         managed_playback,
-        legacy_migration,
         wanted_file,
         services,
     };
