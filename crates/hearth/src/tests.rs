@@ -84,40 +84,6 @@ async fn unified_playback_is_a_concealed_404_by_default() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-#[test]
-fn migration_from_the_expected_edge_peer_requires_the_owner_marker_and_secret() {
-    let mut hearth = hearth();
-    let state = Arc::get_mut(&mut hearth).unwrap();
-    let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
-    remux.cfg.public_session_proxy = Some("10.0.0.2".parse().unwrap());
-    remux.cfg.edge_secret = Some("edge-secret".into());
-
-    let request = |peer: &str, headers: &[(&str, &str)]| {
-        let mut builder = Request::builder().extension(den_remux::Peer(peer.parse().unwrap()));
-        for (name, value) in headers {
-            builder = builder.header(*name, *value);
-        }
-        builder.body(()).unwrap()
-    };
-    assert!(migration_authorized(&hearth, &request("10.0.0.3", &[])));
-    assert!(migration_authorized(
-        &hearth,
-        &request("10.0.0.2", &[("x-den-edge-secret", "edge-secret"), ("x-den-migration-owner", "1")],),
-    ));
-    for headers in [
-        vec![("x-den-migration-owner", "1")],
-        vec![("x-den-edge-secret", "wrong"), ("x-den-migration-owner", "1")],
-        vec![("x-den-edge-secret", "edge-secret"), ("x-den-migration-owner", "0")],
-        vec![
-            ("x-den-edge-secret", "edge-secret"),
-            ("x-den-migration-owner", "1"),
-            ("x-den-owner", "grant:deadbeef"),
-        ],
-    ] {
-        assert!(!migration_authorized(&hearth, &request("10.0.0.2", &headers)));
-    }
-}
-
 async fn get(path: &str) -> (StatusCode, serde_json::Value) {
     get_on(None, path).await
 }

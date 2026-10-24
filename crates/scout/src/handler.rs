@@ -893,10 +893,9 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 impl Handler {
-    /// The validated full legacy config as a combined-addon's member. Credentials never leave this process: the
-    /// migration endpoint immediately seals this value under Hearth's key. A scoped availability config is not an
-    /// install and cannot be promoted.
-    pub fn migration_member(&self, blob: &str) -> Option<serde_json::Value> {
+    /// Validate a standalone install for a guest overlay without exposing credentials outside this process.
+    /// A scoped availability capability is not a full install and cannot supply an overlay's host member.
+    pub fn validated_install_member(&self, blob: &str) -> Option<serde_json::Value> {
         let config = self.inner.open_config(blob)?;
         if !config.scope.is_empty() || self.inner.deps.config_slice.is_some() {
             return None;

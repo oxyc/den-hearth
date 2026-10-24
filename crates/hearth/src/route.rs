@@ -45,6 +45,10 @@ pub fn legacy(service: Service, path: &str) -> Target {
 }
 
 pub fn target(path: &str) -> Target {
+    // The retired config exchange is absent for every method, including CORS preflight.
+    if path == "/den/migrate" {
+        return Target::NotFound;
+    }
     // Routes v1 probes `<entry.url>/health`. The combined addon's entries end in `/den`, so its health address
     // is `/den/health`; answer it with Hearth's same aggregate report rather than parsing `health` as a config.
     if matches!(path, "/health" | "/den/health") {
@@ -157,8 +161,6 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Sidecar(_, _) => bulk(None),
             Route::NotFound => bulk(None),
             // Up to three public-key decryptions: never consume the reserved control lane under abuse.
-            Route::Migrate if *method == Method::OPTIONS => control,
-            Route::Migrate => bulk(None),
             // The configure document embeds the browser seal implementation and is about 148 KiB. Slow or
             // stampeding setup clients must not consume the positions reserved for health and metrics.
             Route::Configure if read => bulk(None),
@@ -251,7 +253,6 @@ mod tests {
             (Target::Remux("/remux/s/sid/sig/heartbeat".into()), Method::POST),
             (Target::Remux("/remux/s/sid/sig/end".into()), Method::POST),
             (Target::Remux("/remux/s/sid/sig".into()), Method::DELETE),
-            (Target::Den(Route::Migrate), Method::OPTIONS),
             (Target::Reel("/play/x.mp4".into()), Method::OPTIONS),
         ] {
             assert_eq!(class(target, method.clone()).0, Control, "{method}");

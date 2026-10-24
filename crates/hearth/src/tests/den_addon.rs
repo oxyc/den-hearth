@@ -211,7 +211,7 @@ async fn guest_overlay_revalidates_personal_revocation_before_answering() {
 }
 
 #[tokio::test]
-async fn guest_overlay_opens_a_migrated_host_hearth_without_returning_its_bearer() {
+async fn guest_overlay_opens_a_combined_host_hearth_without_returning_its_bearer() {
     let hearth = guest_hearth(den_with(None, "", "0", false));
     let host = plain(&config(0, &[SCOUT, SUBS, REEL]));
     let response = guest_overlay(
@@ -296,203 +296,6 @@ async fn a_personal_only_guest_has_no_hidden_host_fallback() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(json_of(response).await["error"], "playback_unavailable");
-}
-
-#[test]
-fn migrated_members_get_one_fresh_identity_and_open_as_a_combined_install() {
-    let den = den_with(Some(VEC_PRIV), "", "7", true);
-    let mut members = serde_json::Map::new();
-    members.insert("scout".into(), serde_json::json!({"debrid":[{"service":"torbox","token":"tb"}]}));
-    members.insert("reel".into(), serde_json::json!({"tmdbKey":"tm"}));
-    let segment = den.migrate_segment(members).unwrap();
-    let install = den.open(&segment).unwrap();
-    assert_eq!(install.members, vec!["scout", "reel"]);
-    assert!(install.iid.as_deref().is_some_and(|iid| iid.len() == den_seal::InstallId::LEN));
-}
-
-async fn migration_request(
-    hearth: &Arc<Hearth>,
-    method: Method,
-    content_type: Option<&str>,
-    body: &str,
-) -> Response<Body> {
-    let mut request = Request::builder().method(method).uri("/den/migrate");
-    if let Some(content_type) = content_type {
-        request = request.header("content-type", content_type);
-    }
-    handle(
-        hearth.clone(),
-        None,
-        false,
-        request.body(http_body_util::Full::new(Bytes::copy_from_slice(body.as_bytes()))).unwrap(),
-    )
-    .await
-}
-
-#[tokio::test]
-async fn legacy_migration_is_concealed_by_default_and_has_a_bounded_http_contract_when_enabled() {
-    let off = hearth_den_with_options(Limits::default(), den_with(None, "", "0", false), Options::default());
-    assert_eq!(
-        migration_request(&off, Method::POST, Some("application/json"), "{}").await.status(),
-        StatusCode::NOT_FOUND
-    );
-
-    let on = hearth_den_with_options(
-        Limits::default(),
-        den_with(None, "", "0", false),
-        Options { legacy_migration: true, ..Default::default() },
-    );
-    let options = migration_request(&on, Method::OPTIONS, None, "").await;
-    assert_eq!(options.status(), StatusCode::NO_CONTENT);
-    assert_eq!(options.headers()["allow"], "POST, OPTIONS");
-    assert_eq!(options.headers()["access-control-allow-origin"], "*");
-    let wrong_type = migration_request(&on, Method::POST, Some("text/plain"), "{}").await;
-    assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert_eq!(wrong_type.headers()["cache-control"], "no-store");
-    assert_eq!(wrong_type.headers()["access-control-allow-origin"], "*");
-    let too_large = " ".repeat(32 * 1024 + 1);
-    assert_eq!(
-        migration_request(&on, Method::POST, Some("application/json"), &too_large).await.status(),
-        StatusCode::BAD_REQUEST
-    );
-    for body in ["{}", r#"{"unknown":"segment"}"#, r#"{"scout":"not-a-segment"}"#] {
-        assert_eq!(
-            migration_request(&on, Method::POST, Some("application/json; charset=utf-8"), body)
-                .await
-                .status(),
-            StatusCode::BAD_REQUEST,
-            "{body}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn migration_validates_legacy_members_and_returns_a_fresh_combined_install() {
-    let den = den_with(Some(VEC_PRIV), "", "7", true);
-    let hearth = hearth_den_with_options(
-        Limits::default(),
-        den,
-        Options { legacy_migration: true, ..Default::default() },
-    );
-    let body = serde_json::json!({
-        "scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#),
-        "subs": plain(r#"{"osKey":"os"}"#),
-        "reel": plain(r#"{"tmdbKey":"tm"}"#),
-    })
-    .to_string();
-    let response = migration_request(&hearth, Method::POST, Some("application/json"), &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()["cache-control"], "no-store");
-    let answer = json_of(response).await;
-    let path = answer["manifestUrl"].as_str().unwrap();
-    let segment = path.strip_prefix("/den/").and_then(|p| p.strip_suffix("/manifest.json")).unwrap();
-    let install = hearth.den.open(segment).unwrap();
-    assert_eq!(install.members, vec!["scout", "subs", "reel"]);
-    assert!(install.iid.as_deref().is_some_and(|iid| iid.len() == den_seal::InstallId::LEN));
-    assert_ne!(segment, plain(&body), "a configured Hearth never returns legacy JSON in plaintext");
-}
-
-#[tokio::test]
-async fn migration_reuses_an_exact_admitted_target_idempotently() {
-    let den = den_with(Some(VEC_PRIV), "", "7", true);
-    let mut members = serde_json::Map::new();
-    members.insert("scout".into(), serde_json::json!({"debrid":[{"service":"torbox","token":"tb"}]}));
-    members.insert("subs".into(), serde_json::json!({"osKey":"os"}));
-    let target = den.migrate_segment(members).unwrap();
-    let hearth = hearth_den_with_options(
-        Limits::default(),
-        den,
-        Options { legacy_migration: true, ..Default::default() },
-    );
-    let body = serde_json::json!({
-        "scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#),
-        "subs": plain(r#"{"osKey":"os"}"#),
-        "target": target,
-    })
-    .to_string();
-    let expected = format!("/den/{target}/manifest.json");
-
-    for _ in 0..2 {
-        let response = migration_request(&hearth, Method::POST, Some("application/json"), &body).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert_eq!(json_of(response).await["manifestUrl"], expected);
-    }
-}
-
-#[tokio::test]
-async fn migration_refuses_a_target_with_different_extra_or_missing_members() {
-    let den = den_with(Some(VEC_PRIV), "", "0", true);
-    let target = |members| den.migrate_segment(members).unwrap();
-    let member = |name: &str, value| {
-        let mut members = serde_json::Map::new();
-        members.insert(name.into(), value);
-        members
-    };
-    let scout = serde_json::json!({"debrid":[{"service":"torbox","token":"tb"}]});
-    let mut scout_and_subs = member("scout", scout.clone());
-    scout_and_subs.insert("subs".into(), serde_json::json!({"osKey":"os"}));
-    let cases = [
-        (
-            target(member("scout", serde_json::json!({"debrid":[{"service":"torbox","token":"different"}]}))),
-            serde_json::json!({"scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#)}),
-        ),
-        (
-            target(scout_and_subs.clone()),
-            serde_json::json!({"scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#)}),
-        ),
-        (
-            target(member("scout", scout)),
-            serde_json::json!({
-                "scout": plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#),
-                "subs": plain(r#"{"osKey":"os"}"#),
-            }),
-        ),
-    ];
-    let hearth = hearth_den_with_options(
-        Limits::default(),
-        den,
-        Options { legacy_migration: true, ..Default::default() },
-    );
-
-    for (target, mut body) in cases {
-        body.as_object_mut().unwrap().insert("target".into(), serde_json::json!(target));
-        let response =
-            migration_request(&hearth, Method::POST, Some("application/json"), &body.to_string()).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_of(response).await["error"], "migration_refused");
-    }
-}
-
-#[tokio::test]
-async fn migration_refuses_invalid_or_revoked_targets_and_target_without_legacy_members() {
-    let legacy = plain(r#"{"debrid":[{"service":"torbox","token":"tb"}]}"#);
-    let cases = [
-        (den_with(Some(VEC_PRIV), "", "0", true), "not-a-segment".to_owned()),
-        (den_with(Some(VEC_PRIV), IID, "0", true), sealed(VEC_PRIV, &config(0, &[SCOUT]))),
-    ];
-    for (den, target) in cases {
-        let hearth = hearth_den_with_options(
-            Limits::default(),
-            den,
-            Options { legacy_migration: true, ..Default::default() },
-        );
-        let body = serde_json::json!({"scout": legacy, "target": target}).to_string();
-        let response = migration_request(&hearth, Method::POST, Some("application/json"), &body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_of(response).await["error"], "migration_refused");
-    }
-
-    let hearth = hearth_den_with_options(
-        Limits::default(),
-        den_with(Some(VEC_PRIV), "", "0", true),
-        Options { legacy_migration: true, ..Default::default() },
-    );
-    let body = serde_json::json!({"target": sealed(VEC_PRIV, &config(0, &[SCOUT]))}).to_string();
-    assert_eq!(
-        migration_request(&hearth, Method::POST, Some("application/json"), &body).await.status(),
-        StatusCode::BAD_REQUEST
-    );
 }
 
 #[tokio::test]
@@ -1268,4 +1071,22 @@ fn moving_to_an_own_key_keeps_the_derived_one_by_name() {
     assert_eq!(mixed.scout.keyring.unwrap().keys.len(), 3);
     let none = Den::from_env(env("scout"), "", "");
     assert_eq!(none.scout.keyring.unwrap().keys.len(), 1);
+}
+
+#[tokio::test]
+async fn retired_config_exchange_is_not_a_route() {
+    let hearth =
+        hearth_den_with_options(Limits::default(), den_with(None, "", "0", false), Options::default());
+    for method in [Method::GET, Method::POST, Method::OPTIONS] {
+        let request = Request::builder()
+            .method(method.clone())
+            .uri("/den/migrate")
+            .header("content-type", "application/json")
+            .header("x-den-migration-owner", "1")
+            .body(http_body_util::Full::new(Bytes::from_static(br#"{"scout":"old-install"}"#)))
+            .unwrap();
+        let response = handle(hearth.clone(), None, false, request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+    }
+    assert_eq!(get_from(&hearth, "/den/manifest.json").await.0, StatusCode::OK);
 }
