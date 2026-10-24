@@ -3234,6 +3234,18 @@ async fn serve_once(status_line: &str, content_length: usize, body: &'static str
     serve_once_bytes(status_line, content_length, body.as_bytes().to_vec()).await
 }
 
+/// Wait for the complete GET request before replying. Writing before Hyper dispatches its request
+/// races its connection state; dropping a socket with unread request bytes can also reset it.
+async fn read_request_head(sock: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 16 * 1024, "fixture request headers are too large");
+        head.push(sock.read_u8().await.expect("complete fixture request headers"));
+    }
+    String::from_utf8(head).expect("fixture request headers are UTF-8")
+}
+
 /// Send headers, then hold the socket open without sending the body — so a client timeout is what
 /// ends the request. `serve_once` closes immediately, which is a connection reset, not a stall.
 async fn serve_once_stalling(content_length: usize) -> String {
@@ -3245,6 +3257,7 @@ async fn serve_once_stalling(content_length: usize) -> String {
     );
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
+            read_request_head(&mut sock).await;
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(b"{\"re").await;
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -3256,7 +3269,7 @@ async fn serve_once_stalling(content_length: usize) -> String {
 /// Serve one fixed response and hand back the request line, so a test can assert WHICH url was asked
 /// for — the only way to pin that an id reached an upstream under the parameter it belongs in.
 async fn serve_once_capturing(body: &'static str) -> (String, tokio::sync::oneshot::Receiver<String>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3266,9 +3279,8 @@ async fn serve_once_capturing(body: &'static str) -> (String, tokio::sync::onesh
     );
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
-            let mut buf = [0u8; 1024];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            let request = read_request_head(&mut sock).await;
+            let line = request.lines().next().unwrap_or("").to_string();
             let _ = tx.send(line);
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(body.as_bytes()).await;
@@ -3287,6 +3299,7 @@ async fn serve_once_bytes(status_line: &str, content_length: usize, body: Vec<u8
     );
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
+            read_request_head(&mut sock).await;
             let _ = sock.write_all(head.as_bytes()).await;
             let _ = sock.write_all(&body).await;
             let _ = sock.shutdown().await;
