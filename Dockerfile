@@ -78,11 +78,11 @@ RUN set -eux; \
 # PyInstaller build and its second bundled Python alongside the system Python the resolver needs.
 # Bump YTDLP_VERSION to update (YouTube changes often — that's the whole maintenance burden, and
 # it's yt-dlp's, not ours).
-ARG YTDLP_VERSION=2026.08.19
+ARG YTDLP_VERSION=2026.10.21
 # SHA256 from the release's SHA2-256SUMS. Verifying the download is the supply-chain guard — there
 # is no package-manager advisory database involved. Kept in lockstep with YTDLP_VERSION by
 # .github/workflows/ytdlp-update.yml.
-ARG YTDLP_SHA256_ZIPAPP=1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6
+ARG YTDLP_SHA256_ZIPAPP=b7af77f686e95f7845ce8d09d21957718febb8b48b30555adb9dd2292ad7bf14
 RUN set -eux; \
     curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
       -o /usr/local/bin/yt-dlp; \
