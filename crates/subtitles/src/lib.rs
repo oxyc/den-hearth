@@ -40,9 +40,9 @@ pub use crate::httputil::Body;
 pub use crate::state::AppState;
 pub use crate::userconfig::is_valid as is_valid_config;
 
-/// Open and validate one legacy install for Hearth's migration endpoint, then drop the member's old revocation
-/// identity. The returned value is sealed immediately as a member of a fresh combined install.
-pub fn migration_member(state: &AppState, blob: &str) -> Option<serde_json::Value> {
+/// Validate a standalone install for a guest overlay, returning its member configuration without the
+/// install's revocation identity. The caller must keep credentials inside this process.
+pub fn validated_install_member(state: &AppState, blob: &str) -> Option<serde_json::Value> {
     userconfig::decode_checked(state.config_keyring.as_ref(), &state.cfg.revocation, blob).ok()?;
     let opened = den_seal::open_segment(state.config_keyring.as_ref(), blob).ok()?;
     let mut value: serde_json::Value = serde_json::from_slice(&opened.json).ok()?;

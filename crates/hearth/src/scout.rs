@@ -61,8 +61,8 @@ fn client() -> Arc<dyn Doer> {
 }
 
 impl Scout {
-    pub fn migration_member(&self, blob: &str) -> Option<serde_json::Value> {
-        self.legacy.migration_member(blob)
+    pub fn validated_install_member(&self, blob: &str) -> Option<serde_json::Value> {
+        self.legacy.validated_install_member(blob)
     }
 
     /// `mount` configures the handler behind `/scout`, `legacy` the one on Scout's own port. They must

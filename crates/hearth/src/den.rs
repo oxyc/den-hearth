@@ -26,7 +26,6 @@
 use std::io::Write;
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use base64::Engine;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use hyper::header::{HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING};
@@ -47,8 +46,6 @@ pub enum Route {
     Manifest,
     /// `/den/config-key`: the key the page seals to, and the epoch it stamps.
     ConfigKey,
-    /// `POST /den/migrate`: exchange validated legacy first-party config segments for one combined install.
-    Migrate,
     /// `POST /den/_guest`: Edge's authenticated guest overlay RPC.
     Guest,
     /// A short-lived, unguessable indexed subtitle capability.
@@ -75,7 +72,6 @@ pub fn route(path: &str) -> Route {
         "/" | "/configure" | "/configure/" => return Route::Configure,
         "/manifest.json" => return Route::Manifest,
         "/config-key" => return Route::ConfigKey,
-        "/migrate" => return Route::Migrate,
         "/_guest" => return Route::Guest,
         // The page's "Test token" button: a pasted token, no config.
         "/validate" => return Route::Scout(path.to_string()),
@@ -300,8 +296,7 @@ impl Den {
                     }
                 }
             }
-            Route::Migrate
-            | Route::Guest
+            Route::Guest
             | Route::Sidecar(_, _)
             | Route::Playback(_)
             | Route::Wanted(_)
@@ -348,44 +343,6 @@ impl Den {
             return Err(Rejected::Undecodable);
         }
         Ok(Install { iid, members })
-    }
-
-    /// Mint one combined config from already-opened, validated legacy members. The response is another bearer
-    /// credential, never plaintext: with sealing configured it is sealed before it leaves this process.
-    pub fn migrate_segment(&self, mut members: serde_json::Map<String, Value>) -> Result<String, ()> {
-        if self.scout.key_invalid || members.is_empty() {
-            return Err(());
-        }
-        members.insert("iid".into(), Value::String(InstallId::random().as_str().to_owned()));
-        members.insert("ep".into(), Value::from(self.scout.revocation.epoch()));
-        let json = serde_json::to_vec(&Value::Object(members)).map_err(|_| ())?;
-        let bytes = match &self.scout.keyring {
-            Some(keyring) => {
-                let mut framed = vec![den_seal::SEALED_VERSION];
-                framed.extend(den_seal::seal(&keyring.keys[0].pub_key, &json).map_err(|_| ())?);
-                framed
-            }
-            None => json,
-        };
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-    }
-
-    /// Whether an existing combined config is still admitted and contains exactly these validated legacy
-    /// members. Only the combined install's own revocation identity is metadata; every service member and every
-    /// value inside it must match. This lets migration callers retry without minting another install.
-    pub fn migration_target_matches(&self, blob: &str, members: &serde_json::Map<String, Value>) -> bool {
-        if self.open(blob).is_err() {
-            return false;
-        }
-        let Ok(opened) = den_seal::open_segment(self.scout.keyring.as_ref(), blob) else {
-            return false;
-        };
-        let Ok(Value::Object(mut target)) = serde_json::from_slice::<Value>(&opened.json) else {
-            return false;
-        };
-        target.remove("iid");
-        target.remove("ep");
-        target == *members
     }
 }
 
@@ -601,7 +558,7 @@ mod tests {
         assert_eq!(route("/"), Route::Configure);
         assert_eq!(route("/configure"), Route::Configure);
         assert_eq!(route("/configure/"), Route::Configure);
-        assert_eq!(route("/migrate"), Route::Migrate);
+        assert_eq!(route("/migrate"), Route::NotFound);
         assert_eq!(route("/_guest"), Route::Guest);
         assert_eq!(route("/manifest.json"), Route::Manifest);
         assert_eq!(route("/config-key"), Route::ConfigKey);
