@@ -62,6 +62,15 @@ pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
 }
 
 impl Config {
+    /// Register a trusted Scout origin served by the embedding process.
+    pub fn add_scout_origin(&mut self, origin: &str) {
+        for origin in crate::resync::parse_origins(origin) {
+            if !self.scout_origins.contains(&origin) {
+                self.scout_origins.push(origin);
+            }
+        }
+    }
+
     pub fn from_env() -> Config {
         Self::from_lookup(|key| env::var(key).ok())
     }

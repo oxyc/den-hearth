@@ -244,9 +244,11 @@ async fn route(
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
                     let resync_key = query_get(query, "resync_key");
-                    let resync_audio = query_get(query, "resync_audio")
-                        .and_then(|value| value.parse::<u32>().ok())
-                        .filter(|index| *index <= 4095);
+                    let requested_audio = query_get(query, "resync_audio");
+                    let resync_audio = requested_audio.as_deref().and_then(crate::sync::AudioStream::parse);
+                    if requested_audio.is_some() && resync_audio.is_none() {
+                        return httputil::error(hyper::StatusCode::BAD_REQUEST, "invalid_audio_selection");
+                    }
                     let lang = query_get(query, "lang");
                     // The caller's own last resort: it has already established nothing better exists
                     // for this language (every other candidate was tried and refused), so a real but
@@ -306,9 +308,11 @@ async fn route(
             };
             let resync = query_get(parts.uri.query().unwrap_or(""), "resync");
             let resync_key = query_get(parts.uri.query().unwrap_or(""), "resync_key");
-            let resync_audio = query_get(parts.uri.query().unwrap_or(""), "resync_audio")
-                .and_then(|value| value.parse::<u32>().ok())
-                .filter(|index| *index <= 4095);
+            let requested_audio = query_get(parts.uri.query().unwrap_or(""), "resync_audio");
+            let resync_audio = requested_audio.as_deref().and_then(crate::sync::AudioStream::parse);
+            if requested_audio.is_some() && resync_audio.is_none() {
+                return httputil::error(hyper::StatusCode::BAD_REQUEST, "invalid_audio_selection");
+            }
             let resp = addon::handle_translate(
                 state,
                 den,

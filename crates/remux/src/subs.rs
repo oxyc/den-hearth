@@ -330,10 +330,14 @@ pub struct Cache {
     pub list: Option<Vec<Entry>>,
     /// Each rendition's document, once made.
     pub docs: Vec<Option<String>>,
+    /// The actual candidate whose document was served, including sparse fallback.
+    pub selected: Vec<Option<Entry>>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Entry {
+    #[serde(default, rename = "hashMatch")]
+    pub hash_match: bool,
     pub url: String,
     #[serde(default)]
     pub lang: String,
@@ -1020,6 +1024,7 @@ mod tests {
     /// A plain, unflagged den-subtitles entry — not marked foreign-parts-only or dubbed.
     fn den_entry(lang: &str) -> Entry {
         Entry {
+            hash_match: false,
             url: "http://s/subtitle/1.srt".into(),
             lang: lang.into(),
             foreign_parts_only: false,

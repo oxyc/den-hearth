@@ -3192,7 +3192,7 @@ async fn subtitles_are_webvtt_renditions_from_den_subtitles() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let j = r.json();
     assert_eq!(
-        j["subtitles"],
+        subtitle_labels(&j),
         serde_json::json!([
             {"language": "en", "name": "English · OpenSubtitles"},
             {"language": "fi", "name": "Finnish · OpenSubtitles"}
@@ -3316,7 +3316,7 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     let j = r.json();
     assert_eq!(j["release"]["filename"], "subs.mkv");
     assert_eq!(
-        j["subtitles"],
+        subtitle_labels(&j),
         serde_json::json!([
             {"language": "en", "name": "English (in file)"},
             {"language": "fi", "name": "Finnish (in file)"}
@@ -3348,7 +3348,7 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
     let r = call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000015"}"#).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(
-        r.json()["subtitles"],
+        subtitle_labels(&r.json()),
         serde_json::json!([
             {"language": "en", "name": "English (in file)"},
             {"language": "fi", "name": "Finnish (in file)"}
@@ -3373,7 +3373,7 @@ async fn a_release_offers_its_own_subtitles_where_den_subtitles_has_none() {
 
     // A release with no text tracks, and a player that names none: no renditions, as before.
     let r = call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000001"}"#).await;
-    assert_eq!(r.json()["subtitles"], serde_json::json!([]));
+    assert_eq!(subtitle_labels(&r.json()), serde_json::json!([]));
     state.end_all("test").await;
 }
 
@@ -3397,7 +3397,7 @@ async fn english_over_original_english_audio_is_the_releases_full_track() {
         assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
         let j = r.json();
         assert_eq!(
-            j["subtitles"][0],
+            subtitle_labels(&j)[0],
             serde_json::json!({"language": "en", "name": "English (in file)"}),
             "{body}"
         );
@@ -3463,7 +3463,7 @@ async fn a_releases_own_subtitles_arrive_with_its_video() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     let j = r.json();
     assert_eq!(
-        j["subtitles"],
+        subtitle_labels(&j),
         serde_json::json!([
             {"language": "fi", "name": "Finnish (in file)"},
             {"language": "en", "name": "English (in file)"}
@@ -4644,4 +4644,227 @@ async fn after_a_restart_scratch_is_served_at_once_and_the_rest_is_made_ahead_of
     assert!((first - seg.start).abs() < 0.05 || rewound, "it starts on its keyframe, {}: {first}", seg.start);
     assert!(packets.iter().all(|(pts, _)| *pts < seg.end - 0.01), "and ends where the next begins");
     b.end_all("test").await;
+}
+
+fn subtitle_labels(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Array(
+        value["subtitles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| serde_json::json!({"language":t["language"],"name":t["name"]}))
+            .collect(),
+    )
+}
+
+struct ResyncFixture {
+    state: Arc<AppState>,
+    control: String,
+    created: serde_json::Value,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+    started: Arc<tokio::sync::Notify>,
+    dropped: Arc<AtomicBool>,
+}
+struct Dropped(Arc<AtomicBool>);
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.store(true, Relaxed);
+    }
+}
+
+// A real Remux session, original source probe and signed HTTP router, with only the integrated
+// subtitle service substituted. Its first candidate fails, proving resync uses the selected fallback.
+async fn resync_fixture(mode: u8) -> ResyncFixture {
+    let origin = origin().await;
+    let state = test_state(&origin, 2, Duration::from_secs(600));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut local = den_http::Local::default();
+    let (record, signal, flag, base) = (requests.clone(), started.clone(), dropped.clone(), origin.clone());
+    local.add(&format!("{origin}/align"), Arc::new(move |req| {
+        let (record, signal, flag, base) = (record.clone(), signal.clone(), flag.clone(), base.clone());
+        Box::pin(async move {
+            let path = req.uri().path();
+            if path.starts_with("/subtitles/") {
+                return crate::httputil::json(StatusCode::OK, &serde_json::json!({"subtitles":[
+                    {"url":format!("{base}/align/subtitle/0.srt"),"lang":"eng"},
+                    {"url":format!("{base}/align/subtitle/1.srt"),"lang":"eng","hashMatch":mode==5}
+                ]}), &[]);
+            }
+            if path == "/subtitle/0.vtt" { return crate::httputil::not_found(); }
+            let query = req.uri().query().unwrap_or("");
+            if !query.contains("resync=") {
+                return crate::httputil::text("text/vtt", "no-store", "WEBVTT\n\n00:00:10.000 --> 00:00:11.000\nChosen fallback\n".into());
+            }
+            assert_eq!(path, "/subtitle/1.vtt");
+            record.lock().unwrap().push(req.uri().to_string());
+            if mode == 3 {
+                let _drop = Dropped(flag);
+                signal.notify_one();
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let sparse = mode == 1 && !query.contains("sparse=1");
+            let mut response = crate::httputil::text("text/vtt", "no-store", "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nChosen fallback\n".into());
+            if sparse { *response.status_mut() = StatusCode::UNPROCESSABLE_ENTITY; }
+            if sparse || mode == 2 { response.headers_mut().insert("x-den-degraded", "sparse".parse().unwrap()); }
+            if mode != 4 { response.headers_mut().insert("x-den-subtitle-offset-ms", "-9000".parse().unwrap()); }
+            response
+        })
+    })).unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+    let cookie = login(&state, "phone-key").await;
+    let body = serde_json::json!({"imdb":"tt0000001","audioTrack":1,"subtitles":format!("{origin}/align"),"subtitleLanguages":["en"]}).to_string();
+    let response = call(&state, "POST", "/remux/session", Some(&cookie), &body).await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    let created = response.json();
+    let control = created["subtitleResync"]["url"].as_str().unwrap().to_owned();
+    ResyncFixture { state, control, created, requests, started, dropped }
+}
+
+#[tokio::test]
+async fn subtitle_resync_keeps_the_session_and_chosen_candidate_coalesces_and_stages_only_vtt() {
+    let f = resync_fixture(0).await;
+    assert_eq!(f.created["subtitles"][0]["source"], "opensubtitles");
+    assert_eq!(f.created["subtitles"][0]["resyncSupported"], true);
+    let check =
+        call(&f.state, "POST", &f.control, None, r#"{"rendition":0,"audioTrack":1,"checkOnly":true}"#).await;
+    assert_eq!(
+        check.json(),
+        serde_json::json!({"supported":true,"hashMatch":false,"source":"opensubtitles"})
+    );
+    assert!(f.requests.lock().unwrap().is_empty(), "capability check must not align");
+    let body = r#"{"rendition":0,"audioTrack":1}"#;
+    let (a, b) = tokio::join!(
+        call(&f.state, "POST", &f.control, None, body),
+        call(&f.state, "POST", &f.control, None, body)
+    );
+    assert_eq!(a.status, StatusCode::OK, "{}", a.text());
+    assert_eq!(a.json(), b.json());
+    assert_eq!(a.json()["offsetMs"], -9000);
+    assert_eq!(a.json()["viaSparse"], false);
+    let requests = f.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let url = reqwest::Url::parse(&format!("http://internal{}", requests[0])).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert_eq!(params.get("resync_audio").unwrap(), "a:1");
+    assert!(
+        params.get("resync").unwrap().contains("/play/") || params.get("resync").unwrap().contains("/p/")
+    );
+    assert!(!a.text().contains("resync=") && !a.text().contains("/align/") && !a.text().contains("play/"));
+    let aligned = call(&f.state, "GET", a.json()["url"].as_str().unwrap(), None, "").await;
+    assert_eq!(aligned.status, StatusCode::OK);
+    assert_eq!(aligned.headers["x-den-subtitle-offset-ms"], "-9000");
+    assert!(aligned.text().contains("00:00:01.000"));
+    let original = call(&f.state, "GET", &f.control.replace("subtitle-resync", "sub0.vtt"), None, "").await;
+    assert!(original.text().contains("00:00:10.000"), "failure/stale UI may retain original sidecar");
+    assert!(f.state.session(f.created["sid"].as_str().unwrap()).is_some());
+    f.state.end_all("test").await;
+    assert_eq!(
+        call(&f.state, "GET", a.json()["url"].as_str().unwrap(), None, "").await.status,
+        StatusCode::GONE
+    );
+}
+
+#[tokio::test]
+async fn subtitle_resync_retries_only_explicit_sparse_failure_and_refuses_degraded_or_unmeasured_success() {
+    for mode in [1, 2, 4, 5] {
+        let f = resync_fixture(mode).await;
+        let result = call(&f.state, "POST", &f.control, None, r#"{"rendition":0,"audioTrack":1}"#).await;
+        if mode == 1 {
+            assert_eq!(result.status, StatusCode::OK, "{}", result.text());
+            assert_eq!(result.json()["viaSparse"], true);
+            assert_eq!(f.requests.lock().unwrap().len(), 2);
+        } else {
+            assert_eq!(result.status, if mode == 5 { StatusCode::CONFLICT } else { StatusCode::BAD_GATEWAY });
+            assert_eq!(f.requests.lock().unwrap().len(), if mode == 5 { 0 } else { 1 });
+            let retry = call(&f.state, "POST", &f.control, None, r#"{"rendition":0,"audioTrack":1}"#).await;
+            assert_eq!(retry.status, result.status);
+            assert_eq!(
+                f.requests.lock().unwrap().len(),
+                if mode == 5 { 0 } else { 1 },
+                "failed operation cooldown"
+            );
+        }
+        f.state.end_all("test").await;
+    }
+}
+
+#[tokio::test]
+async fn subtitle_resync_rejects_arbitrary_sources_wrong_audio_and_unsigned_sessions() {
+    let f = resync_fixture(0).await;
+    for body in [
+        r#"{"rendition":0,"audioTrack":0}"#,
+        r#"{"rendition":8,"audioTrack":1}"#,
+        r#"{"rendition":0,"audioTrack":1,"source":"http://169.254.169.254/"}"#,
+        r#"{"rendition":0,"audioTrack":1,"checkOnly":"true"}"#,
+    ] {
+        assert_eq!(call(&f.state, "POST", &f.control, None, body).await.status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        call(
+            &f.state,
+            "POST",
+            &format!("{}?source=secret", f.control),
+            None,
+            r#"{"rendition":0,"audioTrack":1}"#
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    let wrong = f.control.replace(f.created["sid"].as_str().unwrap(), "aaaaaaaaaaaaaaaaaaaaaa");
+    assert_eq!(
+        call(&f.state, "POST", &wrong, None, r#"{"rendition":0,"audioTrack":1}"#).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(f.requests.lock().unwrap().is_empty());
+    f.state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn ending_session_cancels_inprocess_alignment_and_never_publishes_a_sidecar() {
+    let f = resync_fixture(3).await;
+    let state = f.state.clone();
+    let control = f.control.clone();
+    let task = tokio::spawn(async move {
+        call(&state, "POST", &control, None, r#"{"rendition":0,"audioTrack":1}"#).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), f.started.notified()).await.unwrap();
+    f.state.end_all("test").await;
+    let result = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+    assert_eq!(result.status, StatusCode::GONE);
+    assert!(f.dropped.load(Relaxed), "dropping integrated alignment also drops its subprocess guards");
+    assert_eq!(
+        call(&f.state, "GET", &f.control.replace("subtitle-resync", "sub0.aligned.vtt"), None, "")
+            .await
+            .status,
+        StatusCode::GONE
+    );
+}
+
+#[tokio::test]
+async fn subtitle_resync_deadline_drops_pending_alignment_without_ending_playback() {
+    let f = resync_fixture(3).await;
+    let state = f.state.clone();
+    let control = f.control.clone();
+    let task = tokio::spawn(async move {
+        call(&state, "POST", &control, None, r#"{"rendition":0,"audioTrack":1}"#).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), f.started.notified()).await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(121)).await;
+    let result = task.await.unwrap();
+    tokio::time::resume();
+    assert_eq!(result.status, StatusCode::BAD_GATEWAY);
+    assert!(f.dropped.load(Relaxed));
+    assert!(f.state.session(f.created["sid"].as_str().unwrap()).is_some());
+    assert_eq!(
+        call(&f.state, "GET", &f.control.replace("subtitle-resync", "sub0.aligned.vtt"), None, "")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    f.state.end_all("test").await;
 }

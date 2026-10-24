@@ -224,6 +224,9 @@ pub(crate) fn main() {
     // This reserved origin never leaves the process. Remux still applies its ordinary origin SSRF guards, then
     // `inproc` serves only the combined addon's Scout and Subtitles resource slices for it.
     if services.playback() {
+        if let Some(subs) = subs.as_mut() {
+            subs.add_scout_origin(playback::DEN_SCOUT_ORIGIN);
+        }
         let remux = remux.as_mut().expect("playback selection has remux");
         if !remux.scout_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
             remux.scout_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());

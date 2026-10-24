@@ -24,6 +24,37 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{timeout, Instant};
 
+/// ffmpeg's absolute stream index (Apple TV) or audio-only ordinal (Remux).
+/// Distinct representations also keep their alignment cache entries separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioStream {
+    Index(u32),
+    Ordinal(u32),
+}
+
+impl AudioStream {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let (ordinal, number) = value.strip_prefix("a:").map_or((false, value), |n| (true, n));
+        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let index = number.parse::<u32>().ok().filter(|n| *n <= 4095)?;
+        Some(if ordinal { Self::Ordinal(index) } else { Self::Index(index) })
+    }
+    fn ffmpeg_map(self) -> String {
+        format!("0:{self}")
+    }
+}
+
+impl std::fmt::Display for AudioStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Index(n) => write!(f, "{n}"),
+            Self::Ordinal(n) => write!(f, "a:{n}"),
+        }
+    }
+}
+
 /// Binary paths + work dir, from env. Defaults assume the binaries are on PATH (the container
 /// installs them).
 pub struct SyncTools {
@@ -120,7 +151,7 @@ impl SyncTools {
         &self,
         target_srt: &str,
         media_url: &str,
-        audio_stream: Option<u32>,
+        audio_stream: Option<AudioStream>,
         tag: &str,
     ) -> Result<AudioSync, String> {
         let all = crate::srt::parse(target_srt);
@@ -218,7 +249,7 @@ impl SyncTools {
         &self,
         batch: &AudioBatch,
         media_url: &str,
-        audio_stream: Option<u32>,
+        audio_stream: Option<AudioStream>,
         audio: &PathBuf,
         budget: Duration,
     ) -> Result<(), String> {
@@ -226,7 +257,7 @@ impl SyncTools {
         let batch_seconds = batch.seconds.to_string();
         // Aether exposes FFmpeg AVStream indices directly. Use the stream the viewer is actually
         // hearing; 0:a:0 remains the compatibility fallback for older clients.
-        let audio_map = audio_stream.map_or_else(|| "0:a:0".into(), |index| format!("0:{index}"));
+        let audio_map = audio_stream.map_or_else(|| "0:a:0".into(), AudioStream::ffmpeg_map);
         let extract = self
             .run(
                 &self.ffmpeg,
@@ -1050,7 +1081,12 @@ mod tests {
         .await;
         let t = SyncTools { alass, ffmpeg, work_dir: dir.clone() };
         let out = t
-            .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", Some(3), "tag-t2")
+            .sync_to_audio(
+                &crate::srt::serialize(&full),
+                "http://192.168.1.9/s.mkv",
+                Some(AudioStream::Index(3)),
+                "tag-t2",
+            )
             .await
             .unwrap();
         assert_eq!(out.shift_ms, 0);
@@ -1197,4 +1233,18 @@ async fn read_capped(path: &PathBuf) -> Result<String, String> {
 async fn write_all_and_flush(f: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes).await?;
     f.flush().await
+}
+
+#[cfg(test)]
+mod audio_selection_tests {
+    use super::AudioStream;
+    #[test]
+    fn audio_ordinals_do_not_alias_absolute_avstream_indices() {
+        assert_eq!(AudioStream::parse("3").unwrap().ffmpeg_map(), "0:3");
+        assert_eq!(AudioStream::parse("a:3").unwrap().ffmpeg_map(), "0:a:3");
+        assert_ne!(AudioStream::parse("3"), AudioStream::parse("a:3"));
+        for invalid in ["", "a:", "a:-1", "-1", "4096", "a:4096", "0:a:1", "1:0", " 1", "+1"] {
+            assert_eq!(AudioStream::parse(invalid), None, "{invalid}");
+        }
+    }
 }

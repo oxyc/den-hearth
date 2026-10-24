@@ -31,6 +31,10 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                         400 bad_request/bad_scout/bad_subtitles/bad_audio_track
                                         404 no_release/no_playable_release/no_copy/no_fitting_copy
                                         429 too_many_sessions/rate_limited · 502 scout_unavailable · 503 scout_unconfigured
+POST   /remux/s/<sid>/<sig>/subtitle-resync {rendition, audioTrack, checkOnly?: bool}
+                                        → 200 {url, offsetMs, viaSparse}; checkOnly → {supported, hashMatch, source}
+                                        400 invalid_selection · 409 unsupported · 410 session_ended · 502 alignment_failed
+GET    /remux/s/<sid>/<sig>/sub<N>.aligned.vtt  staged WebVTT + X-Den-Subtitle-Offset-Ms (no-store)
 POST   /remux/releases                  {imdb, season?, episode?, scout?, videoCodecs?, playable?} (a full scout install, or browser cookie/bearer)
                                         → 200 {releases:[{label,filename,size,plays,why}]}: `plays` is "yes" | "convert" |
                                         "no" for the player that sent `playable` (as /remux/session parses it) or
@@ -247,6 +251,22 @@ service's tailnet address because video never goes through the Cloudflare tunnel
 A logged-in browser that creates a session while it already has one ends the old one (it has moved on to
 another title), and an install past `MAX_SESSIONS_PER_INSTALL` ends its oldest, so `MAX_SESSIONS` counts
 people watching, not titles clicked.
+
+Session subtitle resync retains the original Scout play capability and chosen subtitle candidate on the server.
+The strict request accepts only a rendition, the session's selected audio ordinal, and an optional capability check;
+provider credentials and source URLs never appear in its answer. Creation advertises `subtitleResync` and each
+rendition's `source`, `rendition`, and `resyncSupported`; downloaded `hashMatch` starts as null because the actual
+candidate is chosen lazily. `checkOnly` fetches that document if needed but never performs audio alignment.
+Built-in and hash-exact tracks cannot be resynced. TorBox-managed delivery explicitly reports
+`{supported:false,reason:"managed_delivery"}` because it does not retain a resync source session.
+
+Concurrent requests coalesce within the session, successful sidecars remain immutable for its life, and failures
+have a 30-second cooldown. The entire operation (including waiting) is bounded to 120 seconds. Ending or suspending
+the session cancels integrated alignment work. Only an explicit non-success `X-Den-Degraded: sparse` triggers a
+sparse retry; degraded 200s, missing measured offsets and cue-less bodies fail without replacing the old document.
+Clients fetch the staged same-session VTT before swapping only the subtitle sidecar, then reset manual timing to
+zero while preserving the server-aligned baseline. Changing subtitle, audible audio, or session invalidates an
+in-flight result. Native system playback and remote casting require separate delivery support in the client.
 
 ## Intro and credits detection
 

@@ -8,7 +8,7 @@ pub(super) struct SyncWorkflowInput<'a> {
     pub(super) translated_body_key: Option<&'a str>,
     pub(super) ref_id: Option<i64>,
     pub(super) resync_url: Option<String>,
-    pub(super) resync_audio: Option<u32>,
+    pub(super) resync_audio: Option<crate::sync::AudioStream>,
     pub(super) reservation: Option<SyncReservation<'a>>,
     pub(super) flight: Option<InFlightGuard>,
     pub(super) what: &'a str,

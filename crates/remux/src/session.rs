@@ -27,6 +27,7 @@ use crate::state::{unix_now, AppState, Refused};
 
 mod open;
 mod plan;
+pub(crate) mod resync;
 mod select;
 mod serve;
 mod supervise;
@@ -144,6 +145,8 @@ pub fn is_session_file(file: &str) -> bool {
     matches!(file, "master.m3u8" | "media.m3u8" | "init.mp4" | "report" | "heartbeat" | "end")
         || seg_index(file).is_some()
         || sub_file(file).is_some()
+        || file == "subtitle-resync"
+        || resync::aligned_file(file).is_some()
 }
 
 pub struct Release {
@@ -317,6 +320,7 @@ pub struct Session {
     /// One request at a time may queue for and start this session's producer.
     producer_gate: tokio::sync::Mutex<()>,
     wake: Notify,
+    resync: resync::State,
 }
 
 pub struct ApiError {
@@ -1127,27 +1131,29 @@ impl Session {
         if cache.list.is_none() {
             cache.list = self.list_subtitles(st, sb).await;
         }
-        let offered: Vec<String> = cache
+        let offered: Vec<crate::subs::Entry> = cache
             .list
             .iter()
             .flatten()
             .filter(|e| crate::lang::canonical(&e.lang) == *want)
-            .map(|e| e.url.clone())
             .take(3)
+            .cloned()
             .collect();
         let mut doc = None;
+        let mut selected = None;
         // Only a candidate den-subtitles itself named `sparse` (`X-Den-Degraded`, read by
         // `fetch_subtitle`) is worth asking again below — never one refused for any other reason
         // (a cue-less body, an expired link, a dead upload, a transient blip): `?sparse=1` would
         // refuse those identically, for a second metered credit spent finding that out again.
-        let mut sparse_candidates: Vec<&String> = Vec::new();
-        for url in &offered {
-            match self.fetch_subtitle(st, sb, url).await {
+        let mut sparse_candidates: Vec<&crate::subs::Entry> = Vec::new();
+        for entry in &offered {
+            match self.fetch_subtitle(st, sb, &entry.url).await {
                 Fetched::Found(d) => {
                     doc = Some(d);
+                    selected = Some(entry.clone());
                     break;
                 }
-                Fetched::Sparse => sparse_candidates.push(url),
+                Fetched::Sparse => sparse_candidates.push(entry),
                 Fetched::Refused => {}
             }
         }
@@ -1156,9 +1162,12 @@ impl Session {
         // first, same as the strict pass above. This never overrides a non-sparse candidate: it only
         // runs once the whole strict pass has already failed to find one.
         if doc.is_none() {
-            for url in sparse_candidates {
-                if let Fetched::Found(d) = self.fetch_subtitle(st, sb, &crate::subs::with_sparse(url)).await {
+            for entry in sparse_candidates {
+                if let Fetched::Found(d) =
+                    self.fetch_subtitle(st, sb, &crate::subs::with_sparse(&entry.url)).await
+                {
                     doc = Some(d);
+                    selected = Some(entry.clone());
                     break;
                 }
             }
@@ -1168,6 +1177,10 @@ impl Session {
             cache.docs.resize(n + 1, None);
         }
         cache.docs[n] = Some(doc.clone());
+        if cache.selected.len() <= n {
+            cache.selected.resize(n + 1, None);
+        }
+        cache.selected[n] = selected;
         self.lock().subtitle_used = Some((n, "den-subtitles"));
         Some(doc)
     }
@@ -1221,6 +1234,23 @@ impl Session {
             return Fetched::Refused;
         }
         let vtt = crate::config::local(&vtt, &st.cfg.origin_aliases);
+        if let Some(call) = st
+            .local_scout
+            .get()
+            .and_then(|local| local.get(&vtt, hyper::HeaderMap::new(), subs::MAX_SUBTITLE as usize))
+        {
+            let Ok(Ok(resp)) = tokio::time::timeout(crate::scout::SCOUT_TOTAL, call).await else {
+                return Fetched::Refused;
+            };
+            if !resp.status().is_success() {
+                return if resp.headers().get("x-den-degraded").is_some_and(|v| v == "sparse") {
+                    Fetched::Sparse
+                } else {
+                    Fetched::Refused
+                };
+            }
+            return subs::for_hls(resp.body()).map_or(Fetched::Refused, Fetched::Found);
+        }
         let resp = match st.scout_http.get(&vtt).send().await {
             Ok(resp) => resp,
             Err(e) => {
@@ -1277,6 +1307,7 @@ impl Session {
                 return false;
             }
             i.ended = true;
+            self.resync.cancel.send_replace(true);
             // Before anything this can be cancelled at: a dropped request ending it, or a shutdown's cut, must never
             // leave a record a process after this one rebuilds an ended session from.
             crate::resume::forget(&self.dir);
@@ -1337,6 +1368,7 @@ impl Session {
                 return;
             }
             i.ended = true;
+            self.resync.cancel.send_replace(true);
             st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
             i.bytes = 0;
             i.job.take()
@@ -1502,6 +1534,7 @@ impl Session {
             }),
             producer_gate: tokio::sync::Mutex::new(()),
             wake: Notify::new(),
+            resync: Default::default(),
         })
     }
 }
