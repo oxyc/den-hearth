@@ -34,6 +34,26 @@ struct Cached {
     result: Result<Aligned, &'static str>,
 }
 
+// Created only by the gate owner once it starts actual work. Dropping a timed-out/canceled
+// operation records the same cooldown as a returned failure; a queued caller never owns this guard.
+struct Attempt<'a> {
+    state: &'a State,
+    rendition: usize,
+    finished: bool,
+}
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut results = self.state.results.lock().unwrap_or_else(|e| e.into_inner());
+        if results.len() <= self.rendition {
+            results.resize_with(self.rendition + 1, || None);
+        }
+        results[self.rendition] = Some(Cached { at: Instant::now(), result: Err("alignment_failed") });
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Selection {
@@ -64,7 +84,8 @@ pub(crate) fn error(code: &'static str) -> Response<Body> {
 impl Session {
     pub(crate) async fn resync_subtitle(&self, st: &AppState, choice: Selection) -> Response<Body> {
         let mut cancel = self.resync.cancel.subscribe();
-        if *cancel.borrow() || self.lock().ended {
+        let canceled = *cancel.borrow();
+        if canceled || self.lock().ended {
             return error("session_ended");
         }
         if choice.audio_track != self.audio
@@ -122,6 +143,7 @@ impl Session {
         let result = match cached {
             Some(result) => result,
             None => {
+                let mut attempt = Attempt { state: &self.resync, rendition: n, finished: false };
                 let result = self.align_entry(st, &entry).await;
                 // End may race completion; never stage an answer after the session ended.
                 if self.lock().ended {
@@ -132,6 +154,7 @@ impl Session {
                     results.resize_with(n + 1, || None);
                 }
                 results[n] = Some(Cached { at: Instant::now(), result: result.clone() });
+                attempt.finished = true;
                 result
             }
         };
@@ -208,7 +231,7 @@ fn decode(response: Response<Bytes>, via_sparse: bool) -> Result<Aligned, &'stat
         .and_then(|v| v.parse::<i64>().ok())
         .ok_or("alignment_failed")?;
     let doc = crate::subs::for_hls(response.body()).ok_or("alignment_failed")?;
-    if crate::subs::parse_cues(&doc).is_empty() {
+    if doc.len() > crate::subs::MAX_SUBTITLE as usize || crate::subs::parse_cues(&doc).is_empty() {
         return Err("alignment_failed");
     }
     Ok(Aligned { doc: doc.into(), offset_ms, via_sparse })
@@ -234,4 +257,22 @@ async fn fetch(st: &AppState, url: &str) -> Result<Response<Bytes>, &'static str
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn staged_vtt_bound_includes_the_added_timestamp_map() {
+        let prefix = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n";
+        for (length, accepted) in
+            [(crate::subs::MAX_SUBTITLE as usize, false), (crate::subs::MAX_SUBTITLE as usize - 128, true)]
+        {
+            let body = format!("{prefix}{}\n", "x".repeat(length - prefix.len() - 1));
+            assert_eq!(body.len(), length);
+            let response =
+                Response::builder().header("x-den-subtitle-offset-ms", "0").body(Bytes::from(body)).unwrap();
+            assert_eq!(decode(response, false).is_ok(), accepted);
+        }
+    }
 }

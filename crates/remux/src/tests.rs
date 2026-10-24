@@ -4859,6 +4859,14 @@ async fn subtitle_resync_deadline_drops_pending_alignment_without_ending_playbac
     tokio::time::resume();
     assert_eq!(result.status, StatusCode::BAD_GATEWAY);
     assert!(f.dropped.load(Relaxed));
+    let retry = tokio::time::timeout(
+        Duration::from_secs(2),
+        call(&f.state, "POST", &f.control, None, r#"{"rendition":0,"audioTrack":1}"#),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(f.requests.lock().unwrap().len(), 1, "timed out owner retains failure cooldown");
     assert!(f.state.session(f.created["sid"].as_str().unwrap()).is_some());
     assert_eq!(
         call(&f.state, "GET", &f.control.replace("subtitle-resync", "sub0.aligned.vtt"), None, "")

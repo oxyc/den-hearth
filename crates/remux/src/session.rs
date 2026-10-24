@@ -1307,7 +1307,6 @@ impl Session {
                 return false;
             }
             i.ended = true;
-            self.resync.cancel.send_replace(true);
             // Before anything this can be cancelled at: a dropped request ending it, or a shutdown's cut, must never
             // leave a record a process after this one rebuilds an ended session from.
             crate::resume::forget(&self.dir);
@@ -1316,6 +1315,7 @@ impl Session {
             i.gops.clear();
             (i.job.take(), i.segments_served, i.seconds_served, i.subtitle_used)
         };
+        self.resync.cancel.send_replace(true);
         let subtitle = subtitle_used
             .map(|(idx, source)| (idx, self.renditions.get(idx).map_or("und", |r| r.lang.as_str()), source));
         eprintln!(
@@ -1368,11 +1368,11 @@ impl Session {
                 return;
             }
             i.ended = true;
-            self.resync.cancel.send_replace(true);
             st.scratch_bytes.fetch_sub(i.bytes, Relaxed);
             i.bytes = 0;
             i.job.take()
         };
+        self.resync.cancel.send_replace(true);
         if let Some(j) = job {
             if j.exit.is_none() {
                 eprintln!(
