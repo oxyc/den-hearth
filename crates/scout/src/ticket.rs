@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, AeadInOut, Generate, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -227,8 +227,8 @@ impl TicketKeys {
         };
         // Tickets are minted with the first key, as Go's aeads[0].
         let aead = XChaCha20Poly1305::new(&self.keys[0].into());
-        // OsRng panics rather than returning an error, as Go's crypto/rand.Read crashes the process.
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        // OS randomness failure panics, as Go's crypto/rand.Read crashes the process.
+        let nonce = XNonce::generate();
         // nonce || payload || tag in one buffer: the payload is written after the nonce and sealed where it lies.
         // A ticket is a few hundred bytes, so this capacity holds it without growing.
         let mut out = Vec::with_capacity(512);
@@ -236,7 +236,7 @@ impl TicketKeys {
         // Go ignores the marshal error too; this struct always serialises.
         let _ = serde_json::to_writer(&mut out, &w);
         let tag = aead
-            .encrypt_in_place_detached(&nonce, &[], &mut out[NONCE_SIZE..])
+            .encrypt_inout_detached(&nonce, &[], (&mut out[NONCE_SIZE..]).into())
             .expect("XChaCha20-Poly1305 seals any payload");
         out.extend_from_slice(&tag);
         b64url_encode(&out)
@@ -254,11 +254,11 @@ impl TicketKeys {
             return Err(TicketError::Bad);
         }
         let (nonce, ct) = raw.split_at(NONCE_SIZE);
-        let nonce = XNonce::from_slice(nonce);
+        let nonce = XNonce::try_from(nonce).map_err(|_| TicketError::Bad)?;
         let pt = self
             .keys
             .iter()
-            .find_map(|k| XChaCha20Poly1305::new(&(*k).into()).decrypt(nonce, ct).ok())
+            .find_map(|k| XChaCha20Poly1305::new(&(*k).into()).decrypt(&nonce, ct).ok())
             .ok_or(TicketError::Bad)?;
         // Go matches keys to fields case-insensitively, so a payload spelled "X" or "H" still opens there.
         static SHAPE: Shape = Shape::Object(&[

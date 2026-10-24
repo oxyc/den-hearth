@@ -21,7 +21,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 use crate::session::Gop;
@@ -90,7 +90,7 @@ fn cipher(url_key: &[u8]) -> XChaCha20Poly1305 {
 /// `nonce || XChaCha20-Poly1305(record)`, the session id authenticated beside it.
 pub(crate) fn seal(url_key: &[u8], rec: &Record) -> Vec<u8> {
     let json = serde_json::to_vec(rec).expect("a record serialises");
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce = XNonce::generate();
     let sealed = cipher(url_key)
         .encrypt(&nonce, Payload { msg: &json, aad: rec.sid.as_bytes() })
         .expect("XChaCha20-Poly1305 seals any payload");
@@ -107,7 +107,7 @@ pub(crate) fn open(url_key: &[u8], sid: &str, bytes: &[u8]) -> Option<Record> {
     }
     let (nonce, sealed) = bytes.split_at(NONCE_LEN);
     let json = cipher(url_key)
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: sealed, aad: sid.as_bytes() })
+        .decrypt(&XNonce::try_from(nonce).ok()?, Payload { msg: sealed, aad: sid.as_bytes() })
         .ok()?;
     let rec: Record = serde_json::from_slice(&json).ok()?;
     (rec.schema == RECORD_SCHEMA && rec.sid == sid && rec.info.valid()).then_some(rec)
@@ -353,6 +353,26 @@ mod tests {
             master: "#EXTM3U".into(),
             media: "#EXTM3U".into(),
         }
+    }
+
+    #[test]
+    fn record_cipher_matches_the_pre_upgrade_format() {
+        use base64::Engine;
+        // Frozen with chacha20poly1305 0.10.1 and record_key(b"key"). Keeping the derived key,
+        // 24-byte nonce, associated session id, and appended tag preserves persisted records.
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATo95MctUzCaK0zes0pGg6vsc4pv9xdjKfE8fTjfCpyiXUpzjxA")
+            .unwrap();
+        let (nonce, sealed) = bytes.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce).unwrap();
+        let cipher = cipher(b"key");
+        let payload = Payload { msg: b"legacy session record", aad: b"session-id" };
+        assert_eq!(cipher.encrypt(&nonce, payload).unwrap(), sealed);
+        assert_eq!(
+            cipher.decrypt(&nonce, Payload { msg: sealed, aad: b"session-id" }).unwrap(),
+            b"legacy session record"
+        );
+        assert!(cipher.decrypt(&nonce, Payload { msg: sealed, aad: b"another-session" }).is_err());
     }
 
     #[test]
