@@ -300,7 +300,8 @@ impl Inner {
             prefetch: query_is(req, "prefetch", "1"),
             ..Default::default()
         };
-        let resp = self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases).await;
+        let mut resp = self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases).await;
+        mark_debrid_health(&mut resp, config, self.deps.runtime.torbox.health.state());
         let route = if query_is(req, "probe", "1") { "probe" } else { "play" };
         crate::releaselog::observe(&rt, &rid, route, start.elapsed(), &resp);
         // A viewer's player now reads this episode straight from the debrid, past this service; the redirect is
@@ -405,6 +406,24 @@ impl Inner {
                 return write_play_redirect(&hit.link);
             }
             self.links.forget(&memo_key);
+        }
+
+        // TorBox known down: every read below would wait out its budget for nothing, and the client polls again in
+        // seconds. After the link memo, which asks nobody and can still serve a link minted before the outage.
+        if let Some(down) = self.debrid_down(&pool) {
+            log_limited(
+                "play-debrid-down",
+                &play_decision(
+                    "play",
+                    "refused",
+                    &format!("torbox is down ({}), answered at once", down.reason),
+                    DebridService::TorBox.as_str(),
+                    start.elapsed(),
+                    &rid,
+                    &rt,
+                ),
+            );
+            return write_debrid_down(down);
         }
 
         // Held already? Then try to serve it before asking whether it is downloading.
@@ -912,6 +931,21 @@ impl Inner {
         deadline: TokioInstant,
     ) -> Resp {
         let start = Instant::now();
+        if let Some(down) = self.debrid_down(pool) {
+            log_limited(
+                "probe-debrid-down",
+                &play_decision(
+                    "probe",
+                    "refused",
+                    &format!("torbox is down ({}), answered at once", down.reason),
+                    DebridService::TorBox.as_str(),
+                    start.elapsed(),
+                    rid,
+                    rt,
+                ),
+            );
+            return write_debrid_down(down);
+        }
         let outcome = pool.status_outcome(rt, Some(deadline)).await;
         if let ProviderStatus::Downloading(status) = &outcome.result {
             return write_queued(rt, rid, start.elapsed(), status);

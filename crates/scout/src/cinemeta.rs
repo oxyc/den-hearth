@@ -60,6 +60,67 @@ pub(crate) struct CineMeta {
     pub title: String,
     #[serde(rename = "Year")]
     pub year: i64,
+    /// The production countries as Cinemeta lists them ("Sweden, Finland, United Kingdom, Norway"); "" when unknown.
+    #[serde(rename = "Country", default)]
+    pub country: String,
+}
+
+/// Production country to the language its productions are made in. Only countries where that is one language,
+/// or a small known set, are listed: a country left out (India, say) yields no language, which switches the
+/// language rule off rather than guessing.
+const COUNTRY_LANGUAGES: &[(&str, &[&str])] = &[
+    ("United States", &["en"]),
+    ("United Kingdom", &["en"]),
+    ("Ireland", &["en"]),
+    ("Australia", &["en"]),
+    ("New Zealand", &["en"]),
+    ("Canada", &["en", "fr"]),
+    ("Sweden", &["sv"]),
+    ("Norway", &["no"]),
+    ("Denmark", &["da"]),
+    ("Finland", &["fi", "sv"]),
+    ("Iceland", &["is"]),
+    ("Germany", &["de"]),
+    ("West Germany", &["de"]),
+    ("Austria", &["de"]),
+    ("Switzerland", &["de", "fr", "it"]),
+    ("France", &["fr"]),
+    ("Belgium", &["nl", "fr"]),
+    ("Netherlands", &["nl"]),
+    ("Italy", &["it"]),
+    ("Spain", &["es"]),
+    ("Mexico", &["es"]),
+    ("Argentina", &["es"]),
+    ("Colombia", &["es"]),
+    ("Chile", &["es"]),
+    ("Portugal", &["pt"]),
+    ("Brazil", &["pt"]),
+    ("Poland", &["pl"]),
+    ("Czech Republic", &["cs"]),
+    ("Czechia", &["cs"]),
+    ("Hungary", &["hu"]),
+    ("Russia", &["ru"]),
+    ("Soviet Union", &["ru"]),
+    ("Ukraine", &["uk"]),
+    ("Turkey", &["tr"]),
+    ("Japan", &["ja"]),
+    ("South Korea", &["ko"]),
+    ("China", &["zh"]),
+    ("Hong Kong", &["zh"]),
+    ("Taiwan", &["zh"]),
+];
+
+impl CineMeta {
+    /// The title's original languages (ISO 639-1), read from every listed production country. Every country
+    /// counts, not only the first, so a co-production's own languages are never taken for a dub. Empty when no
+    /// country is known or mapped.
+    pub(crate) fn original_languages(&self) -> std::collections::HashSet<String> {
+        self.country
+            .split(',')
+            .filter_map(|c| COUNTRY_LANGUAGES.iter().find(|(name, _)| *name == c.trim()))
+            .flat_map(|(_, langs)| langs.iter().map(|l| (*l).to_owned()))
+            .collect()
+    }
 }
 
 /// Go `cinemetaFlight`: concurrent builds of one film (several installs, or a list and its rebuild) share one
@@ -116,7 +177,8 @@ impl Cinemeta {
 
 /// Go `cinemetaCacheKey`: the key a lookup is cached under. The base is hashed, so the URL itself is not stored.
 pub(crate) fn cinemeta_key(base: &str, typ: &str, imdb: &str) -> String {
-    format!("cinemeta:v2:{}:{typ}:{imdb}", key_hash(base.trim_end_matches('/')))
+    // v3: entries carry `Country`. A v2 entry would answer without it for a week.
+    format!("cinemeta:v3:{}:{typ}:{imdb}", key_hash(base.trim_end_matches('/')))
 }
 
 /// The record Cinemeta answers a lookup with, as far as it is read.
@@ -138,6 +200,8 @@ struct CinemetaMeta {
     year: String,
     #[serde(rename = "releaseInfo", deserialize_with = "null_default")]
     release_info: String,
+    #[serde(deserialize_with = "null_default")]
+    country: String,
 }
 
 /// Go `fetchCinemeta` asks Cinemeta for one film or series.
@@ -156,7 +220,11 @@ async fn fetch_cinemeta(client: &dyn Doer, base: &str, typ: &str, imdb: &str) ->
     let Some(Ok(body)) = serde_json::Deserializer::from_slice(&raw).into_iter::<CinemetaBody>().next() else {
         return none;
     };
-    let mut m = CineMeta { title: body.meta.name.trim().to_owned(), year: 0 };
+    let mut m = CineMeta {
+        title: body.meta.name.trim().to_owned(),
+        year: 0,
+        country: body.meta.country.trim().to_owned(),
+    };
     let year = first_year(&body.meta.year);
     m.year = if year != 0 { year } else { first_year(&body.meta.release_info) };
     // Usable only if we learned at least one signal.

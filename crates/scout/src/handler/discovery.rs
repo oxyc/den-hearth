@@ -468,7 +468,7 @@ impl Inner {
         debug: bool,
     ) -> BuildResult {
         let mut dbg = debug.then(RankDebug::default);
-        let opts = RankOpts { client: job.client.as_ref(), check_cache: true, rid: &job.rid };
+        let opts = RankOpts { client: job.client.as_ref(), check_cache: true, rid: &job.rid, audio: &[] };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
         // A movie's list answers the availability route's question too, so a title someone opened needs no
         // check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
@@ -491,7 +491,7 @@ impl Inner {
         dbg: Option<&mut RankDebug>,
         opts: RankOpts<'_>,
     ) -> RankedList {
-        let RankOpts { client, check_cache, rid } = opts;
+        let RankOpts { client, check_cache, rid, audio } = opts;
         let q = ScrapeQuery {
             kind: sid.kind.clone(),
             imdb: sid.imdb.clone(),
@@ -564,11 +564,17 @@ impl Inner {
             let pool = StorePool { stores: (self.deps.make_stores)(config) };
             let hashes: Vec<String> = seeds.iter().map(|s| s.info_hash.clone()).collect();
             phase = Instant::now();
-            (truth, truth_ok) = match timeout_at(deadline, pool.cache_check(&hashes)).await {
-                Ok(answer) => answer,
-                // The build's own clock ran out: every store would have failed, so nobody could be asked.
-                Err(_) => {
-                    (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false)
+            let unasked =
+                || (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false);
+            // TorBox known down: the list is served at once as "could not check" (degraded `cache-check`), which is
+            // exactly what waiting out the clock would have produced.
+            (truth, truth_ok) = if self.debrid_down(&pool).is_some() {
+                unasked()
+            } else {
+                match timeout_at(deadline, pool.cache_check(&hashes)).await {
+                    Ok(answer) => answer,
+                    // The build's own clock ran out: every store would have failed, so nobody could be asked.
+                    Err(_) => unasked(),
                 }
             };
             timing.push_str(", ");
@@ -639,8 +645,10 @@ impl Inner {
         let mut expected_year: Option<i64> = None;
         let mut expected_title_tokens = HashSet::new();
         let mut show_tokens = HashSet::new();
+        let mut languages = HashSet::new();
         if let Some(meta) = &self.deps.meta {
             if let Ok((m, true)) = timeout_at(deadline, meta.lookup(&sid.kind, &sid.imdb)).await {
+                languages = m.original_languages();
                 if sid.kind == "series" {
                     if !m.title.is_empty() {
                         show_tokens = title_tokens(&m.title);
@@ -654,6 +662,13 @@ impl Inner {
                     }
                 }
             }
+        }
+        // The viewer's preferred audio widens what is not a dub, but only beside a known original: on its own it
+        // would sink an Italian film's own ITA releases for an English-speaking viewer.
+        if !languages.is_empty() {
+            languages.extend(
+                audio.iter().map(|l| crate::probe::clean_lang(l.as_bytes())).filter(|l| !l.is_empty()),
+            );
         }
 
         // Probe facts are ranking inputs, not decorations. Hydrate every locally-known fact before the
@@ -686,6 +701,7 @@ impl Inner {
                 episode,
                 show_tokens,
                 client: client.cloned(),
+                languages,
             },
             Some(&mut *log_dbg),
         );

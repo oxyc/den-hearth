@@ -107,6 +107,33 @@ fn title_tokens_would_empty_real_series() {
 /// What a `MockDoer` closure returns; the mock cannot infer the error type of a bare `Ok(..)`.
 type Answer = Result<reqwest::Response, crate::scrape::DoError>;
 
+// The original language comes from Cinemeta's production countries, every one of them, so a co-production's own
+// language is never taken for a dub. A country with no single language (India) says nothing.
+#[tokio::test]
+async fn cinemeta_meta_reads_original_languages_from_its_countries() {
+    use crate::cache::MemoryCache;
+    use crate::cinemeta::cinemeta_meta;
+    use std::sync::Arc;
+
+    let client: Arc<dyn crate::scrape::Doer> = Arc::new(crate::tests::mock::MockDoer(
+        |_r: reqwest::Request| -> Answer {
+            Ok(crate::tests::mock::resp(
+                200,
+                r#"{"meta":{"id":"tt2309405","name":"Jordskott","releaseInfo":"2015–2017","country":"Sweden, Finland, United Kingdom, Norway"}}"#,
+            ))
+        },
+    ));
+    let meta = cinemeta_meta(client, "https://cinemeta.example", Arc::new(MemoryCache::new(1 << 20)));
+    let (m, found) = meta.lookup("series", "tt2309405").await;
+    assert!(found, "series meta: {m:?}");
+    let mut got: Vec<String> = m.original_languages().into_iter().collect();
+    got.sort();
+    assert_eq!(got, ["en", "fi", "no", "sv"]);
+
+    let unknown = crate::cinemeta::CineMeta { country: "India".into(), ..Default::default() };
+    assert!(unknown.original_languages().is_empty(), "an unmapped country must switch the language rule off");
+}
+
 #[tokio::test]
 async fn cinemeta_meta() {
     use crate::cache::MemoryCache;
