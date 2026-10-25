@@ -623,3 +623,18 @@ async fn health_reports_all_four() {
     assert_eq!(mounted_status, StatusCode::OK);
     assert_eq!(mounted_body, body, "the routes-v1 probe sees Hearth's aggregate health");
 }
+
+#[tokio::test]
+async fn public_torbox_status_warns_without_becoming_a_liveness_gate() {
+    let node = hearth();
+    let before = json_of(send(&node, "/den/health").await).await;
+    node.scout.as_ref().unwrap().runtime().torbox_public_status_for_test("down");
+    let body = json_of(send(&node, "/den/health").await).await;
+
+    assert_eq!(body["debrid"]["provider"], "torbox");
+    assert_eq!(body["debrid"]["state"], "down");
+    assert_eq!(body["debrid"]["source"], "status_page");
+    assert_eq!(body["debrid"]["statusPage"]["state"], "down");
+    assert_eq!(body["services"]["scout"]["status"], "ok", "an external page is not Scout liveness");
+    assert_eq!(body["status"], before["status"], "an external page cannot change Hearth rollout health");
+}

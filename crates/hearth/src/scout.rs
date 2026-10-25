@@ -49,6 +49,7 @@ pub struct Scout {
     den_local: Handler,
     cache: Arc<TieredCache>,
     runtime: Arc<ScoutRuntime>,
+    client: Arc<dyn Doer>,
     summary: String,
 }
 
@@ -108,6 +109,7 @@ impl Scout {
             den_local: new_handler(den_deps(crate::playback::DEN_ADDON_BASE.to_string())),
             cache,
             runtime,
+            client,
             summary,
         }
     }
@@ -134,6 +136,7 @@ impl Scout {
                 }
             }
         });
+        self.runtime.start_torbox_public_status(self.client.clone());
     }
 
     /// Serve one request already routed to Scout (its path is final). `own_listener` picks the handler
