@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::addbudget::{AddBudget, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
 use crate::metrics::{new_metric_set, MetricSet};
+use crate::scrape::Doer;
 use crate::stores::torbox::TorboxRuntime;
 
 /// Maximum number of distinct stream-list builds admitted across one hosted Scout runtime.
@@ -103,6 +104,12 @@ impl ScoutRuntime {
         let _ = self.play_observer.set(observer);
     }
 
+    /// Start the one low-rate TorBox public-status refresh for this process. It is deliberately separate from
+    /// every play, probe, and list build: status.torbox.app being slow or unavailable must never slow playback.
+    pub fn start_torbox_public_status(&self, client: Arc<dyn Doer>) {
+        self.torbox.public_status.start(client);
+    }
+
     /// Leaves TorBox's health as Scout's own calls would: `down` fails enough calls in a row to call it down, else
     /// one answer arrives slowly. For a dependant's tests, which cannot make TorBox's real API fail.
     #[cfg(feature = "test-support")]
@@ -116,6 +123,12 @@ impl ScoutRuntime {
         } else {
             health.record(CallOutcome::Answered(SLOW_ANSWER), Instant::now());
         }
+    }
+
+    /// Put the cached TorBox public page into one of its controlled states for a dependent's health tests.
+    #[cfg(feature = "test-support")]
+    pub fn torbox_public_status_for_test(&self, state: &str) {
+        self.torbox.public_status.record_for_test(state);
     }
 
     pub(crate) fn played(&self, imdb: &str, season: u32, episode: u32) {
