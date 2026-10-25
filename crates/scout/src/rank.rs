@@ -63,6 +63,10 @@ pub(crate) struct RankFilters {
     pub expected_year: Option<i64>,
     /// Significant tokens of the requested title, applied only to a release with no parseable year.
     pub expected_title_tokens: HashSet<String>,
+    /// ISO 639-1 languages a release's audio may be in without sinking: the title's original language(s), plus
+    /// the viewer's preferred audio where the request names it. Empty means the original language is unknown,
+    /// and then no release is judged by its language tags (see `foreign_language_sink`).
+    pub languages: HashSet<String>,
 }
 
 /// Go `rankDebug`: where a list went, one count per filter, and what the survivors scored. Served only
@@ -407,6 +411,135 @@ pub(crate) const PREFERENCE_SINK: i64 = 5000;
 /// episode outranks it, and it stays above a release that cannot play at all and above junk.
 const WRONG_SHOW_SINK: i64 = 30_000;
 
+/// What a release costs when every audio language its name declares is one nobody asked for: a dub made for
+/// another market. It clears cached (+8000) plus the most quality alone can earn (4860), so an uncached
+/// original-language release outranks a cached dub, and it stays under `WRONG_SHOW_SINK`, so the right episode
+/// in any language still outranks the wrong one.
+const FOREIGN_AUDIO_SINK: i64 = 15_000;
+
+/// What a release costs when its audio is not declared but its subtitles are made for another market (VOSTFR).
+/// The audio is most likely the original, so it sinks below untagged releases but stays above a dub.
+const FOREIGN_SUBS_SINK: i64 = PREFERENCE_SINK;
+
+/// Release-name tokens that declare the audio language, mapped to ISO 639-1. Scene names leave the original
+/// language of an English title untagged and tag everything else, so a tag is evidence of the audio track.
+const AUDIO_LANGUAGE_TAGS: &[(&str, &str)] = &[
+    ("ita", "it"),
+    ("italian", "it"),
+    ("french", "fr"),
+    ("truefrench", "fr"),
+    ("vf", "fr"),
+    ("vff", "fr"),
+    ("vfq", "fr"),
+    ("vfi", "fr"),
+    ("vf2", "fr"),
+    ("german", "de"),
+    ("ger", "de"),
+    ("deutsch", "de"),
+    ("spanish", "es"),
+    ("castellano", "es"),
+    ("latino", "es"),
+    ("esp", "es"),
+    ("spa", "es"),
+    ("rus", "ru"),
+    ("russian", "ru"),
+    ("ukr", "uk"),
+    ("ukrainian", "uk"),
+    ("polish", "pl"),
+    ("pldub", "pl"),
+    ("lektor", "pl"),
+    ("portuguese", "pt"),
+    ("dublado", "pt"),
+    ("hindi", "hi"),
+    ("tamil", "ta"),
+    ("telugu", "te"),
+    ("turkish", "tr"),
+    ("japanese", "ja"),
+    ("jap", "ja"),
+    ("korean", "ko"),
+    ("kor", "ko"),
+    ("chinese", "zh"),
+    ("mandarin", "zh"),
+    ("cantonese", "zh"),
+    ("swedish", "sv"),
+    ("swe", "sv"),
+    ("norwegian", "no"),
+    ("nor", "no"),
+    ("danish", "da"),
+    ("dan", "da"),
+    ("finnish", "fi"),
+    ("fin", "fi"),
+    ("dutch", "nl"),
+    ("flemish", "nl"),
+    ("czech", "cs"),
+    ("cze", "cs"),
+    ("hungarian", "hu"),
+    ("hun", "hu"),
+    ("english", "en"),
+    ("eng", "en"),
+];
+
+/// Release-name tokens that declare only the subtitle language. English subtitles never sink a release: they are
+/// what a viewer reading along most often wants, whatever the audio.
+const SUBTITLE_LANGUAGE_TAGS: &[(&str, &str)] = &[
+    ("vostfr", "fr"),
+    ("vost", "fr"),
+    ("subfrench", "fr"),
+    ("nlsub", "nl"),
+    ("nlsubs", "nl"),
+    ("plsub", "pl"),
+    ("korsub", "ko"),
+    ("ensub", "en"),
+    ("ensubbed", "en"),
+    ("engsub", "en"),
+];
+
+/// Tokens that say a release carries several audio tracks, which in practice includes the original.
+const MULTI_AUDIO_TAGS: &[&str] = &["multi", "dual"];
+
+/// Whether `c` is Cyrillic. A release named in Cyrillic is a release made for that market, almost always dubbed.
+fn is_cyrillic(c: char) -> bool {
+    ('\u{0400}'..='\u{04FF}').contains(&c)
+}
+
+/// What a release's language tags cost it against `f.languages`. Tokens of the title itself are not read as tags,
+/// so a film whose name holds "Fin" is not taken for Finnish. Nothing is judged while the original language is
+/// unknown: sinking an Italian film's ITA releases because nobody said it was Italian would trade the original for
+/// a dub, which is the failure this exists to prevent.
+pub(crate) fn foreign_language_sink(lower: &str, f: &RankFilters) -> i64 {
+    if f.languages.is_empty() {
+        return 0;
+    }
+    let folded = fold_diacritics(lower);
+    let mut audio: Vec<&str> = Vec::new();
+    let mut subs: Vec<&str> = Vec::new();
+    for m in TITLE_TOKEN_RE.find_iter(&folded) {
+        let tok = m.as_str();
+        if f.show_tokens.contains(tok) || f.expected_title_tokens.contains(tok) {
+            continue;
+        }
+        if MULTI_AUDIO_TAGS.contains(&tok) {
+            return 0;
+        }
+        if let Some((_, lang)) = AUDIO_LANGUAGE_TAGS.iter().find(|(t, _)| *t == tok) {
+            audio.push(lang);
+        } else if let Some((_, lang)) = SUBTITLE_LANGUAGE_TAGS.iter().find(|(t, _)| *t == tok) {
+            subs.push(lang);
+        }
+    }
+    if lower.chars().any(is_cyrillic) {
+        audio.push("ru");
+    }
+    if !audio.is_empty() {
+        return if audio.iter().any(|lang| f.languages.contains(*lang)) { 0 } else { FOREIGN_AUDIO_SINK };
+    }
+    if subs.iter().any(|lang| *lang != "en" && !f.languages.contains(*lang)) {
+        FOREIGN_SUBS_SINK
+    } else {
+        0
+    }
+}
+
 /// Go `real-debrid` anti-piracy filename block (src/rank.ts realDebridBlocked).
 const RD_BLOCK_SUBSTRINGS: &[&str] = &["web-dl", "webrip", "bdrip", "hdrip", "dvdrip"];
 const RD_BLOCK_DOT_ADJACENT: &[&str] = &["bluray.x264", "hdtv.x264", "hdtv.xvid", "web.x264", "web.h264"];
@@ -491,8 +624,21 @@ static SHOW_END_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
-/// Go `showNoise`: words a release puts between the show and the episode that name neither.
-const SHOW_NOISE: &[&str] = &["season", "temporada", "saison", "staffel", "complete"];
+/// Go `showNoise`: words a release puts between the show and the episode that name neither. "Season" in the
+/// languages releases are named in, folded as `title_tokens` folds them ("Säsong" is "sasong").
+const SHOW_NOISE: &[&str] = &[
+    "season",
+    "temporada",
+    "saison",
+    "staffel",
+    "complete",
+    "sasong",
+    "sesong",
+    "kausi",
+    "stagione",
+    "seizoen",
+    "sezon",
+];
 
 /// Go `otherShow`: whether a release names a show with a word the requested title does not have (a spin-off
 /// or a sequel series). A name with no episode marker, or one that starts with it, is not judged.
@@ -750,6 +896,7 @@ pub(crate) fn rank_streams_debug(
         if !f.prefer_resolution.is_empty() && !res.is_empty() && res != f.prefer_resolution {
             score -= PREFERENCE_SINK;
         }
+        score -= foreign_language_sink(&lower, &f);
         if let Some([season, episode]) = f.episode {
             if (!f.show_tokens.is_empty() && other_show(&s.title, &f.show_tokens))
                 || other_episode(&s.title, season, episode)

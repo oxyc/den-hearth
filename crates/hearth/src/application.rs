@@ -301,7 +301,13 @@ async fn health(hearth: &Hearth) -> serde_json::Value {
     }
     let services = serde_json::Value::Object(services);
     let all_ok = services.as_object().is_some_and(|all| all.values().all(|s| s["status"] == "ok"));
-    serde_json::json!({"status": if all_ok { "ok" } else { "degraded" }, "services": services})
+    let mut out = serde_json::json!({"status": if all_ok { "ok" } else { "degraded" }, "services": services});
+    // Scout's account of the debrid, at the top as well, so a client deciding whether to warn the viewer reads one
+    // field rather than knowing which service owns it.
+    if let Some(debrid) = out["services"]["scout"].get("debrid").cloned() {
+        out["debrid"] = debrid;
+    }
+    out
 }
 
 /// A service's health response body as JSON, or `unavailable` when it did not answer with one.

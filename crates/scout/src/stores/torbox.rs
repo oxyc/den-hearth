@@ -7,6 +7,7 @@
 //! task, for the same reason Go gives: another waiter may still need the answer.
 
 mod batching;
+pub(crate) mod health;
 mod listing;
 mod status;
 pub(crate) mod support;
@@ -183,6 +184,8 @@ pub(crate) struct TorboxRuntime {
     listing_flights: DetachedFlight<Option<Arc<HashMap<String, i64>>>>,
     batchers: Mutex<BTreeMap<String, SharedBatcher>>,
     listing_memo: Mutex<BTreeMap<(usize, String), ListingMemoEntry>>,
+    /// How TorBox has been answering, fed by every call `send` makes; read by /health and the play routes.
+    pub(crate) health: health::DebridHealth,
 }
 
 impl TorboxRuntime {
@@ -200,6 +203,7 @@ impl TorboxRuntime {
             listing_flights: DetachedFlight::new("account listing fetch"),
             batchers: Mutex::new(BTreeMap::new()),
             listing_memo: Mutex::new(BTreeMap::new()),
+            health: health::DebridHealth::default(),
         }
     }
 

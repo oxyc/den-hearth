@@ -67,6 +67,7 @@ use crate::reqlog::redact_path;
 use crate::scrape::{scrape_covered_until, Doer, ScrapeQuery, Scraper};
 use crate::stores::pool::{has_cache_truth, status_outcome_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
+use crate::stores::torbox::health::{DebridDown, DebridState};
 use crate::stores::{
     join_all, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus,
     StoreUnavailableError, FETCH_DOWNLOADING, FETCH_QUEUED,
@@ -149,6 +150,10 @@ pub(crate) const MAX_CONCURRENT_REBUILDS: usize = 8;
 /// What /health says about that state, and what the log line marking the flip says too.
 pub(crate) const INDEXERS_DOWN_DETAIL: &str =
     "No indexer has answered the last few stream-list builds, so lists are coming back empty.";
+
+/// What /health says while TorBox is down.
+const DEBRID_DOWN_DETAIL: &str =
+    "TorBox has not answered its last few calls, so plays are refused at once until it answers again.";
 
 /// What /health says once a source has missed scrapeFailThreshold builds in a row while others answered.
 const SOURCES_MISSING_DETAIL: &str =
@@ -823,6 +828,8 @@ pub(crate) struct RankOpts<'a> {
     pub(crate) client: Option<&'a ClientPlayable>,
     pub(crate) check_cache: bool,
     pub(crate) rid: &'a str,
+    /// The viewer's preferred audio languages, most wanted first; empty where the request names none (a stream list).
+    pub(crate) audio: &'a [String],
 }
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
@@ -1212,6 +1219,17 @@ impl Inner {
         Duration::from_millis(self.status_budget_ms.load(Ordering::Relaxed))
     }
 
+    /// `Some` when every configured debrid is TorBox and TorBox is known down, so a play or probe is answered now
+    /// instead of waiting out the status budget on a service that has stopped answering. Only TorBox's health is
+    /// tracked, so an install with another debrid beside it is never refused here. `None` also for the one recovery
+    /// probe per window, which goes ahead and whose answer ends the outage.
+    pub(crate) fn debrid_down(&self, pool: &StorePool) -> Option<DebridDown> {
+        if pool.stores.is_empty() || !pool.stores.iter().all(|s| s.service() == DebridService::TorBox) {
+            return None;
+        }
+        self.deps.runtime.torbox.health.admit().err()
+    }
+
     /// deadlinePassed's counterpart for the explicit clock: the deadline `d` from now.
     fn deadline_in(d: Duration) -> TokioInstant {
         TokioInstant::now() + d
@@ -1236,7 +1254,12 @@ impl Inner {
                 config,
                 &sid,
                 None,
-                RankOpts { client: request.playable.as_ref(), check_cache: true, rid: "" },
+                RankOpts {
+                    client: request.playable.as_ref(),
+                    check_cache: true,
+                    rid: "",
+                    audio: &request.audio,
+                },
             )
             .await;
         for candidate in managed_candidates(&list, request)? {
@@ -1350,6 +1373,16 @@ impl Inner {
                 let (left, accounts) = global_add_budget().lowest();
                 if accounts > 0 {
                     status["addBudgetRemaining"] = json!(left);
+                }
+                // How TorBox has been answering, so a client can warn before playback fails. Absent until a TorBox
+                // call has been made. Down is degraded; slow is reported but the service is still doing its job.
+                if let Some(debrid) = self.deps.runtime.torbox.health.report() {
+                    if debrid["state"] == "down" && status["status"] == "ok" {
+                        status["status"] = json!("degraded");
+                        status["reason"] = json!("debrid");
+                        status["detail"] = json!(DEBRID_DOWN_DETAIL);
+                    }
+                    status["debrid"] = debrid;
                 }
                 return json_response(StatusCode::OK, &status);
             }
@@ -1626,6 +1659,37 @@ fn write_unavailable(wait: Duration, body: &serde_json::Value) -> Resp {
         body["service"].as_str().unwrap_or(""),
     ));
     resp
+}
+
+/// The answer while TorBox is known down: at once, naming the cause, with Retry-After set to the next recovery
+/// probe so a polling client asks again exactly when asking could help.
+fn write_debrid_down(down: DebridDown) -> Resp {
+    let mut resp = write_unavailable(
+        down.retry_after,
+        &json!({"error": "debrid_down", "service": DebridService::TorBox.as_str(), "reason": down.reason}),
+    );
+    mark_degraded(&mut resp, "debrid_down");
+    resp
+}
+
+/// Marks a "could not ask the debrid" 503 with how TorBox has been answering, when it has not been answering
+/// well, so a client can tell a slow or down TorBox from a one-off miss. Other 503s (Scout's own add budget, the
+/// play reserve) are about Scout, and are left as they are.
+fn mark_debrid_health(resp: &mut Resp, config: &Config, state: DebridState) {
+    if resp.status() != StatusCode::SERVICE_UNAVAILABLE
+        || resp.headers().contains_key(X_DEN_DEGRADED)
+        || !config.debrid.iter().any(|a| a.service == DebridService::TorBox)
+    {
+        return;
+    }
+    let asked = resp.extensions().get::<ReleaseAnswer>().is_some_and(|a| {
+        matches!(a.state.as_str(), "status_unavailable" | "cache_check_unavailable" | "store_unavailable")
+    });
+    match state {
+        DebridState::Slow if asked => mark_degraded(resp, "debrid_slow"),
+        DebridState::Down if asked => mark_degraded(resp, "debrid_down"),
+        _ => {}
+    }
 }
 
 /// Stable retryable refusal for a cold list build that could not be admitted. `json_response` supplies

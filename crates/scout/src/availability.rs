@@ -221,7 +221,7 @@ impl Inner {
     ) -> RankedList {
         // No rid: this runs detached from any request (checkBehind), well after the one that triggered it has
         // answered. The rank decision line simply omits it, like reqlog.go's own line does when one is absent.
-        let opts = || RankOpts { client: None, check_cache: false, rid: "" };
+        let opts = || RankOpts { client: None, check_cache: false, rid: "", audio: &[] };
         if !config.cached_only || !has_cache_truth(config) {
             return self.rank_list(deadline, config, sid, None, opts()).await;
         }

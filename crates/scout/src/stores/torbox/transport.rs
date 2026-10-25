@@ -1,11 +1,16 @@
 //! TorBox HTTP response lifetime, body decoding, and fixed endpoint metrics.
 
+use std::sync::Arc;
+
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
 
 use crate::metrics::metrics;
+use crate::runtime::ScoutRuntime;
 use crate::stores::{read_limited, read_store_error, redact_token, MAX_STORE_BYTES};
 use crate::util::Shape;
 
+use super::health::{CallOutcome, SLOW_ANSWER};
 use super::support::first_value;
 use super::{build_request, encode_form, TorBoxStore};
 use crate::scrape::DoError;
@@ -36,8 +41,11 @@ impl TorBoxStore {
             .acquire_owned()
             .await
             .map_err(|_| DoError::from("the outbound limiter is closed"))?;
+        // Timed from the slot, so a wait behind Scout's own limiter is not blamed on TorBox.
+        let mut watch = CallWatch { runtime: runtime.clone(), started: Instant::now(), settled: false };
         let resp = self.client.do_request(req).await;
         count.succeeded(resp.as_ref().is_ok_and(|r| r.status().is_success()));
+        watch.settle(&resp);
         Ok(Reply::new(resp?, slot))
     }
 
@@ -84,6 +92,37 @@ impl Reply {
 
     pub(super) async fn detail(&mut self, token: &str) -> String {
         redact_token(&read_store_error(&mut self.resp).await, token)
+    }
+}
+
+/// Reports one call's outcome to the runtime's TorBox health, including a call its caller gave up on: a request
+/// dropped unanswered after `SLOW_ANSWER` is a timeout, which is how most outages show (the caller's status budget
+/// runs out first). One dropped sooner says nothing, since a caller can go away for its own reasons.
+struct CallWatch {
+    runtime: Arc<ScoutRuntime>,
+    started: Instant,
+    settled: bool,
+}
+
+impl CallWatch {
+    fn settle(&mut self, resp: &Result<reqwest::Response, DoError>) {
+        self.settled = true;
+        let outcome = match resp {
+            // Scout's own pause answering for a throttled upstream: TorBox was not asked.
+            Ok(r) if r.headers().contains_key("x-scout-paused") => return,
+            Ok(r) if r.status().is_server_error() => CallOutcome::Failed("http_5xx"),
+            Ok(_) => CallOutcome::Answered(self.started.elapsed()),
+            Err(_) => CallOutcome::Failed("unreachable"),
+        };
+        self.runtime.torbox.health.record(outcome, self.started);
+    }
+}
+
+impl Drop for CallWatch {
+    fn drop(&mut self) {
+        if !self.settled && self.started.elapsed() >= SLOW_ANSWER {
+            self.runtime.torbox.health.record(CallOutcome::Failed("timeout"), self.started);
+        }
     }
 }
 

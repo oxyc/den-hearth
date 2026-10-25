@@ -78,6 +78,99 @@ fn other_episode() {
     }
 }
 
+// Jordskott S01E10 (tt2309405) as the indexers answered it on 2026-10-25, while TorBox's cache check was down so
+// nothing was known cached. The Italian dub was served first and auto-played; the Swedish original came last, sunk
+// as "another show" because "Säsong" was not read as the word for season. Names and sizes are from that night's
+// rank line.
+fn jordskott_s01e10() -> [RawStream; 4] {
+    let gb = |tenths: i64| move |s: &mut RawStream| s.size_bytes = Some(tenths * crate::rank::GIB / 10);
+    [
+        rs("Jordskott.S01E10.Rivelazione.720p.HDTVMux.ITA.x264-BlackBit.mkv", gb(13)),
+        rs("Jordskott.S01E10.VOSTFR.WEBRip.x264.mp4", gb(4)),
+        rs("Тайны.Сильверхёйда.S01E10.mkv", gb(15)),
+        rs("Säsong 1 - Avsnitt 10.mkv", gb(13)),
+    ]
+}
+
+fn jordskott_filters(languages: &[&str]) -> RankFilters {
+    RankFilters {
+        result_cap: 10,
+        show_tokens: title_tokens("Jordskott"),
+        episode: Some([1, 10]),
+        languages: languages.iter().map(|l| (*l).to_owned()).collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn rank_streams_the_original_language_release_leads_and_a_foreign_dub_sinks() {
+    let streams = jordskott_s01e10();
+    // Cinemeta lists Jordskott as "Sweden, Finland, United Kingdom, Norway".
+    let got = titles(&rank_streams(&streams, jordskott_filters(&["sv", "fi", "en", "no"])));
+    assert_eq!(
+        got,
+        [
+            "Säsong 1 - Avsnitt 10.mkv",
+            // Swedish audio with French subtitles: below the untagged original, above any dub.
+            "Jordskott.S01E10.VOSTFR.WEBRip.x264.mp4",
+            "Jordskott.S01E10.Rivelazione.720p.HDTVMux.ITA.x264-BlackBit.mkv",
+            "Тайны.Сильверхёйда.S01E10.mkv",
+        ],
+        "the Swedish original must lead a Swedish series, and the Italian and Russian dubs sink"
+    );
+}
+
+#[test]
+fn rank_streams_a_dub_outranks_nothing_even_when_it_alone_is_cached() {
+    let mut streams = jordskott_s01e10();
+    streams[0].cached = true;
+    streams[0].cache_known = true;
+    let got = titles(&rank_streams(&streams, jordskott_filters(&["sv", "fi", "en", "no"])));
+    assert_eq!(
+        got[0], "Säsong 1 - Avsnitt 10.mkv",
+        "a cached Italian dub must not outrank the original: {got:?}"
+    );
+}
+
+#[test]
+fn rank_streams_with_no_known_original_language_judges_no_tag() {
+    // Without an original language, an ITA tag may be the original (an Italian film), so nothing sinks for it.
+    let ranked = rank_streams(&jordskott_s01e10(), jordskott_filters(&[]));
+    assert_eq!(titles(&ranked)[0], "Jordskott.S01E10.Rivelazione.720p.HDTVMux.ITA.x264-BlackBit.mkv");
+}
+
+#[test]
+fn rank_streams_an_italian_titles_own_ita_release_is_not_a_dub() {
+    let streams = [
+        rs("La.Grande.Bellezza.2013.ITA.1080p.BluRay.x264.mkv", |_| {}),
+        rs("La.Grande.Bellezza.2013.FRENCH.1080p.BluRay.x264.mkv", |_| {}),
+        rs("La.Grande.Bellezza.2013.ITA.ENG.720p.BluRay.x264.mkv", |_| {}),
+        rs("La.Grande.Bellezza.2013.MULTi.720p.WEB.x264.mkv", |_| {}),
+    ];
+    let got = titles(&rank_streams(
+        &streams,
+        RankFilters {
+            result_cap: 10,
+            expected_title_tokens: title_tokens("La grande bellezza"),
+            languages: ["it".to_owned()].into(),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        got.last().map(String::as_str),
+        Some(streams[1].title.as_str()),
+        "only the French dub sinks: {got:?}"
+    );
+}
+
+#[test]
+fn other_show_reads_season_words_in_the_languages_releases_use() {
+    let expected = title_tokens("Jordskott");
+    for title in ["Säsong 1 - Avsnitt 10.mkv", "Jordskott Sesong 1 - 10.mkv", "Jordskott Kausi 1 - 10.mkv"] {
+        assert!(!crate::rank::other_show(title, &expected), "{title:?} names no other show");
+    }
+}
+
 #[test]
 fn title_tokens_folds_diacritics() {
     assert!(

@@ -15,6 +15,7 @@ mod cancel;
 mod client;
 mod core;
 mod coverage;
+mod debrid_health;
 mod decisionlog;
 mod deps;
 mod diskcache;
