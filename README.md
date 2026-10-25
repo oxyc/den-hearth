@@ -171,7 +171,10 @@ A `"player": "cast"` request takes managed HLS only for a release its `playable`
 video, since a Cast receiver plays TorBox's stream as it is; anything else goes to Remux.
 It does not create an outer session. Responses are JSON with `Cache-Control: no-store`; completed retries are
 held briefly in bounded memory so a lost response cannot create another Remux session. The 16 KiB command body
-must arrive within 15 seconds, before Hearth creates any idempotency or finalization record.
+must arrive within 15 seconds, before Hearth creates any idempotency or finalization record. While TorBox is known
+down for the install, the play is answered at once as Scout's play route answers it: 503
+`{"error":"debrid_down","service":"torbox","reason":…}` with `X-Den-Degraded: debrid_down` and `Retry-After` to the
+next recovery probe. While TorBox is slow, a failed play keeps its code and carries `X-Den-Degraded: debrid_slow`.
 
 `/den/<config>/wanted` keeps a season download looking for releases while no Den client is open
 (`crates/hearth/src/wanted.rs`). The client holding the download lease `POST`s `{"items": [...]}`, one per wanted

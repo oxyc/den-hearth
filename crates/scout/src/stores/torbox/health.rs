@@ -161,6 +161,17 @@ impl DebridHealth {
         Err(DebridDown { reason: h.reason, retry_after: h.next_probe - now })
     }
 
+    /// What `admit` would answer now, without taking a due recovery probe: for a caller that only decides whether
+    /// to start work whose own TorBox calls are admitted further on, so the probe stays with the call that asks.
+    pub(crate) fn peek(&self) -> Result<(), DebridDown> {
+        let h = self.lock();
+        let now = Instant::now();
+        if h.state != DebridState::Down || now >= h.next_probe {
+            return Ok(());
+        }
+        Err(DebridDown { reason: h.reason, retry_after: h.next_probe - now })
+    }
+
     pub(crate) fn state(&self) -> DebridState {
         self.lock().state
     }
@@ -232,10 +243,12 @@ mod tests {
         let refused = health.admit().expect_err("down refuses");
         assert_eq!(refused.reason, "unreachable");
         assert!(refused.retry_after <= RECOVERY_PROBE_EVERY && !refused.retry_after.is_zero());
+        assert_eq!(health.peek(), Err(refused), "peek answers as admit does");
 
         // A call made before TorBox was known down, failing after the window ran out, does not push recovery out.
         tokio::time::advance(RECOVERY_PROBE_EVERY).await;
         health.record(CallOutcome::Failed("timeout"), before_the_outage);
+        assert!(health.peek().is_ok() && health.peek().is_ok(), "a peek leaves the due probe where it is");
         assert!(health.admit().is_ok(), "the recovery probe must be let through");
         assert!(health.admit().is_err(), "only one request per window");
 

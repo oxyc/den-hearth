@@ -23,7 +23,7 @@ use den_scout::deps::{
     build_deps_shared_with_runtime, shared_http, shared_profile, startup_summary, GuardedClient, Settings,
 };
 use den_scout::diskcache::{TieredCache, SWEEP_INTERVAL};
-use den_scout::handler::{new_handler, Handler};
+use den_scout::handler::{new_handler, DebridSignal, Handler};
 use den_scout::managed_hls::{ManagedHlsError, ManagedHlsRequest, ManagedHlsResult};
 use den_scout::runtime::ScoutRuntime;
 use den_scout::scrape::Doer;
@@ -173,6 +173,22 @@ impl Scout {
         request: &ManagedHlsRequest,
     ) -> Result<ManagedHlsResult, ManagedHlsError> {
         self.den.managed_hls(config, request).await
+    }
+
+    /// How TorBox stands for the install a playback base URL names (`playback::DEN_ADDON_BASE` or
+    /// `LEGACY_SCOUT_BASE` and its segment), read with the handler that serves that base to Remux.
+    pub fn debrid_signal(&self, install: &str) -> Option<DebridSignal> {
+        let segment = |base: &str| install.strip_prefix(base).and_then(|rest| rest.strip_prefix('/'));
+        if let Some(blob) = segment(crate::playback::DEN_ADDON_BASE) {
+            self.den.debrid_signal(blob)
+        } else {
+            self.mount.debrid_signal(segment(crate::playback::LEGACY_SCOUT_BASE)?)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime(&self) -> &ScoutRuntime {
+        &self.runtime
     }
 
     /// `handler` serving `req` after the head and body bounds. `shared_listener`: the connection is not

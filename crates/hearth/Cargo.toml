@@ -45,6 +45,8 @@ tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
+# TorBox's health put into a state, for the playback facade's tests (`tests/den_addon.rs`).
+den-scout = { path = "../scout", features = ["test-support"] }
 # Config segments, and Reel's link tags, for the Den addon's tests (`tests/den_addon.rs`).
 blake2.workspace = true
 futures-util = { workspace = true, features = ["std", "async-await"] }

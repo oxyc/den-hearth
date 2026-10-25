@@ -9,12 +9,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::Instant;
 
-use crate::handler::{new_handler, Handler};
+use crate::handler::{new_handler, DebridSignal, Handler};
+use crate::managed_hls::{ManagedHlsError, ManagedHlsRequest, ManagedHlsResolver};
 use crate::play::{encode_play_token, PlayTarget};
 use crate::scrape::{DoError, Doer};
-use crate::stores::torbox::health::{RECOVERY_PROBE_EVERY, SLOW_ANSWER};
+use crate::stores::torbox::health::{CallOutcome, DOWN_AFTER, RECOVERY_PROBE_EVERY, SLOW_ANSWER};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
-use crate::tests::handler::{body_str, get, test_deps, valid_blob};
+use crate::tests::handler::{blob, body_str, get, test_deps, valid_blob};
 
 /// A TorBox that can stop answering: while `down` is set every request hangs, as TorBox's API did; once cleared,
 /// each is answered with an empty success.
@@ -138,4 +139,72 @@ async fn play_is_answered_at_once_while_torbox_is_down() {
         assert!(tries <= 6, "play never answered debrid_down");
     };
     assert!(took < Duration::from_millis(50), "a play while TorBox is down took {took:?}");
+}
+
+/// Counts the managed streams asked for, and makes none.
+#[derive(Default)]
+struct CountingManagedHls(AtomicUsize);
+
+#[async_trait]
+impl ManagedHlsResolver for CountingManagedHls {
+    async fn resolve(
+        &self,
+        _config: &crate::config::Config,
+        _target: &crate::stores::ResolveTarget,
+        _subtitle: Option<i64>,
+    ) -> Result<crate::managed_hls::ManagedHlsPrepared, ManagedHlsError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(ManagedHlsError::Unavailable)
+    }
+}
+
+// Hearth's /playback asks for a managed TorBox stream before Remux, which waited on TorBox as a play did before the
+// play route's gate. It is refused at once by the same gate, and `debrid_signal` tells Hearth what that route says.
+#[tokio::test(start_paused = true)]
+async fn a_managed_stream_and_the_debrid_signal_follow_the_play_route_s_gate() {
+    let runtime = crate::runtime::ScoutRuntime::new();
+    let resolver = Arc::new(CountingManagedHls::default());
+    let (rt, r) = (runtime.clone(), resolver.clone());
+    let h = new_handler(test_deps(move |d| {
+        d.runtime = rt;
+        d.managed_hls = Some(r);
+    }));
+    let health = &runtime.torbox.health;
+    let install = valid_blob();
+    let mixed = blob(r#"{"debrid":[{"service":"torbox","token":"t"},{"service":"realdebrid","token":"r"}]}"#);
+    let elsewhere = blob(r#"{"debrid":[{"service":"realdebrid","token":"r"}]}"#);
+    assert_eq!(h.debrid_signal(&install), None, "nothing to say before TorBox was asked anything");
+
+    health.record(CallOutcome::Answered(SLOW_ANSWER), Instant::now());
+    assert_eq!(h.debrid_signal(&install), Some(DebridSignal::Degraded("debrid_slow")));
+
+    for _ in 0..DOWN_AFTER {
+        health.record(CallOutcome::Failed("timeout"), Instant::now());
+    }
+    assert!(
+        matches!(h.debrid_signal(&install), Some(DebridSignal::Refused { reason: "timeout", retry_after })
+            if retry_after <= RECOVERY_PROBE_EVERY),
+        "{:?}",
+        h.debrid_signal(&install)
+    );
+    // Scout's play route refuses only an install whose every debrid is TorBox; another's 503s are only marked.
+    assert_eq!(h.debrid_signal(&mixed), Some(DebridSignal::Degraded("debrid_down")));
+    assert_eq!(h.debrid_signal(&elsewhere), None);
+
+    let request = ManagedHlsRequest { imdb: "tt0111161".into(), ..Default::default() };
+    let started = Instant::now();
+    let refused = h.managed_hls(&install, &request).await.expect_err("TorBox is down");
+    assert!(
+        matches!(refused, ManagedHlsError::DebridDown { retry_after } if retry_after <= RECOVERY_PROBE_EVERY),
+        "{refused:?}"
+    );
+    assert_eq!(refused.code(), "torbox_down");
+    assert_eq!(resolver.0.load(Ordering::SeqCst), 0, "TorBox was asked for a stream while down");
+    assert!(started.elapsed() < Duration::from_millis(50), "took {:?}", started.elapsed());
+
+    // Once a recovery probe is due, the signal lets the play go and leaves the probe for it to take.
+    tokio::time::advance(RECOVERY_PROBE_EVERY).await;
+    assert_eq!(h.debrid_signal(&install), Some(DebridSignal::Degraded("debrid_down")));
+    assert_eq!(h.debrid_signal(&install), Some(DebridSignal::Degraded("debrid_down")));
+    assert!(health.admit().is_ok(), "the signal took the recovery probe");
 }

@@ -19,6 +19,8 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use den_scout::handler::DebridSignal;
+
 use crate::{Body, Hearth};
 
 static LOG: den_http::log::LimitedLog = den_http::log::LimitedLog::new();
@@ -48,6 +50,8 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(80);
 // Match the shared outbound HTTP ceiling: an upstream cannot ask the browser to stop trying for a day.
 const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+/// Every den service's name for an answer made while something it depends on is not answering well.
+const DEGRADED_HEADER: &str = "x-den-degraded";
 const FINALIZE_HEADER: &str = "x-den-playback-finalize";
 const FINALIZATION_PROTOCOL_HEADER: &str = "x-den-playback-finalization";
 const SIDECAR_FOR: Duration = Duration::from_secs(2 * 60 * 60);
@@ -399,7 +403,54 @@ fn replay_state(snapshot: Snapshot, delivered_direct: bool, finalization_protoco
 
 fn stamp(response: &mut Response<Body>) {
     response.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
-    den_http::cors_stamp(response.headers_mut(), "Retry-After, Server-Timing");
+    den_http::cors_stamp(response.headers_mut(), "Retry-After, Server-Timing, X-Den-Degraded");
+}
+
+/// Scout's own `debrid_down` refusal, in the same shape (`write_debrid_down`): TorBox is known down, so the play was
+/// answered without asking it, and `Retry-After` is when the next recovery probe is let through.
+fn debrid_down(reason: &str, retry_after: Duration) -> Response<Body> {
+    let mut response = den_http::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({"error": "debrid_down", "service": "torbox", "reason": reason}),
+        &[("cache-control", "no-store")],
+    );
+    let seconds = retry_after.min(MAX_DIRECT_RETRY_AFTER).as_secs().max(1);
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response.headers_mut().insert(DEGRADED_HEADER, HeaderValue::from_static("debrid_down"));
+    stamp(&mut response);
+    response
+}
+
+/// Carries what Scout says of TorBox onto a failed answer whose cause it can be (nothing to play, the source
+/// failing or timing out), as Scout carries it onto its own 503s. A refusal Scout's play route would give becomes
+/// that refusal; otherwise the closed code stays and `X-Den-Degraded` names the debrid's state beside it.
+async fn apply_debrid_signal(snapshot: &mut Snapshot, signal: DebridSignal) {
+    if snapshot.status.is_success()
+        || !matches!(
+            error_code(snapshot),
+            "no_release"
+                | "direct_unavailable"
+                | "source_unavailable"
+                | "playback_unavailable"
+                | "playback_timeout"
+        )
+    {
+        return;
+    }
+    match signal {
+        DebridSignal::Refused { reason, retry_after } => {
+            let timing = snapshot.headers.get("server-timing").cloned();
+            *snapshot = self::snapshot(debrid_down(reason, retry_after)).await;
+            if let Some(value) = timing {
+                snapshot.headers.insert("server-timing", value);
+            }
+        }
+        DebridSignal::Degraded(value) => {
+            snapshot.headers.insert(DEGRADED_HEADER, HeaderValue::from_static(value));
+        }
+    }
 }
 
 fn preflight() -> Response<Body> {
@@ -670,6 +721,7 @@ fn error_code(snapshot: &Snapshot) -> &'static str {
         Some("source_unavailable") => "source_unavailable",
         Some("playback_unavailable") => "playback_unavailable",
         Some("playback_timeout") => "playback_timeout",
+        Some("debrid_down") => "debrid_down",
         _ => "unknown",
     }
 }
@@ -1055,11 +1107,23 @@ where
         && parts.headers.get(FINALIZATION_PROTOCOL_HEADER).is_some_and(|value| value.as_bytes() == b"1");
     let managed = edge_managed && direct_config.is_some() && !direct_failed;
     let direct = managed_request(&request, subtitle_track);
+    // The install whose Scout plays this: Remux's, unless only the managed stream may answer.
+    let signal_install = match remux_scout {
+        Some(scout) if !direct_only => Some(scout.to_string()),
+        _ => direct_config.map(install_url),
+    };
+    let debrid_signal =
+        || signal_install.as_deref().and_then(|install| hearth.scout.as_ref()?.debrid_signal(install));
     // Kept outside the bounded future so a completed direct attempt is still available when Remux consumes the
     // rest of the overall deadline and the future is cancelled by the outer timeout.
     let mut direct_failure = None;
     let mut prepare_elapsed = None;
     let operation = async {
+        // Scout would refuse this install's play at once while TorBox is down, so neither path is started. A due
+        // recovery probe is not refused here: it goes on to the play, whose own gate lets it through.
+        if let Some(DebridSignal::Refused { reason, retry_after }) = debrid_signal() {
+            return (debrid_down(reason, retry_after), false);
+        }
         if managed {
             if let Some(direct) = direct.as_ref() {
                 let started = Instant::now();
@@ -1123,6 +1187,11 @@ where
     let mut saved = snapshot(response).await;
     if let Some(failure) = direct_failure {
         annotate_direct_failure(&mut saved, failure);
+    }
+    // Remux puts a refused play in its own terms (nothing could be opened), so the debrid's state is read here,
+    // after the attempt, and not from its answer.
+    if let Some(signal) = debrid_signal().filter(|_| !saved.status.is_success()) {
+        apply_debrid_signal(&mut saved, signal).await;
     }
     if saved.status.is_success() {
         if delivered_direct {

@@ -54,6 +54,9 @@ pub enum ManagedHlsError {
     PlaylistUnavailable,
     /// TorBox, its answer, or the returned playlist was temporarily unusable.
     Unavailable,
+    /// TorBox is known down (Scout's play route answers `debrid_down` now too), so it was not asked. Asking again
+    /// can help after `retry_after`, when the next recovery probe is let through.
+    DebridDown { retry_after: Duration },
 }
 
 impl ManagedHlsError {
@@ -70,12 +73,14 @@ impl ManagedHlsError {
             Self::UnsafeResponse => "torbox_unsafe_stream_url",
             Self::PlaylistUnavailable => "torbox_playlist_unavailable",
             Self::Unavailable => "torbox_unavailable",
+            Self::DebridDown { .. } => "torbox_down",
         }
     }
 
     pub fn retry_after(self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after } => retry_after,
+            Self::DebridDown { retry_after } => Some(retry_after),
             _ => None,
         }
     }
