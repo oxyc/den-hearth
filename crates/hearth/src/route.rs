@@ -157,6 +157,7 @@ pub fn classify(target: &Target, method: &Method) -> Class {
             Route::Reel(path) => classify(&Target::Reel(path.clone()), method),
             Route::Playback(_) => bulk(None),
             Route::Wanted(_) => bulk(None),
+            Route::WakeTarget(_) => bulk(None),
             Route::Guest => bulk(None),
             Route::Sidecar(_, _) => bulk(None),
             Route::NotFound => bulk(None),

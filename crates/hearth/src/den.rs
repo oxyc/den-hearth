@@ -56,6 +56,8 @@ pub enum Route {
     Playback(String),
     /// `/den/<config>/wanted`, with the config segment: the downloads Hearth keeps looking for (`wanted`).
     Wanted(String),
+    /// `PUT /den/<config>/wake/target`: register this installed TV with the local wake controller.
+    WakeTarget(String),
     /// A path as Scout, Subtitles or Reel routes it.
     Scout(String),
     Subs(String),
@@ -102,6 +104,9 @@ pub fn route(path: &str) -> Route {
         (config, Some("manifest.json")) if third.is_none() => Route::Installed(config.to_string()),
         (config, Some("playback")) if third.is_none() => Route::Playback(config.to_string()),
         (config, Some("wanted")) if third.is_none() => Route::Wanted(config.to_string()),
+        (config, Some("wake")) if third == Some("target") && segments.next().is_none() => {
+            Route::WakeTarget(config.to_string())
+        }
         (_, Some("stream" | "play" | "account" | "availability")) => Route::Scout(path.to_string()),
         (_, Some("subtitles" | "subtitle" | "translate")) => Route::Subs(path.to_string()),
         (_, Some("meta" | "prepare")) => Route::Reel(path.to_string()),
@@ -300,6 +305,7 @@ impl Den {
             | Route::Sidecar(_, _)
             | Route::Playback(_)
             | Route::Wanted(_)
+            | Route::WakeTarget(_)
             | Route::Scout(_)
             | Route::Subs(_)
             | Route::Reel(_)

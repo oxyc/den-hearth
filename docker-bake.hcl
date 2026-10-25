@@ -5,6 +5,17 @@ group "default" {
   targets = ["hearth"]
 }
 
+target "controller" {
+  context    = "."
+  dockerfile = "Dockerfile.controller"
+  platforms  = ["linux/amd64", "linux/arm64"]
+  pull       = true
+  attest = [
+    "type=provenance,mode=max",
+    "type=sbom",
+  ]
+}
+
 target "common" {
   context    = "."
   dockerfile = "Dockerfile"

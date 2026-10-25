@@ -6,3 +6,6 @@ target
 bench/fixtures
 bench/results
 crates/reel/worker/youtubei/deno
+controller/.venv
+**/__pycache__
+**/*.pyc

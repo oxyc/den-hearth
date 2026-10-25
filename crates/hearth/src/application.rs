@@ -13,7 +13,7 @@ use crate::media::Guarded;
 use crate::route::{Service, Target};
 
 use crate::Body;
-use crate::{admit, den, guest, media, playback, route, wanted};
+use crate::{admit, den, guest, media, playback, route, wake, wanted};
 
 pub(crate) struct Hearth {
     pub(crate) reel: Option<Arc<den_reel::AppState>>,
@@ -32,6 +32,8 @@ pub(crate) struct Hearth {
     pub(crate) playback: playback::Playback,
     /// The downloads each install asked Hearth to keep looking for (`/den/<config>/wanted`).
     pub(crate) wanted: wanted::Wanted,
+    /// Permissioned local controller socket. It carries target registration only, never queue credentials.
+    pub(crate) controller_socket: std::path::PathBuf,
 }
 
 /// Every bound the node enforces; `Default` is production, tests shrink it.
@@ -47,6 +49,7 @@ pub(crate) struct Options {
     pub(crate) managed_playback: bool,
     /// Where the wanted lists are kept across a restart; None keeps them in RAM only.
     pub(crate) wanted_file: Option<std::path::PathBuf>,
+    pub(crate) controller_socket: Option<std::path::PathBuf>,
 }
 
 impl Hearth {
@@ -78,6 +81,9 @@ impl Hearth {
             metrics_token: options.metrics_token,
             playback: playback::Playback::new(options.managed_playback),
             wanted: wanted::Wanted::new(Box::new(wanted::InProcess), options.wanted_file),
+            controller_socket: options
+                .controller_socket
+                .unwrap_or_else(|| "/run/den-controller/controller.sock".into()),
         })
     }
 }
@@ -230,6 +236,7 @@ where
         },
         den::Route::Playback(config) => playback::handle(hearth, &config, req).await,
         den::Route::Wanted(config) => wanted::handle(hearth, &config, req).await,
+        den::Route::WakeTarget(config) => wake::handle(hearth, &config, req).await,
         den::Route::Guest => guest::handle(hearth, req).await,
         den::Route::Sidecar(token, track) => playback::sidecar(hearth, &token, track, req).await,
         own => hearth.den.answer(own, req.method(), req.headers()),

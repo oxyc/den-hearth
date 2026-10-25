@@ -29,6 +29,7 @@ mod scout;
 mod server;
 mod services;
 mod sock;
+mod wake;
 mod wanted;
 
 pub(crate) use application::{bad_path, handle, json, with_path, Hearth};

@@ -177,6 +177,23 @@ docker compose --env-file selfhost/.env -f selfhost/compose.yaml up -d
 docker compose --env-file selfhost/.env -f selfhost/compose.yaml logs -f hearth
 ```
 
+### Optional Apple TV wake controller
+
+The `apple-tv` Compose profile builds and runs the separate pyatv sidecar with host networking and no published
+ports. Set `DEN_EDGE_URL` to Edge's HTTPS API origin, then follow [`controller/README.md`](../controller/README.md)
+for enrollment, Companion pairing, installed-app selection and target mapping. Start it with:
+
+```sh
+docker compose --env-file selfhost/.env -f selfhost/compose.yaml --profile apple-tv build apple-tv-controller
+docker compose --env-file selfhost/.env -f selfhost/compose.yaml --profile apple-tv up -d
+```
+
+The named `controller-state` volume is private authoritative state and must be backed up. For a bind mount, create
+the directory mode 0700 and make it writable by uid/gid 65532 before starting; the controller refuses state or
+pyatv credential files readable by group or other users. Hearth shares only the separate `controller-runtime`
+volume with the sidecar so authenticated `PUT /den/<config>/wake/target` requests can reach its mode-0600 Unix
+socket; controller state and credentials are never mounted into Hearth.
+
 For the locally built ARM64 Scout image, rebuild with the `docker build` command above instead of running
 `compose pull`. For predictable rollback, pin `HEARTH_IMAGE` to a release tag or digest before upgrading; changing
 it back and running `compose up -d` rolls the container back without discarding the cache volume or `.env`.

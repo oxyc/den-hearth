@@ -3,6 +3,9 @@
 Den's self-hosted media node: Scout (stream addon), Reel (trailers, yt-dlp + ffmpeg), Subtitles and Remux (HLS
 remux and transcode) in one process and one runtime.
 
+The optional Apple TV wake/launch sidecar is documented in [`controller/README.md`](controller/README.md). It is a
+separate Python/pyatv process because Companion discovery must reach the physical LAN; it never handles media.
+
 ```
 crates/
   scout/      den-scout      library: ported from the Go den-scout, which it replaced

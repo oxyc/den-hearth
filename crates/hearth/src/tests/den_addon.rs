@@ -86,6 +86,79 @@ async fn response_bytes(response: Response<Body>) -> (StatusCode, HeaderMap, Byt
     (parts.status, parts.headers, bytes)
 }
 
+#[tokio::test]
+async fn an_admitted_install_registers_its_tv_over_the_private_controller_socket() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("controller.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        let value: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(value["op"], "upsert");
+        assert_eq!(value["target"]["deviceId"], "0011223344556677");
+        assert_eq!(value["target"]["householdInbox"], "ab".repeat(32));
+        stream.write_all(b"{\"ok\":true,\"target\":\"00112233445566778899aabbccddeeff\"}\n").await.unwrap();
+    });
+    let hearth = hearth_den_with_options(
+        Limits::default(),
+        den_with(None, "", "0", false),
+        Options { controller_socket: Some(socket), ..Default::default() },
+    );
+    let segment = plain(&config(0, &[SCOUT, SUBS, REEL]));
+    let body = serde_json::json!({
+        "v": 1,
+        "deviceId": "0011223344556677",
+        "name": "Living Room",
+        "householdInbox": "ab".repeat(32),
+        "assistantLane": "cd".repeat(16),
+        "bundleId": "fi.oxy.den.TEAM"
+    });
+    let request = Request::put(format!("/den/{segment}/wake/target"))
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+        .unwrap();
+    let response = handle(hearth, None, false, request).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn wake_registration_refuses_bad_install_and_bad_or_unreachable_targets() {
+    let hearth = hearth_den_with_options(
+        Limits::default(),
+        den_with(None, "", "0", false),
+        Options { controller_socket: Some("/not/a/socket".into()), ..Default::default() },
+    );
+    let target = serde_json::json!({
+        "v": 1,
+        "deviceId": "0011223344556677",
+        "name": "Living Room",
+        "householdInbox": "ab".repeat(32),
+        "assistantLane": "cd".repeat(16),
+        "bundleId": "fi.oxy.den.TEAM"
+    });
+    let send_target = |segment: String, target: Value| {
+        let hearth = hearth.clone();
+        async move {
+            let request = Request::put(format!("/den/{segment}/wake/target"))
+                .body(http_body_util::Full::new(Bytes::from(serde_json::to_vec(&target).unwrap())))
+                .unwrap();
+            handle(hearth, None, false, request).await
+        }
+    };
+    assert_eq!(send_target("bad-config".into(), target.clone()).await.status(), StatusCode::BAD_REQUEST);
+    let segment = plain(&config(0, &[SCOUT, SUBS, REEL]));
+    assert_eq!(
+        send_target(segment.clone(), serde_json::json!({"v": 1, "extra": true})).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(send_target(segment, target).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 fn guest_hearth(den: Den) -> Arc<Hearth> {
     let mut hearth = hearth_den_with_options(
         Limits::default(),

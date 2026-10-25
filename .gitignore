@@ -1,4 +1,7 @@
 /target
+/controller/.venv/
+__pycache__/
+*.pyc
 .env
 cache/
 # ...but not the den-cache crate, which is named for what the line above ignores.

@@ -50,6 +50,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
             metrics_token: c.metrics_token,
             managed_playback: c.managed_playback,
             wanted_file: c.wanted_file,
+            controller_socket: std::env::var_os("HEARTH_CONTROLLER_SOCKET").map(Into::into),
         },
     );
     if let Some(scout) = &hearth.scout {

@@ -292,7 +292,8 @@ COPY --from=release-metadata /den-version /den-version
 # under $HOME. /cache is created owned by it with one directory per service, so a fresh volume mounted
 # at /cache is writable (the services create their own directory on first use).
 RUN useradd --system --uid 65532 --user-group --create-home --home-dir /home/nonroot nonroot \
-    && mkdir -p /cache/scout /cache/reel /cache/subs /cache/remux && chown -R nonroot:nonroot /cache
+    && mkdir -p /cache/scout /cache/reel /cache/subs /cache/remux /run/den-controller \
+    && chown -R nonroot:nonroot /cache /run/den-controller
 
 WORKDIR /app
 # hearth's own PORT default (8090) applies, and each service also listens on the port its old container used

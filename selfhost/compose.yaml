@@ -24,6 +24,7 @@ services:
       HEARTH_REMUX_PORT: "0"
       HEARTH_PUBLIC_BASE_URL: ${HEARTH_PUBLIC_BASE_URL:-}
       HEARTH_WORKER_THREADS: ${HEARTH_WORKER_THREADS:-2}
+      HEARTH_CONTROLLER_SOCKET: /run/den-controller/controller.sock
       SCOUT_CONFIG_KEY: ${SCOUT_CONFIG_KEY:-}
       SCOUT_REMUX_KEY: ${SCOUT_REMUX_KEY:-}
       SCOUT_MEMORY_CACHE_BYTES: ${SCOUT_MEMORY_CACHE_BYTES:-50331648}
@@ -42,6 +43,7 @@ services:
       LOG_IDENTITY: ${LOG_IDENTITY:-0}
     volumes:
       - ${HEARTH_CACHE:-hearth-cache}:/cache
+      - controller-runtime:/run/den-controller
     tmpfs:
       - /tmp:size=256m,mode=1777
       - /home/nonroot:size=64m,mode=0700,uid=65532,gid=65532
@@ -56,5 +58,38 @@ services:
       retries: 3
       start_period: 30s
 
+  apple-tv-controller:
+    profiles: [apple-tv]
+    image: ${HEARTH_CONTROLLER_IMAGE:-den-hearth-controller:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile.controller
+    platform: ${HEARTH_CONTROLLER_PLATFORM:-linux/amd64}
+    restart: unless-stopped
+    network_mode: host
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DEN_EDGE_URL: ${DEN_EDGE_URL:-}
+      DEN_CONTROLLER_STATE: /state
+      DEN_CONTROLLER_SOCKET: /run/den-controller/controller.sock
+    volumes:
+      - ${HEARTH_CONTROLLER_STATE:-controller-state}:/state
+      - controller-runtime:/run/den-controller
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /home/nonroot:size=8m,mode=0700,uid=65532,gid=65532
+    healthcheck:
+      test: [CMD, den-hearth-controller, health, --require-running]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 volumes:
   hearth-cache:
+  controller-state:
+  controller-runtime:

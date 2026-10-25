@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "den-hearth-controller"
+version = "0.1.0"
+description = "Hearth-owned Apple TV wake and Den launch controller"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "aiohttp==3.13.3",
+  "pyatv==0.18.0",
+]
+
+[project.scripts]
+den-hearth-controller = "den_hearth_controller.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/den_hearth_controller"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = ["coverage==7.13.4"]
+

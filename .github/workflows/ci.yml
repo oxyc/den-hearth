@@ -61,6 +61,11 @@ jobs:
           CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
       - name: Load harness checks
         run: python3 bench/http/test.py
+      - name: Apple TV controller tests
+        run: |
+          python3 -m pip install uv==0.11.28
+          uv sync --directory controller --locked --all-groups
+          uv run --directory controller python -m unittest discover -s tests -v
       # Reel's two resident resolvers. The python one against a stub yt-dlp; the youtubei.js one with the deno the
       # image pins (checked against the Dockerfile's own sum) and the packages its lockfile pins.
       - name: Reel's yt-dlp worker tests
@@ -94,6 +99,26 @@ jobs:
           source: .
           files: docker-bake.hcl
           targets: e2e
+
+  controller-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build Apple TV controller image
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: docker-bake.hcl
+          targets: controller
+          set: |
+            controller.platform=linux/amd64
+            controller.output=type=cacheonly
 
   # On a PR (e.g. a yt-dlp or dependency bump) — build the image WITHOUT pushing. This is the merge gate for the
   # checksummed downloads (yt-dlp, deno), the pinned GPAC commit and the checksummed ffmpeg source: a bad checksum
