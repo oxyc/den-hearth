@@ -102,7 +102,7 @@ jobs:
           targets: e2e
 
   controller-image:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -130,7 +130,7 @@ jobs:
   # Note: this proves the image builds, NOT that YouTube extraction still works (that canary
   # can't run on datacenter IPs) — extraction breakage is caught operationally via /health.
   build-pr:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
