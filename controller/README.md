@@ -30,10 +30,10 @@ docker compose --env-file selfhost/.env -f selfhost/compose.yaml --profile apple
   apple-tv-controller apps --id <pyatv-id>
 ```
 
-The authenticated Den install flow registers `{v, deviceId, name, householdInbox, assistantLane, bundleId}`. Until
-the Rust forwarding route is added, an operator can send that exact JSON object on standard input to
-`docker compose exec -T apple-tv-controller den-hearth-controller register`. The permissioned socket framing is one
-JSON line:
+The authenticated Den install flow registers `{v, deviceId, name, householdInbox, assistantLane, bundleId}` through
+Hearth's configured-install route. For recovery or diagnostics, an operator can send that exact JSON object on
+standard input to `docker compose exec -T apple-tv-controller den-hearth-controller register`. The permissioned
+socket framing is one JSON line:
 
 ```json
 {"op":"upsert","target":{"v":1,"deviceId":"0011223344556677","name":"Living Room","householdInbox":"<64 hex>","assistantLane":"<32 hex>","bundleId":"fi.oxy.den.TEAM"}}
