@@ -513,6 +513,16 @@ impl Inner {
         )
         .await;
         let (mut seeds, scrape_ok, scrape_complete) = (scraped.seeds, scraped.any_ok, scraped.complete);
+        let restored = crate::continuity::restore(&*self.deps.cache, config, sid, &mut seeds);
+        if restored > 0 {
+            log_limited(
+                "continuity-restored",
+                &format!(
+                    "series {} S{}E{}: restored {restored} proven release(s)",
+                    sid.imdb, sid.season, sid.episode
+                ),
+            );
+        }
         let mut sources = scraped.sources;
         sources.extend(quarantined_reports(config));
         let cov = Coverage { complete: scrape_complete, sources };
