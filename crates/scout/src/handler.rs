@@ -155,6 +155,15 @@ pub(crate) const INDEXERS_DOWN_DETAIL: &str =
 const DEBRID_DOWN_DETAIL: &str =
     "TorBox has not answered its last few calls, so plays are refused at once until it answers again.";
 
+/// `Handler::debrid_signal`: what Scout's own play route would say of TorBox for one install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebridSignal {
+    /// A play is answered at once with `debrid_down` (every debrid is TorBox, TorBox is down, no probe is due).
+    Refused { reason: &'static str, retry_after: Duration },
+    /// TorBox is down or slow and the install uses it: the `X-Den-Degraded` value Scout marks its 503s with.
+    Degraded(&'static str),
+}
+
 /// What /health says once a source has missed scrapeFailThreshold builds in a row while others answered.
 const SOURCES_MISSING_DETAIL: &str =
     "A source has missed the last few stream-list builds, so lists may be short; /metrics names it.";
@@ -929,6 +938,27 @@ impl Handler {
         crate::runtime::scope(self.inner.deps.runtime.clone(), self.inner.managed_hls(&config, request)).await
     }
 
+    /// How TorBox stands for one install, in the terms Scout's play and probe routes answer in, for a caller that
+    /// answers playback outside those routes (Hearth's `/playback`). Reads the same health the routes' gate does,
+    /// without taking a due recovery probe: that stays with the play the caller goes on to make. `None` when the
+    /// install does not open, uses no TorBox, or TorBox is answering well.
+    pub fn debrid_signal(&self, config_blob: &str) -> Option<DebridSignal> {
+        let config = self.inner.open_config(config_blob)?;
+        if !config.debrid.iter().any(|a| a.service == DebridService::TorBox) {
+            return None;
+        }
+        let health = &self.inner.deps.runtime.torbox.health;
+        let only_torbox = config.debrid.iter().all(|a| a.service == DebridService::TorBox);
+        match (health.peek(), health.state()) {
+            (Err(down), _) if only_torbox => {
+                Some(DebridSignal::Refused { reason: down.reason, retry_after: down.retry_after })
+            }
+            (_, DebridState::Down) => Some(DebridSignal::Degraded("debrid_down")),
+            (_, DebridState::Slow) => Some(DebridSignal::Degraded("debrid_slow")),
+            (_, DebridState::Ok) => None,
+        }
+    }
+
     /// Serves one request. The request body is already read (hearth bounds it); the response body is whole.
     ///
     /// A cacheable answer carries its ETag, and a matching `If-None-Match` (weak or strong) collapses it to a 304
@@ -1262,6 +1292,12 @@ impl Inner {
                 },
             )
             .await;
+        // TorBox known down: preparing the item and creating the stream would wait out their budgets for nothing,
+        // which is the play route's own gate (`debrid_down`). Only TorBox makes managed streams, so another debrid
+        // beside it does not lift it. After the list, whose cache check takes a due recovery probe first.
+        if let Err(down) = self.deps.runtime.torbox.health.admit() {
+            return Err(ManagedHlsError::DebridDown { retry_after: down.retry_after });
+        }
         for candidate in managed_candidates(&list, request)? {
             let audio_track = managed_audio_track(candidate, &request.audio, request.audio_track);
             let target = ResolveTarget {

@@ -484,6 +484,17 @@ fn trusted_offline_playback_hearth() -> Arc<Hearth> {
     hearth
 }
 
+/// `trusted_offline_playback_hearth` with Remux reaching Scout in process, as bootstrap wires it, so a play gets as
+/// far as Scout's stream list (empty: no indexer answers) and ends in Remux's own refusal.
+fn wired_offline_playback_hearth() -> Arc<Hearth> {
+    let mut hearth = trusted_offline_playback_hearth();
+    let state = Arc::get_mut(&mut hearth).unwrap();
+    let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
+    remux.cfg.scout_origins.push(crate::playback::DEN_SCOUT_ORIGIN.to_string());
+    crate::inproc::install(&hearth, &[]);
+    hearth
+}
+
 /// How many managed (TorBox) preparations Hearth attempted, whatever came of them.
 fn managed_attempts(hearth: &Hearth) -> u64 {
     let mut metrics = String::new();
@@ -551,6 +562,69 @@ async fn a_direct_only_request_is_refused_rather_than_given_remux() {
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["error"], "direct_unavailable");
     assert!(value["cause"].is_string(), "the managed reason is named: {value}");
+}
+
+// While TorBox is down Scout's play route refuses at once with `debrid_down`, but `/playback` put every failure in its
+// own closed codes, so Den Web could not tell the viewer TorBox was the cause, and the managed attempt still waited on
+// TorBox. Both paths, Edge's managed one and a plain one straight to Remux, answer Scout's refusal without starting.
+#[tokio::test]
+async fn while_torbox_is_down_playback_answers_debrid_down_at_once() {
+    let hearth = wired_offline_playback_hearth();
+    let segment = plain(&config(0, &[SCOUT]));
+    hearth.scout.as_ref().unwrap().runtime().torbox_health_for_test(true);
+
+    let started = std::time::Instant::now();
+    let managed = edge_playback(&hearth, &segment, "down", serde_json::json!({"imdb": "tt0111161"})).await;
+    let plain_request = playback_request(
+        &hearth,
+        Method::POST,
+        &segment,
+        Some("down-plain"),
+        Some("application/json"),
+        r#"{"imdb":"tt0111161"}"#,
+    )
+    .await;
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(1), "two plays while TorBox is down took {took:?}");
+    assert_eq!(managed_attempts(&hearth), 0, "TorBox was asked for a managed stream while down");
+
+    for (name, response) in [("managed", managed), ("plain", plain_request)] {
+        let (status, headers, bytes) = response_bytes(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{name}");
+        assert_eq!(headers["x-den-degraded"], "debrid_down", "{name}");
+        let retry: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((1..=30).contains(&retry), "{name}: Retry-After {retry}");
+        assert!(
+            headers["access-control-expose-headers"].to_str().unwrap().contains("X-Den-Degraded"),
+            "{name}: a browser can read the header"
+        );
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"error": "debrid_down", "service": "torbox", "reason": "timeout"})
+        );
+    }
+}
+
+// TorBox answering slowly is not a refusal: the facade's own answer and closed code stay as they were, and
+// `X-Den-Degraded: debrid_slow` beside them says why the play may have failed.
+#[tokio::test]
+async fn while_torbox_is_slow_a_failed_play_keeps_its_code_and_names_the_debrid() {
+    let hearth = wired_offline_playback_hearth();
+    let segment = plain(&config(0, &[SCOUT]));
+    let play =
+        |key: &'static str| edge_playback(&hearth, &segment, key, serde_json::json!({"imdb": "tt0111161"}));
+
+    let (status, headers, bytes) = response_bytes(play("well").await).await;
+    let well: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!((status, &well["error"]), (StatusCode::NOT_FOUND, &serde_json::json!("no_release")));
+    assert!(!headers.contains_key("x-den-degraded"), "{headers:?}");
+
+    hearth.scout.as_ref().unwrap().runtime().torbox_health_for_test(false);
+    let (slow_status, headers, bytes) = response_bytes(play("slow").await).await;
+    assert_eq!(slow_status, status);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"], well["error"]);
+    assert_eq!(headers["x-den-degraded"], "debrid_slow");
 }
 
 #[tokio::test]

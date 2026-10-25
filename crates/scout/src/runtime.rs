@@ -103,6 +103,21 @@ impl ScoutRuntime {
         let _ = self.play_observer.set(observer);
     }
 
+    /// Leaves TorBox's health as Scout's own calls would: `down` fails enough calls in a row to call it down, else
+    /// one answer arrives slowly. For a dependant's tests, which cannot make TorBox's real API fail.
+    #[cfg(feature = "test-support")]
+    pub fn torbox_health_for_test(&self, down: bool) {
+        use crate::stores::torbox::health::{CallOutcome, DOWN_AFTER, SLOW_ANSWER};
+        let health = &self.torbox.health;
+        if down {
+            for _ in 0..DOWN_AFTER {
+                health.record(CallOutcome::Failed("timeout"), Instant::now());
+            }
+        } else {
+            health.record(CallOutcome::Answered(SLOW_ANSWER), Instant::now());
+        }
+    }
+
     pub(crate) fn played(&self, imdb: &str, season: u32, episode: u32) {
         if let Some(observer) = self.play_observer.get() {
             observer(imdb, season, episode);

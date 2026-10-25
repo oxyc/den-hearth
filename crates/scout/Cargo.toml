@@ -66,6 +66,8 @@ subtle.workspace = true
 [features]
 # Forwards to the pub(crate) hot paths for benches/scout.rs (src/bench_api.rs). Off in every build that ships.
 bench = []
+# `ScoutRuntime::torbox_health_for_test`, for Hearth's tests (its dev-dependency). Off in every build that ships.
+test-support = []
 
 [[bench]]
 name = "scout"
