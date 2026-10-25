@@ -21,6 +21,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/${{ github.repository_owner }}/den-hearth
+  CONTROLLER_IMAGE: ghcr.io/${{ github.repository_owner }}/den-hearth-controller
 
 jobs:
   test:
@@ -101,6 +102,7 @@ jobs:
           targets: e2e
 
   controller-image:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -151,8 +153,8 @@ jobs:
             *.args.GIT_REVISION=${{ github.sha }}
             *.output=type=cacheonly
 
-  # Main builds, probes and scans an immutable candidate while the other jobs run. It is intentionally unsigned and
-  # never receives :latest here; docker-publish promotes it only after this exact workflow has succeeded.
+  # Main builds, probes and scans immutable Hearth and controller candidates while the other jobs run. They are
+  # intentionally unsigned and never receive :latest here; docker-publish promotes this exact pair only after CI.
   candidate:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -185,17 +187,20 @@ jobs:
         with:
           source: .
           files: docker-bake.hcl
+          targets: hearth,controller
           push: true
           set: |
             *.args.DEN_VERSION=${{ steps.source.outputs.version }}
             *.args.GIT_REVISION=${{ github.sha }}
             hearth.tags=${{ env.IMAGE }}:candidate-${{ github.sha }}
+            controller.tags=${{ env.CONTROLLER_IMAGE }}:candidate-${{ github.sha }}
             hearth.cache-to=type=gha,mode=max,scope=release-image
-      - name: Record candidate digest
+            controller.cache-to=type=gha,mode=max,scope=controller-release-image
+      - name: Record candidate digests
         id: image
         env:
           METADATA: ${{ steps.bake.outputs.metadata }}
-        run: bash .github/scripts/release-metadata.sh bake-digest >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/release-metadata.sh bake-digests >> "$GITHUB_OUTPUT"
       # Served without a TMDB key or a cache, so it proves the image starts, all three services answer through
       # their prefixes, and each reports the release the VERSION file names.
       - name: Prove the image reports its release version
@@ -203,6 +208,10 @@ jobs:
           DIGEST: ${{ steps.image.outputs.digest }}
           VERSION: ${{ steps.source.outputs.version }}
         run: scripts/probe-image.sh "$IMAGE@$DIGEST" "$VERSION"
+      - name: Prove the controller candidate starts
+        env:
+          DIGEST: ${{ steps.image.outputs.controller_digest }}
+        run: docker run --rm "$CONTROLLER_IMAGE@$DIGEST" health | jq -e '.running == false and .edgeConnected == false'
       # One scan, of fixable HIGH and CRITICAL findings, which the report and the gate below both read.
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -214,15 +223,29 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "0"
+      - name: Scan controller image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.CONTROLLER_IMAGE }}@${{ steps.image.outputs.controller_digest }}
+          version: v0.74.0
+          format: json
+          output: trivy-controller.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
       # Gate: a CRITICAL with a fixed version available fails here, before the digest is recorded, so no tag can
       # promote it. Unfixed CVEs are ignored. A finding that does not apply goes in .trivyignore with a reason.
       - name: Scan gate
         run: bash .github/scripts/image-scan-results.sh candidate trivy.json
-      - name: Bind this CI run to its candidate digest
+      - name: Controller scan gate
+        run: bash .github/scripts/image-scan-results.sh candidate trivy-controller.json
+      - name: Bind this CI run to its candidate digests
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ steps.image.outputs.controller_digest }}
         run: |
-          jq -n --arg image "$DIGEST" '{image: $image}' > candidate-digest.json
+          jq -n --arg image "$DIGEST" --arg controller "$CONTROLLER_DIGEST" \
+            '{image: $image, controller: $controller}' > candidate-digest.json
       - name: Save candidate identity for release promotion
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -241,3 +264,12 @@ jobs:
         with:
           sarif_file: trivy.sarif
           category: trivy-image
+      - name: Controller report for code scanning
+        continue-on-error: true
+        run: trivy convert --format sarif --output trivy-controller.sarif trivy-controller.json
+      - name: Upload controller scan to code scanning
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        continue-on-error: true
+        with:
+          sarif_file: trivy-controller.sarif
+          category: trivy-controller-image

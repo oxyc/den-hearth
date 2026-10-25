@@ -2,6 +2,18 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+digest="sha256:$(printf '1%.0s' {1..64})"
+controller_digest="sha256:$(printf '2%.0s' {1..64})"
+metadata=$(jq -cn --arg hearth "$digest" --arg controller "$controller_digest" \
+    '{hearth:{"containerimage.digest":$hearth},controller:{"containerimage.digest":$controller}}')
+parsed=$(METADATA="$metadata" bash "$root/.github/scripts/release-metadata.sh" bake-digests)
+grep -Fxq "digest=$digest" <<<"$parsed"
+grep -Fxq "controller_digest=$controller_digest" <<<"$parsed"
+if METADATA="$(jq -cn --arg hearth "$digest" '{hearth:{"containerimage.digest":$hearth}}')" \
+    bash "$root/.github/scripts/release-metadata.sh" bake-digests >/dev/null 2>&1; then
+    echo "paired candidate metadata unexpectedly accepted a missing controller digest" >&2
+    exit 1
+fi
 tmp_parent="${TMPDIR:-/tmp}"
 tmp="$(mktemp -d "$tmp_parent/den-hearth-release-test.XXXXXX")"
 cleanup() {

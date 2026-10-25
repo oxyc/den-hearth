@@ -1,8 +1,8 @@
-# Promote the den-hearth image to GitHub Container Registry. No app release.
+# Promote the den-hearth and den-hearth-controller images to GitHub Container Registry. No app release.
 #
-# Main CI (ci.yml) builds, behavior-probes and scans an immutable candidate image for its exact commit. A v* tag
-# only verifies and promotes the digest that run recorded: it signs it, tags it and moves :latest. It does not
-# compile or test the same commit again.
+# Main CI (ci.yml) builds, behavior-probes and scans an immutable candidate pair for its exact commit. A v* tag
+# only verifies and promotes the digests that run recorded: it signs them, tags them and moves both :latest tags.
+# It does not compile or test the same commit again.
 #
 # Every Monday, and on a manual run, the NEWEST v* tag is rebuilt instead: released code only, never main,
 # with the base images re-pulled, no build cache and apt run again, so Debian runtime security fixes reach the box
@@ -19,6 +19,7 @@ on:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/den-hearth
+  CONTROLLER_IMAGE: ghcr.io/${{ github.repository_owner }}/den-hearth-controller
 
 # One publish at a time, never cancelled: a patch rebuild and a release must not race each other to :latest.
 concurrency:
@@ -65,8 +66,8 @@ jobs:
             echo "stamp=$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER"
           } >> "$GITHUB_OUTPUT"
 
-  # A release consumes the digest record emitted only after the exact main workflow built, behavior-probed and
-  # scanned the image. Resolving by the artifact rather than a moving tag binds promotion to that CI run, and
+  # A release consumes the digest record emitted only after exact-main CI built, behavior-probed and scanned both
+  # images. Resolving by the artifact rather than moving tags binds promotion to that CI run, and
   # that run only succeeds when its tests, fmt and clippy did too.
   candidate:
     if: github.event_name == 'push'
@@ -78,6 +79,7 @@ jobs:
       packages: read
     outputs:
       digest: ${{ steps.image.outputs.digest }}
+      controller_digest: ${{ steps.image.outputs.controller_digest }}
       sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -145,16 +147,27 @@ jobs:
         run: |
           set -euo pipefail
           digest=$(jq -r .image candidate-digest.json)
+          controller_digest=$(jq -r .controller candidate-digest.json)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$controller_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           live=$(docker buildx imagetools inspect "$IMAGE:candidate-$SHA" --format '{{json .Manifest}}' | jq -r .digest)
+          controller_live=$(docker buildx imagetools inspect "$CONTROLLER_IMAGE:candidate-$SHA" --format '{{json .Manifest}}' | jq -r .digest)
           test "$live" = "$digest" || { echo "::error::candidate tag no longer matches the digest recorded by main CI"; exit 1; }
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          test "$controller_live" = "$controller_digest" || { echo "::error::controller candidate tag no longer matches the digest recorded by main CI"; exit 1; }
+          {
+            echo "digest=$digest"
+            echo "controller_digest=$controller_digest"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prove the image reports the release tag
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
           VERSION: ${{ needs.source.outputs.version }}
         run: scripts/probe-image.sh "$IMAGE@$DIGEST" "$VERSION"
+      - name: Prove the controller candidate starts
+        env:
+          DIGEST: ${{ steps.image.outputs.controller_digest }}
+        run: docker run --rm "$CONTROLLER_IMAGE@$DIGEST" health | jq -e '.running == false and .edgeConnected == false'
 
   # Security patch rebuilds intentionally bypass the candidate: their purpose is to pull fresh base packages even
   # when source did not change. They retain the full build, behavior probe, scan and gate.
@@ -168,6 +181,7 @@ jobs:
       security-events: write  # Trivy's report goes to code scanning
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      controller_digest: ${{ steps.build.outputs.controller_digest }}
       sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -208,25 +222,32 @@ jobs:
         with:
           source: .
           files: docker-bake.hcl
+          targets: hearth,controller
           push: true
           set: |
             *.args.DEN_VERSION=${{ needs.source.outputs.version }}
             *.args.GIT_REVISION=${{ steps.commit.outputs.sha }}
             *.no-cache=true
             hearth.tags=${{ env.IMAGE }}:${{ needs.source.outputs.version }}-patch.${{ needs.source.outputs.stamp }}
+            controller.tags=${{ env.CONTROLLER_IMAGE }}:${{ needs.source.outputs.version }}-patch.${{ needs.source.outputs.stamp }}
             hearth.cache-to=type=gha,mode=max,scope=release-image
+            controller.cache-to=type=gha,mode=max,scope=controller-release-image
 
-      - name: Record rebuilt digest
+      - name: Record rebuilt digests
         id: build
         env:
           METADATA: ${{ steps.bake.outputs.metadata }}
-        run: bash .github/scripts/release-metadata.sh bake-digest >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/release-metadata.sh bake-digests >> "$GITHUB_OUTPUT"
 
       - name: Prove the rebuilt image
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ needs.source.outputs.version }}
         run: scripts/probe-image.sh "$IMAGE@$DIGEST" "$VERSION"
+      - name: Prove the rebuilt controller
+        env:
+          DIGEST: ${{ steps.build.outputs.controller_digest }}
+        run: docker run --rm "$CONTROLLER_IMAGE@$DIGEST" health | jq -e '.running == false and .edgeConnected == false'
 
       # One scan, of fixable HIGH and CRITICAL findings, which the report and the gate below both read.
       - name: Scan image
@@ -239,6 +260,16 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "0"
+      - name: Scan controller image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.CONTROLLER_IMAGE }}@${{ steps.build.outputs.controller_digest }}
+          version: v0.74.0
+          format: json
+          output: trivy-controller.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
 
       # Gate: a CRITICAL with a fixed version available fails here, before anything is signed or :latest
       # moves. A patch rebuild gates on OS packages only — the part a rebuild can fix; a vulnerable crate or
@@ -246,6 +277,8 @@ jobs:
       # finding that does not apply goes in .trivyignore with a reason.
       - name: Scan gate
         run: bash .github/scripts/image-scan-results.sh os-only trivy.json
+      - name: Controller scan gate
+        run: bash .github/scripts/image-scan-results.sh os-only trivy-controller.json
 
       # Report: those findings go to the repository's code scanning. Advisory — it never fails the job.
       - name: Report for code scanning
@@ -259,9 +292,18 @@ jobs:
         with:
           sarif_file: trivy.sarif
           category: trivy-image
+      - name: Controller report for code scanning
+        continue-on-error: true
+        run: trivy convert --format sarif --output trivy-controller.sarif trivy-controller.json
+      - name: Upload controller scan to code scanning
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        continue-on-error: true
+        with:
+          sarif_file: trivy-controller.sarif
+          category: trivy-controller-image
 
-  # Only this workflow signs and advances :latest, so the box's cosign identity check (README, Deploy), den-update's
-  # throwaway probe, digest pin, live probe and rollback keep working unchanged.
+  # Only this workflow signs and advances either :latest, so the box's cosign identity check trusts the same
+  # workflow identity for both images. The dependency moves first and Hearth's deploy-triggering tag moves last.
   release:
     needs: [source, candidate, patch-build]
     if: ${{ !cancelled() && needs.source.result == 'success' && ((needs.source.outputs.patch == 'false' && needs.candidate.result == 'success') || (needs.source.outputs.patch == 'true' && needs.patch-build.result == 'success')) }}
@@ -283,16 +325,20 @@ jobs:
 
       # Keyless: Fulcio issues a short-lived certificate to this workflow's GitHub OIDC identity and the
       # signature is recorded in Rekor. The box verifies that identity before deploying.
-      - name: Sign the image
+      - name: Sign both images
         env:
           DIGEST: ${{ needs.candidate.outputs.digest || needs.patch-build.outputs.digest }}
-        run: cosign sign --yes "$IMAGE@$DIGEST"
+          CONTROLLER_DIGEST: ${{ needs.candidate.outputs.controller_digest || needs.patch-build.outputs.controller_digest }}
+        run: |
+          cosign sign --yes "$IMAGE@$DIGEST"
+          cosign sign --yes "$CONTROLLER_IMAGE@$CONTROLLER_DIGEST"
 
-      # :latest is what den-update deploys, so it moves last, to exactly the digest that was scanned and
-      # signed. imagetools re-tags a single index as-is; the check proves the digest survived the move.
+      # Hearth :latest is what den-update deploys, so it moves last, after controller :latest. Both name exactly
+      # the digests scanned and signed above; imagetools re-tags each index as-is and the checks prove both moves.
       - name: Publish release tags and move latest last
         env:
           DIGEST: ${{ needs.candidate.outputs.digest || needs.patch-build.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ needs.candidate.outputs.controller_digest || needs.patch-build.outputs.controller_digest }}
           SHA: ${{ needs.candidate.outputs.sha || needs.patch-build.outputs.sha }}
           VERSION: ${{ needs.source.outputs.version }}
           PATCH: ${{ needs.source.outputs.patch }}
@@ -303,11 +349,19 @@ jobs:
           # name for that one rebuild (the build already pushed it, re-tagging is idempotent).
           if [ "$PATCH" = true ]; then
             tags=(--tag "$IMAGE:$VERSION-patch.$STAMP")
+            controller_tags=(--tag "$CONTROLLER_IMAGE:$VERSION-patch.$STAMP")
           else
             minor=${VERSION%.*}; major=${VERSION%%.*}; short=${SHA:0:7}
             tags=(--tag "$IMAGE:$VERSION" --tag "$IMAGE:$minor" --tag "$IMAGE:$major" --tag "$IMAGE:sha-$short")
+            controller_tags=(--tag "$CONTROLLER_IMAGE:$VERSION" --tag "$CONTROLLER_IMAGE:$minor" --tag "$CONTROLLER_IMAGE:$major" --tag "$CONTROLLER_IMAGE:sha-$short")
           fi
           docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST"
+          docker buildx imagetools create "${controller_tags[@]}" "$CONTROLLER_IMAGE@$CONTROLLER_DIGEST"
+          # Move the dependency first. Hearth's :latest is the deploy trigger and therefore moves only after the
+          # controller's signed digest and immutable tags are already available.
+          docker buildx imagetools create --tag "$CONTROLLER_IMAGE:latest" "$CONTROLLER_IMAGE@$CONTROLLER_DIGEST"
+          controller_moved=$(docker buildx imagetools inspect "$CONTROLLER_IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          test "$controller_moved" = "$CONTROLLER_DIGEST" || { echo "::error::controller latest resolved to $controller_moved, not the signed $CONTROLLER_DIGEST"; exit 1; }
           docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
           moved=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
           test "$moved" = "$DIGEST" || { echo "::error::latest resolved to $moved, not the signed $DIGEST"; exit 1; }

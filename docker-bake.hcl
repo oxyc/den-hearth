@@ -10,6 +10,7 @@ target "controller" {
   dockerfile = "Dockerfile.controller"
   platforms  = ["linux/amd64", "linux/arm64"]
   pull       = true
+  cache-from = ["type=gha,scope=controller-release-image"]
   attest = [
     "type=provenance,mode=max",
     "type=sbom",
