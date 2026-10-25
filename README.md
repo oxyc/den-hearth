@@ -136,6 +136,14 @@ tags or publishes a release, and publishing never writes or pushes directly to p
 "remux": {...}}}`, each entry being that service's own `/health` body. It is `degraded` when any service
 says anything but `ok`. Each service's own `/health` and `/metrics` stay reachable under its prefix.
 
+Scout's `debrid` block is also copied to the top level for `/den/health` clients. Its `state` is Scout's local
+TorBox observation whenever one exists (`source: "local"`). A background observer reads TorBox's public status
+page at most once every five minutes, outside every playback request, with a two-second deadline and a bounded
+body. Its fixed-vocabulary result appears under `statusPage`; it is only the top-level state while no local call
+has been observed (`source: "status_page"`). A failed refresh retains that snapshot for at most 30 minutes and
+marks it stale after 10. Public green never clears a local failure, public red never refuses a play, and a
+public-only outage does not make Hearth's own liveness `degraded`.
+
 ## The Den addon
 
 One Stremio addon for what were three installs ([oxyc/den#286](https://github.com/oxyc/den/issues/286)): one
