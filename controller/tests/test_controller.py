@@ -14,7 +14,7 @@ from aiohttp import web
 from pyatv import exceptions
 from pyatv.const import Protocol
 
-from den_hearth_controller.apple_tv import AppleTVClient
+from den_hearth_controller.apple_tv import AppleTVClient, LAUNCH_RETRY_DELAYS
 from den_hearth_controller.coordinator import Coordinator
 from den_hearth_controller.edge import EdgeClient
 from den_hearth_controller.ipc import RegistrationServer
@@ -261,10 +261,11 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         waking.remote_control.wakeup.assert_not_called()
         self.assertEqual(client._find.await_count, 2)
         waking.close.assert_called_once_with()
-        self.assertEqual(ready.apps.launch_app.await_count, 3)
+        self.assertEqual(ready.apps.launch_app.await_count, 6)
         ready.apps.launch_app.assert_awaited_with("fi.oxy.den")
         self.assertEqual(
-            [call.args for call in sleep.await_args_list], [(15,), (15,)]
+            [call.args for call in sleep.await_args_list],
+            [(3,), (3,), (4,), (5,), (15,)],
         )
         ready.user_accounts.switch_account.assert_not_called()
         ready.remote_control.select.assert_not_called()
@@ -273,6 +274,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         atv = MagicMock()
         atv.apps.launch_app = AsyncMock(
             side_effect=[
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
                 exceptions.ProtocolError("profile gate"),
                 exceptions.ProtocolError("profile gate"),
                 None,
@@ -284,9 +288,14 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         ) as sleep:
             await AppleTVClient._launch_after_profile_gate(atv, "fi.oxy.den")
 
-        self.assertEqual(atv.apps.launch_app.await_count, 3)
+        self.assertEqual(atv.apps.launch_app.await_count, 6)
         self.assertEqual(
-            [call.args for call in sleep.await_args_list], [(15,), (15,)]
+            [call.args for call in sleep.await_args_list],
+            [(3,), (3,), (4,), (5,), (15,)],
+        )
+        self.assertEqual(
+            [sum(LAUNCH_RETRY_DELAYS[: index + 1]) for index in range(6)],
+            [0, 3, 6, 10, 15, 30],
         )
         atv.user_accounts.switch_account.assert_not_called()
         atv.remote_control.select.assert_not_called()
