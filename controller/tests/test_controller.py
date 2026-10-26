@@ -17,7 +17,7 @@ from den_hearth_controller.apple_tv import AppleTVClient
 from den_hearth_controller.coordinator import Coordinator
 from den_hearth_controller.edge import EdgeClient
 from den_hearth_controller.ipc import RegistrationServer
-from den_hearth_controller.models import WakeEvent
+from den_hearth_controller.models import Target, WakeEvent
 from den_hearth_controller.state import StateStore
 
 
@@ -210,6 +210,52 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["id"], "companion-id")
         pairing.pin.assert_called_once_with(1234)
         pairing.close.assert_awaited_once_with()
+
+    async def test_wake_uses_companion_power_without_wait_then_reconnects(self):
+        target = Target(
+            id="1" * 32,
+            device_id="0" * 16,
+            name="Living Room",
+            inbox="a" * 64,
+            assistant="b" * 32,
+            bundle_id="fi.oxy.den",
+            selected_bundle_id="fi.oxy.den",
+            apple_tv_id="36:FB:AA:BB:CC:DD",
+            last_address="192.0.2.4",
+        )
+        config = MagicMock(address="192.0.2.4")
+        storage = object()
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        client._find = AsyncMock(
+            side_effect=[(config, storage), (config, storage)]
+        )
+
+        waking = MagicMock()
+        waking.power.turn_on = AsyncMock()
+        waking.remote_control.wakeup = AsyncMock(
+            side_effect=AssertionError("Companion remote wake is unsupported")
+        )
+        waking.close.return_value = set()
+        ready = MagicMock()
+        ready.apps.app_list = AsyncMock(
+            return_value=[MagicMock(identifier="fi.oxy.den")]
+        )
+        ready.apps.launch_app = AsyncMock()
+        ready.close.return_value = set()
+        stage = AsyncMock()
+
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.connect",
+            new=AsyncMock(side_effect=[waking, ready]),
+        ):
+            result = await client.wake_and_launch(target, stage)
+
+        self.assertIsNone(result)
+        waking.power.turn_on.assert_awaited_once_with()
+        waking.remote_control.wakeup.assert_not_called()
+        self.assertEqual(client._find.await_count, 2)
+        waking.close.assert_called_once_with()
+        ready.apps.launch_app.assert_awaited_once_with("fi.oxy.den")
 
     async def test_edge_poll_uses_least_privilege_header_and_bounded_shape(self):
         seen = {}
