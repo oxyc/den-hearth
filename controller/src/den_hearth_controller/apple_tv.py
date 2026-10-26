@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import inspect
 from ipaddress import ip_address
 import os
 from pathlib import Path
@@ -71,7 +72,6 @@ class AppleTVClient:
         configs = await pyatv.scan(
             asyncio.get_running_loop(),
             timeout=self.scan_timeout,
-            protocol=Protocol.Companion,
             storage=storage,
         )
         configs = [config for config in configs if self._matches(config, identifier)]
@@ -81,7 +81,6 @@ class AppleTVClient:
                 asyncio.get_running_loop(),
                 timeout=self.scan_timeout,
                 hosts=[address],
-                protocol=Protocol.Companion,
                 storage=storage,
             )
             configs = [config for config in configs if self._matches(config, identifier)]
@@ -105,7 +104,9 @@ class AppleTVClient:
             await storage.save()
             os.chmod(self.storage_path, 0o600)
         finally:
-            pairing.close()
+            closing = pairing.close()
+            if inspect.isawaitable(closing):
+                await closing
         return {
             "id": config.identifier,
             "name": config.name,
