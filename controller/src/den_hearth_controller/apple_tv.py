@@ -161,9 +161,9 @@ class AppleTVClient:
                 10,
             )
             try:
-                await asyncio.wait_for(atv.power.turn_on(await_new_state=True), 15)
+                await asyncio.wait_for(atv.remote_control.wakeup(), 15)
             except asyncio.TimeoutError:
-                # Some tvOS versions do not publish the new power state. Reconnect is the readiness proof.
+                # Some tvOS versions do not answer the wake command. Reconnect is the readiness proof.
                 pass
             await stage(
                 "receiver-awake",
