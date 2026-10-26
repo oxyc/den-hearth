@@ -9,6 +9,7 @@
 mod batching;
 pub(crate) mod health;
 mod listing;
+mod public_status;
 mod status;
 pub(crate) mod support;
 mod transport;
@@ -186,6 +187,9 @@ pub(crate) struct TorboxRuntime {
     listing_memo: Mutex<BTreeMap<(usize, String), ListingMemoEntry>>,
     /// How TorBox has been answering, fed by every call `send` makes; read by /health and the play routes.
     pub(crate) health: health::DebridHealth,
+    /// TorBox's public status page, refreshed out of band. This is only an informational fallback in /health;
+    /// it never admits, refuses, or delays a debrid call.
+    pub(crate) public_status: Arc<public_status::PublicStatus>,
 }
 
 impl TorboxRuntime {
@@ -204,6 +208,7 @@ impl TorboxRuntime {
             batchers: Mutex::new(BTreeMap::new()),
             listing_memo: Mutex::new(BTreeMap::new()),
             health: health::DebridHealth::default(),
+            public_status: Arc::new(public_status::PublicStatus::default()),
         }
     }
 
@@ -215,6 +220,38 @@ impl TorboxRuntime {
     #[cfg(test)]
     pub(crate) fn active_listing_flights(&self) -> usize {
         self.listing_flights.active()
+    }
+
+    /// The public `/health` view. Scout's own observations win whenever they exist. The public page is nested as
+    /// corroboration in that case; before the first API call it can provide an explicitly sourced fallback. This
+    /// method is informational only and is deliberately not used by admission or playback.
+    pub(crate) fn health_report(&self) -> Option<Value> {
+        let public = self.public_status.report();
+        if let Some(mut local) = self.health.report() {
+            local["source"] = Value::String("local".into());
+            if let Some(public) = public {
+                local["statusPage"] = public;
+            }
+            return Some(local);
+        }
+        let public = public?;
+        let state = match public["state"].as_str()? {
+            "operational" => "ok",
+            "degraded" => "slow",
+            "down" => "down",
+            _ => return None,
+        };
+        let mut report = serde_json::json!({
+            "provider": "torbox",
+            "state": state,
+            "since": public["checkedAt"],
+            "source": "status_page",
+            "statusPage": public,
+        });
+        if state != "ok" {
+            report["reason"] = Value::String("status_page".into());
+        }
+        Some(report)
     }
 }
 

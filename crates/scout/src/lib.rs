@@ -8,6 +8,7 @@ pub mod cache;
 pub mod cinemeta;
 pub mod client;
 pub mod config;
+mod continuity;
 pub mod coverage;
 pub mod decisionlog;
 pub mod deps;
