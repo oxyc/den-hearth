@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import web
+from pyatv import exceptions
 from pyatv.const import Protocol
 
 from den_hearth_controller.apple_tv import AppleTVClient
@@ -244,9 +245,14 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         ready.close.return_value = set()
         stage = AsyncMock()
 
-        with patch(
-            "den_hearth_controller.apple_tv.pyatv.connect",
-            new=AsyncMock(side_effect=[waking, ready]),
+        with (
+            patch(
+                "den_hearth_controller.apple_tv.pyatv.connect",
+                new=AsyncMock(side_effect=[waking, ready]),
+            ),
+            patch(
+                "den_hearth_controller.apple_tv.asyncio.sleep", new=AsyncMock()
+            ) as sleep,
         ):
             result = await client.wake_and_launch(target, stage)
 
@@ -255,7 +261,35 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         waking.remote_control.wakeup.assert_not_called()
         self.assertEqual(client._find.await_count, 2)
         waking.close.assert_called_once_with()
-        ready.apps.launch_app.assert_awaited_once_with("fi.oxy.den")
+        self.assertEqual(ready.apps.launch_app.await_count, 3)
+        ready.apps.launch_app.assert_awaited_with("fi.oxy.den")
+        self.assertEqual(
+            [call.args for call in sleep.await_args_list], [(15,), (15,)]
+        )
+        ready.user_accounts.switch_account.assert_not_called()
+        ready.remote_control.select.assert_not_called()
+
+    async def test_launch_retries_protocol_errors_while_profile_gate_clears(self):
+        atv = MagicMock()
+        atv.apps.launch_app = AsyncMock(
+            side_effect=[
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
+                None,
+            ]
+        )
+
+        with patch(
+            "den_hearth_controller.apple_tv.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            await AppleTVClient._launch_after_profile_gate(atv, "fi.oxy.den")
+
+        self.assertEqual(atv.apps.launch_app.await_count, 3)
+        self.assertEqual(
+            [call.args for call in sleep.await_args_list], [(15,), (15,)]
+        )
+        atv.user_accounts.switch_account.assert_not_called()
+        atv.remote_control.select.assert_not_called()
 
     async def test_edge_poll_uses_least_privilege_header_and_bounded_shape(self):
         seen = {}
