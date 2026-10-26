@@ -22,6 +22,12 @@ PYATV_ERRORS = tuple(
     if isinstance(value, type) and issubclass(value, Exception)
 )
 
+# tvOS can acknowledge launch requests while its wake-time profile chooser still
+# owns the foreground. It dismisses that chooser without changing the selected
+# profile, so retry the same idempotent launch across that bounded window. Never
+# synthesize navigation or use the separate account-switching Companion API.
+LAUNCH_RETRY_DELAYS = (0, 15, 15)
+
 
 class AppleTVClient:
     def __init__(self, storage_path: Path, *, scan_timeout: int = 5):
@@ -135,6 +141,20 @@ class AppleTVClient:
         finally:
             await self._close(atv)
 
+    @staticmethod
+    async def _launch_after_profile_gate(atv, bundle_id: str) -> None:
+        last_error: Exception | None = None
+        for delay in LAUNCH_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(atv.apps.launch_app(bundle_id), 10)
+                last_error = None
+            except (asyncio.TimeoutError, pyatv.exceptions.ProtocolError) as error:
+                last_error = error
+        if last_error is not None:
+            raise last_error
+
     async def wake_and_launch(self, target: Target, stage: StageFn) -> str | None:
         if not target.apple_tv_id or not target.selected_bundle_id:
             return "internal"
@@ -203,7 +223,7 @@ class AppleTVClient:
                 None,
             )
             await stage("launch-requested", "started", None, None)
-            await asyncio.wait_for(atv.apps.launch_app(target.selected_bundle_id), 10)
+            await self._launch_after_profile_gate(atv, target.selected_bundle_id)
             await stage(
                 "launch-requested",
                 "ok",
