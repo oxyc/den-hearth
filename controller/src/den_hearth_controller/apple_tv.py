@@ -56,15 +56,25 @@ class AppleTVClient:
             if config.get_service(Protocol.Companion) is not None
         ]
 
+    @staticmethod
+    def _matches(config, identifier: str) -> bool:
+        return (
+            config.get_service(Protocol.Companion) is not None
+            and (
+                config.identifier == identifier
+                or identifier in config.all_identifiers
+            )
+        )
+
     async def _find(self, identifier: str, address: str | None = None):
         storage = await self._storage()
         configs = await pyatv.scan(
             asyncio.get_running_loop(),
             timeout=self.scan_timeout,
-            identifier=identifier,
             protocol=Protocol.Companion,
             storage=storage,
         )
+        configs = [config for config in configs if self._matches(config, identifier)]
         if not configs and address:
             ip_address(address)
             configs = await pyatv.scan(
@@ -74,9 +84,7 @@ class AppleTVClient:
                 protocol=Protocol.Companion,
                 storage=storage,
             )
-            configs = [
-                config for config in configs if identifier in config.all_identifiers
-            ]
+            configs = [config for config in configs if self._matches(config, identifier)]
         if not configs:
             raise LookupError("offline")
         return configs[0], storage

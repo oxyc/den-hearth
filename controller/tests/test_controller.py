@@ -8,9 +8,12 @@ import stat
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
+from pyatv.const import Protocol
 
+from den_hearth_controller.apple_tv import AppleTVClient
 from den_hearth_controller.coordinator import Coordinator
 from den_hearth_controller.edge import EdgeClient
 from den_hearth_controller.ipc import RegistrationServer
@@ -116,6 +119,47 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
         await server.close()
+
+    async def test_find_accepts_discovery_identifier_from_all_identifiers(self):
+        class Config:
+            identifier = "companion-id"
+            all_identifiers = {"companion-id", "36:FB:AA:BB:CC:DD"}
+
+            @staticmethod
+            def get_service(protocol):
+                return object() if protocol == Protocol.Companion else None
+
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        storage = object()
+        client._storage = AsyncMock(return_value=storage)
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.scan",
+            new=AsyncMock(return_value=[Config()]),
+        ) as scan:
+            config, found_storage = await client._find("36:FB:AA:BB:CC:DD")
+
+        self.assertEqual(config.identifier, "companion-id")
+        self.assertIs(found_storage, storage)
+        self.assertNotIn("identifier", scan.await_args.kwargs)
+        self.assertEqual(scan.await_args.kwargs["protocol"], Protocol.Companion)
+
+    async def test_find_rejects_matching_identifier_without_companion(self):
+        class Config:
+            identifier = "36:FB:AA:BB:CC:DD"
+            all_identifiers = {identifier}
+
+            @staticmethod
+            def get_service(protocol):
+                return None
+
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        client._storage = AsyncMock(return_value=object())
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.scan",
+            new=AsyncMock(return_value=[Config()]),
+        ):
+            with self.assertRaisesRegex(LookupError, "offline"):
+                await client._find("36:FB:AA:BB:CC:DD")
 
     async def test_edge_poll_uses_least_privilege_header_and_bounded_shape(self):
         seen = {}
