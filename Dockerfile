@@ -96,7 +96,7 @@ RUN set -eux; \
 # (`--frozen`). The lockfile is the pin; its SHA-256 below ties it to this Dockerfile the way the sums above
 # tie the binaries, so a changed lockfile cannot ride in without this line changing with it. Kept in
 # lockstep with deno.json + deno.lock by .github/workflows/youtubei-update.yml.
-ARG YOUTUBEI_LOCK_SHA256=9bcd07416709f28439d51d1164045bcd3f7cd6c97b91f6125151a31e816fc7b5
+ARG YOUTUBEI_LOCK_SHA256=aa632f3060c813aa8a86facbc2219394526c6673cd2184f92aed5ca8b60f8be1
 COPY crates/reel/worker/youtubei/ /youtubei/
 RUN set -eux; \
     cd /youtubei; \
