@@ -211,7 +211,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         pairing.pin.assert_called_once_with(1234)
         pairing.close.assert_awaited_once_with()
 
-    async def test_wake_uses_companion_remote_control_then_reconnects(self):
+    async def test_wake_uses_companion_power_without_wait_then_reconnects(self):
         target = Target(
             id="1" * 32,
             device_id="0" * 16,
@@ -231,9 +231,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         )
 
         waking = MagicMock()
-        waking.remote_control.wakeup = AsyncMock()
-        waking.power.turn_on = AsyncMock(
-            side_effect=AssertionError("Companion power is unsupported")
+        waking.power.turn_on = AsyncMock()
+        waking.remote_control.wakeup = AsyncMock(
+            side_effect=AssertionError("Companion remote wake is unsupported")
         )
         waking.close.return_value = set()
         ready = MagicMock()
@@ -251,8 +251,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             result = await client.wake_and_launch(target, stage)
 
         self.assertIsNone(result)
-        waking.remote_control.wakeup.assert_awaited_once_with()
-        waking.power.turn_on.assert_not_called()
+        waking.power.turn_on.assert_awaited_once_with()
+        waking.remote_control.wakeup.assert_not_called()
         self.assertEqual(client._find.await_count, 2)
         waking.close.assert_called_once_with()
         ready.apps.launch_app.assert_awaited_once_with("fi.oxy.den")
