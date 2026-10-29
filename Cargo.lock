@@ -521,7 +521,7 @@ dependencies = [
 [[package]]
 name = "den-assistant"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?rev=8d975ffc259853f3d3115f6a186aea63f06c97dd#8d975ffc259853f3d3115f6a186aea63f06c97dd"
+source = "git+https://github.com/oxyc/den-core.git?rev=9e1b54edd1fe9837fa0f7831b77e59803cba0701#9e1b54edd1fe9837fa0f7831b77e59803cba0701"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -553,6 +553,7 @@ dependencies = [
  "base64 0.23.1",
  "blake2 0.10.6",
  "bytes",
+ "den-assistant",
  "den-http",
  "den-reel",
  "den-remux",
@@ -743,7 +744,7 @@ dependencies = [
 [[package]]
 name = "den-sync"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?rev=8d975ffc259853f3d3115f6a186aea63f06c97dd#8d975ffc259853f3d3115f6a186aea63f06c97dd"
+source = "git+https://github.com/oxyc/den-core.git?rev=9e1b54edd1fe9837fa0f7831b77e59803cba0701#9e1b54edd1fe9837fa0f7831b77e59803cba0701"
 dependencies = [
  "argon2",
  "den-assistant",

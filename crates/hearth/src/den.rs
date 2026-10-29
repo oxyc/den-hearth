@@ -50,6 +50,8 @@ pub enum Route {
     Guest,
     /// A short-lived, unguessable indexed subtitle capability.
     Sidecar(String, usize),
+    /// A short-lived end capability that seals terminal player evidence to the household.
+    Receipt(String),
     /// `/den/<config>/manifest.json`, with the config segment.
     Installed(String),
     /// `/den/<config>/playback`, with the config segment. Hearth chooses the delivery path.
@@ -88,6 +90,15 @@ pub fn route(path: &str) -> Route {
             if let Some(track) = track {
                 return Route::Sidecar(token.to_owned(), track);
             }
+        }
+        return Route::NotFound;
+    }
+    if let Some(rest) = path.strip_prefix("/_receipt/") {
+        let token = rest.strip_suffix("/end").unwrap_or(rest);
+        if token.len() == 43
+            && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Route::Receipt(token.to_owned());
         }
         return Route::NotFound;
     }
@@ -303,6 +314,7 @@ impl Den {
             }
             Route::Guest
             | Route::Sidecar(_, _)
+            | Route::Receipt(_)
             | Route::Playback(_)
             | Route::Wanted(_)
             | Route::WakeTarget(_)
@@ -570,6 +582,10 @@ mod tests {
         assert_eq!(route("/config-key"), Route::ConfigKey);
         assert_eq!(route("/CFG/manifest.json"), Route::Installed("CFG".into()));
         assert_eq!(route("/CFG/playback"), Route::Playback("CFG".into()));
+        assert_eq!(route(&format!("/_receipt/{}", "A".repeat(43))), Route::Receipt("A".repeat(43)));
+        assert_eq!(route(&format!("/_receipt/{}/end", "A".repeat(43))), Route::Receipt("A".repeat(43)));
+        assert_eq!(route(&format!("/_receipt/{}/other", "A".repeat(43))), Route::NotFound);
+        assert_eq!(route(&format!("/_receipt/{}", "A".repeat(42))), Route::NotFound);
         assert_eq!(route("/CFG/wanted"), Route::Wanted("CFG".into()));
         assert_eq!(route("/CFG/wanted/more"), Route::NotFound);
     }

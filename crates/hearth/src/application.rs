@@ -239,6 +239,7 @@ where
         den::Route::WakeTarget(config) => wake::handle(hearth, &config, req).await,
         den::Route::Guest => guest::handle(hearth, req).await,
         den::Route::Sidecar(token, track) => playback::sidecar(hearth, &token, track, req).await,
+        den::Route::Receipt(token) => playback::receipt(hearth, &token, req).await,
         own => hearth.den.answer(own, req.method(), req.headers()),
     }
 }

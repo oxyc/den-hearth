@@ -60,6 +60,9 @@ const MAX_SIDECAR_SESSIONS_PER_OWNER: usize = 32;
 const MAX_SIDECAR_SESSION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SIDECAR_OWNER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SIDECAR_BYTES: usize = 128 * 1024 * 1024;
+const RECEIPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_RECEIPTS: usize = 256;
+const RECEIPT_BODY: usize = 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 enum BodyReadError {
@@ -194,6 +197,7 @@ pub struct Playback {
     records: Mutex<HashMap<(String, String, String), Record>>,
     metrics: Metrics,
     sidecars: Mutex<HashMap<String, SidecarSession>>,
+    receipts: Mutex<HashMap<String, ReceiptSession>>,
 }
 
 struct SidecarSession {
@@ -201,6 +205,25 @@ struct SidecarSession {
     owner: String,
     bytes: usize,
     tracks: HashMap<i64, Arc<str>>,
+}
+
+#[derive(Clone)]
+struct ReceiptContext {
+    library: String,
+    kid: String,
+    id: String,
+    public: Vec<u8>,
+    callback: String,
+}
+
+struct ReceiptSession {
+    expires: Instant,
+    context: ReceiptContext,
+    title: Value,
+    season: Option<u64>,
+    episode: Option<u64>,
+    underlying_end: Option<String>,
+    sealed: Option<String>,
 }
 
 #[derive(Default)]
@@ -256,6 +279,7 @@ impl Playback {
             records: Mutex::new(HashMap::new()),
             metrics: Metrics::default(),
             sidecars: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -303,6 +327,54 @@ impl Playback {
         let mut sessions = self.sidecars.lock().await;
         sessions.retain(|_, session| session.expires > now);
         sessions.get(token)?.tracks.get(&track).cloned()
+    }
+
+    async fn attach_receipt(
+        &self,
+        snapshot: &mut Snapshot,
+        context: ReceiptContext,
+        title: Value,
+        season: Option<u64>,
+        episode: Option<u64>,
+    ) {
+        if !snapshot.status.is_success() {
+            return;
+        }
+        let Ok(mut answer) = serde_json::from_slice::<Value>(&snapshot.body) else { return };
+        let Some(object) = answer.as_object_mut() else { return };
+        let session = object.entry("session").or_insert_with(|| json!({}));
+        let Some(session) = session.as_object_mut() else { return };
+        let underlying_end = session.get("endUrl").and_then(Value::as_str).map(str::to_owned);
+        let now = Instant::now();
+        let mut receipts = self.receipts.lock().await;
+        receipts.retain(|_, receipt| receipt.expires > now);
+        if receipts.len() >= MAX_RECEIPTS {
+            return;
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("the OS random source is unavailable");
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        session.insert("endUrl".into(), Value::String(format!("/den/_receipt/{token}")));
+        let Ok(body) = serde_json::to_vec(&answer) else { return };
+        if body.len() > MAX_ANSWER {
+            return;
+        }
+        snapshot.body = Bytes::from(body);
+        if let Ok(length) = HeaderValue::from_str(&snapshot.body.len().to_string()) {
+            snapshot.headers.insert(CONTENT_LENGTH, length);
+        }
+        receipts.insert(
+            token,
+            ReceiptSession {
+                expires: now + RECEIPT_FOR,
+                context,
+                title,
+                season,
+                episode,
+                underlying_end,
+                sealed: None,
+            },
+        );
     }
 
     pub fn summary(&self) -> &'static str {
@@ -486,6 +558,31 @@ pub(crate) fn trusted_edge(hearth: &Hearth, parts: &hyper::http::request::Parts)
     secret_ok && peer.is_some() && peer == remux.cfg.public_session_proxy
 }
 
+fn receipt_context(hearth: &Hearth, parts: &hyper::http::request::Parts) -> Option<ReceiptContext> {
+    if !trusted_edge(hearth, parts) {
+        return None;
+    }
+    let text = |name: &str| parts.headers.get(name)?.to_str().ok().map(str::to_owned);
+    let library = text("x-den-receipt-library")?;
+    let kid = text("x-den-receipt-kid")?;
+    let id = text("x-den-receipt-id")?;
+    let callback = text("x-den-receipt-token")?;
+    let public = text("x-den-receipt-public").and_then(|value| den_assistant::b64url_decode(&value))?;
+    let hex32 = |value: &str| {
+        value.len() == 32 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if !hex32(&library)
+        || !hex32(&kid)
+        || !hex32(&id)
+        || callback.len() != 43
+        || public.len() != den_assistant::KEM_PUBLIC_LEN
+        || den_assistant::key_id(&public) != kid
+    {
+        return None;
+    }
+    Some(ReceiptContext { library, kid, id, public, callback })
+}
+
 fn owner_scope(hearth: &Hearth, parts: &hyper::http::request::Parts) -> String {
     if trusted_edge(hearth, parts) {
         if let Some(owner) = parts.headers.get("x-den-owner").and_then(|v| v.to_str().ok()) {
@@ -500,7 +597,9 @@ fn owner_scope(hearth: &Hearth, parts: &hyper::http::request::Parts) -> String {
 
 /// The request Remux may be handed, and the two delivery flags that stay here: `directFailed` (skip the managed
 /// stream) and `directOnly` (the managed stream or a refusal, never a Remux session in its place).
-fn validate_request(mut value: Value) -> Result<(Value, bool, bool, Option<i64>), ()> {
+type ValidatedRequest = (Value, bool, bool, Option<i64>, Option<Value>);
+
+fn validate_request(mut value: Value) -> Result<ValidatedRequest, ()> {
     let object = value.as_object_mut().ok_or(())?;
     let direct_failed = match object.remove("directFailed") {
         None => false,
@@ -520,10 +619,25 @@ fn validate_request(mut value: Value) -> Result<(Value, bool, bool, Option<i64>)
         Some(Value::Number(value)) => Some(value.as_i64().filter(|index| *index >= 0).ok_or(())?),
         Some(_) => return Err(()),
     };
+    let title = match object.remove("title") {
+        None => None,
+        Some(title) => {
+            let title_object = title.as_object().ok_or(())?;
+            let kind = title_object.get("type").and_then(Value::as_str);
+            let id = title_object.get("id").and_then(Value::as_u64);
+            if title_object.len() != 2
+                || !matches!(kind, Some("movie" | "tv"))
+                || !id.is_some_and(|id| id > 0 && id <= den_assistant::MAX_SAFE_INTEGER)
+            {
+                return Err(());
+            }
+            Some(title)
+        }
+    };
     let request: den_remux::PlaybackRequest = serde_json::from_value(value).map_err(|_| ())?;
     request.validate().map_err(|_| ())?;
     let request = serde_json::to_value(request).map_err(|_| ())?;
-    Ok((request, direct_failed, direct_only, subtitle))
+    Ok((request, direct_failed, direct_only, subtitle, title))
 }
 
 fn install_url(config: &str) -> String {
@@ -682,6 +796,131 @@ where
         .unwrap();
     stamp(&mut response);
     response
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TerminalEvidence {
+    position_seconds: u64,
+    duration_seconds: u64,
+    completed: bool,
+}
+
+fn seal_terminal(session: &ReceiptSession, evidence: &TerminalEvidence, ended_at: u64) -> Option<String> {
+    let receipt = den_assistant::PlaybackReceipt {
+        library: &session.context.library,
+        kid: &session.context.kid,
+        id: &session.context.id,
+        title: &session.title,
+        season: session.season,
+        episode: session.episode,
+        position_seconds: evidence.position_seconds,
+        duration_seconds: evidence.duration_seconds,
+        completed: evidence.completed,
+        ended_at,
+        expires_at: ended_at.saturating_add(7 * 86_400_000),
+    };
+    let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
+    den_assistant::seal_playback_receipt_with_rng(&session.context.public, &receipt, &mut rng).ok()
+}
+
+fn deliver_receipt(hearth: &Hearth, context: &ReceiptContext, sealed: String) {
+    let Some(remux) = hearth.remux.as_ref() else { return };
+    let (Some(base), Some(_)) = (remux.cfg.edge_report_url.clone(), remux.cfg.edge_secret.as_ref()) else {
+        return;
+    };
+    let http = remux.http.clone();
+    let token = context.callback.clone();
+    tokio::spawn(async move {
+        for attempt in 0..5 {
+            let sent = http
+                .post(format!("{base}/playback/receipts/callback"))
+                .bearer_auth(&token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(json!({"sealed": sealed}).to_string())
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
+            if sent.as_ref().is_ok_and(|response| response.status().is_success()) {
+                return;
+            }
+            if attempt < 4 {
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+        }
+        eprintln!("playback receipt callback failed");
+    });
+}
+
+/// End one managed playback lifecycle. The capability, not a cookie or install, authorizes this narrow operation.
+/// Empty legacy ends still release Remux; only checked terminal evidence produces a receipt.
+pub async fn receipt<B>(hearth: &Arc<Hearth>, token: &str, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if !matches!(*req.method(), Method::POST | Method::DELETE) {
+        return den_http::not_found();
+    }
+    let (parts, body) = req.into_parts();
+    let evidence = if parts.method == Method::POST {
+        let bytes = match http_body_util::Limited::new(body, RECEIPT_BODY).collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(_) => return answer(StatusCode::BAD_REQUEST, "bad_request", None),
+        };
+        if bytes.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<TerminalEvidence>(&bytes) {
+                Ok(value)
+                    if value.duration_seconds > 0
+                        && value.position_seconds <= value.duration_seconds
+                        && value.duration_seconds <= den_assistant::MAX_SAFE_INTEGER =>
+                {
+                    Some(value)
+                }
+                _ => return answer(StatusCode::BAD_REQUEST, "bad_request", None),
+            }
+        }
+    } else {
+        None
+    };
+
+    let now_instant = Instant::now();
+    let (underlying, delivery) = {
+        let mut receipts = hearth.playback.receipts.lock().await;
+        receipts.retain(|_, receipt| receipt.expires > now_instant);
+        let Some(session) = receipts.get_mut(token) else { return den_http::not_found() };
+        let delivery = evidence.and_then(|evidence| {
+            if session.sealed.is_none() {
+                let ended_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis()
+                    .try_into()
+                    .ok()?;
+                let sealed = seal_terminal(session, &evidence, ended_at);
+                session.sealed = sealed;
+            }
+            session.sealed.clone().map(|sealed| (session.context.clone(), sealed))
+        });
+        (session.underlying_end.clone(), delivery)
+    };
+
+    if let Some((context, sealed)) = delivery {
+        deliver_receipt(hearth, &context, sealed);
+    }
+    if let (Some(end), Some(remux)) = (underlying, hearth.remux.clone()) {
+        tokio::spawn(async move {
+            let Ok(request) =
+                Request::builder().method(Method::DELETE).uri(end).body(http_body_util::Empty::new())
+            else {
+                return;
+            };
+            let _ = den_remux::handle_request(remux, request).await;
+        });
+    }
+    finalized()
 }
 
 fn with_prepare_timing(mut response: Response<Body>, elapsed: Duration) -> Response<Body> {
@@ -1019,11 +1258,20 @@ where
         Some(parsed) => parsed,
         None => return refuse(StatusCode::BAD_REQUEST, "bad_request", None, rid.as_deref()),
     };
-    let (request, direct_failed, direct_only, subtitle_track) = parsed;
+    let (request, direct_failed, direct_only, subtitle_track, receipt_title) = parsed;
+    let season = request.get("season").and_then(Value::as_u64);
+    let episode = request.get("episode").and_then(Value::as_u64);
+    let receipt = receipt_context(hearth, &parts).zip(receipt_title).filter(|(_, title)| {
+        match title.get("type").and_then(Value::as_str) {
+            Some("movie") => season.is_none() && episode.is_none(),
+            Some("tv") => season.is_some() && episode.is_some(),
+            _ => false,
+        }
+    });
     let canonical = Bytes::from(
         serde_json::to_vec(
             &json!({"request": request, "directFailed": direct_failed, "directOnly": direct_only,
-                    "subtitleTrack": subtitle_track}),
+                    "subtitleTrack": subtitle_track, "receiptTitle": receipt.as_ref().map(|(_, title)| title)}),
         )
         .unwrap(),
     );
@@ -1193,6 +1441,9 @@ where
     if let Some(signal) = debrid_signal().filter(|_| !saved.status.is_success()) {
         apply_debrid_signal(&mut saved, signal).await;
     }
+    if let Some((context, title)) = receipt {
+        hearth.playback.attach_receipt(&mut saved, context, title, season, episode).await;
+    }
     if saved.status.is_success() {
         if delivered_direct {
             hearth.playback.metrics.operation_direct.fetch_add(1, Relaxed);
@@ -1245,15 +1496,17 @@ mod tests {
 
     #[test]
     fn request_fields_are_closed_and_direct_failed_is_not_forwarded() {
-        let (value, failed, only, subtitle) =
+        let (value, failed, only, subtitle, title) =
             validate_request(json!({"imdb": "tt1", "directFailed": true})).unwrap();
         assert!(failed && !only);
         assert_eq!(subtitle, None);
+        assert_eq!(title, None);
         assert_eq!(value, json!({"imdb": "tt1"}));
-        let (value, failed, only, subtitle) =
+        let (value, failed, only, subtitle, title) =
             validate_request(json!({"imdb": "tt1", "directOnly": true, "subtitleTrack": 3})).unwrap();
         assert!(only && !failed);
         assert_eq!(subtitle, Some(3));
+        assert_eq!(title, None);
         assert_eq!(value, json!({"imdb": "tt1"}), "directOnly is not forwarded to Remux");
         assert_eq!(managed_request(&value, subtitle).unwrap().subtitle, Some(3));
         assert!(validate_request(json!({"imdb": "tt1", "directOnly": "yes"})).is_err());
@@ -1265,6 +1518,62 @@ mod tests {
         assert!(validate_request(json!({"imdb": "tt1", "maxBitrate": 0})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "subtitleTrack": -1})).is_err());
         assert!(validate_request(json!({"imdb": "tt1", "season": 1})).is_err());
+        let (_, _, _, _, title) = validate_request(json!({
+            "imdb": "tt1",
+            "title": {"type": "movie", "id": 550}
+        }))
+        .unwrap();
+        assert_eq!(title, Some(json!({"type": "movie", "id": 550})));
+        assert!(validate_request(json!({"imdb": "tt1", "title": {"type": "movie", "id": 0}})).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_direct_answer_gains_a_receipt_lifecycle_and_terminal_evidence_opens_only_at_home() {
+        let secret = [7u8; 32];
+        let public = den_assistant::kem_public(&secret);
+        let kid = den_assistant::key_id(&public);
+        let context = ReceiptContext {
+            library: "4c1b7a0e9d3f2c8b5a6e1d0f7c3b9a2e".into(),
+            kid: kid.clone(),
+            id: "94619420c64002287a3ad7ecad5dfa6b".into(),
+            public,
+            callback: "A".repeat(43),
+        };
+        let playback = Playback::new(true);
+        let mut answer = Snapshot {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(
+                br#"{"url":"https://video.test/stream.m3u8","release":{"label":"Film","filename":"Film.mkv","size":42}}"#,
+            ),
+        };
+        let title = json!({"type": "movie", "id": 550});
+        playback.attach_receipt(&mut answer, context, title.clone(), None, None).await;
+        let body: Value = serde_json::from_slice(&answer.body).unwrap();
+        let end = body["session"]["endUrl"].as_str().unwrap();
+        let token = end.strip_prefix("/den/_receipt/").unwrap();
+        let receipts = playback.receipts.lock().await;
+        let session = receipts.get(token).unwrap();
+        assert_eq!(session.underlying_end, None, "a direct stream has no Remux session to end");
+
+        let ended_at = 1_790_000_000_000;
+        let sealed = seal_terminal(
+            session,
+            &TerminalEvidence { position_seconds: 5_000, duration_seconds: 6_000, completed: false },
+            ended_at,
+        )
+        .unwrap();
+        let opened = den_assistant::open_playback_receipt(
+            &[(kid, secret)],
+            &session.context.library,
+            &sealed,
+            &Default::default(),
+            ended_at,
+        )
+        .unwrap();
+        assert_eq!(opened.title, title);
+        assert_eq!(opened.position_seconds, 5_000);
+        assert!(!opened.completed);
     }
 
     #[test]
