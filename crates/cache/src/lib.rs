@@ -14,6 +14,7 @@ mod name;
 #[cfg(test)]
 mod tests;
 
+use std::hash::BuildHasher;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};

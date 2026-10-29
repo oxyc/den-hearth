@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
+use std::hash::BuildHasher;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
