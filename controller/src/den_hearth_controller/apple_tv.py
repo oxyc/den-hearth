@@ -24,9 +24,11 @@ PYATV_ERRORS = tuple(
 
 # tvOS can acknowledge launch requests while its wake-time profile chooser still
 # owns the foreground. It dismisses that chooser without changing the selected
-# profile, so retry the same idempotent launch across that bounded window. Never
-# synthesize navigation or use the separate account-switching Companion API.
-LAUNCH_RETRY_DELAYS = (0, 15, 15)
+# profile, so retry the same idempotent launch across that bounded window. The
+# early retries catch tvOS soon after it hands the foreground to Home; the 15-
+# and 30-second attempts retain the slower wake fallback. Never synthesize
+# navigation or use the separate account-switching Companion API.
+LAUNCH_RETRY_DELAYS = (0, 3, 3, 4, 5, 15)
 
 
 class AppleTVClient:
