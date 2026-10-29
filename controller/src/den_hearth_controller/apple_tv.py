@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import inspect
 from ipaddress import ip_address
 import os
 from pathlib import Path
@@ -20,6 +21,14 @@ PYATV_ERRORS = tuple(
     for value in vars(pyatv.exceptions).values()
     if isinstance(value, type) and issubclass(value, Exception)
 )
+
+# tvOS can acknowledge launch requests while its wake-time profile chooser still
+# owns the foreground. It dismisses that chooser without changing the selected
+# profile, so retry the same idempotent launch across that bounded window. The
+# early retries catch tvOS soon after it hands the foreground to Home; the 15-
+# and 30-second attempts retain the slower wake fallback. Never synthesize
+# navigation or use the separate account-switching Companion API.
+LAUNCH_RETRY_DELAYS = (0, 3, 3, 4, 5, 15)
 
 
 class AppleTVClient:
@@ -56,27 +65,33 @@ class AppleTVClient:
             if config.get_service(Protocol.Companion) is not None
         ]
 
+    @staticmethod
+    def _matches(config, identifier: str) -> bool:
+        return (
+            config.get_service(Protocol.Companion) is not None
+            and (
+                config.identifier == identifier
+                or identifier in config.all_identifiers
+            )
+        )
+
     async def _find(self, identifier: str, address: str | None = None):
         storage = await self._storage()
         configs = await pyatv.scan(
             asyncio.get_running_loop(),
             timeout=self.scan_timeout,
-            identifier=identifier,
-            protocol=Protocol.Companion,
             storage=storage,
         )
+        configs = [config for config in configs if self._matches(config, identifier)]
         if not configs and address:
             ip_address(address)
             configs = await pyatv.scan(
                 asyncio.get_running_loop(),
                 timeout=self.scan_timeout,
                 hosts=[address],
-                protocol=Protocol.Companion,
                 storage=storage,
             )
-            configs = [
-                config for config in configs if identifier in config.all_identifiers
-            ]
+            configs = [config for config in configs if self._matches(config, identifier)]
         if not configs:
             raise LookupError("offline")
         return configs[0], storage
@@ -97,7 +112,9 @@ class AppleTVClient:
             await storage.save()
             os.chmod(self.storage_path, 0o600)
         finally:
-            pairing.close()
+            closing = pairing.close()
+            if inspect.isawaitable(closing):
+                await closing
         return {
             "id": config.identifier,
             "name": config.name,
@@ -126,6 +143,20 @@ class AppleTVClient:
         finally:
             await self._close(atv)
 
+    @staticmethod
+    async def _launch_after_profile_gate(atv, bundle_id: str) -> None:
+        last_error: Exception | None = None
+        for delay in LAUNCH_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(atv.apps.launch_app(bundle_id), 10)
+                last_error = None
+            except (asyncio.TimeoutError, pyatv.exceptions.ProtocolError) as error:
+                last_error = error
+        if last_error is not None:
+            raise last_error
+
     async def wake_and_launch(self, target: Target, stage: StageFn) -> str | None:
         if not target.apple_tv_id or not target.selected_bundle_id:
             return "internal"
@@ -152,9 +183,9 @@ class AppleTVClient:
                 10,
             )
             try:
-                await asyncio.wait_for(atv.power.turn_on(await_new_state=True), 15)
+                await asyncio.wait_for(atv.power.turn_on(), 15)
             except asyncio.TimeoutError:
-                # Some tvOS versions do not publish the new power state. Reconnect is the readiness proof.
+                # Some tvOS versions do not answer the wake command. Reconnect is the readiness proof.
                 pass
             await stage(
                 "receiver-awake",
@@ -194,7 +225,7 @@ class AppleTVClient:
                 None,
             )
             await stage("launch-requested", "started", None, None)
-            await asyncio.wait_for(atv.apps.launch_app(target.selected_bundle_id), 10)
+            await self._launch_after_profile_gate(atv, target.selected_bundle_id)
             await stage(
                 "launch-requested",
                 "ok",

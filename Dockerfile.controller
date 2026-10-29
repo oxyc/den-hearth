@@ -1,5 +1,5 @@
 # pyatv 0.18.0 sidecar. Host networking is selected by deployment, never by the image.
-FROM python:3.12.12-slim-trixie@sha256:f3fa41d74a768c2fce8016b98c191ae8c1bacd8f1152870a3f9f87d350920b7c AS build
+FROM python:3.15.0-slim-trixie@sha256:f5b92f2a669a4c347044f29367f31983280b648250ca94dea66f98c53bc87e58 AS build
 COPY --from=ghcr.io/astral-sh/uv:0.11.28@sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install --no-install-recommends -y g++ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -9,7 +9,10 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY controller/src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
-FROM python:3.12.12-slim-trixie@sha256:f3fa41d74a768c2fce8016b98c191ae8c1bacd8f1152870a3f9f87d350920b7c
+FROM python:3.15.0-slim-trixie@sha256:f5b92f2a669a4c347044f29367f31983280b648250ca94dea66f98c53bc87e58
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 65532 nonroot && useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --create-home nonroot
 RUN install -d -o 65532 -g 65532 -m 0700 /state /run/den-controller
 COPY --from=build --chown=65532:65532 /app /app

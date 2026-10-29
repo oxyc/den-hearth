@@ -8,13 +8,17 @@ import stat
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import web
+from pyatv import exceptions
+from pyatv.const import Protocol
 
+from den_hearth_controller.apple_tv import AppleTVClient, LAUNCH_RETRY_DELAYS
 from den_hearth_controller.coordinator import Coordinator
 from den_hearth_controller.edge import EdgeClient
 from den_hearth_controller.ipc import RegistrationServer
-from den_hearth_controller.models import WakeEvent
+from den_hearth_controller.models import Target, WakeEvent
 from den_hearth_controller.state import StateStore
 
 
@@ -116,6 +120,185 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         writer.close()
         await writer.wait_closed()
         await server.close()
+
+    async def test_find_accepts_discovery_identifier_from_all_identifiers(self):
+        class Config:
+            identifier = "companion-id"
+            all_identifiers = {"companion-id", "36:FB:AA:BB:CC:DD"}
+
+            @staticmethod
+            def get_service(protocol):
+                return object() if protocol == Protocol.Companion else None
+
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        storage = object()
+        client._storage = AsyncMock(return_value=storage)
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.scan",
+            new=AsyncMock(return_value=[Config()]),
+        ) as scan:
+            config, found_storage = await client._find("36:FB:AA:BB:CC:DD")
+
+        self.assertEqual(config.identifier, "companion-id")
+        self.assertIs(found_storage, storage)
+        self.assertNotIn("identifier", scan.await_args.kwargs)
+        self.assertNotIn("protocol", scan.await_args.kwargs)
+
+    async def test_find_address_fallback_preserves_all_identifiers(self):
+        class Config:
+            identifier = "companion-id"
+            all_identifiers = {"companion-id", "36:FB:AA:BB:CC:DD"}
+
+            @staticmethod
+            def get_service(protocol):
+                return object() if protocol == Protocol.Companion else None
+
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        client._storage = AsyncMock(return_value=object())
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.scan",
+            new=AsyncMock(side_effect=[[], [Config()]]),
+        ) as scan:
+            config, _ = await client._find(
+                "36:FB:AA:BB:CC:DD", "192.0.2.4"
+            )
+
+        self.assertEqual(config.identifier, "companion-id")
+        self.assertEqual(scan.await_count, 2)
+        for call in scan.await_args_list:
+            self.assertNotIn("protocol", call.kwargs)
+        self.assertEqual(scan.await_args_list[1].kwargs["hosts"], ["192.0.2.4"])
+
+    async def test_find_rejects_matching_identifier_without_companion(self):
+        class Config:
+            identifier = "36:FB:AA:BB:CC:DD"
+            all_identifiers = {identifier}
+
+            @staticmethod
+            def get_service(protocol):
+                return None
+
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        client._storage = AsyncMock(return_value=object())
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.scan",
+            new=AsyncMock(return_value=[Config()]),
+        ):
+            with self.assertRaisesRegex(LookupError, "offline"):
+                await client._find("36:FB:AA:BB:CC:DD")
+
+    async def test_pair_awaits_async_close(self):
+        storage_path = Path(self.temp.name) / "pyatv.conf"
+        storage_path.touch()
+        client = AppleTVClient(storage_path)
+        config = MagicMock(
+            identifier="companion-id", name="Living Room", address="192.0.2.4"
+        )
+        storage = MagicMock()
+        storage.save = AsyncMock()
+        client._find = AsyncMock(return_value=(config, storage))
+        pairing = MagicMock(has_paired=True)
+        pairing.begin = AsyncMock()
+        pairing.finish = AsyncMock()
+        pairing.close = AsyncMock()
+
+        with patch(
+            "den_hearth_controller.apple_tv.pyatv.pair",
+            new=AsyncMock(return_value=pairing),
+        ):
+            result = await client.pair("36:FB:AA:BB:CC:DD", lambda: "1234")
+
+        self.assertEqual(result["id"], "companion-id")
+        pairing.pin.assert_called_once_with(1234)
+        pairing.close.assert_awaited_once_with()
+
+    async def test_wake_uses_companion_power_without_wait_then_reconnects(self):
+        target = Target(
+            id="1" * 32,
+            device_id="0" * 16,
+            name="Living Room",
+            inbox="a" * 64,
+            assistant="b" * 32,
+            bundle_id="fi.oxy.den",
+            selected_bundle_id="fi.oxy.den",
+            apple_tv_id="36:FB:AA:BB:CC:DD",
+            last_address="192.0.2.4",
+        )
+        config = MagicMock(address="192.0.2.4")
+        storage = object()
+        client = AppleTVClient(Path(self.temp.name) / "pyatv.conf")
+        client._find = AsyncMock(
+            side_effect=[(config, storage), (config, storage)]
+        )
+
+        waking = MagicMock()
+        waking.power.turn_on = AsyncMock()
+        waking.remote_control.wakeup = AsyncMock(
+            side_effect=AssertionError("Companion remote wake is unsupported")
+        )
+        waking.close.return_value = set()
+        ready = MagicMock()
+        ready.apps.app_list = AsyncMock(
+            return_value=[MagicMock(identifier="fi.oxy.den")]
+        )
+        ready.apps.launch_app = AsyncMock()
+        ready.close.return_value = set()
+        stage = AsyncMock()
+
+        with (
+            patch(
+                "den_hearth_controller.apple_tv.pyatv.connect",
+                new=AsyncMock(side_effect=[waking, ready]),
+            ),
+            patch(
+                "den_hearth_controller.apple_tv.asyncio.sleep", new=AsyncMock()
+            ) as sleep,
+        ):
+            result = await client.wake_and_launch(target, stage)
+
+        self.assertIsNone(result)
+        waking.power.turn_on.assert_awaited_once_with()
+        waking.remote_control.wakeup.assert_not_called()
+        self.assertEqual(client._find.await_count, 2)
+        waking.close.assert_called_once_with()
+        self.assertEqual(ready.apps.launch_app.await_count, 6)
+        ready.apps.launch_app.assert_awaited_with("fi.oxy.den")
+        self.assertEqual(
+            [call.args for call in sleep.await_args_list],
+            [(3,), (3,), (4,), (5,), (15,)],
+        )
+        ready.user_accounts.switch_account.assert_not_called()
+        ready.remote_control.select.assert_not_called()
+
+    async def test_launch_retries_protocol_errors_while_profile_gate_clears(self):
+        atv = MagicMock()
+        atv.apps.launch_app = AsyncMock(
+            side_effect=[
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
+                exceptions.ProtocolError("profile gate"),
+                None,
+            ]
+        )
+
+        with patch(
+            "den_hearth_controller.apple_tv.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            await AppleTVClient._launch_after_profile_gate(atv, "fi.oxy.den")
+
+        self.assertEqual(atv.apps.launch_app.await_count, 6)
+        self.assertEqual(
+            [call.args for call in sleep.await_args_list],
+            [(3,), (3,), (4,), (5,), (15,)],
+        )
+        self.assertEqual(
+            [sum(LAUNCH_RETRY_DELAYS[: index + 1]) for index in range(6)],
+            [0, 3, 6, 10, 15, 30],
+        )
+        atv.user_accounts.switch_account.assert_not_called()
+        atv.remote_control.select.assert_not_called()
 
     async def test_edge_poll_uses_least_privilege_header_and_bounded_shape(self):
         seen = {}

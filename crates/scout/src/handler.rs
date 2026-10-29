@@ -1410,10 +1410,12 @@ impl Inner {
                 if accounts > 0 {
                     status["addBudgetRemaining"] = json!(left);
                 }
-                // How TorBox has been answering, so a client can warn before playback fails. Absent until a TorBox
-                // call has been made. Down is degraded; slow is reported but the service is still doing its job.
-                if let Some(debrid) = self.deps.runtime.torbox.health.report() {
-                    if debrid["state"] == "down" && status["status"] == "ok" {
+                // How TorBox has been answering, so a client can warn before playback fails. Scout's direct API
+                // observations are authoritative. The separately cached public status page is only corroboration,
+                // or an explicitly sourced fallback before the first API call; it never makes Scout itself
+                // degraded (which would turn an external status-site answer into a rollout/liveness gate).
+                if let Some(debrid) = self.deps.runtime.torbox.health_report() {
+                    if debrid["state"] == "down" && debrid["source"] == "local" && status["status"] == "ok" {
                         status["status"] = json!("degraded");
                         status["reason"] = json!("debrid");
                         status["detail"] = json!(DEBRID_DOWN_DETAIL);

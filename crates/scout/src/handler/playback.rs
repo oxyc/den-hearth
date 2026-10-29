@@ -301,6 +301,11 @@ impl Inner {
             ..Default::default()
         };
         let mut resp = self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases).await;
+        if matches!(resp.status(), StatusCode::OK | StatusCode::FOUND | StatusCode::ACCEPTED) {
+            crate::continuity::remember_held(&*self.deps.cache, config, &rt);
+        } else if resp.status() == StatusCode::NOT_FOUND {
+            crate::continuity::forget(&*self.deps.cache, config, &rt);
+        }
         mark_debrid_health(&mut resp, config, self.deps.runtime.torbox.health.state());
         let route = if query_is(req, "probe", "1") { "probe" } else { "play" };
         crate::releaselog::observe(&rt, &rid, route, start.elapsed(), &resp);
