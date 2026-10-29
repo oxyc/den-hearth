@@ -187,6 +187,13 @@ down for the install, the play is answered at once as Scout's play route answers
 `{"error":"debrid_down","service":"torbox","reason":…}` with `X-Den-Degraded: debrid_down` and `Retry-After` to the
 next recovery probe. While TorBox is slow, a failed play keeps its code and carries `X-Den-Degraded: debrid_slow`.
 
+For a trusted Edge request carrying a playback-receipt capability, a successful direct or Remux answer replaces
+its end URL with a process-local `/den/_receipt/<capability>`. The player posts terminal position, duration and
+completion evidence there; Hearth timestamps and seals it to the household's published assistant dropbox key,
+then sends only the ciphertext to Edge. An empty POST or DELETE remains a plain session release and emits no
+receipt. Receipt sessions are bounded, expire after seven days and survive neither a restart nor redeploy; see
+[den-spec playback receipts v1](https://github.com/oxyc/den-spec/blob/main/wire/playback-receipts-v1.md).
+
 `/den/<config>/wanted` keeps a season download looking for releases while no Den client is open
 (`crates/hearth/src/wanted.rs`). The client holding the download lease `POST`s `{"items": [...]}`, one per wanted
 row: its content key, IMDb id, season and episode, air date, the releases already tried, the row's search count and

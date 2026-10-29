@@ -21,7 +21,8 @@ den-http.workspace = true
 den-seal.workspace = true
 # The download rules both clients run (`download_retry`, `rank_releases`), for the searches Hearth makes for them
 # (`wanted.rs`). Pinned like den-atlas pins it; a ranking change reaches Hearth with a bump of this rev.
-den-sync = { git = "https://github.com/oxyc/den-core.git", rev = "8d975ffc259853f3d3115f6a186aea63f06c97dd" }
+den-sync = { git = "https://github.com/oxyc/den-core.git", rev = "9e1b54edd1fe9837fa0f7831b77e59803cba0701" }
+den-assistant = { git = "https://github.com/oxyc/den-core.git", rev = "9e1b54edd1fe9837fa0f7831b77e59803cba0701" }
 # The services were written for a current_thread runtime; one process serving all of them has more to
 # do, so hearth runs a small multi-thread pool instead (HEARTH_WORKER_THREADS).
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
