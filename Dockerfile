@@ -59,10 +59,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-c
 # JS runtime for yt-dlp. Recent yt-dlp REQUIRES one to solve YouTube's signature/nsig challenge —
 # without it extraction is deprecated, formats go missing, and playback fails intermittently. deno
 # is the one yt-dlp enables by default.
-ARG DENO_VERSION=2.9.7
+ARG DENO_VERSION=2.9.8
 # Checksummed like yt-dlp below: this binary executes YouTube's JS in our container, so it is the
 # last thing that should arrive unverified.
-ARG DENO_SHA256_AMD64=c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490
+ARG DENO_SHA256_AMD64=e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) arch=x86_64-unknown-linux-gnu; sha=$DENO_SHA256_AMD64 ;; \
