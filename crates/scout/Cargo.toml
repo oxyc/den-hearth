@@ -54,7 +54,7 @@ tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
 regex = "1"
 # Go `regexp2`: the patterns that need lookaround, which RE2 lacks (rank.go's "upscaled" junk pattern,
 # season.go's episode matchers).
-fancy-regex = "0.19"
+fancy-regex = "0.20"
 # Go `net/url`, for the household source links in sources.go.
 url = "2"
 # The two-tier cache (cache.rs `MemoryCache`, diskcache.rs `TieredCache`), shared with Subtitles.
