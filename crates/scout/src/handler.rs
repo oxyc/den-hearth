@@ -147,6 +147,16 @@ pub(crate) const REBUILD_COOLOFF: Duration = Duration::from_secs(60);
 /// rebuilt by the next request for that title, which is the same outcome as never having booked it.
 pub(crate) const MAX_CONCURRENT_REBUILDS: usize = 8;
 
+/// How often one list (a title under one config, origin and variant) may be rebuilt on request with `?fresh=1`.
+pub(crate) const FRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Says whether `?fresh=1` was honoured: `rebuilt`, or `limited` (answered as a plain request).
+pub(crate) const X_DEN_FRESH: HeaderName = HeaderName::from_static("x-den-fresh");
+
+/// How many lists the `?fresh=1` ledger remembers. Entries are only added once the config opens and are swept when
+/// older than FRESH_INTERVAL; past the bound a fresh request is served like a plain one.
+pub(crate) const MAX_FRESH_KEYS: usize = 4096;
+
 /// What /health says about that state, and what the log line marking the flip says too.
 pub(crate) const INDEXERS_DOWN_DETAIL: &str =
     "No indexer has answered the last few stream-list builds, so lists are coming back empty.";
@@ -376,6 +386,37 @@ impl RebuildGate {
     #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live
+    }
+}
+
+/// When each list was last rebuilt on `?fresh=1`: at most one rebuild per key per FRESH_INTERVAL, and never more
+/// than MAX_FRESH_KEYS keys held.
+#[derive(Default)]
+pub(crate) struct FreshGate {
+    at: HashMap<String, Instant>,
+}
+
+impl FreshGate {
+    /// Records a rebuild of `key` at `now`. False when one ran within FRESH_INTERVAL, or when the ledger is full of
+    /// entries still inside it.
+    pub(crate) fn claim(&mut self, key: &str, now: Instant) -> bool {
+        let live = |at: &Instant| now.saturating_duration_since(*at) < FRESH_INTERVAL;
+        if self.at.get(key).is_some_and(live) {
+            return false;
+        }
+        if self.at.len() >= MAX_FRESH_KEYS {
+            self.at.retain(|_, at| live(at));
+            if self.at.len() >= MAX_FRESH_KEYS {
+                return false;
+            }
+        }
+        self.at.insert(key.to_owned(), now);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.at.len()
     }
 }
 
@@ -807,6 +848,8 @@ struct ListJob {
     cache_key: String,
     client: Option<ClientPlayable>,
     rid: String,
+    /// Built past the kept indexer answers (`?fresh=1`).
+    fresh: bool,
 }
 
 impl ListJob {
@@ -819,7 +862,13 @@ impl ListJob {
             cache_key: key.cache_key.to_owned(),
             client,
             rid,
+            fresh: false,
         }
+    }
+
+    fn fresh(mut self) -> ListJob {
+        self.fresh = true;
+        self
     }
 }
 
@@ -839,6 +888,8 @@ pub(crate) struct RankOpts<'a> {
     pub(crate) rid: &'a str,
     /// The viewer's preferred audio languages, most wanted first; empty where the request names none (a stream list).
     pub(crate) audio: &'a [String],
+    /// Ask every indexer again instead of answering from its kept answer.
+    pub(crate) fresh: bool,
 }
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
@@ -855,6 +906,8 @@ pub(crate) struct Inner {
     /// The probe fan-out's own singleflight (Go shares `sf` and prefixes the key with "probe:").
     probe_flight: Flight<()>,
     rebuilds: Mutex<RebuildGate>,
+    /// `?fresh=1` rebuilds, by list key.
+    fresh: Mutex<FreshGate>,
     /// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
     /// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
     scrape_fails: AtomicI32,
@@ -1109,7 +1162,7 @@ impl Handler {
 fn add_cors(resp: &mut Resp) {
     den_http::cors_stamp(
         resp.headers_mut(),
-        "Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy",
+        "Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy",
     );
 }
 
@@ -1227,6 +1280,7 @@ impl Inner {
             flights: Mutex::new(HashMap::new()),
             probe_flight: Flight::new(),
             rebuilds: Mutex::new(RebuildGate::default()),
+            fresh: Mutex::new(FreshGate::default()),
             scrape_fails: AtomicI32::new(0),
             partial_builds: AtomicI32::new(0),
             avail_in_flight: Mutex::new(HashSet::new()),
@@ -1289,6 +1343,7 @@ impl Inner {
                     check_cache: true,
                     rid: "",
                     audio: &request.audio,
+                    fresh: false,
                 },
             )
             .await;

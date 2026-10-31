@@ -20,6 +20,7 @@ mod decisionlog;
 mod deps;
 mod diskcache;
 mod extra;
+mod freshlist;
 mod go_wire_vectors;
 mod golden;
 mod handler;

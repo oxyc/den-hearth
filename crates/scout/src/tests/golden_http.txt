@@ -4,7 +4,7 @@
 < access-control-allow-headers: *
 < access-control-allow-methods: GET, HEAD, POST, DELETE, OPTIONS
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < access-control-max-age: 86400
 < timing-allow-origin: *
 
@@ -13,7 +13,7 @@
 > GET /
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -23,7 +23,7 @@
 > GET /configure
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -33,7 +33,7 @@
 > GET /manifest.json
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -43,7 +43,7 @@
 > GET /config-key
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -53,7 +53,7 @@
 > GET /health
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -63,7 +63,7 @@
 > HEAD /health
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -73,7 +73,7 @@
 > POST /health
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: GET, HEAD
 < cache-control: no-store
 < content-type: application/json
@@ -84,7 +84,7 @@
 > PUT /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: GET, HEAD
 < cache-control: no-store
 < content-type: application/json
@@ -96,7 +96,7 @@
 > authorization: …
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -106,7 +106,7 @@
 > GET /nope
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -116,7 +116,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/nope/x
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -126,7 +126,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/nope.json
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -136,7 +136,7 @@
 > GET /not-a-config/stream/movie/tt1234567.json
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -147,7 +147,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -160,7 +160,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -174,7 +174,7 @@
 > if-none-match: …
 < 304
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < etag: <the tag revalidated>
 < server-timing: cache;desc=hit, total;dur=*
@@ -187,7 +187,7 @@
 > if-none-match: …
 < 304
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < etag: <the tag revalidated>
 < server-timing: cache;desc=hit, total;dur=*
@@ -199,7 +199,7 @@
 > HEAD /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the previous response's>
@@ -213,7 +213,7 @@
 > x-den-playable: …
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -227,7 +227,7 @@
 > x-den-playable: …
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -240,7 +240,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/series/tt1234567:1:2.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -253,7 +253,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json?debug=1
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: scrape;dur=*, cache-check;dur=*, total;dur=*
@@ -265,7 +265,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json?debug=1
 < 429
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 10
@@ -277,7 +277,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwic2NvcGUiOiJhdmFpbGFiaWxpdHkifQ/stream/movie/tt1234567.json
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -288,7 +288,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -301,7 +301,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=60
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -314,7 +314,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -327,7 +327,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -341,7 +341,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 302
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-length: 0
 < location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
@@ -353,7 +353,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 302
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-length: 0
 < location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
@@ -365,7 +365,7 @@
 > HEAD /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: GET
 < cache-control: no-store
 < content-type: application/json
@@ -377,7 +377,7 @@
 > POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: GET, HEAD
 < cache-control: no-store
 < content-type: application/json
@@ -388,7 +388,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/nope
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -399,7 +399,7 @@
 > GET /not-a-config/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -410,7 +410,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9?probe=1
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -421,7 +421,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9?probe=1
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -432,7 +432,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: resolve;dur=*, total;dur=*
@@ -443,7 +443,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
 < 202
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -454,7 +454,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
 < 202
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -465,7 +465,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsImYiOjB9
 < 503
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 60
@@ -477,7 +477,7 @@
 > DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 501
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -487,7 +487,7 @@
 > DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/nope
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -497,7 +497,7 @@
 > DELETE /health
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: GET, HEAD
 < cache-control: no-store
 < content-type: application/json
@@ -508,7 +508,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/account
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -518,7 +518,7 @@
 > GET /not-a-config/account
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -528,7 +528,7 @@
 > GET /validate
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: POST
 < cache-control: no-store
 < content-type: application/json
@@ -539,7 +539,7 @@
 > POST /validate
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -549,7 +549,7 @@
 > POST /validate
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -559,7 +559,7 @@
 > POST /validate
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -569,7 +569,7 @@
 > POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -579,7 +579,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: POST
 < cache-control: no-store
 < content-type: application/json
@@ -590,7 +590,7 @@
 > POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -600,7 +600,7 @@
 > POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -610,7 +610,7 @@
 > POST /not-a-config/availability
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -620,7 +620,7 @@
 > POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/x/availability
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -631,7 +631,7 @@
 > authorization: …
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -642,7 +642,7 @@
 > authorization: …
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -653,7 +653,7 @@
 > authorization: …
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: text/plain; version=0.0.4; charset=utf-8
 < timing-allow-origin: *
@@ -663,7 +663,7 @@
 > GET /<sealed config>/stream/movie/tt1234567.json
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -676,7 +676,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -687,7 +687,7 @@
 > GET /p/<ticket>
 < 302
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-length: 0
 < location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
@@ -699,7 +699,7 @@
 > HEAD /p/<ticket>
 < 405
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < allow: GET
 < cache-control: no-store
 < content-type: application/json
@@ -711,7 +711,7 @@
 > GET /p/garbage
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -722,7 +722,7 @@
 > GET /p/<ticket>
 < 410
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -733,7 +733,7 @@
 > GET /p/<ticket>?probe=1
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -744,7 +744,7 @@
 > DELETE /p/<ticket>
 < 501
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -754,7 +754,7 @@
 > DELETE /p/<ticket>
 < 410
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -764,7 +764,7 @@
 > DELETE /p/garbage
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -774,7 +774,7 @@
 > GET /p/garbage
 < 404
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -784,7 +784,7 @@
 > GET /<sealed scoped config>/stream/movie/tt1234567.json
 < 403
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -796,7 +796,7 @@
 > x-den-remux-key: …
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: private, max-age=300, stale-while-revalidate=300, stale-if-error=3600
 < content-type: application/json
 < etag: <the body's FNV-1a-64>
@@ -810,7 +810,7 @@
 > x-den-remux-key: …
 < 403
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -821,7 +821,7 @@
 > GET /<sealed config>/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 403
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < server-timing: total;dur=*
@@ -832,7 +832,7 @@
 > DELETE /<sealed config>/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 403
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -842,7 +842,7 @@
 > GET /health
 < 200
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
@@ -852,7 +852,7 @@
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/stream/movie/tt1234567.json
 < 503
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 60
@@ -863,7 +863,7 @@
 > GET /p/garbage
 < 503
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 60
@@ -874,7 +874,7 @@
 > DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9
 < 503
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 60
@@ -885,7 +885,7 @@
 > POST /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
 < 503
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 60
@@ -898,7 +898,7 @@
 < access-control-allow-headers: *
 < access-control-allow-methods: GET, HEAD, POST, DELETE, OPTIONS
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < access-control-max-age: 86400
 < timing-allow-origin: *
 
@@ -907,7 +907,7 @@
 > POST /validate
 < 400
 < access-control-allow-origin: *
-< access-control-expose-headers: Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy
+< access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
