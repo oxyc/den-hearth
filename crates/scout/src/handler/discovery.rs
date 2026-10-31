@@ -108,16 +108,22 @@ impl Inner {
         let Some(sid) = parse_stream_id(at(parts, 2), at(parts, 3)) else {
             return error(StatusCode::BAD_REQUEST, "bad_id");
         };
-        let mut resp = self.handle_stream_for(req, config_blob, &sid).await;
+        let mut limited = false;
+        let mut resp = self.handle_stream_for(req, config_blob, &sid, &mut limited).await;
         resp.headers_mut().append(VARY, HeaderValue::from_static(PLAYABLE_HEADER));
+        if limited {
+            resp.headers_mut().insert(X_DEN_FRESH, HeaderValue::from_static("limited"));
+        }
         resp
     }
 
+    /// `fresh_limited` is set when `?fresh=1` was refused its rebuild and the request is answered as a plain one.
     pub(super) async fn handle_stream_for(
         self: &Arc<Self>,
         req: &Request<Bytes>,
         config_blob: &str,
         sid: &StreamId,
+        fresh_limited: &mut bool,
     ) -> Resp {
         let start = Instant::now();
         let origin = self.public_origin(req);
@@ -191,6 +197,38 @@ impl Inner {
                 .expect("a static response");
             mark_degraded(&mut resp, &res.degraded);
             return with_timing(resp, &res.timing, start);
+        }
+
+        // ?fresh=1 — a viewer asking to look again (an episode out before its date, a list that came back empty
+        // a minute ago): rebuilt past the held list and every indexer's kept answer, then cached like any other
+        // build, so the plain request that follows is served the rebuilt list. At most one per list key per
+        // FRESH_INTERVAL; inside it, or for a config that does not open, the request is served as a plain one.
+        // The ledger is only touched once the config opens, so an undecodable blob mints no state.
+        if query_is(req, "fresh", "1") {
+            if let Some(config) = self.open_config(config_blob) {
+                if let Some(refused) = self.refuse_scoped(req, &config) {
+                    return refused;
+                }
+                if !lock(&self.fresh).claim(&cache_key, Instant::now()) {
+                    *fresh_limited = true;
+                } else {
+                    metrics().list_cache_miss.fetch_add(1, Ordering::Relaxed);
+                    // Its own flight: joining a plain build already running would hand back answers this
+                    // request asked to skip.
+                    let key = format!("{cache_key}:fresh");
+                    let job = ListJob::new(config, list_key, client, rid(req)).fresh();
+                    let res = match self.shared(key, self.clone().build_task(job, false)).await {
+                        SharedBuild::Ready(res) => res,
+                        SharedBuild::Busy => return list_build_busy(),
+                        SharedBuild::Panicked => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+                    };
+                    let mut res = BuildResult::clone(&res);
+                    res.timing = format!("fresh;desc=rebuilt, {}", res.timing);
+                    let mut resp = self.write_built(start, &res);
+                    resp.headers_mut().insert(X_DEN_FRESH, HeaderValue::from_static("rebuilt"));
+                    return resp;
+                }
+            }
         }
 
         if let Some(hit) = self.deps.cache.get(&cache_key) {
@@ -468,7 +506,13 @@ impl Inner {
         debug: bool,
     ) -> BuildResult {
         let mut dbg = debug.then(RankDebug::default);
-        let opts = RankOpts { client: job.client.as_ref(), check_cache: true, rid: &job.rid, audio: &[] };
+        let opts = RankOpts {
+            client: job.client.as_ref(),
+            check_cache: true,
+            rid: &job.rid,
+            audio: &[],
+            fresh: job.fresh,
+        };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
         // A movie's list answers the availability route's question too, so a title someone opened needs no
         // check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
@@ -491,7 +535,7 @@ impl Inner {
         dbg: Option<&mut RankDebug>,
         opts: RankOpts<'_>,
     ) -> RankedList {
-        let RankOpts { client, check_cache, rid, audio } = opts;
+        let RankOpts { client, check_cache, rid, audio, fresh } = opts;
         let q = ScrapeQuery {
             kind: sid.kind.clone(),
             imdb: sid.imdb.clone(),
@@ -499,6 +543,7 @@ impl Inner {
             episode: sid.episode,
             has_ep: sid.has_ep,
             rid: rid.to_owned(),
+            fresh,
         };
         let mut phase = Instant::now();
         let scrapers: Vec<Arc<dyn Scraper>> =

@@ -37,6 +37,15 @@ new installs use Hearth's combined `/den` addon rather than Scout's former stand
 - **It runs inside hearth's runtime, supervised the way the others are.** A panic in a request is a 500 for that
   request; the hourly cache sweep is a supervised task; Scout is part of the combined `/health` and the startup
   line; and SIGTERM drains its requests with the rest.
+- **`?fresh=1` on a stream list** is a viewer asking to look again: an episode out earlier than TMDB says, a list
+  that came back empty a minute ago. `GET /<config>/stream/...?fresh=1` skips the held list and every indexer's kept
+  answer, asks each indexer, and caches the result as any other build, so the next plain request is served the
+  rebuilt list; the response carries the normal `Cache-Control`. One such rebuild per list (title, config, origin
+  and variant) per 30 seconds, from a ledger of at most 4096 lists filled only once the config opens: inside that
+  window the request is answered like a plain one. `X-Den-Fresh` (exposed to browsers) says which, `rebuilt` or
+  `limited`, and `Server-Timing` leads with `fresh;desc=rebuilt` on a rebuild. A client must not cache a fresh
+  request's answer in front of Scout; a Scout without this ignores the parameter. On `/play`, `?fresh=1` is a
+  different thing: it drops a minted link the client could not open.
 
 ## Run
 

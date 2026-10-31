@@ -62,6 +62,9 @@ pub struct ScrapeQuery {
     /// The request's X-Request-Id, carried through for the per-indexer decision line. Not part of any
     /// cache key.
     pub rid: String,
+    /// Ask every indexer again rather than answer from its kept answer (a `?fresh=1` list rebuild). The new
+    /// answer is kept as usual. Not part of any cache key.
+    pub fresh: bool,
 }
 
 /// Go `scraper`.
@@ -877,6 +880,9 @@ pub(crate) fn kept_answer(
     sc: &dyn Scraper,
     q: &ScrapeQuery,
 ) -> Option<Vec<RawStream>> {
+    if q.fresh {
+        return None;
+    }
     let key = answer_cache_key(sc, q)?;
     let raw = cache?.get(&key)?;
     // Go's nil slice marshals as `null`, which a build of either language may have written.
@@ -1019,6 +1025,9 @@ async fn scrape_one_cached(
     };
     let waiting = Instant::now();
     let (task_sc, task_q) = (Arc::clone(sc), q.clone());
+    // A fresh question has a flight of its own: joining a plain one already running could hand back an answer
+    // read from the cache it asked to skip.
+    let key = if q.fresh { format!("{key}:fresh") } else { key };
     // Cached answers are decoded for each caller. Preserve that ownership for a shared live answer too: later
     // phases annotate RawStream values with cache and probe facts (the flight hands each waiter its own clone).
     let (answer, _shared) =
