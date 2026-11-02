@@ -57,18 +57,27 @@ fn releases(n: usize) -> Vec<RawStream> {
 
 // ---- rank: filter, score and sort one scrape's worth of releases ---------------------------------------------
 
+/// Ranks a fresh copy of the releases each iteration: a stream keeps its parsed title once anything has read it,
+/// so ranking the same slice twice would leave the parse out of every iteration after the first.
+fn bench_rank(bencher: Bencher, n: usize, rank: fn(&[RawStream]) -> Vec<RawStream>) {
+    let streams = releases(n);
+    assert!(rank(&streams.clone()).len() > 10, "the filters must leave a list to sort");
+    bencher.with_inputs(|| streams.clone()).bench_local_refs(|s| rank(black_box(s)));
+}
+
 #[divan::bench(args = [100, 500, 2000])]
 fn rank_movie(bencher: Bencher, n: usize) {
-    let streams = releases(n);
-    assert!(bench_api::rank_movie(&streams).len() > 10, "the filters must leave a list to sort");
-    bencher.bench(|| bench_api::rank_movie(black_box(&streams)));
+    bench_rank(bencher, n, bench_api::rank_movie);
 }
 
 #[divan::bench(args = [100, 500, 2000])]
 fn rank_episode(bencher: Bencher, n: usize) {
-    let streams = releases(n);
-    assert!(bench_api::rank_episode(&streams).len() > 10, "the filters must leave a list to sort");
-    bencher.bench(|| bench_api::rank_episode(black_box(&streams)));
+    bench_rank(bencher, n, bench_api::rank_episode);
+}
+
+#[divan::bench(args = [100, 500, 2000])]
+fn rank_movie_web(bencher: Bencher, n: usize) {
+    bench_rank(bencher, n, bench_api::rank_movie_web);
 }
 
 // ---- season: episode matching (Go season_bench_test.go) ------------------------------------------------------

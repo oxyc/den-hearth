@@ -870,6 +870,7 @@ impl From<CachedStream> for RawStream {
             cache_known: s.cache_known,
             source: s.source,
             probe: s.probe,
+            traits: Default::default(),
         }
     }
 }

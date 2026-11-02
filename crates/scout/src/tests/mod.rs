@@ -59,6 +59,7 @@ mod stores_pick;
 mod stores_preference;
 mod ticket;
 mod token_leak;
+mod traits_parity;
 mod upstreampause;
 mod validate;
 mod version;

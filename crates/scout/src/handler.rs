@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
 
 use crate::addbudget::{global_add_budget, is_play_reserve, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
-use crate::attributes::stream_attributes;
+use crate::attributes::{cost_attributes, stream_attributes_ref};
 use crate::availability::verdict_prefix;
 use crate::client::{web_ready, ClientPlayable};
 use crate::config::{Config, DebridService, SCOPE_AVAILABILITY};
@@ -47,7 +47,7 @@ use crate::deps::{Deps, ReqwestDoer};
 use crate::hostlimit::{new_host_limiter, HostLimiter};
 use crate::id::{parse_stream_id, StreamId};
 use crate::indexerconfig::Flight;
-use crate::label::binge_group;
+use crate::label::binge_group_of;
 use crate::linkcheck::LinkVerdict;
 use crate::linkmemo::{link_memo_key, LinkMemo, LINK_MEMO_TTL};
 use crate::loglimit::{emit, log_limited};
@@ -705,7 +705,7 @@ fn to_stremio_stream(s: &RawStream, sid: &StreamId, play_url: &dyn Fn(&PlayTarge
         target.release_size = n;
     }
     let url = play_url(&target);
-    let attrs = stream_attributes(s.clone());
+    let attrs = stream_attributes_ref(s);
     // Counted here rather than at the scrape: this is the one place every stream a client is actually
     // offered passes through, which is the population oxyc/den#26 estimates and nothing measures.
     metrics().release(&attrs);
@@ -713,7 +713,7 @@ fn to_stremio_stream(s: &RawStream, sid: &StreamId, play_url: &dyn Fn(&PlayTarge
         name: "Den Scout".to_owned(),
         title: s.title.clone(), // raw release name
         behavior_hints: StreamHints {
-            binge_group: binge_group(&str::to_lowercase(&s.title), &s.title),
+            binge_group: binge_group_of(s),
             not_web_ready: !web_ready(s, &url),
             filename: s.title.clone(),
         },
@@ -1373,10 +1373,7 @@ impl Inner {
                         subtitles: prepared.subtitles,
                         selected_subtitle: prepared.selected_subtitle,
                         release: ManagedHlsRelease {
-                            label: crate::label::clean_label_lower(
-                                &str::to_lowercase(&candidate.title),
-                                candidate,
-                            ),
+                            label: crate::label::clean_label_traits(candidate.traits(), candidate),
                             filename: candidate.title.clone(),
                             size: candidate.size_bytes.filter(|size| *size > 0),
                         },

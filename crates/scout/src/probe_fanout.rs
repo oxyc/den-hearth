@@ -8,14 +8,14 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::attributes::stream_attributes_ref;
+use crate::attributes::cost_attributes;
 use crate::cache::Cache;
 use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::id::StreamId;
 use crate::metrics::metrics;
 use crate::probe::Probe;
-use crate::rank::{detect_resolution_lower, junk_class_of, quality_score_lower, RawStream, PREFERENCE_SINK};
+use crate::rank::{quality_score_ref, resolution_bucket, RawStream, PREFERENCE_SINK};
 use crate::stores::{CacheTruth, ResolveTarget};
 
 /// Go `probeTopN`: how many of the ranked releases get probed. The list is already in the order the client will show,
@@ -207,18 +207,17 @@ pub(crate) fn browser_probe_candidates(
         return frontier;
     }
     let score = |stream: &RawStream, include_client: bool| -> i64 {
-        let lower = str::to_lowercase(&stream.title);
-        let mut out = quality_score_lower(&lower, stream, junk_class_of(&lower));
+        let mut out = quality_score_ref(stream);
         let prefer = &cfg.filters.prefer_resolution;
         if !prefer.is_empty() {
-            let resolution = detect_resolution_lower(&lower);
+            let resolution = resolution_bucket(stream.traits());
             if !resolution.is_empty() && resolution != prefer {
                 out -= PREFERENCE_SINK;
             }
         }
         if include_client {
             if let Some(client) = client {
-                out -= client.cost_ref(stream, stream_attributes_ref(stream));
+                out -= client.cost_ref(stream, cost_attributes(stream));
             }
         }
         out

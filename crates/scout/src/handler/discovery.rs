@@ -16,7 +16,7 @@ pub(super) fn managed_candidates<'a>(
     // SDR candidate before trying an HDR/DV one. The stable sort preserves Scout's ranking inside both groups.
     if request.filename.is_none() && request.platform.as_deref() == Some("webos") {
         candidates.sort_by_key(|candidate| {
-            let attributes = stream_attributes((*candidate).clone());
+            let attributes = cost_attributes(candidate);
             attributes.hdr || attributes.dolby_vision
         });
     }
@@ -25,11 +25,10 @@ pub(super) fn managed_candidates<'a>(
     // renderer: never silently trade correctness for the direct path. An automatic choice can take the next
     // non-DV release, and an explicitly selected DV release falls through to Remux unchanged. Atmos alone remains
     // eligible; it cannot account for damaged picture.
-    candidates.retain(|candidate| !stream_attributes((*candidate).clone()).dolby_vision);
+    candidates.retain(|candidate| !cost_attributes(candidate).dolby_vision);
     if let Some(client) = request.playable.as_ref().filter(|_| request.receiver) {
         candidates.retain(|candidate| {
-            client.cost((*candidate).clone(), stream_attributes((*candidate).clone()))
-                < crate::client::VIDEO_CONVERTED_COST
+            client.cost_ref(candidate, cost_attributes(candidate)) < crate::client::VIDEO_CONVERTED_COST
         });
     }
     // An explicit choice is an instruction, not a hint. For automatic playback, however, a release whose probe
