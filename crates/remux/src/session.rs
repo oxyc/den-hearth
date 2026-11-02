@@ -499,8 +499,9 @@ impl Session {
         let Some(job) = job.as_mut() else { return };
         let newly_exited = job.exit.is_none() && job.poll_exit().is_some();
         // After the exit check, so everything written before the exit is read.
-        let text = std::fs::read_to_string(job.dir.join("gops.m3u8")).unwrap_or_default();
-        for (name, dur) in job::parse_gops(&text).into_iter().skip(job.read) {
+        let (listed, list_at) = job::read_gops(&job.dir.join("gops.m3u8"), job.list_at, job.read);
+        job.list_at = list_at;
+        for (name, dur) in listed {
             let start = snap(&self.info.keyframes, job.next_start);
             job.next_start = start + dur;
             job.read += 1;
