@@ -101,31 +101,52 @@ impl Shared {
     }
 }
 
-/// Each point's last position: Intro Skipper's inverted index.
-fn inverted(fp: &[u32]) -> HashMap<u32, usize> {
-    let mut index = HashMap::with_capacity(fp.len());
-    for (i, &p) in fp.iter().enumerate() {
-        index.insert(p, i);
+/// Each point's last position: Intro Skipper's inverted index, as one sorted run of `(point << 32) | position`
+/// with a single entry per point.
+fn inverted(fp: &[u32]) -> Vec<u64> {
+    let mut index: Vec<u64> = fp.iter().enumerate().map(|(i, &p)| (u64::from(p) << 32) | i as u64).collect();
+    // Sorted by point and then position, so the last of a point's entries is its last position.
+    index.sort_unstable();
+    let mut keep = 0;
+    for k in 0..index.len() {
+        if index.get(k + 1).is_none_or(|next| next >> 32 != index[k] >> 32) {
+            index[keep] = index[k];
+            keep += 1;
+        }
     }
+    index.truncate(keep);
     index
 }
 
-/// The longest run of matching points between `a` and `b` at least `min_secs` long, over every alignment an
-/// (almost) identical point suggests — an inverted index on the hashes, not every offset.
-pub fn longest_shared(a: &[u32], b: &[u32], min_secs: f64) -> Option<Shared> {
+/// The position of `point` in an `inverted` index.
+fn position(index: &[u64], point: u32) -> Option<usize> {
+    let at = index.partition_point(|&e| e < u64::from(point) << 32);
+    index.get(at).filter(|&&e| e >> 32 == u64::from(point)).map(|&e| (e & 0xffff_ffff) as usize)
+}
+
+/// Every alignment (position in `b` minus position in `a`) at which a point of `a` meets a point of `b` within
+/// `INDEX_SHIFT` of it, sorted and without repeats.
+fn candidate_shifts(a: &[u32], b: &[u32]) -> Vec<isize> {
     let (ia, ib) = (inverted(a), inverted(b));
     let mut shifts: Vec<isize> = Vec::new();
-    for (&point, &pa) in &ia {
+    for &e in &ia {
+        let (point, pa) = ((e >> 32) as u32, (e & 0xffff_ffff) as usize);
         for d in -INDEX_SHIFT..=INDEX_SHIFT {
-            if let Some(&pb) = ib.get(&point.wrapping_add_signed(d)) {
+            if let Some(pb) = position(&ib, point.wrapping_add_signed(d)) {
                 shifts.push(pb as isize - pa as isize);
             }
         }
     }
     shifts.sort_unstable();
     shifts.dedup();
+    shifts
+}
+
+/// The longest run of matching points between `a` and `b` at least `min_secs` long, over every alignment an
+/// (almost) identical point suggests — an inverted index on the hashes, not every offset.
+pub fn longest_shared(a: &[u32], b: &[u32], min_secs: f64) -> Option<Shared> {
     let mut best: Option<Shared> = None;
-    for shift in shifts {
+    for shift in candidate_shifts(a, b) {
         if let Some((s, e)) = contiguous(a, b, shift, min_secs) {
             if best.is_none_or(|b| e - s > b.a.1 - b.a.0) {
                 let at = |i: usize| (i as isize + shift) as usize;
@@ -1418,6 +1439,79 @@ mod tests {
         v.extend_from_slice(shared);
         v.extend(noise(seed.wrapping_mul(7919), post));
         v
+    }
+
+    /// The hash-map index this replaced, kept to hold the sorted one to the same alignments.
+    fn candidate_shifts_hashed(a: &[u32], b: &[u32]) -> Vec<isize> {
+        let inv =
+            |fp: &[u32]| -> HashMap<u32, usize> { fp.iter().enumerate().map(|(i, &p)| (p, i)).collect() };
+        let (ia, ib) = (inv(a), inv(b));
+        let mut shifts: Vec<isize> = Vec::new();
+        for (&point, &pa) in &ia {
+            for d in -INDEX_SHIFT..=INDEX_SHIFT {
+                if let Some(&pb) = ib.get(&point.wrapping_add_signed(d)) {
+                    shifts.push(pb as isize - pa as isize);
+                }
+            }
+        }
+        shifts.sort_unstable();
+        shifts.dedup();
+        shifts
+    }
+
+    /// Two episodes' intro windows as the matcher sees them: the 360 s window of points, a shared intro with a few
+    /// bits off per point, runs of silence (one repeated point), a few repeated sounds, and the extreme values.
+    fn windows(seed: u32) -> (Vec<u32>, Vec<u32>) {
+        let n = secs(INTRO_WINDOW_MAX_SECS);
+        let intro: Vec<u32> = noise(seed, secs(45.0))
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| p ^ [0, 1, 0b110, 1 << 31][i % 4])
+            .collect();
+        let silence = vec![0u32; secs(3.0)];
+        let mut a = noise(seed + 1, secs(20.0));
+        a.extend(&silence);
+        a.extend(&intro);
+        a.extend([u32::MAX, 0, u32::MAX - 1, 1]);
+        a.extend(noise(seed + 2, n));
+        a.truncate(n);
+        let mut b = noise(seed + 3, secs(61.0));
+        b.extend(intro.iter().map(|p| p ^ 0b1));
+        b.extend(&silence);
+        b.extend(noise(seed + 4, n));
+        b.truncate(n);
+        (a, b)
+    }
+
+    #[test]
+    fn the_sorted_index_finds_the_alignments_the_hash_map_did() {
+        for seed in [3, 11, 29, 1013] {
+            let (a, b) = windows(seed);
+            assert_eq!(candidate_shifts(&a, &b), candidate_shifts_hashed(&a, &b), "seed {seed}");
+            assert_eq!(candidate_shifts(&b, &a), candidate_shifts_hashed(&b, &a), "seed {seed} reversed");
+        }
+        // A point's last position is the one kept.
+        assert_eq!(position(&inverted(&[5, 9, 5, 7, 5]), 5), Some(4));
+        assert_eq!(position(&inverted(&[5, 9]), 6), None);
+        assert_eq!(position(&inverted(&[u32::MAX]), u32::MAX), Some(0));
+    }
+
+    /// `cargo test --release inverted_index_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn inverted_index_timing() {
+        let (a, b) = windows(7);
+        let time = |f: &dyn Fn() -> Vec<isize>| {
+            let t = std::time::Instant::now();
+            let mut out = Vec::new();
+            for _ in 0..50 {
+                out = std::hint::black_box(f());
+            }
+            (t.elapsed() / 50, out.len())
+        };
+        let hashed = time(&|| candidate_shifts_hashed(&a, &b));
+        let sorted = time(&|| candidate_shifts(&a, &b));
+        eprintln!("hash map: {hashed:?}  sorted vec: {sorted:?}  ({} points)", a.len());
     }
 
     #[test]
