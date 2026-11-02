@@ -394,8 +394,8 @@ pub fn parse_gops(text: &str) -> Vec<(String, f64)> {
 }
 
 /// `parse_gops` over the part of the playlist not yet taken, plus how many bytes of `text` it consumed. The
-/// playlist only ever grows (an event playlist, unlimited list size), so a reader that resumes at the returned
-/// offset sees each GOP exactly once. The offset stops after the last whole entry: a `#EXTINF` still waiting
+/// entries only ever grow at the end (an event playlist, unlimited list size), though the header ahead of them
+/// may change length, so `text` should start at the entries. The offset stops after the last whole entry: a `#EXTINF` still waiting
 /// for its file name, or a line without its newline, is left for the next read.
 pub fn parse_gops_tail(text: &str) -> (Vec<(String, f64)>, usize) {
     let mut out = Vec::new();
@@ -425,20 +425,53 @@ pub fn parse_gops_tail(text: &str) -> (Vec<(String, f64)>, usize) {
     (out, consumed)
 }
 
-/// The GOPs ffmpeg's playlist at `path` lists past byte `from`, and the offset to resume at. Reads only that
-/// tail, so the cost of a look does not grow with the length of the run. A playlist not there yet is no GOPs.
-pub fn read_gops(path: &Path, from: u64) -> (Vec<(String, f64)>, u64) {
+/// How much of the playlist's start is read to find where its entries begin: the header is a few short lines.
+const HEAD_PROBE: usize = 1024;
+
+/// The GOPs ffmpeg's playlist at `path` lists beyond the first `read` of them, and the offset to resume at.
+/// `at` is measured from the first `#EXTINF`, not from the file's start: ffmpeg rewrites the whole file for each
+/// GOP, and its header changes length (`#EXT-X-TARGETDURATION` goes from 9 to 10), so only the entries keep
+/// their place. Reads the head and the new tail, so the cost of a look does not grow with the length of the run.
+/// A resume point that does not land just after a newline, or a tail whose first file is not GOP number `read`
+/// (they are numbered from 0, in order), is not trusted: the whole file is parsed instead.
+/// A playlist not there yet is no GOPs.
+pub fn read_gops(path: &Path, at: u64, read: usize) -> (Vec<(String, f64)>, u64) {
     use std::io::{Read, Seek, SeekFrom};
-    let mut tail = Vec::new();
-    let read = std::fs::File::open(path).and_then(|mut f| {
-        f.seek(SeekFrom::Start(from))?;
-        f.read_to_end(&mut tail)
-    });
-    if read.is_err() {
-        return (Vec::new(), from);
+    let Ok(mut f) = std::fs::File::open(path) else { return (Vec::new(), at) };
+    let mut head = Vec::new();
+    if f.by_ref().take(HEAD_PROBE as u64).read_to_end(&mut head).is_err() {
+        return (Vec::new(), at);
     }
-    let (gops, used) = parse_gops_tail(&String::from_utf8_lossy(&tail));
-    (gops, from + used as u64)
+    let marker = b"#EXTINF";
+    let body = head.windows(marker.len()).position(|w| w == marker);
+    if body.is_none() && head.len() < HEAD_PROBE {
+        // Header only, so far.
+        return (Vec::new(), at);
+    }
+    if let Some(body) = body {
+        // One byte back from the resume point, which has to be the newline that ended the last entry taken.
+        let (from, skip) = if at == 0 { (body as u64, 0) } else { (body as u64 + at - 1, 1) };
+        let mut tail = Vec::new();
+        if f.seek(SeekFrom::Start(from)).and_then(|_| f.read_to_end(&mut tail)).is_ok()
+            && (skip == 0 || tail.first() == Some(&b'\n'))
+        {
+            let (gops, used) = parse_gops_tail(&String::from_utf8_lossy(&tail[skip..]));
+            let in_order =
+                gops.iter().enumerate().all(|(i, (name, _))| *name == format!("g{}.m4s", read + i));
+            if in_order {
+                return (gops, at + used as u64);
+            }
+        }
+    }
+    // The old way: all of it, and skip what was taken.
+    let mut all = String::new();
+    let whole = std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut all));
+    if whole.is_err() {
+        return (Vec::new(), at);
+    }
+    let body = all.find("#EXTINF").unwrap_or(all.len());
+    let (gops, used) = parse_gops_tail(&all[body..]);
+    (gops.into_iter().skip(read).collect(), used as u64)
 }
 
 /// The init segment of a Dolby Vision copy whose source names no Dolby Vision, with the sample entry a real
@@ -555,7 +588,7 @@ pub struct Job {
     pub next_start: f64,
     /// GOPs already taken from ffmpeg's playlist.
     pub read: usize,
-    /// How far into its playlist those GOPs reach, in bytes: the next look starts there.
+    /// How far into its playlist's entries (counted from the first `#EXTINF`) those GOPs reach, in bytes.
     pub list_at: u64,
     /// The subtitle tracks this run writes (`Spec::text`).
     pub text: Vec<usize>,
@@ -1334,7 +1367,7 @@ mod tests {
                 late_bytes = text.len();
             }
             let t = Instant::now();
-            let (new, next) = read_gops(&path, at);
+            let (new, next) = read_gops(&path, at, seen.len());
             if n == late {
                 eprintln!(
                     "refresh at GOP {n}: full re-read {late_bytes} B in {full_time:?}; tail {} B in {:?}",
@@ -1348,6 +1381,52 @@ mod tests {
             seen.extend(new);
         }
         assert_eq!(seen, parse_gops(&playlist_of(total)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_header_that_grows_a_byte_mid_run_loses_no_gop() {
+        let dir = std::env::temp_dir().join(format!("den-remux-gops-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gops.m3u8");
+        // ffmpeg rewrites the whole file per GOP, with TARGETDURATION the longest GOP so far, rounded.
+        let durs: Vec<f64> =
+            (0..40).map(|i| if i == 20 { 9.6 } else { 4.0 + (i % 5) as f64 * 0.5 }).collect();
+        let write = |n: usize| {
+            let target = durs[..n].iter().cloned().fold(0.0, f64::max).round() as u64;
+            let mut text = format!(
+                "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+            );
+            for (i, d) in durs[..n].iter().enumerate() {
+                text.push_str(&format!("#EXTINF:{d:.6},\ng{i}.m4s\n"));
+            }
+            std::fs::write(&path, text).unwrap();
+        };
+        let (mut at, mut seen) = (0, Vec::new());
+        for n in 1..=durs.len() {
+            write(n);
+            let (new, next) = read_gops(&path, at, seen.len());
+            at = next;
+            seen.extend(new);
+        }
+        let want: Vec<(String, f64)> =
+            durs.iter().enumerate().map(|(i, d)| (format!("g{i}.m4s"), *d)).collect();
+        assert_eq!(seen, want);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_resume_point_that_is_not_after_a_newline_falls_back_to_the_whole_file() {
+        let dir = std::env::temp_dir().join(format!("den-remux-gops-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gops.m3u8");
+        std::fs::write(&path, playlist_of(10)).unwrap();
+        // Three taken, but an offset that lands mid-line.
+        let (gops, _) = read_gops(&path, 5, 3);
+        assert_eq!(
+            gops.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(),
+            ["g3.m4s", "g4.m4s", "g5.m4s", "g6.m4s", "g7.m4s", "g8.m4s", "g9.m4s"]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
