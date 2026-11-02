@@ -802,6 +802,40 @@ pub(crate) fn is_group_live(pgid: u32) -> bool {
     LIVE_GROUPS.contains(pgid)
 }
 
+/// How long a test waits on a real event (a script reporting its pid, a process dying) before it calls the
+/// event lost. Not a pace: the first exec of a freshly written script is assessed by the OS (macOS spends
+/// 0.5 to 0.75 s on it, longer under load), so a tight deadline fails on the first run after a compile. The
+/// waits return the moment the event happens; this only bounds a hang.
+#[cfg(all(test, unix))]
+const TEST_EVENT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait for a spawned fake tool to write its descendant's pid into `file`. Fails at once, with the task's
+/// outcome, if the task ends first: the tool never started, and no pid is coming.
+#[cfg(all(test, unix))]
+pub(crate) async fn reported_pid<T>(file: &std::path::Path, task: &tokio::task::JoinHandle<T>) -> i32 {
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(pid) = std::fs::read_to_string(file).ok().and_then(|s| s.trim().parse().ok()) {
+            return pid;
+        }
+        assert!(!task.is_finished(), "the task ended before its tool reported a pid");
+        assert!(began.elapsed() < TEST_EVENT_BOUND, "the tool did not report a pid");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Wait for process `pid` to be gone.
+#[cfg(all(test, unix))]
+pub(crate) async fn wait_gone(pid: i32, what: &str) {
+    tokio::time::timeout(TEST_EVENT_BOUND, async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1291,27 +1291,10 @@ mod tests {
 
         let script_for_task = script.to_string_lossy().into_owned();
         let task = tokio::spawn(async move { decode(&script_for_task, "unused", 0.0, 1.0).await });
-        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        break pid;
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the fake decoder did not report its descendant pid");
+        let descendant = crate::job::reported_pid(&pid_file, &task).await;
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while unsafe { libc::kill(descendant, 0) } == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("a cancelled fingerprint decode left its descendant alive");
+        crate::job::wait_gone(descendant, "a cancelled fingerprint decode left its descendant alive").await;
     }
 
     #[cfg(unix)]
@@ -1341,13 +1324,11 @@ mod tests {
         let leader: u32 = std::fs::read_to_string(&leader_file).unwrap().trim().parse().unwrap();
         assert!(!crate::job::is_group_live(leader), "reaped decoder stayed registered");
         let descendant: i32 = std::fs::read_to_string(&descendant_file).unwrap().trim().parse().unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while unsafe { libc::kill(descendant, 0) } == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("a normally completed fingerprint decode left its descendant alive");
+        crate::job::wait_gone(
+            descendant,
+            "a normally completed fingerprint decode left its descendant alive",
+        )
+        .await;
     }
 
     fn ep(n: u32) -> Episode {
