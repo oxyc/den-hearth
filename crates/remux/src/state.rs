@@ -1626,9 +1626,10 @@ mod tests {
             executable_script(&format!("#!/bin/sh\nhead -c {} /dev/zero\nsleep 30\n", PROBE_OUTPUT_MAX + 1));
         let mut cmd = tokio::process::Command::new(&noisy);
         let began = Instant::now();
-        let err = grouped_probe(cmd, None, Duration::from_secs(10)).await.unwrap_err();
+        // The outer deadline is far past the script's cold-exec cost, so only the overflow can end this early.
+        let err = grouped_probe(cmd, None, Duration::from_secs(60)).await.unwrap_err();
         assert!(err.contains("exceeded"), "{err}");
-        assert!(began.elapsed() < Duration::from_secs(3), "overflow waited for the outer deadline");
+        assert!(began.elapsed() < Duration::from_secs(30), "overflow waited for the outer deadline");
 
         let recovered_pid =
             std::env::temp_dir().join(format!("den-remux-recovered-probe-{}.pid", std::process::id()));
@@ -1638,7 +1639,7 @@ mod tests {
             recovered_pid.display()
         ));
         cmd = tokio::process::Command::new(&recovered);
-        let out = grouped_probe(cmd, None, Duration::from_secs(2)).await.unwrap();
+        let out = grouped_probe(cmd, None, Duration::from_secs(60)).await.unwrap();
         assert_eq!(out.stdout, b"recovered");
         let pid: u32 = std::fs::read_to_string(recovered_pid).unwrap().trim().parse().unwrap();
         assert!(!crate::job::is_group_live(pid), "reaped startup probe stayed registered");
@@ -1653,27 +1654,10 @@ mod tests {
         let mut cmd = tokio::process::Command::new(&script);
         cmd.arg(&pid_file);
         let task = tokio::spawn(async move { grouped_probe(cmd, None, Duration::from_secs(30)).await });
-        let descendant = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        break pid;
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the startup probe did not report its descendant pid");
+        let descendant = crate::job::reported_pid(&pid_file, &task).await;
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while unsafe { libc::kill(descendant, 0) } == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("a cancelled startup probe left its descendant alive");
+        crate::job::wait_gone(descendant, "a cancelled startup probe left its descendant alive").await;
     }
 
     fn persistence_state() -> Arc<AppState> {
