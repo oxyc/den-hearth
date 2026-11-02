@@ -388,7 +388,6 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
 
 /// The GOP files ffmpeg's own playlist lists as finished, with their durations. It rewrites that file
 /// by rename after each GOP, so a read never sees half of it.
-#[cfg(test)]
 pub fn parse_gops(text: &str) -> Vec<(String, f64)> {
     parse_gops_tail(text).0
 }
