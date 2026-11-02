@@ -41,6 +41,7 @@ pub mod season;
 pub mod sources;
 pub mod stores;
 pub mod ticket;
+mod traits;
 pub mod upstreampause;
 pub mod util;
 pub mod validate;

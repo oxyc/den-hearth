@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attributes::{container_of_ref, StreamAttributes};
 use crate::rank::RawStream;
+use crate::traits::NameContainer;
 
 /// A browser's report of what it plays, as Den Web sends it to den-remux and den-remux passes on in
 /// X-Den-Playable (den-edge web/src/lib/playable.ts). With it a stream list is ranked for that browser rather
@@ -61,6 +62,7 @@ pub(crate) const NEVER_PLAYS_COST: i64 = 60000;
 impl ClientPlayable {
     /// Go `(*ClientPlayable).cost`: applies den-remux's own reading of scout's attributes (what it copies,
     /// what it converts, what it won't open).
+    #[cfg(test)]
     pub(crate) fn cost(&self, s: RawStream, a: StreamAttributes) -> i64 {
         self.cost_ref(&s, a)
     }
@@ -161,23 +163,16 @@ impl ClientPlayable {
     }
 }
 
-/// Go `remuxRefusedExt`: den-remux opens Matroska, MP4, MPEG-TS and AVI, and refuses these by name (den-remux's
+/// Go `remuxOpens`: den-remux opens Matroska, MP4, MPEG-TS and AVI, and refuses the rest by name (den-remux's
 /// `scout::left_out_by_name`).
-const REMUX_REFUSED_EXT: [&str; 7] = [".m2ts", ".iso", ".wmv", ".mpg", ".mpeg", ".vob", ".webm"];
-
-/// Go `remuxOpens`.
 fn remux_opens(s: &RawStream) -> bool {
-    if container_of_ref(s) == "webm" {
-        return false;
-    }
-    let name = str::to_lowercase(&s.title);
-    !REMUX_REFUSED_EXT.iter().any(|ext| name.ends_with(ext))
+    container_of_ref(s) != "webm" && !s.traits().remux_refused_ext()
 }
 
 /// Whether den-remux transcodes the release for its container: an MPEG-TS or AVI has no index to cut a copy on.
 fn remux_converts(s: &RawStream) -> bool {
-    let name = str::to_lowercase(&s.title);
-    container_of_ref(s) == "avi" || name.ends_with(".ts") || name.ends_with(".avi")
+    let t = s.traits();
+    container_of_ref(s) == "avi" || t.ts_ext() || t.name_container() == NameContainer::Avi
 }
 
 /// Go `webReady`: whether a browser can play the release as it is served (an https MP4).

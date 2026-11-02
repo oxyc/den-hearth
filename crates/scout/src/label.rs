@@ -1,52 +1,51 @@
 //! Port of `internal/scout/label.go`.
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 use regex::Regex;
 
 use crate::attributes::detect_source_attr;
-use crate::rank::{
-    detect_resolution_lower, re2, RawStream, GIB, RES_1080, RES_1440, RES_2160, RES_480, RES_4K_UHD, RES_540,
-    RES_576, RES_720, RE_ATMOS, RE_BLURAY, RE_BR_RIP, RE_DOVI, RE_HDR10P, RE_REMUX, RE_WEB, RE_WEB_DL,
-    RE_WEB_RIP,
-};
+use crate::rank::{resolution_bucket, RawStream, GIB};
+use crate::traits::{Pat, ReleaseTraits};
 
 /// Go `mib` (label.go).
 pub(crate) const MIB: i64 = 1_048_576;
 
-/// Go `reHDRLabel`.
-static RE_HDR_LABEL: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhdr\b|hdr10|\bhlg\b"));
+/// Go `reHDRLabel` (`\bhdr\b|hdr10|\bhlg\b`).
+fn hdr_label(t: &ReleaseTraits) -> bool {
+    t.has(Pat::HdrPlain) || t.has(Pat::Hdr10Any) || t.has(Pat::Hlg)
+}
 
 /// Go `resolutionLabel`.
-fn resolution_label(t: &str, size_bytes: Option<i64>) -> &'static str {
-    if RES_2160.is_match(t) {
+fn resolution_label(t: &ReleaseTraits, size_bytes: Option<i64>) -> &'static str {
+    if t.has(Pat::Res2160) {
         return "4K";
     }
-    if RES_1440.is_match(t) {
+    if t.has(Pat::Res1440) {
         return "1440p";
     }
-    if RES_1080.is_match(t) {
+    if t.has(Pat::Res1080) {
         return "1080p";
     }
-    if RES_720.is_match(t) {
+    if t.has(Pat::Res720) {
         return "720p";
     }
-    if RES_480.is_match(t) || RES_576.is_match(t) || RES_540.is_match(t) {
+    if t.has(Pat::Res480) || t.has(Pat::Res576) || t.has(Pat::Res540) {
         return "SD";
     }
-    if RES_4K_UHD.is_match(t) && size_bytes.unwrap_or(0) > 3 * GIB {
+    if t.has(Pat::Res4kUhd) && size_bytes.unwrap_or(0) > 3 * GIB {
         return "4K";
     }
     ""
 }
 
 /// Go `dynamicRangeLabel`.
-fn dynamic_range_label(t: &str) -> &'static str {
-    if RE_DOVI.is_match(t) {
+fn dynamic_range_label(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Dovi) {
         "Dolby Vision"
-    } else if RE_HDR10P.is_match(t) {
+    } else if t.has(Pat::Hdr10p) {
         "HDR10+"
-    } else if RE_HDR_LABEL.is_match(t) {
+    } else if hdr_label(t) {
         "HDR"
     } else {
         ""
@@ -54,14 +53,14 @@ fn dynamic_range_label(t: &str) -> &'static str {
 }
 
 /// Go `sourceLabelForDisplay`.
-fn source_label_for_display(t: &str) -> &'static str {
-    if RE_REMUX.is_match(t) {
+fn source_label_for_display(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Remux) {
         "REMUX"
-    } else if RE_BLURAY.is_match(t) || RE_BR_RIP.is_match(t) {
+    } else if t.has(Pat::Bluray) || t.has(Pat::BrRip) {
         "BluRay"
-    } else if RE_WEB_DL.is_match(t) {
+    } else if t.has(Pat::WebDl) {
         "WEB-DL"
-    } else if RE_WEB_RIP.is_match(t) || RE_WEB.is_match(t) {
+    } else if t.has(Pat::WebRip) || t.has(Pat::Web) {
         "WEB"
     } else {
         ""
@@ -86,16 +85,26 @@ pub(crate) fn size_label(bytes: i64) -> String {
 /// `den-scout-<imdb>` — the same for every release of a title — so the first candidate always matched and
 /// "stay on the same release" never happened. Resolution, source, dynamic range and release group are
 /// what make two episodes "the same release".
+pub(crate) fn binge_group_of(s: &RawStream) -> String {
+    binge_group_traits(s.traits(), &s.title)
+}
+
+/// `binge_group_of` for a lowercased title `t` and the title itself.
+#[cfg(test)]
 pub(crate) fn binge_group(t: &str, title: &str) -> String {
-    let dr = if RE_DOVI.is_match(t) {
+    binge_group_traits(&ReleaseTraits::parse_lower(t), title)
+}
+
+fn binge_group_traits(t: &ReleaseTraits, title: &str) -> String {
+    let dr = if t.has(Pat::Dovi) {
         "dv"
-    } else if RE_HDR_LABEL.is_match(t) || RE_HDR10P.is_match(t) {
+    } else if hdr_label(t) || t.has(Pat::Hdr10p) {
         "hdr"
     } else {
         ""
     };
     let group = release_group(title);
-    ["den-scout", detect_resolution_lower(t), detect_source_attr(t), dr, group.as_str()].join("|")
+    ["den-scout", resolution_bucket(t), detect_source_attr(t), dr, group.as_str()].join("|")
 }
 
 /// Go `fileExt`: the extension a release name may end on, which is dropped before its group is read.
@@ -143,11 +152,11 @@ pub(crate) fn release_group(title: &str) -> String {
 /// Go `cleanLabel` is the bullet-joined quality summary shown as attributes.label.
 #[cfg(test)]
 pub(crate) fn clean_label(s: &RawStream) -> String {
-    clean_label_lower(&str::to_lowercase(&s.title), s)
+    clean_label_traits(s.traits(), s)
 }
 
-/// Go `cleanLabelLower` is `clean_label` when the caller already has the lowercased title.
-pub(crate) fn clean_label_lower(t: &str, s: &RawStream) -> String {
+/// Go `cleanLabelLower`: `clean_label` over the parsed title `t`, which need not be `s.title`'s.
+pub(crate) fn clean_label_traits(t: &ReleaseTraits, s: &RawStream) -> String {
     let mut parts: Vec<String> = Vec::new();
     let res = resolution_label(t, s.size_bytes);
     if !res.is_empty() {
@@ -161,7 +170,7 @@ pub(crate) fn clean_label_lower(t: &str, s: &RawStream) -> String {
     if !dr.is_empty() {
         parts.push(dr.to_owned());
     }
-    if RE_ATMOS.is_match(t) {
+    if t.has(Pat::Atmos) {
         parts.push("Atmos".to_owned());
     }
     if let Some(size) = s.size_bytes {

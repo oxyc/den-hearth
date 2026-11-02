@@ -1,18 +1,44 @@
 //! Port of `internal/scout/rank.go`: release-title parsing, filtering and ranking. Scrapers produce
 //! `RawStream`, and the handler and probes consume it.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
-use fancy_regex::{Regex as LookRegex, RegexBuilder as LookRegexBuilder};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 
-use crate::attributes::stream_attributes_ref;
+use crate::attributes::cost_attributes;
 use crate::client::ClientPlayable;
 use crate::label::MIB;
 use crate::probe::Probe;
 use crate::season::{declares_episode, names_episode};
+use crate::traits::{fold_diacritics, Pat, ReleaseTraits, TagKind, YEAR_TOKEN};
+
+/// The `ReleaseTraits` of a `RawStream`'s title, parsed the first time anything asks and then carried with the
+/// stream (a clone carries it too). It is a cache of `title`, so it takes no part in equality, and a title is never
+/// rewritten once a stream exists.
+#[derive(Clone, Default)]
+pub struct TraitsCell(OnceLock<ReleaseTraits>);
+
+impl PartialEq for TraitsCell {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for TraitsCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TraitsCell")
+    }
+}
+
+impl RawStream {
+    /// What the title says, parsed once per stream.
+    pub(crate) fn traits(&self) -> &ReleaseTraits {
+        self.traits.0.get_or_init(|| ReleaseTraits::parse(&self.title))
+    }
+}
 
 /// Go `RawStream`: one release from one indexer.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -35,6 +61,8 @@ pub struct RawStream {
     /// What the file itself said, when probed. `None` means "not asked", distinct from "asked and it
     /// told us nothing".
     pub probe: Option<Probe>,
+    /// The parsed title; see `RawStream::traits`.
+    pub traits: TraitsCell,
 }
 
 /// Go `gib` (rank.go).
@@ -106,114 +134,21 @@ pub(crate) fn re2(pattern: &str) -> Regex {
     RegexBuilder::new(pattern).unicode(false).build().expect("static RE2 pattern")
 }
 
-/// Go `matcher`: RE2 for every pattern except the one lookbehind pattern, which Go runs on regexp2.
-pub(crate) enum Matcher {
-    Re2(Regex),
-    Look(LookRegex),
-}
-
-impl Matcher {
-    fn is_match(&self, s: &str) -> bool {
-        match self {
-            Matcher::Re2(r) => r.is_match(s),
-            // regexp2's MatchString reports an error as no match; so does this. fancy-regex's only runtime error
-            // is the backtrack limit, which `look` lifts.
-            Matcher::Look(r) => r.is_match(s).unwrap_or(false),
-        }
-    }
-}
-
-/// Go `mustR2`: a pattern RE2 cannot express, run on fancy-regex as regexp2 runs it. regexp2 has no backtrack
-/// ceiling, where fancy-regex stops after a million and reports an error that `Matcher::is_match` reads as "no
-/// match" — so a long enough title would silently stop being judged. The pattern backtracks a bounded amount per
-/// start position, so lifting the ceiling costs time linear in the title.
-fn look(pattern: &str) -> Matcher {
-    let re = LookRegexBuilder::new(pattern)
-        .backtrack_limit(usize::MAX)
-        .build()
-        .expect("static lookaround pattern");
-    Matcher::Look(re)
-}
-
-/// Go `goodSource`: markers that downgrade a bare cam/ts/scr to non-junk.
-pub(crate) static RE_GOOD_SOURCE: LazyLock<Regex> =
-    LazyLock::new(|| re2(r"remux|bluray|blu-ray|b[dr][ .\-_]?rip|web[ .\-_]?(dl|rip)?|hdtv|dvd[ .\-_]?rip"));
-
-/// Go `unambiguousJunk`: always junk. The "upscaled" pattern uses a lookbehind, so it runs on fancy-regex.
-pub(crate) static UNAMBIGUOUS_JUNK: LazyLock<Vec<(&'static str, Matcher)>> = LazyLock::new(|| {
-    vec![
-        ("cam", Matcher::Re2(re2(r"h[dq][ .\-_]?cam(rip)?|cam[ .\-_]?rip|s[ .\-]+print"))),
-        ("telesync", Matcher::Re2(re2(r"telesynch?|hd[ .\-_]?ts(rip)?|ts[ .\-_]?rip"))),
-        ("telecine", Matcher::Re2(re2(r"telecine|hd[ .\-_]?tc"))),
-        ("screener", Matcher::Re2(re2(r"(dvd|bd|br|web|hd)[ .\-_]?scr|p(re)?dvd(rip)?|screener"))),
-        ("workprint", Matcher::Re2(re2(r"workprint"))),
-        ("r5", Matcher::Re2(re2(r"\br5\b"))),
-        (
-            "upscaled",
-            look(
-                r"1xbet|read[ .\-_]?note|(?<!not[ .\-_])(?<!non[ .\-_])(upscaled?|up[ .\-_]?rez)|ai[ .\-_]?(upscaled?|enhanced?)|re[ .\-_]?graded?",
-            ),
-        ),
-    ]
-});
-
-pub(crate) static RE_BARE_CAM: LazyLock<Regex> = LazyLock::new(|| re2(r"\bcam\b"));
-pub(crate) static RE_BARE_TS: LazyLock<Regex> = LazyLock::new(|| re2(r"\bts\b"));
-pub(crate) static RE_BARE_SCR: LazyLock<Regex> = LazyLock::new(|| re2(r"\bscr\b"));
-
-/// Go `containerExt`: a container extension at the end of a file name. `.ts` is MPEG transport stream,
-/// not TeleSync: without this, `Show.S01E01.ts` matched the bare-TS rule and was dropped as junk. Only at
-/// the end of a name (or of a line in a multi-line title); a `.TS.` in the middle is still a TeleSync tag.
-/// RE2's `\s` is `[\t\n\f\r ]`, without the vertical tab the regex crate's ASCII `\s` adds, so it is spelled out.
-static CONTAINER_EXT: LazyLock<Regex> =
-    LazyLock::new(|| re2(r"\.(?:m2ts|ts|mkv|mp4|avi|m4v|webm)([\t\n\f\r ]|$)"));
-
-/// Go `junkClassOf`: the junk class of an already-lowercased title, or "" for a legit source.
-pub(crate) fn junk_class_of(t: &str) -> &'static str {
-    let t = CONTAINER_EXT.replace_all(t, "${1}");
-    for (class, re) in UNAMBIGUOUS_JUNK.iter() {
-        if re.is_match(&t) {
-            return class;
-        }
-    }
-    if !RE_GOOD_SOURCE.is_match(&t) {
-        if RE_BARE_CAM.is_match(&t) {
-            return "cam";
-        }
-        if RE_BARE_TS.is_match(&t) {
-            return "telesync";
-        }
-        if RE_BARE_SCR.is_match(&t) {
-            return "screener";
-        }
-    }
-    ""
-}
-
 /// Go `junkClass`: "" if the title is a legit source.
 #[cfg(test)]
 pub(crate) fn junk_class(title: &str) -> &'static str {
-    junk_class_of(&str::to_lowercase(title))
+    ReleaseTraits::parse(title).junk_class()
 }
 
-pub(crate) static RES_2160: LazyLock<Regex> = LazyLock::new(|| re2(r"2160p?"));
-pub(crate) static RES_1440: LazyLock<Regex> = LazyLock::new(|| re2(r"1440p?"));
-pub(crate) static RES_1080: LazyLock<Regex> = LazyLock::new(|| re2(r"1080p?"));
-pub(crate) static RES_720: LazyLock<Regex> = LazyLock::new(|| re2(r"720p?"));
-pub(crate) static RES_576: LazyLock<Regex> = LazyLock::new(|| re2(r"576p?"));
-pub(crate) static RES_540: LazyLock<Regex> = LazyLock::new(|| re2(r"540p?"));
-pub(crate) static RES_480: LazyLock<Regex> = LazyLock::new(|| re2(r"480p?"));
-pub(crate) static RES_4K_UHD: LazyLock<Regex> = LazyLock::new(|| re2(r"4k|uhd"));
-
 /// Go `detectResolutionLower`: the coarse bucket for the resolutions filter ("" when untagged).
-pub(crate) fn detect_resolution_lower(t: &str) -> &'static str {
-    if RES_2160.is_match(t) {
+pub(crate) fn resolution_bucket(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Res2160) {
         "2160p"
-    } else if RES_1080.is_match(t) {
+    } else if t.has(Pat::Res1080) {
         "1080p"
-    } else if RES_720.is_match(t) {
+    } else if t.has(Pat::Res720) {
         "720p"
-    } else if RES_480.is_match(t) || RES_576.is_match(t) || RES_540.is_match(t) {
+    } else if t.has(Pat::Res480) || t.has(Pat::Res576) || t.has(Pat::Res540) {
         "480p"
     } else {
         ""
@@ -221,8 +156,9 @@ pub(crate) fn detect_resolution_lower(t: &str) -> &'static str {
 }
 
 /// Go `detectResolution`: "" when the title names none.
+#[cfg(test)]
 pub(crate) fn detect_resolution(title: &str) -> &'static str {
-    detect_resolution_lower(&str::to_lowercase(title))
+    resolution_bucket(&ReleaseTraits::parse(title))
 }
 
 /// Go `fake4KFloor`: a "2160p" file smaller than this is not 4K in any sense that matters (mislabelled or
@@ -230,61 +166,31 @@ pub(crate) fn detect_resolution(title: &str) -> &'static str {
 const FAKE_4K_FLOOR: i64 = 700 * MIB;
 
 /// Go `resolutionBase`.
-fn resolution_base(t: &str, size_bytes: Option<i64>) -> i64 {
-    if RES_2160.is_match(t) {
+fn resolution_base(t: &ReleaseTraits, size_bytes: Option<i64>) -> i64 {
+    if t.has(Pat::Res2160) {
         if size_bytes.is_some_and(|s| s < FAKE_4K_FLOOR) {
             return 1080;
         }
         return 4000;
     }
-    if RES_1440.is_match(t) {
+    if t.has(Pat::Res1440) {
         1440
-    } else if RES_1080.is_match(t) {
+    } else if t.has(Pat::Res1080) {
         1080
-    } else if RES_720.is_match(t) {
+    } else if t.has(Pat::Res720) {
         720
-    } else if RES_576.is_match(t) {
+    } else if t.has(Pat::Res576) {
         576
-    } else if RES_540.is_match(t) {
+    } else if t.has(Pat::Res540) {
         540
-    } else if RES_480.is_match(t) {
+    } else if t.has(Pat::Res480) {
         480
-    } else if RES_4K_UHD.is_match(t) && size_bytes.unwrap_or(0) > 3 * GIB {
+    } else if t.has(Pat::Res4kUhd) && size_bytes.unwrap_or(0) > 3 * GIB {
         4000
     } else {
         100
     }
 }
-
-pub(crate) static RE_REMUX: LazyLock<Regex> = LazyLock::new(|| re2(r"\bremux\b"));
-pub(crate) static RE_BLURAY: LazyLock<Regex> = LazyLock::new(|| re2(r"bluray|blu-ray"));
-pub(crate) static RE_BR_RIP: LazyLock<Regex> = LazyLock::new(|| re2(r"b[dr][ .\-_]?rip"));
-pub(crate) static RE_WEB_DL: LazyLock<Regex> = LazyLock::new(|| re2(r"web[ .\-_]?dl"));
-pub(crate) static RE_WEB_RIP: LazyLock<Regex> = LazyLock::new(|| re2(r"web[ .\-_]?rip"));
-pub(crate) static RE_WEB: LazyLock<Regex> = LazyLock::new(|| re2(r"\bweb\b"));
-pub(crate) static RE_HDTV: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhdtv\b"));
-pub(crate) static RE_DVD_RIP: LazyLock<Regex> = LazyLock::new(|| re2(r"dvd[ .\-_]?rip"));
-pub(crate) static RE_LOW_SRC: LazyLock<Regex> = LazyLock::new(|| re2(r"tvrip|satrip|pdtv"));
-/// Bare DV is the common scene tag for Dolby Vision.
-pub(crate) static RE_DOVI: LazyLock<Regex> = LazyLock::new(|| re2(r"dolby vision|dolbyvision|dovi|\bdv\b"));
-pub(crate) static RE_HDR10P: LazyLock<Regex> = LazyLock::new(|| re2(r"hdr10\+|hdr10plus"));
-pub(crate) static RE_HDR: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhdr\b|\bhlg\b"));
-pub(crate) static RE_ATMOS: LazyLock<Regex> = LazyLock::new(|| re2(r"atmos"));
-pub(crate) static RE_DTSX: LazyLock<Regex> = LazyLock::new(|| re2(r"dts:x|dtsx|dts-x"));
-pub(crate) static RE_TRUEHD: LazyLock<Regex> = LazyLock::new(|| re2(r"truehd|true-hd"));
-pub(crate) static RE_DTSHD_MA: LazyLock<Regex> = LazyLock::new(|| re2(r"dts-hd ma|dts-hd\.ma|dts-ma"));
-pub(crate) static RE_DTSHD: LazyLock<Regex> = LazyLock::new(|| re2(r"dts-hd|dts hd|dtshd|flac|lpcm|pcm"));
-pub(crate) static RE_EAC3: LazyLock<Regex> = LazyLock::new(|| re2(r"eac3|e-ac3|dd\+|ddp|ddplus"));
-pub(crate) static RE_DTS: LazyLock<Regex> = LazyLock::new(|| re2(r"\bdts\b"));
-pub(crate) static RE_AC3: LazyLock<Regex> = LazyLock::new(|| re2(r"ac3|\bdd\b|dolby digital"));
-pub(crate) static RE_IS_4K: LazyLock<Regex> = LazyLock::new(|| re2(r"2160p?|4k|uhd"));
-pub(crate) static RE_AV1: LazyLock<Regex> = LazyLock::new(|| re2(r"av1"));
-pub(crate) static RE_3D: LazyLock<Regex> =
-    LazyLock::new(|| re2(r"\b3d\b|hsbs|half[ .\-_]?sbs|sbs[ .\-_]?3d"));
-pub(crate) static RE_KORSUB_HC: LazyLock<Regex> = LazyLock::new(|| re2(r"korsub|\bhc\b"));
-/// HDROnly filter: matches the TS hdrOnly regex.
-pub(crate) static RE_HDR_ONLY: LazyLock<Regex> =
-    LazyLock::new(|| re2(r"dolby vision|dolbyvision|dovi|\bhdr\b|hdr10|\bhlg\b"));
 
 /// Go `capSeeds`: keeps the best `limit` releases, not the first ones.
 ///
@@ -316,14 +222,13 @@ pub(crate) fn quality_score(s: RawStream) -> i64 {
 
 /// Borrowed scorer used by ranking paths that already own a stream collection.
 pub(crate) fn quality_score_ref(s: &RawStream) -> i64 {
-    let t = str::to_lowercase(&s.title);
-    quality_score_lower(&t, s, junk_class_of(&t))
+    quality_score_traits(s.traits(), s)
 }
 
-/// Go `qualityScoreLower`.
-pub(crate) fn quality_score_lower(t: &str, s: &RawStream, junk: &str) -> i64 {
+/// Go `qualityScoreLower`, over the parsed title.
+pub(crate) fn quality_score_traits(t: &ReleaseTraits, s: &RawStream) -> i64 {
     let mut score = 0i64;
-    if !junk.is_empty() {
+    if !t.junk_class().is_empty() {
         score -= 100_000;
     }
     if s.cached {
@@ -331,48 +236,52 @@ pub(crate) fn quality_score_lower(t: &str, s: &RawStream, junk: &str) -> i64 {
     }
     score += resolution_base(t, s.size_bytes);
 
-    if RE_REMUX.is_match(t) {
+    if t.has(Pat::Remux) {
         score += 230;
-    } else if RE_BLURAY.is_match(t) || RE_BR_RIP.is_match(t) {
+    } else if t.has(Pat::Bluray) || t.has(Pat::BrRip) {
         score += 150;
-    } else if RE_WEB_DL.is_match(t) {
+    } else if t.has(Pat::WebDl) {
         score += 75;
-    } else if RE_WEB_RIP.is_match(t) {
+    } else if t.has(Pat::WebRip) {
         score += 50;
-    } else if RE_WEB.is_match(t) {
+    } else if t.has(Pat::Web) {
         score += 75;
     }
-    if RE_HDTV.is_match(t) {
+    if t.has(Pat::Hdtv) {
         score -= 150;
     }
-    if RE_DVD_RIP.is_match(t) {
+    if t.has(Pat::DvdRip) {
         score -= 200;
     }
-    if RE_LOW_SRC.is_match(t) {
+    if t.has(Pat::LowSrc) {
         score -= 300;
     }
 
-    if RE_DOVI.is_match(t) {
+    if t.has(Pat::Dovi) {
         score += 30;
-    } else if RE_HDR10P.is_match(t) {
+    } else if t.has(Pat::Hdr10p) {
         score += 24;
-    } else if RE_HDR.is_match(t) {
+    } else if t.has(Pat::HdrPlain) || t.has(Pat::Hlg) {
         score += 18;
     }
 
     // Audio scored by what Den DELIVERS, not the source spec: DD+/EAC3 stream-copies (and EAC3+JOC keeps
     // real Atmos), while TrueHD / DTS / DTS-HD bridge down to EAC3 5.1 (a transcode, losing Atmos + 7.1).
-    let atmos = RE_ATMOS.is_match(t);
-    if RE_EAC3.is_match(t) && atmos {
+    let atmos = t.has(Pat::Atmos);
+    if t.has(Pat::Eac3) && atmos {
         score += 30; // DD+ Atmos: real Atmos, stream-copied on every route
-    } else if RE_EAC3.is_match(t) {
+    } else if t.has(Pat::Eac3) {
         score += 20; // DD+ 5.1/7.1: stream-copy, native (7.1 preserved)
-    } else if RE_AC3.is_match(t) {
+    } else if t.has(Pat::Ac3) {
         score += 14; // AC3: stream-copy, native 5.1
-    } else if RE_DTSX.is_match(t) || RE_TRUEHD.is_match(t) || RE_DTSHD_MA.is_match(t) || RE_DTSHD.is_match(t)
+    } else if t.has(Pat::Dtsx)
+        || t.has(Pat::Truehd)
+        || t.has(Pat::DtshdMa)
+        || t.has(Pat::DtshdAttr)
+        || t.has(Pat::Flac)
     {
         score += 12; // lossless/object source, but Den bridges to EAC3 5.1 (below native DD+)
-    } else if RE_DTS.is_match(t) {
+    } else if t.has(Pat::Dts) {
         score += 8; // DTS core: bridged to 5.1
     } else if atmos {
         score += 20; // Atmos with no identifiable codec token: assume DD+ (most streaming Atmos is)
@@ -383,18 +292,18 @@ pub(crate) fn quality_score_lower(t: &str, s: &RawStream, junk: &str) -> i64 {
         score += add.min(600);
     }
 
-    let is_4k = RE_IS_4K.is_match(t);
-    if RE_AV1.is_match(t) {
+    let is_4k = t.has(Pat::Res2160) || t.has(Pat::Res4kUhd);
+    if t.has(Pat::Av1) {
         if is_4k {
             score -= 1500;
         } else {
             score -= 150;
         }
     }
-    if RE_3D.is_match(t) {
+    if t.has(Pat::ThreeD) {
         score -= 2000;
     }
-    if RE_KORSUB_HC.is_match(t) {
+    if t.has(Pat::KorsubHc) {
         score -= 200;
     }
     score
@@ -421,119 +330,37 @@ const FOREIGN_AUDIO_SINK: i64 = 15_000;
 /// The audio is most likely the original, so it sinks below untagged releases but stays above a dub.
 const FOREIGN_SUBS_SINK: i64 = PREFERENCE_SINK;
 
-/// Release-name tokens that declare the audio language, mapped to ISO 639-1. Scene names leave the original
-/// language of an English title untagged and tag everything else, so a tag is evidence of the audio track.
-const AUDIO_LANGUAGE_TAGS: &[(&str, &str)] = &[
-    ("ita", "it"),
-    ("italian", "it"),
-    ("french", "fr"),
-    ("truefrench", "fr"),
-    ("vf", "fr"),
-    ("vff", "fr"),
-    ("vfq", "fr"),
-    ("vfi", "fr"),
-    ("vf2", "fr"),
-    ("german", "de"),
-    ("ger", "de"),
-    ("deutsch", "de"),
-    ("spanish", "es"),
-    ("castellano", "es"),
-    ("latino", "es"),
-    ("esp", "es"),
-    ("spa", "es"),
-    ("rus", "ru"),
-    ("russian", "ru"),
-    ("ukr", "uk"),
-    ("ukrainian", "uk"),
-    ("polish", "pl"),
-    ("pldub", "pl"),
-    ("lektor", "pl"),
-    ("portuguese", "pt"),
-    ("dublado", "pt"),
-    ("hindi", "hi"),
-    ("tamil", "ta"),
-    ("telugu", "te"),
-    ("turkish", "tr"),
-    ("japanese", "ja"),
-    ("jap", "ja"),
-    ("korean", "ko"),
-    ("kor", "ko"),
-    ("chinese", "zh"),
-    ("mandarin", "zh"),
-    ("cantonese", "zh"),
-    ("swedish", "sv"),
-    ("swe", "sv"),
-    ("norwegian", "no"),
-    ("nor", "no"),
-    ("danish", "da"),
-    ("dan", "da"),
-    ("finnish", "fi"),
-    ("fin", "fi"),
-    ("dutch", "nl"),
-    ("flemish", "nl"),
-    ("czech", "cs"),
-    ("cze", "cs"),
-    ("hungarian", "hu"),
-    ("hun", "hu"),
-    ("english", "en"),
-    ("eng", "en"),
-];
-
-/// Release-name tokens that declare only the subtitle language. English subtitles never sink a release: they are
-/// what a viewer reading along most often wants, whatever the audio.
-const SUBTITLE_LANGUAGE_TAGS: &[(&str, &str)] = &[
-    ("vostfr", "fr"),
-    ("vost", "fr"),
-    ("subfrench", "fr"),
-    ("nlsub", "nl"),
-    ("nlsubs", "nl"),
-    ("plsub", "pl"),
-    ("korsub", "ko"),
-    ("ensub", "en"),
-    ("ensubbed", "en"),
-    ("engsub", "en"),
-];
-
-/// Tokens that say a release carries several audio tracks, which in practice includes the original.
-const MULTI_AUDIO_TAGS: &[&str] = &["multi", "dual"];
-
-/// Whether `c` is Cyrillic. A release named in Cyrillic is a release made for that market, almost always dubbed.
-fn is_cyrillic(c: char) -> bool {
-    ('\u{0400}'..='\u{04FF}').contains(&c)
-}
-
-/// What a release's language tags cost it against `f.languages`. Tokens of the title itself are not read as tags,
-/// so a film whose name holds "Fin" is not taken for Finnish. Nothing is judged while the original language is
-/// unknown: sinking an Italian film's ITA releases because nobody said it was Italian would trade the original for
-/// a dub, which is the failure this exists to prevent.
-pub(crate) fn foreign_language_sink(lower: &str, f: &RankFilters) -> i64 {
+/// What a release's language tags (`LANGUAGE_TAGS`) cost it against `f.languages`. Tokens of the title itself are
+/// not read as tags, so a film whose name holds "Fin" is not taken for Finnish. Nothing is judged while the original
+/// language is unknown: sinking an Italian film's ITA releases because nobody said it was Italian would trade the
+/// original for a dub, which is the failure this exists to prevent.
+pub(crate) fn foreign_language_sink(t: &ReleaseTraits, f: &RankFilters) -> i64 {
     if f.languages.is_empty() {
         return 0;
     }
-    let folded = fold_diacritics(lower);
-    let mut audio: Vec<&str> = Vec::new();
-    let mut subs: Vec<&str> = Vec::new();
-    for m in TITLE_TOKEN_RE.find_iter(&folded) {
-        let tok = m.as_str();
-        if f.show_tokens.contains(tok) || f.expected_title_tokens.contains(tok) {
+    let (mut audio, mut audio_wanted, mut foreign_subs) = (false, false, false);
+    for (tok, kind, lang) in t.language_tags() {
+        if f.show_tokens.contains(*tok) || f.expected_title_tokens.contains(*tok) {
             continue;
         }
-        if MULTI_AUDIO_TAGS.contains(&tok) {
-            return 0;
+        match kind {
+            TagKind::Multi => return 0,
+            TagKind::Audio => {
+                audio = true;
+                audio_wanted |= f.languages.contains(*lang);
+            }
+            TagKind::Subs => foreign_subs |= *lang != "en" && !f.languages.contains(*lang),
         }
-        if let Some((_, lang)) = AUDIO_LANGUAGE_TAGS.iter().find(|(t, _)| *t == tok) {
-            audio.push(lang);
-        } else if let Some((_, lang)) = SUBTITLE_LANGUAGE_TAGS.iter().find(|(t, _)| *t == tok) {
-            subs.push(lang);
-        }
     }
-    if lower.chars().any(is_cyrillic) {
-        audio.push("ru");
+    // A release named in Cyrillic is a release made for that market, almost always dubbed.
+    if t.cyrillic() {
+        audio = true;
+        audio_wanted |= f.languages.contains("ru");
     }
-    if !audio.is_empty() {
-        return if audio.iter().any(|lang| f.languages.contains(*lang)) { 0 } else { FOREIGN_AUDIO_SINK };
+    if audio {
+        return if audio_wanted { 0 } else { FOREIGN_AUDIO_SINK };
     }
-    if subs.iter().any(|lang| *lang != "en" && !f.languages.contains(*lang)) {
+    if foreign_subs {
         FOREIGN_SUBS_SINK
     } else {
         0
@@ -562,28 +389,6 @@ const TITLE_STOP: &[&str] = &[
     "hdr10", "dv", "sdr", "aac", "ac3", "dts", "atmos", "ddp", "mp4", "mkv", "avi", "esp", "eng", "lat",
     "dub", "dubbed", "sub", "subs", "multi", "dual",
 ];
-
-/// Go `yearToken`: a plausible 4-digit film year (1900 to 2039). `release_years` then rejects matches that
-/// are really resolution or codec digits.
-pub(crate) static YEAR_TOKEN: LazyLock<Regex> = LazyLock::new(|| re2(r"19\d\d|20[0-3]\d"));
-
-/// Go `foldDiacritics`: maps accented Latin letters onto their plain forms before tokenising. Tokens are
-/// `[a-z0-9]` runs, so without it "Pokémon" split into "pok" and "mon".
-fn fold_diacritics(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' => 'a',
-            'é' | 'è' | 'ê' | 'ë' | 'ē' => 'e',
-            'í' | 'ì' | 'î' | 'ï' | 'ī' => 'i',
-            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' | 'ō' => 'o',
-            'ú' | 'ù' | 'û' | 'ü' | 'ū' => 'u',
-            'ñ' => 'n',
-            'ç' => 'c',
-            'ý' | 'ÿ' => 'y',
-            other => other,
-        })
-        .collect()
-}
 
 /// Go `titleTokens`: significant lowercase tokens (stopwords, format noise, bare years and single-letter
 /// noise removed). Used to sanity-check a year-less release against the request.
@@ -670,34 +475,20 @@ pub(crate) fn title_overlap(release_title: &str, expected: &HashSet<String>) -> 
 }
 
 /// Go `releaseYears`: every plausible year in a release name (usually one, e.g. "(2026)").
+#[cfg(test)]
 pub(crate) fn release_years(title: &str) -> Vec<i64> {
-    let t = str::to_lowercase(title);
-    let bytes = t.as_bytes();
-    let mut out = Vec::new();
-    for m in YEAR_TOKEN.find_iter(&t) {
-        let before = if m.start() > 0 { bytes[m.start() - 1] } else { b' ' };
-        let after = if m.end() < bytes.len() { bytes[m.end()] } else { b' ' };
-        if before.is_ascii_digit() || before == b'x' {
-            continue; // trailing digits of a bigger number, or a resolution like 1920x...
-        }
-        if after.is_ascii_digit() || after == b'p' || after == b'i' || after == b'x' {
-            continue; // 2160p, 1920x..., etc.
-        }
-        if let Ok(y) = m.as_str().parse::<i64>() {
-            out.push(y);
-        }
-    }
-    out
+    crate::traits::year_matches(&str::to_lowercase(title)).collect()
 }
 
 /// Go `yearMismatch`: whether a title has a parseable year and none of them is within one of `expected`.
 /// No parseable year means no mismatch: we can't tell, so the release is kept.
+#[cfg(test)]
 pub(crate) fn year_mismatch(title: &str, expected: i64) -> bool {
-    let years = release_years(title);
-    if years.is_empty() {
-        return false;
-    }
-    !years.iter().any(|&y| y >= expected - 1 && y <= expected + 1)
+    year_mismatch_traits(&ReleaseTraits::parse(title), expected)
+}
+
+fn year_mismatch_traits(t: &ReleaseTraits, expected: i64) -> bool {
+    t.has_year() && !t.year_in(expected - 1, expected + 1)
 }
 
 /// Rewrites a user's pattern, written for Go's RE2, so the regex crate reads it the way RE2 does.
@@ -825,15 +616,12 @@ pub(crate) fn rank_streams_debug(
     };
     let allowed: HashSet<&str> = f.resolutions.iter().map(String::as_str).collect();
 
-    struct Scored {
-        idx: usize,
-        score: i64,
-        seeders: i64,
-    }
-    let mut out: Vec<Scored> = Vec::new();
+    // The sort key of each survivor, (score, seeders, input index): the index makes every key distinct, so an
+    // unstable sort orders them exactly as a stable one would.
+    let mut out: Vec<(i64, i64, usize)> = Vec::new();
     for (i, s) in streams.iter().enumerate() {
-        let lower = str::to_lowercase(&s.title);
-        let junk = junk_class_of(&lower);
+        let t = s.traits();
+        let junk = t.junk_class();
         if f.exclude_cam && !junk.is_empty() {
             drop_n(&mut debug, junk, 1);
             continue;
@@ -843,14 +631,14 @@ pub(crate) fn rank_streams_debug(
             continue;
         }
         // Drop a mistagged torrent (another film's IMDb id): its release year is clearly wrong.
-        if f.expected_year.is_some_and(|y| year_mismatch(&s.title, y)) {
+        if f.expected_year.is_some_and(|y| year_mismatch_traits(t, y)) {
             drop_n(&mut debug, "yearMismatch", 1);
             continue;
         }
         // A release with no parseable year can't be year-checked; if we know the title, require at least one
         // significant-token overlap so year-less junk ("B-Bead.mp4") is dropped.
         if !f.expected_title_tokens.is_empty()
-            && release_years(&s.title).is_empty()
+            && !t.has_year()
             && !title_overlap(&s.title, &f.expected_title_tokens)
         {
             drop_n(&mut debug, "titleMismatch", 1);
@@ -859,13 +647,13 @@ pub(crate) fn rank_streams_debug(
         // Computed once for both the hard filter and the soft preference, and only when one is set.
         let mut res = "";
         if !allowed.is_empty() || !f.prefer_resolution.is_empty() {
-            res = detect_resolution_lower(&lower);
+            res = resolution_bucket(t);
         }
         if !allowed.is_empty() && !res.is_empty() && !allowed.contains(res) {
             drop_n(&mut debug, "resolution", 1);
             continue;
         }
-        if f.hdr_only && !RE_HDR_ONLY.is_match(&lower) {
+        if f.hdr_only && !t.has(Pat::HdrOnly) {
             drop_n(&mut debug, "hdrOnly", 1);
             continue;
         }
@@ -888,15 +676,15 @@ pub(crate) fn rank_streams_debug(
             drop_n(&mut debug, "cachedOnly", 1);
             continue;
         }
-        let mut score = quality_score_lower(&lower, s, junk);
+        let mut score = quality_score_traits(t, s);
         if let Some(client) = &f.client {
-            score -= client.cost_ref(s, stream_attributes_ref(s));
+            score -= client.cost_ref(s, cost_attributes(s));
         }
         // A release whose resolution could not be read is NOT sunk, matching every hard filter here.
         if !f.prefer_resolution.is_empty() && !res.is_empty() && res != f.prefer_resolution {
             score -= PREFERENCE_SINK;
         }
-        score -= foreign_language_sink(&lower, &f);
+        score -= foreign_language_sink(t, &f);
         if let Some([season, episode]) = f.episode {
             if (!f.show_tokens.is_empty() && other_show(&s.title, &f.show_tokens))
                 || other_episode(&s.title, season, episode)
@@ -904,10 +692,10 @@ pub(crate) fn rank_streams_debug(
                 score -= WRONG_SHOW_SINK;
             }
         }
-        out.push(Scored { idx: i, score, seeders: s.seeders.unwrap_or(0) });
+        out.push((score, s.seeders.unwrap_or(0), i));
     }
 
-    out.sort_by(|a, b| b.score.cmp(&a.score).then(b.seeders.cmp(&a.seeders)).then(a.idx.cmp(&b.idx)));
+    out.sort_unstable_by_key(|&(score, seeders, idx)| (Reverse(score), Reverse(seeders), idx));
     let cap = usize::try_from(f.result_cap).unwrap_or(0);
     if out.len() > cap {
         drop_n(&mut debug, "resultCap", (out.len() - cap) as i64);
@@ -918,16 +706,16 @@ pub(crate) fn rank_streams_debug(
         d.ranked = out.len() as i64;
         d.kept = out
             .iter()
-            .map(|o| {
-                let s = &streams[o.idx];
+            .map(|&(score, _, idx)| {
+                let s = &streams[idx];
                 DebugScore {
                     title: s.title.clone(),
-                    score: o.score,
-                    resolution: detect_resolution(&s.title).to_string(),
+                    score,
+                    resolution: resolution_bucket(s.traits()).to_string(),
                     cached: s.cached,
                 }
             })
             .collect();
     }
-    out.iter().map(|o| streams[o.idx].clone()).collect()
+    out.iter().map(|&(_, _, idx)| streams[idx].clone()).collect()
 }
