@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use crate::cache::{Cache, MemoryCache};
 use crate::config::Indexer;
-use crate::coverage::{OUTCOME_ANSWERED, OUTCOME_TIMEOUT};
+use crate::coverage::{OUTCOME_ANSWERED, OUTCOME_LATE};
 use crate::handler::new_handler;
 use crate::loglimit::Capture;
 use crate::rank::{RawStream, GIB};
@@ -158,7 +158,7 @@ async fn the_late_answer_is_kept_for_the_next_build() {
     assert_eq!(start.elapsed(), Duration::from_millis(1400));
     let outcomes: Vec<(&str, &str)> =
         res.sources.iter().map(|s| (s.id.as_str(), s.outcome.as_str())).collect();
-    assert_eq!(outcomes, [("torrentio", OUTCOME_ANSWERED), ("mediafusion", OUTCOME_TIMEOUT)]);
+    assert_eq!(outcomes, [("torrentio", OUTCOME_ANSWERED), ("mediafusion", OUTCOME_LATE)]);
     assert!(!res.complete && res.any_ok);
     let late = res.late.expect("a source was left behind");
     assert_eq!(late.ids, ["mediafusion"]);
@@ -183,11 +183,9 @@ async fn the_late_answer_is_kept_for_the_next_build() {
     assert_eq!((fast.asked.load(Ordering::SeqCst), slow.asked.load(Ordering::SeqCst)), (1, 1));
 }
 
-/// Through the stream route: the list goes out after the grace, without the slow indexer's release, and once that
-/// lands the log says whether it would have led the list. Here it would have (a cached 4K copy), and says so.
-#[tokio::test(start_paused = true)]
-async fn the_route_answers_early_and_counts_what_the_late_indexer_would_have_changed() {
-    let h = new_handler(test_deps(|d| {
+/// A stream route whose torrentio answers in 400 ms and mediafusion in 4 s.
+fn slow_second_indexer() -> crate::handler::Handler {
+    new_handler(test_deps(|d| {
         d.scrape_timeout = TIMEOUT;
         d.make_scrapers = Arc::new(|_| {
             vec![
@@ -205,15 +203,60 @@ async fn the_route_answers_early_and_counts_what_the_late_indexer_would_have_cha
                 }),
             ]
         });
-    }));
+    }))
+}
+
+fn list_path() -> String {
+    format!("/{}/stream/movie/tt1234567.json", valid_blob())
+}
+
+const EARLY: (&str, &str) = ("X-Den-Early-Answer", "1");
+
+/// Without the header a list waits for every indexer: a request that judges a list complete (a download's search
+/// or fallback, an availability check), and every client that has never heard of the header, is unchanged.
+#[tokio::test(start_paused = true)]
+async fn without_the_header_the_route_waits_for_every_indexer() {
+    let h = slow_second_indexer();
+    let start = Instant::now();
+    let resp = get(&h, &list_path(), &[]).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(4000));
+    let body = String::from_utf8_lossy(resp.body()).into_owned();
+    assert!(body.contains("Movie 1080p WEB-DL") && body.contains("Movie 2160p"), "{body}");
+    assert!(body.contains(r#""answerKind":"live""#) && !body.contains(r#""outcome":"late""#), "{body}");
+}
+
+/// An early answer is its requester's alone: not stored by any cache, and not the list a plain request that
+/// follows is served — that one waits for every indexer, and gets the 4K copy the early list went without.
+#[tokio::test(start_paused = true)]
+async fn an_early_answer_is_never_served_to_a_request_that_waits() {
+    let h = slow_second_indexer();
+    let early = get(&h, &list_path(), &[EARLY]).await;
+    assert_eq!(early.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store"));
+    let body = String::from_utf8_lossy(early.body()).into_owned();
+    assert!(body.contains(r#""outcome":"late""#) && !body.contains("expiresAt"), "{body}");
+
+    let start = Instant::now();
+    let plain = get(&h, &list_path(), &[]).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(4000), "built again, waiting for every indexer");
+    let body = String::from_utf8_lossy(plain.body()).into_owned();
+    assert!(body.contains("Movie 2160p") && !body.contains(r#""outcome":"late""#), "{body}");
+}
+
+/// Through the stream route with the header: the list goes out after the grace, without the slow indexer's
+/// release, which is reported `late` (not `timeout`, which clients read as a source that failed). Once that lands
+/// the log says whether it would have led the list. Here it would have (a cached 4K copy), and says so.
+#[tokio::test(start_paused = true)]
+async fn the_route_answers_early_and_counts_what_the_late_indexer_would_have_changed() {
+    let h = slow_second_indexer();
     let log = Capture::start();
     let start = Instant::now();
-    let resp = get(&h, &format!("/{}/stream/movie/tt1234567.json", valid_blob()), &[]).await;
+    let resp = get(&h, &list_path(), &[EARLY]).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(start.elapsed(), Duration::from_millis(1400), "answered a grace after the first indexer");
     let body = String::from_utf8_lossy(resp.body()).into_owned();
     assert!(body.contains("Movie 1080p WEB-DL") && !body.contains("Movie 2160p"), "{body}");
-    assert!(body.contains(r#""id":"mediafusion","outcome":"timeout""#), "{body}");
+    assert!(body.contains(r#""id":"mediafusion","outcome":"late""#), "{body}");
+    assert!(body.contains(r#""answerKind":"partial""#), "{body}");
 
     let mut line = None;
     for _ in 0..200 {

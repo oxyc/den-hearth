@@ -300,8 +300,16 @@ impl Inner {
         // Detach the shared build from the request: a client disconnect (Stremio routinely races and cancels
         // addon requests) must not cancel the scrape mid-flight and let an empty list get cached and served
         // to every follower. The build runs on a task of its own, which a dropped request does not abort.
+        //
+        // An early-answer build is its own flight: a request that waits for every indexer must never be handed a
+        // list that went out without one.
         let job = ListJob::new(config, list_key, client, rid(req));
-        match self.shared(cache_key.clone(), self.clone().build_task(job, false)).await {
+        let (job, flight) = if req.headers().get(X_DEN_EARLY_ANSWER).is_some_and(|v| v == "1") {
+            (job.early(), format!("{cache_key}:early"))
+        } else {
+            (job, cache_key.clone())
+        };
+        match self.shared(flight, self.clone().build_task(job, false)).await {
             SharedBuild::Ready(res) => self.write_built(start, &res),
             SharedBuild::Busy => list_build_busy(),
             SharedBuild::Panicked => error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
@@ -427,7 +435,9 @@ impl Inner {
         // stale-if-error=86400`, which URLSession's shared cache honours. The guard was defeated one layer
         // down, on the only client that matters: an outage's empty list stuck on the device for five minutes,
         // and up to a day on any later error.
-        let cache_header = if !res.degraded.is_empty() {
+        // An early answer is for the request that asked for it: a client cache keyed on the URL alone would hand it
+        // to a later request that waits for every indexer.
+        let cache_header = if !res.degraded.is_empty() || res.answered_early {
             NO_STORE
         } else if !res.complete {
             // The SAME lesson one line up, for the partial case: the server held this list for a minute and
@@ -476,7 +486,7 @@ impl Inner {
         };
         let (client, _) = client_playable(req);
         let this = self.clone();
-        let job = ListJob::new(config, key, client, rid(req)).behind();
+        let job = ListJob::new(config, key, client, rid(req));
         let flight_key = cache_key.to_owned();
         spawn_background(self.deps.runtime.clone(), "stale list rebuild", async move {
             // The booking is released from the guard, so a panic cannot strand the key permanently.
@@ -511,9 +521,8 @@ impl Inner {
             rid: &job.rid,
             audio: &[],
             fresh: job.fresh,
-            // A debug build is a diagnostic of the whole scrape, and a rebuild behind a stale answer has nobody
-            // waiting on it.
-            answer_early: !debug && !job.behind,
+            // A debug build is a diagnostic of the whole scrape.
+            answer_early: job.early && !debug,
         };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
         // A movie's list answers the availability route's question too, so a title someone opened needs no
@@ -561,6 +570,7 @@ impl Inner {
         )
         .await;
         let late = scraped.late;
+        let answered_early = late.is_some();
         let (mut seeds, scrape_ok, scrape_complete) = (scraped.seeds, scraped.any_ok, scraped.complete);
         let restored = crate::continuity::restore(&*self.deps.cache, config, sid, &mut seeds);
         if restored > 0 {
@@ -846,6 +856,7 @@ impl Inner {
             complete: scrape_complete,
             coverage: cov,
             timing,
+            answered_early,
         }
     }
 
@@ -937,6 +948,7 @@ impl Inner {
             complete: scrape_complete,
             coverage,
             mut timing,
+            answered_early,
         } = list;
         let degraded = !degraded_reason.is_empty();
         // Ask the top few releases what they actually contain. After ranking, so the probe follows the order
@@ -970,7 +982,9 @@ impl Inner {
             fresh_until = (now + ttl).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
             hold = ttl + stale_window_for(ttl).max(self.outage_hold);
         }
-        let cached = !degraded && dbg.is_none();
+        // Nor a list that went out without a late source: it answers the request that asked for it, and every
+        // other request (one that judges a list complete included) is served a list that waited for all of them.
+        let cached = !degraded && dbg.is_none() && !answered_early;
         let whole_seconds = |t: SystemTime| {
             UNIX_EPOCH + Duration::from_secs(t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))
         };
@@ -1008,7 +1022,7 @@ impl Inner {
             }
             self.deps.cache.put(cache_key, &value, hold);
         }
-        BuildResult { value, degraded: degraded_reason, complete: scrape_complete, timing }
+        BuildResult { value, degraded: degraded_reason, complete: scrape_complete, timing, answered_early }
     }
 
     /// playURLs is how one stream list names its play URLs: a ticket per release while tickets are on, all
@@ -1062,6 +1076,7 @@ mod managed_audio_tests {
             complete: true,
             coverage: Coverage { complete: true, sources: vec![] },
             timing: String::new(),
+            answered_early: false,
         }
     }
 
