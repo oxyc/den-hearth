@@ -300,8 +300,16 @@ impl Inner {
         // Detach the shared build from the request: a client disconnect (Stremio routinely races and cancels
         // addon requests) must not cancel the scrape mid-flight and let an empty list get cached and served
         // to every follower. The build runs on a task of its own, which a dropped request does not abort.
+        //
+        // An early-answer build is its own flight: a request that waits for every indexer must never be handed a
+        // list that went out without one.
         let job = ListJob::new(config, list_key, client, rid(req));
-        match self.shared(cache_key.clone(), self.clone().build_task(job, false)).await {
+        let (job, flight) = if req.headers().get(X_DEN_EARLY_ANSWER).is_some_and(|v| v == "1") {
+            (job.early(), format!("{cache_key}:early"))
+        } else {
+            (job, cache_key.clone())
+        };
+        match self.shared(flight, self.clone().build_task(job, false)).await {
             SharedBuild::Ready(res) => self.write_built(start, &res),
             SharedBuild::Busy => list_build_busy(),
             SharedBuild::Panicked => error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
@@ -427,7 +435,9 @@ impl Inner {
         // stale-if-error=86400`, which URLSession's shared cache honours. The guard was defeated one layer
         // down, on the only client that matters: an outage's empty list stuck on the device for five minutes,
         // and up to a day on any later error.
-        let cache_header = if !res.degraded.is_empty() {
+        // An early answer is for the request that asked for it: a client cache keyed on the URL alone would hand it
+        // to a later request that waits for every indexer.
+        let cache_header = if !res.degraded.is_empty() || res.answered_early {
             NO_STORE
         } else if !res.complete {
             // The SAME lesson one line up, for the partial case: the server held this list for a minute and
@@ -511,6 +521,8 @@ impl Inner {
             rid: &job.rid,
             audio: &[],
             fresh: job.fresh,
+            // A debug build is a diagnostic of the whole scrape.
+            answer_early: job.early && !debug,
         };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
         // A movie's list answers the availability route's question too, so a title someone opened needs no
@@ -534,7 +546,7 @@ impl Inner {
         dbg: Option<&mut RankDebug>,
         opts: RankOpts<'_>,
     ) -> RankedList {
-        let RankOpts { client, check_cache, rid, audio, fresh } = opts;
+        let RankOpts { client, check_cache, rid, audio, fresh, answer_early } = opts;
         let q = ScrapeQuery {
             kind: sid.kind.clone(),
             imdb: sid.imdb.clone(),
@@ -554,8 +566,11 @@ impl Inner {
             deadline,
             Some(self.deps.cache.clone()),
             self.deps.list_ttl,
+            answer_early.then_some(LATE_GRACE),
         )
         .await;
+        let late = scraped.late;
+        let answered_early = late.is_some();
         let (mut seeds, scrape_ok, scrape_complete) = (scraped.seeds, scraped.any_ok, scraped.complete);
         let restored = crate::continuity::restore(&*self.deps.cache, config, sid, &mut seeds);
         if restored > 0 {
@@ -571,6 +586,12 @@ impl Inner {
         sources.extend(quarantined_reports(config));
         let cov = Coverage { complete: scrape_complete, sources };
         metrics().coverage(&cov.sources);
+        // A source the list went out without is still answering, not missing: it does not count towards /health's
+        // "coverage partial", which is about sources that fail.
+        let late_ids: &[String] = late.as_ref().map_or(&[], |l| &l.ids);
+        let sources_missed = cov.sources.iter().any(|r| {
+            r.outcome != OUTCOME_ANSWERED && !excused_from_quorum(&r.outcome) && !late_ids.contains(&r.id)
+        });
         let mut timing = den_http::timing("scrape", phase.elapsed());
 
         // The accounting object the rank decision line reads. When the request asked for ?debug=1 it is the SAME
@@ -641,6 +662,9 @@ impl Inner {
                 // rest of the list is perfectly well known. Stamping the request-wide `truthOK` on all of them
                 // asserted the answer for exactly the hashes nobody had an answer for.
                 s.cache_known = truth.known(&s.info_hash);
+                // A cache read per store (a remembered torrent id), never a request.
+                let target = ResolveTarget { info_hash: s.info_hash.clone(), ..Default::default() };
+                s.held = !pool.holding_services(&target).is_empty();
             }
         }
         // A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
@@ -657,7 +681,7 @@ impl Inner {
         } else if self.scrape_fails.fetch_add(1, Ordering::Relaxed) + 1 == SCRAPE_FAIL_THRESHOLD {
             emit(&format!("health: ok → degraded (indexers): {INDEXERS_DOWN_DETAIL}"));
         }
-        if scrape_complete {
+        if !sources_missed {
             if self.partial_builds.swap(0, Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                 emit("health: coverage partial → complete, every source answered again");
             }
@@ -738,28 +762,30 @@ impl Inner {
         let episode = sid.has_ep.then_some([sid.season, sid.episode]);
         let candidates = seeds.len() as i64;
         let rank_start = Instant::now();
-        let ranked = rank_streams_debug(
-            &seeds,
-            RankFilters {
-                exclude_cam: config.filters.exclude_cam,
-                resolutions: config.filters.resolutions.clone(),
-                prefer_resolution: config.filters.prefer_resolution.clone(),
-                hdr_only: config.filters.hdr_only,
-                min_seeders: config.filters.min_seeders,
-                max_size_gb: config.filters.max_size_gb,
-                exclude_regex: config.filters.exclude_regex.clone(),
-                cached_only: eff_cached_only,
-                result_cap: config.result_cap,
-                expected_year,
-                expected_title_tokens,
-                episode,
-                show_tokens,
-                client: client.cloned(),
-                languages,
-            },
-            Some(&mut *log_dbg),
-        );
+        let filters = RankFilters {
+            exclude_cam: config.filters.exclude_cam,
+            resolutions: config.filters.resolutions.clone(),
+            prefer_resolution: config.filters.prefer_resolution.clone(),
+            hdr_only: config.filters.hdr_only,
+            min_seeders: config.filters.min_seeders,
+            max_size_gb: config.filters.max_size_gb,
+            exclude_regex: config.filters.exclude_regex.clone(),
+            cached_only: eff_cached_only,
+            result_cap: config.result_cap,
+            expected_year,
+            expected_title_tokens,
+            episode,
+            show_tokens,
+            client: client.cloned(),
+            languages,
+        };
+        let late_check = late.map(|late| (late, seeds.clone(), filters.clone()));
+        let ranked = rank_streams_debug(&seeds, filters, Some(&mut *log_dbg));
         log_rank_decision(sid, candidates, &ranked, log_dbg, rank_start.elapsed(), rid);
+        if let Some((late, seeds, filters)) = late_check {
+            let top = ranked.first().map(|s| s.info_hash.clone());
+            self.judge_late_answers(config, sid, rid, late, seeds, filters, top);
+        }
 
         // Degraded is judged on what is actually SERVED, not on what was scraped.
         //
@@ -830,7 +856,79 @@ impl Inner {
             complete: scrape_complete,
             coverage: cov,
             timing,
+            answered_early,
         }
+    }
+
+    /// Once the sources a list went out without have answered, says whether waiting for them would have changed
+    /// the release the list led with: their new releases are cache-checked (a read, as the list's own check is),
+    /// ranked with the list's own filters beside what it had, and the two leaders compared. One line per such
+    /// list, `event=scrape outcome=late … new=<n> top_changed=<bool>`, so the cost of answering early is counted
+    /// rather than assumed.
+    #[allow(clippy::too_many_arguments)]
+    fn judge_late_answers(
+        self: &Arc<Self>,
+        config: &Config,
+        sid: &StreamId,
+        rid: &str,
+        late: LateAnswers,
+        mut seeds: Vec<RawStream>,
+        filters: RankFilters,
+        served_top: Option<String>,
+    ) {
+        let (this, config, sid, rid) = (self.clone(), config.clone(), sid.clone(), rid.to_owned());
+        spawn_background(self.deps.runtime.clone(), "late indexer check", async move {
+            let LateAnswers { ids, waited, answers } = late;
+            let Ok(answers) = answers.await else { return };
+            let mut known: HashSet<String> = seeds.iter().map(|s| s.info_hash.clone()).collect();
+            let mut fresh: Vec<RawStream> = Vec::new();
+            for s in answers.iter().filter_map(|a| a.streams.as_ref()).flatten() {
+                if known.insert(s.info_hash.clone()) {
+                    fresh.push(s.clone());
+                }
+            }
+            let new = fresh.len();
+            if new > 0 {
+                let pool = StorePool { stores: (this.deps.make_stores)(&config) };
+                let hashes: Vec<String> = fresh.iter().map(|s| s.info_hash.clone()).collect();
+                if let Ok((truth, _)) = timeout(this.status_budget(), pool.cache_check(&hashes)).await {
+                    for s in fresh.iter_mut() {
+                        s.cached = truth.cached(&s.info_hash);
+                        s.cache_known = truth.known(&s.info_hash);
+                    }
+                }
+                for s in fresh.iter_mut() {
+                    let target = ResolveTarget { info_hash: s.info_hash.clone(), ..Default::default() };
+                    s.held = !pool.holding_services(&target).is_empty();
+                }
+                seeds.extend(fresh);
+            }
+            let top = rank_streams_debug(&seeds, filters, None).first().map(|s| s.info_hash.clone());
+            let changed = new > 0 && top != served_top;
+            let answered: Vec<String> = answers
+                .iter()
+                .map(|a| {
+                    let state = if a.streams.is_some() { "answered" } else { "failed" };
+                    format!("{}:{state}:{}ms", a.id, a.latency_ms)
+                })
+                .collect();
+            let longest = answers.iter().map(|a| a.latency_ms).max().unwrap_or(0);
+            let mut identity = format!("imdb={} type={}", sid.imdb, sid.kind);
+            if sid.has_ep {
+                identity.push_str(&format!(" season={} episode={}", sid.season, sid.episode));
+            }
+            let mut line = decision_line(
+                "scrape",
+                "late",
+                &format!("answered after the list went out at {}ms", waited.as_millis()),
+                &ids.join(","),
+                Duration::from_millis(u64::try_from(longest).unwrap_or(0)),
+                &rid,
+                &identity,
+            );
+            line.push_str(&format!(" sources={} new={new} top_changed={changed}", answered.join(",")));
+            emit(&line);
+        });
     }
 
     /// finishStreamList probes the top of a ranked list, serialises it and caches it — the half of a build only a
@@ -850,6 +948,7 @@ impl Inner {
             complete: scrape_complete,
             coverage,
             mut timing,
+            answered_early,
         } = list;
         let degraded = !degraded_reason.is_empty();
         // Ask the top few releases what they actually contain. After ranking, so the probe follows the order
@@ -883,7 +982,9 @@ impl Inner {
             fresh_until = (now + ttl).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
             hold = ttl + stale_window_for(ttl).max(self.outage_hold);
         }
-        let cached = !degraded && dbg.is_none();
+        // Nor a list that went out without a late source: it answers the request that asked for it, and every
+        // other request (one that judges a list complete included) is served a list that waited for all of them.
+        let cached = !degraded && dbg.is_none() && !answered_early;
         let whole_seconds = |t: SystemTime| {
             UNIX_EPOCH + Duration::from_secs(t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))
         };
@@ -921,7 +1022,7 @@ impl Inner {
             }
             self.deps.cache.put(cache_key, &value, hold);
         }
-        BuildResult { value, degraded: degraded_reason, complete: scrape_complete, timing }
+        BuildResult { value, degraded: degraded_reason, complete: scrape_complete, timing, answered_early }
     }
 
     /// playURLs is how one stream list names its play URLs: a ticket per release while tickets are on, all
@@ -975,6 +1076,7 @@ mod managed_audio_tests {
             complete: true,
             coverage: Coverage { complete: true, sources: vec![] },
             timing: String::new(),
+            answered_early: false,
         }
     }
 

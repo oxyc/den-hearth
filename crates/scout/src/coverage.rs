@@ -47,6 +47,11 @@ pub(crate) const OUTCOME_TIMEOUT: &str = "timeout";
 pub(crate) const OUTCOME_MISCONFIGURED: &str = "skipped_misconfigured";
 /// outcomeQuarantined: the config names an indexer this build has disabled, so it was not asked.
 pub(crate) const OUTCOME_QUARANTINED: &str = "quarantined";
+/// outcomeLate: asked and still answering when a list that asked for an early answer went out without it. Not a
+/// failure (the source is up and its answer is kept for the next build), and not an answer (its releases are not
+/// in this list), so the list is incomplete. Only an early-answered list carries it, and it is never cached for
+/// anyone else. Not in `SOURCE_OUTCOMES`: /metrics counts outcomes of the lists every request is served.
+pub(crate) const OUTCOME_LATE: &str = "late";
 
 /// sourceOutcomes is every outcome, in the order /metrics renders them.
 pub(crate) const SOURCE_OUTCOMES: [&str; 6] = [

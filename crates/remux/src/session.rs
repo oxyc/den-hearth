@@ -1046,7 +1046,7 @@ impl Session {
                 Ok(r) => return Ok((r, None)),
                 Err(e) => e,
             };
-        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None)
+        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None, false)
             .await
             .map_err(|e| format!("{first}; listing the title again: {}", e.detail))?;
         let again = list
@@ -1712,6 +1712,10 @@ pub struct Want<'a> {
     /// including the ones this call writes before the session exists, while still picking a release —
     /// can be joined back to the request that started it with one grep.
     pub rid: Option<&'a str>,
+    /// A viewer is waiting on this Play (`X-Den-Early-Answer: 1`): scout's list may go out before its slowest
+    /// indexer. Only to pick what to open: a list with nothing to open is asked for again, waiting for every indexer,
+    /// before the answer is that nothing plays (`select::create`).
+    pub early_answer: bool,
 }
 
 /// What the player decodes (`playable` in `POST /remux/session`). An HEVC release beyond it is transcoded on the GPU;
@@ -1757,9 +1761,10 @@ async fn scout_list(
     id: &str,
     by_install: bool,
     playable: Option<&Playable>,
+    early_answer: bool,
 ) -> Result<Vec<scout::Stream>, ApiError> {
     let secrets = [source.base.as_str()];
-    scout::list(st.scout_via(), source, id, playable).await.map_err(|e| match e.status {
+    scout::list(st.scout_via(), source, id, playable, early_answer).await.map_err(|e| match e.status {
         // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
         // logged-in browser alone.
         Some(403) if by_install => api(
@@ -1891,7 +1896,7 @@ pub async fn releases(
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
     // Without a capability report no AV1 or VP9: nothing says the player decodes them.
-    let list = scout_list(st, &source, id, by_install, playable).await?;
+    let list = scout_list(st, &source, id, by_install, playable, false).await?;
     let candidates = scout::candidates(
         &list,
         None,
@@ -2328,6 +2333,7 @@ mod tests {
             fits_only: false,
             replaces: None,
             rid: None,
+            early_answer: false,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -2636,6 +2642,7 @@ mod tests {
             fits_only: false,
             replaces: None,
             rid: None,
+            early_answer: false,
         }
     }
 

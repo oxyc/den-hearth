@@ -345,7 +345,7 @@
 < cache-control: no-store
 < content-length: 0
 < location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
-< server-timing: resolve;dur=*, total;dur=*
+< server-timing: status;dur=*, resolve;dur=*, link_check;dur=*, total;dur=*
 < timing-allow-origin: *
 
 
@@ -435,7 +435,7 @@
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
-< server-timing: resolve;dur=*, total;dur=*
+< server-timing: status;dur=*, resolve;dur=*, total;dur=*
 < timing-allow-origin: *
 {"error":"dead_link"}
 
@@ -446,7 +446,7 @@
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
-< server-timing: total;dur=*
+< server-timing: status;dur=*, total;dur=*
 < timing-allow-origin: *
 {"etaSeconds":90,"progress":0.25,"seeds":4,"service":"torbox","state":"downloading"}
 
@@ -457,7 +457,7 @@
 < access-control-expose-headers: Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy
 < cache-control: no-store
 < content-type: application/json
-< server-timing: total;dur=*
+< server-timing: status;dur=*, total;dur=*
 < timing-allow-origin: *
 {"progress":0,"service":"torbox","state":"downloading"}
 
@@ -469,7 +469,7 @@
 < cache-control: no-store
 < content-type: application/json
 < retry-after: 60
-< server-timing: resolve;dur=*, total;dur=*
+< server-timing: status;dur=*, resolve;dur=*, total;dur=*
 < timing-allow-origin: *
 {"error":"store_unavailable","service":"torbox"}
 
@@ -691,7 +691,7 @@
 < cache-control: no-store
 < content-length: 0
 < location: https://cdn.torbox/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mkv
-< server-timing: resolve;dur=*, total;dur=*
+< server-timing: status;dur=*, resolve;dur=*, link_check;dur=*, total;dur=*
 < timing-allow-origin: *
 
 

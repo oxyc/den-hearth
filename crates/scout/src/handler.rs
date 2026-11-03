@@ -40,9 +40,10 @@ use crate::availability::verdict_prefix;
 use crate::client::{web_ready, ClientPlayable};
 use crate::config::{Config, DebridService, SCOPE_AVAILABILITY};
 use crate::coverage::{
-    decide_answer_kind, quarantined_reports, stale_body, AnswerEnvelope, Coverage, ANSWER_ENVELOPE_VERSION,
+    decide_answer_kind, excused_from_quorum, quarantined_reports, stale_body, AnswerEnvelope, Coverage,
+    ANSWER_ENVELOPE_VERSION, OUTCOME_ANSWERED,
 };
-use crate::decisionlog::{log_rank_decision, play_decision};
+use crate::decisionlog::{decision_line, log_rank_decision, play_decision};
 use crate::deps::{Deps, ReqwestDoer};
 use crate::hostlimit::{new_host_limiter, HostLimiter};
 use crate::id::{parse_stream_id, StreamId};
@@ -64,7 +65,7 @@ use crate::rank::{
 };
 use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;
-use crate::scrape::{scrape_covered_until, Doer, ScrapeQuery, Scraper};
+use crate::scrape::{scrape_covered_until, Doer, LateAnswers, ScrapeQuery, Scraper, LATE_GRACE};
 use crate::stores::pool::{has_cache_truth, status_outcome_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
 use crate::stores::torbox::health::{DebridDown, DebridState};
@@ -152,6 +153,13 @@ pub(crate) const FRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Says whether `?fresh=1` was honoured: `rebuilt`, or `limited` (answered as a plain request).
 pub(crate) const X_DEN_FRESH: HeaderName = HeaderName::from_static("x-den-fresh");
+
+/// `X-Den-Early-Answer: 1` on a stream list request: a viewer is waiting on this list (the Sources screen, a Play
+/// press), so it may go out `LATE_GRACE` after the first indexer answers rather than on the slowest, with what it
+/// went without reported as `late`. Without it a list waits for every indexer, which is what every request that
+/// judges a list complete (a download's search, race or fallback, an availability check) needs, and what a client
+/// that has never heard of the header keeps getting.
+pub(crate) const X_DEN_EARLY_ANSWER: &str = "x-den-early-answer";
 
 /// How many lists the `?fresh=1` ledger remembers. Entries are only added once the config opens and are swept when
 /// older than FRESH_INTERVAL; past the bound a fresh request is served like a plain one.
@@ -806,6 +814,8 @@ pub(crate) struct BuildResult {
     complete: bool,
     /// The build's phases as Server-Timing entries — scrape, cache-check, and probe when it ran.
     timing: String,
+    /// It went out without a `late` source: answered to its own requester only, with `no-store`.
+    answered_early: bool,
 }
 
 /// Outcome of consulting the list-build singleflight. Busy is deliberately distinct from a failed build: no
@@ -827,6 +837,8 @@ pub(crate) struct RankedList {
     pub(crate) complete: bool,
     pub(crate) coverage: Coverage,
     pub(crate) timing: String,
+    /// Some source was left `late` (an early answer the request asked for).
+    pub(crate) answered_early: bool,
 }
 
 /// Where a stream list lives: the config segment and title the request named, the origin its play URLs name, and
@@ -850,6 +862,8 @@ struct ListJob {
     rid: String,
     /// Built past the kept indexer answers (`?fresh=1`).
     fresh: bool,
+    /// The request asked for an early answer (`X_DEN_EARLY_ANSWER`).
+    early: bool,
 }
 
 impl ListJob {
@@ -863,11 +877,17 @@ impl ListJob {
             client,
             rid,
             fresh: false,
+            early: false,
         }
     }
 
     fn fresh(mut self) -> ListJob {
         self.fresh = true;
+        self
+    }
+
+    fn early(mut self) -> ListJob {
+        self.early = true;
         self
     }
 }
@@ -890,6 +910,9 @@ pub(crate) struct RankOpts<'a> {
     pub(crate) audio: &'a [String],
     /// Ask every indexer again instead of answering from its kept answer.
     pub(crate) fresh: bool,
+    /// The request asked for an early answer: go out once the indexers that have answered have had `LATE_GRACE` to
+    /// be joined, rather than on the slowest (see `scrape_covered_until`, `X_DEN_EARLY_ANSWER`).
+    pub(crate) answer_early: bool,
 }
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
@@ -1344,6 +1367,9 @@ impl Inner {
                     rid: "",
                     audio: &request.audio,
                     fresh: false,
+                    // The list picks what to play and nothing else: it is not cached, and a miss falls back to
+                    // Remux, which asks again for every indexer before saying there is nothing.
+                    answer_early: request.early_answer && request.filename.is_none(),
                 },
             )
             .await;

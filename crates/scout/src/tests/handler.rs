@@ -143,8 +143,8 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
 }
 
 #[derive(Default)]
-struct FixedManagedHls {
-    targets: Mutex<Vec<ResolveTarget>>,
+pub(crate) struct FixedManagedHls {
+    pub(crate) targets: Mutex<Vec<ResolveTarget>>,
 }
 
 #[async_trait]
@@ -1008,7 +1008,10 @@ async fn server_timing() {
     let play = get(&h, &play_path, &[]).await;
     let st = hdr(&play, "server-timing");
     assert!(
-        play.status() == 302 && st.starts_with("resolve;dur=") && st.contains(", total;dur="),
+        play.status() == 302
+            && st.starts_with("status;dur=")
+            && st.contains(", resolve;dur=")
+            && st.contains(", total;dur="),
         "play: {} Server-Timing {st:?}",
         play.status()
     );

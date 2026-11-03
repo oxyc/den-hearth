@@ -810,6 +810,10 @@ where
         fits_only: req.fits_only.unwrap_or(false),
         replaces: req.replaces.as_deref(),
         rid: rid.as_deref(),
+        early_answer: parts
+            .headers
+            .get(scout::EARLY_ANSWER_HEADER)
+            .is_some_and(|value| value.as_bytes() == b"1"),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;

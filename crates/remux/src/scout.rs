@@ -353,13 +353,18 @@ pub struct ListError {
 /// The header carrying the browser's capability report to scout, which ranks the list for that browser.
 pub const PLAYABLE_HEADER: &str = "x-den-playable";
 
+/// The header asking scout for an early stream list: a viewer is waiting on it (scout's `X_DEN_EARLY_ANSWER`).
+pub const EARLY_ANSWER_HEADER: &str = "x-den-early-answer";
+
 /// The stream list for `imdb`, with the service key when the source has one, ranked for the browser whose report
-/// `playable` is.
+/// `playable` is. With `early_answer`, scout may answer before its slowest indexer; such a list is for picking what
+/// to open, never for deciding that nothing exists.
 pub async fn list(
     via: Via<'_>,
     src: &ScoutSource,
     imdb: &str,
     playable: Option<&crate::session::Playable>,
+    early_answer: bool,
 ) -> Result<Vec<Stream>, ListError> {
     let fail = |status: Option<u16>, detail: String| ListError { status, detail };
     let url = reqwest::Url::parse(&stream_list_url(&src.base, imdb))
@@ -375,6 +380,9 @@ pub async fn list(
         // Integers and booleans only: there is nothing in a Playable that fails to serialise, or that is not ASCII.
         let report = serde_json::to_string(p).expect("a Playable serialises");
         headers.insert(PLAYABLE_HEADER, report.parse().expect("a Playable report is a header value"));
+    }
+    if early_answer {
+        headers.insert(EARLY_ANSWER_HEADER, reqwest::header::HeaderValue::from_static("1"));
     }
     let resp = via.get_scout(&url, headers).await.map_err(|d| fail(None, d))?;
     if !resp.status().is_success() {

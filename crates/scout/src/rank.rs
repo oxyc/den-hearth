@@ -57,6 +57,9 @@ pub struct RawStream {
     /// Whether anyone could answer the cachedness question this request. False means `cached` is a
     /// default rather than an observation.
     pub cache_known: bool,
+    /// A configured account already has this torrent (Scout remembers its id), so a play needs no add: a link in
+    /// a few hundred milliseconds rather than the several seconds an add and a file listing take.
+    pub held: bool,
     pub source: String,
     /// What the file itself said, when probed. `None` means "not asked", distinct from "asked and it
     /// told us nothing".
@@ -600,6 +603,39 @@ pub(crate) fn rank_streams(streams: &[RawStream], f: RankFilters) -> Vec<RawStre
     rank_streams_debug(streams, f, None)
 }
 
+/// How far below the releases it passes a held one may score and still count as the same tier. Under every sink
+/// and penalty that marks a release as worse in kind (the smallest is 1,500), over the small preferences (group,
+/// audio, codec) that separate two good copies of the same resolution.
+const HELD_TIER_MARGIN: i64 = 1000;
+
+/// Moves each held release ahead of the unheld releases directly above it in its tier: the same resolution, the same
+/// cachedness, scoring less than `HELD_TIER_MARGIN` higher. Playing a held release is a link (~0.7 s); playing
+/// an unheld one is an add, a file listing and a link (4-7 s measured), for a copy no better in kind. It never
+/// crosses a resolution or a sink, so a held 1080p stays below a cached 2160p and a held wrong episode stays sunk.
+fn held_first_within_tier(streams: &[RawStream], out: &mut [(i64, i64, usize)]) {
+    for i in 1..out.len() {
+        let (score, _, idx) = out[i];
+        let s = &streams[idx];
+        if !s.held {
+            continue;
+        }
+        let tier = (resolution_bucket(s.traits()), s.cached);
+        let mut j = i;
+        while j > 0 {
+            let (above_score, _, above_idx) = out[j - 1];
+            let above = &streams[above_idx];
+            if above.held
+                || (resolution_bucket(above.traits()), above.cached) != tier
+                || above_score - score >= HELD_TIER_MARGIN
+            {
+                break;
+            }
+            j -= 1;
+        }
+        out[j..=i].rotate_right(1);
+    }
+}
+
 /// Go `rankStreams` with its `Debug` field: the same ranking, also recording the drop counts and the
 /// served scores into `debug` when one is passed.
 pub(crate) fn rank_streams_debug(
@@ -696,6 +732,7 @@ pub(crate) fn rank_streams_debug(
     }
 
     out.sort_unstable_by_key(|&(score, seeders, idx)| (Reverse(score), Reverse(seeders), idx));
+    held_first_within_tier(streams, &mut out);
     let cap = usize::try_from(f.result_cap).unwrap_or(0);
     if out.len() > cap {
         drop_n(&mut debug, "resultCap", (out.len() - cap) as i64);

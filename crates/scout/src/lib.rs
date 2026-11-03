@@ -5,6 +5,7 @@ pub mod addbudget;
 pub mod attributes;
 pub mod availability;
 pub mod cache;
+mod calltrace;
 pub mod cinemeta;
 pub mod client;
 pub mod config;

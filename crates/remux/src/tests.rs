@@ -394,6 +394,10 @@ static METERED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The part of a `hold` copy, in tenths of its length, that is served at once.
 const HELD_FROM_TENTHS: usize = 9;
 
+/// Whether each list of `tt0000031` / `tt0000032` was asked for early (`x-den-early-answer: 1`).
+static EARLY_LISTS: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+static EARLY_LISTS_32: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
 /// What the restart tests' titles (`tt000004N`) asked of the fake scout: `list 4N` and `play 4N`.
 static RESUME_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -520,6 +524,39 @@ async fn origin_handle<B>(
         let p = if scoped { "p/s" } else { "p" };
         if imdb.starts_with("tt000004") {
             RESUME_CALLS.lock().unwrap().push(format!("list {}", &imdb[7..]));
+        }
+        if imdb == "tt0000031" {
+            // An early list (`x-den-early-answer: 1`) went out before the indexer with the cached copy: it lists
+            // an uncached release only. The list that waited for every indexer has the cached one.
+            let early = req.headers().get("x-den-early-answer").is_some_and(|v| v == "1");
+            EARLY_LISTS.lock().unwrap().push(early);
+            let body = if early {
+                serde_json::json!({"streams": [
+                    {"url": format!("http://{addr}/{p}/h264.mkv"),
+                     "attributes": {"cached": false, "codec": "h264", "label": "H.264"},
+                     "behaviorHints": {"filename": "uncached.mkv"}}
+                ]})
+            } else {
+                serde_json::json!({"streams": [
+                    {"url": format!("http://{addr}/{p}/h264.mkv"),
+                     "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                     "behaviorHints": {"filename": "h264.mkv"}}
+                ]})
+            };
+            return origin_full(200, body.to_string());
+        }
+        if imdb == "tt0000032" {
+            // Lists the same either way, recording whether the list was asked for early.
+            EARLY_LISTS_32
+                .lock()
+                .unwrap()
+                .push(req.headers().get("x-den-early-answer").is_some_and(|v| v == "1"));
+            let body = serde_json::json!({"streams": [
+                {"url": format!("http://{addr}/{p}/h264.mkv"),
+                 "attributes": {"cached": true, "codec": "h264", "label": "H.264"},
+                 "behaviorHints": {"filename": "h264.mkv"}}
+            ]});
+            return origin_full(200, body.to_string());
         }
         if imdb == "tt0000005" {
             return origin_full(
@@ -2229,6 +2266,46 @@ async fn scout_in_process_answers_and_refuses_as_over_http() {
     assert_eq!(fake.connections.load(Relaxed), 0, "scout in process was reached over a socket");
 }
 
+/// A viewer's Play (`x-den-early-answer: 1`) asks scout early; a session named by filename, or one created
+/// without the header, waits for every indexer.
+#[tokio::test]
+async fn only_a_viewers_unnamed_play_asks_scout_early() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let play = |body: &str, early: bool| {
+        let (state, cookie, body) = (state.clone(), cookie.clone(), body.to_owned());
+        async move {
+            let headers: &[(&str, &str)] = if early { &[("x-den-early-answer", "1")] } else { &[] };
+            call_with(&state, "POST", "/remux/session", Some(&cookie), headers, &body).await
+        }
+    };
+    let title = format!(r#"{{"imdb":"tt0000032","scout":"{origin}/cfg"}}"#);
+    let named = format!(r#"{{"imdb":"tt0000032","scout":"{origin}/cfg","filename":"h264.mkv"}}"#);
+    for (body, early) in [(&title, true), (&title, false), (&named, true)] {
+        let r = play(body, early).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        state.end_all("test").await;
+    }
+    assert_eq!(*EARLY_LISTS_32.lock().unwrap(), [true, false, false]);
+}
+
+/// An early list with nothing to open is no verdict that nothing plays: the session asks again, waiting for every
+/// indexer, and plays the cached release the early list went without.
+#[tokio::test]
+async fn an_early_list_with_nothing_to_open_is_asked_again_in_full() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let body = format!(r#"{{"imdb":"tt0000031","scout":"{origin}/cfg"}}"#);
+    let r = call_with(&state, "POST", "/remux/session", Some(&cookie), &[("x-den-early-answer", "1")], &body)
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["release"]["filename"], "h264.mkv");
+    assert_eq!(*EARLY_LISTS.lock().unwrap(), [true, false]);
+    state.end_all("test").await;
+}
+
 /// The same fixture through both paths gives the same list and the same resolved release: in process, a stream
 /// list and a play URL's head, link and size are what HTTP gives, and only HTTP touches scout's port.
 #[tokio::test]
@@ -2243,8 +2320,8 @@ async fn a_list_and_a_resolve_are_the_same_in_process_and_over_http() {
     for (config, id) in
         [("cfg", "tt0000001"), (SCOPED, "tt0000005"), ("cfg", "tt0000004:1:2"), ("cfg", "tt9")]
     {
-        let a = list(over_http.scout_via(), &source(config), id, None).await.ok().unwrap();
-        let b = list(in_process.scout_via(), &source(config), id, None).await.ok().unwrap();
+        let a = list(over_http.scout_via(), &source(config), id, None, false).await.ok().unwrap();
+        let b = list(in_process.scout_via(), &source(config), id, None, false).await.ok().unwrap();
         let names = |l: &[crate::scout::Stream]| {
             l.iter().map(|s| (s.url.clone(), s.filename().to_string())).collect::<Vec<_>>()
         };
@@ -2262,15 +2339,15 @@ async fn a_list_and_a_resolve_are_the_same_in_process_and_over_http() {
     // Refusals carry the same status both ways: a scoped config without the key, and a config scout won't open.
     for (config, key) in [(SCOPED, None), ("bad", Some(SCOUT_KEY))] {
         let src = ScoutSource { base: format!("{}/{config}", fake.url), key: key.map(String::from) };
-        let a = list(over_http.scout_via(), &src, "tt0000001", None).await.err().unwrap();
-        let b = list(in_process.scout_via(), &src, "tt0000001", None).await.err().unwrap();
+        let a = list(over_http.scout_via(), &src, "tt0000001", None, false).await.err().unwrap();
+        let b = list(in_process.scout_via(), &src, "tt0000001", None, false).await.err().unwrap();
         assert_eq!((a.status, a.detail), (b.status, b.detail), "{config}");
     }
     let http_connections = fake.connections.load(Relaxed);
     assert!(http_connections > 0);
 
     // Only the in-process side again: not one more connection.
-    list(in_process.scout_via(), &source("cfg"), "tt0000001", None).await.ok().unwrap();
+    list(in_process.scout_via(), &source("cfg"), "tt0000001", None, false).await.ok().unwrap();
     assert_eq!(fake.connections.load(Relaxed), http_connections);
 }
 

@@ -81,7 +81,21 @@ pub async fn create(
     // Timed for the `Server-Timing` header on the 201 (den-edge#234's step 0): how long scout's list took
     // ("resolve"), and how long picking a release from it took ("open", with how many were tried).
     let resolve_started = Instant::now();
-    let list = scout_list(st, &source, imdb, by_install, want.playable).await?;
+    // A viewer waiting on Play may be answered from a list scout sent before its slowest indexer — but not for a
+    // release they named, which only a complete list is sure to hold.
+    let early = want.early_answer && want.filename.is_none();
+    let mut list = scout_list(st, &source, imdb, by_install, want.playable, early).await?;
+    // Nothing to open in an early list is no verdict: the indexer it went without may have the cached release.
+    // Asked again, waiting for all of them, before the answer is that nothing plays.
+    let openable = |list: &[scout::Stream]| {
+        list.iter().any(|s| s.attributes.cached == Some(true) && scout::left_out_by_name(s).is_none())
+    };
+    if early && !openable(&list) {
+        eprintln!(
+            "session {short}: {imdb} early list has nothing to open; asking for every source{rid_suffix}"
+        );
+        list = scout_list(st, &source, imdb, by_install, want.playable, false).await?;
+    }
     let resolve_ms = resolve_started.elapsed().as_millis() as u64;
     let candidates = scout::candidates(
         &list,
