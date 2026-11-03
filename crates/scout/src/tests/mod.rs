@@ -19,6 +19,7 @@ mod debrid_health;
 mod decisionlog;
 mod deps;
 mod diskcache;
+mod early_answer;
 mod extra;
 mod freshlist;
 mod go_wire_vectors;

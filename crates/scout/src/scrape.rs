@@ -35,7 +35,6 @@ use crate::metrics::metrics;
 use crate::probe::Probe;
 use crate::rank::{re2, RawStream, GIB};
 use crate::sources::{new_source_client, source_host, ERR_NOT_PUBLIC, OWN_SOURCES, SOURCE_LIMITER};
-use crate::stores::join_all;
 use crate::upstreampause::pause_on_refusal;
 use crate::util::{fold_json_keys, go_url_parse, key_hash, DetachedFlight, Shape, LEAF};
 
@@ -1067,7 +1066,35 @@ pub(crate) struct ScrapeResult {
     pub(crate) any_ok: bool,
     pub(crate) complete: bool,
     pub(crate) sources: Vec<SourceReport>,
+    /// The sources the list did not wait for (reported as `timeout`), and their answers once they land. `None`
+    /// when every source was waited for.
+    pub(crate) late: Option<LateAnswers>,
 }
+
+/// What a list answered early left behind: the sources still answering, and a channel their answers arrive on.
+/// The answers fill each source's kept answer whether or not anyone reads them here.
+pub(crate) struct LateAnswers {
+    pub(crate) ids: Vec<String>,
+    /// How long the list waited before going out without them.
+    pub(crate) waited: Duration,
+    pub(crate) answers: tokio::sync::oneshot::Receiver<Vec<LateAnswer>>,
+}
+
+/// One late source's answer: its id, how long it took in all, and its releases (`None` for a failure).
+pub(crate) struct LateAnswer {
+    pub(crate) id: String,
+    pub(crate) latency_ms: i64,
+    pub(crate) streams: Option<Vec<RawStream>>,
+}
+
+/// How long a list waits on the slower indexers once one has answered with releases, when a viewer is waiting.
+///
+/// The fan-out used to wait for the slowest indexer, up to the scrape timeout: series lists built in 0.9 s at the
+/// median and 3.5 s at p95, movies 2.0 s and 4.1 s (7 days of builds on the box), with the tail one slow indexer.
+/// One second covers an indexer answering in step with the first; a slower one is left to land behind the reply,
+/// where it fills its kept answer for the next build, and the list goes out marked incomplete so it is held for a
+/// minute rather than five.
+pub(crate) const LATE_GRACE: Duration = Duration::from_secs(1);
 
 /// Go `scrapeCovered` is scrapeAllCached keeping each source's report.
 #[cfg(test)]
@@ -1078,11 +1105,14 @@ pub(crate) async fn scrape_covered(
     cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
 ) -> ScrapeResult {
-    scrape_covered_until(scrapers, q, timeout, TokioInstant::now() + timeout, cache, ttl).await
+    scrape_covered_until(scrapers, q, timeout, TokioInstant::now() + timeout, cache, ttl, None).await
 }
 
 /// `scrape_covered` under an existing list-build deadline. Every fan-out branch is created immediately, retaining
 /// per-list concurrency, while the shared runtime decides which requests may buffer bodies at once.
+///
+/// With `grace`, the list stops waiting `grace` after the first source answers with releases (see `LATE_GRACE`);
+/// the sources still out are reported as timed out, keep running behind it, and hand their answers to `late`.
 pub(crate) async fn scrape_covered_until(
     scrapers: &[Arc<dyn Scraper>],
     q: &ScrapeQuery,
@@ -1090,13 +1120,70 @@ pub(crate) async fn scrape_covered_until(
     build_deadline: TokioInstant,
     cache: Option<Arc<dyn Cache>>,
     ttl: Duration,
+    grace: Option<Duration>,
 ) -> ScrapeResult {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
     // Keep the existing per-source budget, but never let it extend beyond the whole build's clock. Because this
     // deadline is made before any permit can be awaited, queue time is charged to both budgets.
     let deadline = (TokioInstant::now() + timeout).min(build_deadline);
-    let attempts =
-        join_all(scrapers.iter().map(|sc| scrape_one_cached(sc, q, deadline, cache.clone(), ttl)).collect())
-            .await;
+    let started = Instant::now();
+    // Owned, so whatever is still out when the list stops waiting can be finished on a task of its own.
+    let mut pending: FuturesUnordered<_> = scrapers
+        .iter()
+        .enumerate()
+        .map(|(i, sc)| {
+            let (sc, q, cache) = (Arc::clone(sc), q.clone(), cache.clone());
+            async move { (i, scrape_one_cached(&sc, &q, deadline, cache, ttl).await) }
+        })
+        .collect();
+    let mut answered: Vec<Option<ScrapeAttempt>> = vec![None; scrapers.len()];
+    let mut cutoff: Option<TokioInstant> = None;
+    loop {
+        let next = match cutoff {
+            Some(at) => match tokio::time::timeout_at(at, pending.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+            None => pending.next().await,
+        };
+        let Some((i, attempt)) = next else { break };
+        if cutoff.is_none() && attempt.err.is_none() && !attempt.streams.is_empty() {
+            cutoff = grace.map(|g| TokioInstant::now() + g);
+        }
+        answered[i] = Some(attempt);
+    }
+    let mut late = None;
+    if !pending.is_empty() {
+        let waited = started.elapsed();
+        let ids: Vec<String> =
+            answered.iter().zip(scrapers).filter(|(a, _)| a.is_none()).map(|(_, sc)| sc.id().0).collect();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let names: Vec<String> = scrapers.iter().map(|sc| sc.id().0).collect();
+        let runtime = crate::runtime::current_runtime();
+        tokio::spawn(crate::runtime::scope(runtime, async move {
+            let mut out = Vec::new();
+            while let Some((i, attempt)) = pending.next().await {
+                out.push(LateAnswer {
+                    id: names[i].clone(),
+                    latency_ms: millis(started.elapsed()),
+                    streams: attempt.err.is_none().then_some(attempt.streams),
+                });
+            }
+            let _ = tx.send(out);
+        }));
+        late = Some(LateAnswers { ids, waited, answers: rx });
+    }
+    let waited_ms = millis(started.elapsed());
+    let attempts: Vec<ScrapeAttempt> = answered
+        .into_iter()
+        .map(|a| {
+            a.unwrap_or_else(|| ScrapeAttempt {
+                latency_ms: waited_ms,
+                ..ScrapeAttempt::failed(Arc::new(DeadlineExceeded))
+            })
+        })
+        .collect();
     let mut all: Vec<RawStream> = Vec::new();
     let mut reports: Vec<SourceReport> = Vec::with_capacity(scrapers.len());
     for (sc, attempt) in scrapers.iter().zip(attempts) {
@@ -1161,7 +1248,7 @@ pub(crate) async fn scrape_covered_until(
             break;
         }
     }
-    ScrapeResult { seeds: dedupe(all), any_ok, complete, sources: reports }
+    ScrapeResult { seeds: dedupe(all), any_ok, complete, sources: reports, late }
 }
 
 /// Go `dedupe` by infohash, merging the richest facts (fill missing fileIdx/size, max seeders); first-seen

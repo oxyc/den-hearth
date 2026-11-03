@@ -40,9 +40,10 @@ use crate::availability::verdict_prefix;
 use crate::client::{web_ready, ClientPlayable};
 use crate::config::{Config, DebridService, SCOPE_AVAILABILITY};
 use crate::coverage::{
-    decide_answer_kind, quarantined_reports, stale_body, AnswerEnvelope, Coverage, ANSWER_ENVELOPE_VERSION,
+    decide_answer_kind, excused_from_quorum, quarantined_reports, stale_body, AnswerEnvelope, Coverage,
+    ANSWER_ENVELOPE_VERSION, OUTCOME_ANSWERED,
 };
-use crate::decisionlog::{log_rank_decision, play_decision};
+use crate::decisionlog::{decision_line, log_rank_decision, play_decision};
 use crate::deps::{Deps, ReqwestDoer};
 use crate::hostlimit::{new_host_limiter, HostLimiter};
 use crate::id::{parse_stream_id, StreamId};
@@ -64,7 +65,7 @@ use crate::rank::{
 };
 use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;
-use crate::scrape::{scrape_covered_until, Doer, ScrapeQuery, Scraper};
+use crate::scrape::{scrape_covered_until, Doer, LateAnswers, ScrapeQuery, Scraper, LATE_GRACE};
 use crate::stores::pool::{has_cache_truth, status_outcome_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
 use crate::stores::torbox::health::{DebridDown, DebridState};
@@ -850,6 +851,8 @@ struct ListJob {
     rid: String,
     /// Built past the kept indexer answers (`?fresh=1`).
     fresh: bool,
+    /// Built behind a stale answer the viewer already has: nobody waits on it, so it waits on every indexer.
+    behind: bool,
 }
 
 impl ListJob {
@@ -863,11 +866,17 @@ impl ListJob {
             client,
             rid,
             fresh: false,
+            behind: false,
         }
     }
 
     fn fresh(mut self) -> ListJob {
         self.fresh = true;
+        self
+    }
+
+    fn behind(mut self) -> ListJob {
+        self.behind = true;
         self
     }
 }
@@ -890,6 +899,9 @@ pub(crate) struct RankOpts<'a> {
     pub(crate) audio: &'a [String],
     /// Ask every indexer again instead of answering from its kept answer.
     pub(crate) fresh: bool,
+    /// A viewer is waiting: answer once the indexers that have answered have had `LATE_GRACE` to be joined, rather
+    /// than on the slowest (see `scrape_covered_until`).
+    pub(crate) answer_early: bool,
 }
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
@@ -1344,6 +1356,7 @@ impl Inner {
                     rid: "",
                     audio: &request.audio,
                     fresh: false,
+                    answer_early: false,
                 },
             )
             .await;
