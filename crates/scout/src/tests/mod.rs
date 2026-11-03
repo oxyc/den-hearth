@@ -31,6 +31,7 @@ mod linkmemo;
 mod loglimit;
 mod metrics;
 mod mock;
+mod play_latency;
 mod playreserve;
 mod playwarm;
 mod probe;

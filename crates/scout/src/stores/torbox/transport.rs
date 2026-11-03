@@ -33,6 +33,7 @@ impl TorBoxStore {
     /// and outcome (Go does it beside the request in `get`, `addMagnet` and `controlRequest`; it is the same count).
     pub(super) async fn send(&self, req: reqwest::Request) -> Result<Reply, DoError> {
         let mut count = CallCount::new(req.url());
+        let traced = TracedCall { endpoint: count.endpoint, started: Instant::now() };
         let runtime = crate::runtime::current_runtime();
         let slot = runtime
             .torbox
@@ -46,7 +47,7 @@ impl TorBoxStore {
         let resp = self.client.do_request(req).await;
         count.succeeded(resp.as_ref().is_ok_and(|r| r.status().is_success()));
         watch.settle(&resp);
-        Ok(Reply::new(resp?, slot))
+        Ok(Reply { resp: resp?, _slot: slot, _traced: traced })
     }
 
     /// Go `torBoxStore.post`: a form POST, authorised by header.
@@ -66,13 +67,25 @@ impl TorBoxStore {
 pub(super) struct Reply {
     resp: reqwest::Response,
     _slot: OwnedSemaphorePermit,
+    _traced: TracedCall,
+}
+
+/// One call in the request's trace (`calltrace`), timed from when it was sent — a wait for Scout's own outbound slot
+/// included, since the viewer waits for it too — to when its reply is let go, so a listing's body read counts. A
+/// call that failed before any reply is recorded as it fails.
+struct TracedCall {
+    endpoint: &'static str,
+    started: Instant,
+}
+
+impl Drop for TracedCall {
+    fn drop(&mut self) {
+        let name = if self.endpoint.is_empty() { "other" } else { self.endpoint };
+        crate::calltrace::record(name, self.started.elapsed());
+    }
 }
 
 impl Reply {
-    pub(super) fn new(resp: reqwest::Response, slot: OwnedSemaphorePermit) -> Self {
-        Self { resp, _slot: slot }
-    }
-
     pub(super) fn status(&self) -> u16 {
         self.resp.status().as_u16()
     }
@@ -127,7 +140,7 @@ impl Drop for CallWatch {
 }
 
 pub(super) struct CallCount {
-    endpoint: &'static str,
+    pub(super) endpoint: &'static str,
     ok: bool,
 }
 
