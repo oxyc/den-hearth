@@ -11,6 +11,8 @@ pub(crate) mod health;
 mod listing;
 mod public_status;
 mod status;
+#[cfg(test)]
+pub(crate) use status::{DEAD_SWARM_AFTER, DEAD_SWARM_RECHECK};
 pub(crate) mod support;
 mod transport;
 
@@ -1590,9 +1592,21 @@ pub(crate) fn torbox_status_key(identity: &str, info_hash: &str) -> String {
     )
 }
 
-/// Go `clearTorboxStatus`.
+/// Go `clearTorboxStatus`. The dead-swarm clock goes with the snapshot: whatever made the snapshot stale (an add,
+/// a resolve, a reannounce) is a new start for the swarm too.
 pub(crate) fn clear_torbox_status(cache: &dyn Cache, identity: &str, info_hash: &str) {
     clear(cache, &torbox_status_key(identity, info_hash));
+    clear(cache, &torbox_dead_swarm_key(identity, info_hash));
+}
+
+/// When a torrent was first seen stalled with no seeds, and at what progress: `<unix ms>:<progress>`. See
+/// `TorBoxStore::status_ttl`.
+pub(crate) fn torbox_dead_swarm_key(identity: &str, info_hash: &str) -> String {
+    format!(
+        "torbox:deadswarm:{}:{}",
+        key_hash(&canonical_torbox_identity(identity)),
+        str::to_lowercase(info_hash)
+    )
 }
 
 /// Go `torboxAddedKey` records that THIS process is the one that asked TorBox to fetch a hash, as opposed to
@@ -2725,6 +2739,8 @@ impl TorBoxStore {
         };
         if reannounce {
             self.control_torrent(torrent_id, "reannounce").await?;
+            // A reannounce is a new chance at a swarm: the next poll asks TorBox rather than a held snapshot.
+            clear_torbox_status(cache, &identity, info_hash);
             return Ok(CancelOutcome { done: true, reannounced: true, status, ..Default::default() });
         }
         self.control_torrent(torrent_id, "delete").await?;

@@ -1,6 +1,16 @@
 //! TorBox status snapshot representation and stable queued answer.
 
 use super::*;
+use crate::handler::go_duration;
+use crate::stores::short_hash;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// How long a torrent sits stalled with no seeds and no progress before its status is held (see `status_ttl`).
+/// Past den-core's own stall limit (20 min), so a client that moves a stalled download on has done so first.
+pub(crate) const DEAD_SWARM_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// How often TorBox is asked again about a torrent past `DEAD_SWARM_AFTER`.
+pub(crate) const DEAD_SWARM_RECHECK: Duration = Duration::from_secs(10 * 60);
 
 impl TorBoxStore {
     pub(super) async fn status_for(&self, t: &ResolveTarget) -> ProviderStatus {
@@ -34,7 +44,7 @@ impl TorBoxStore {
                     .await
                     .unwrap_or(ProviderStatus::Unknown);
                 let unknown = matches!(answer, ProviderStatus::Unknown);
-                let ttl = if unknown { UNKNOWN_STATUS_TTL } else { STATUS_TTL };
+                let ttl = if unknown { UNKNOWN_STATUS_TTL } else { store.status_ttl(&target, &answer) };
                 let shared = CachedStatus::new(answer);
                 if !unknown {
                     if let (Some(cache), Ok(raw)) = (&store.cache, serde_json::to_string(&shared)) {
@@ -53,6 +63,54 @@ impl TorBoxStore {
             // The shared read panicked: nothing is known.
             None => ProviderStatus::Unknown,
         }
+    }
+
+    /// How long a status answer is reused before TorBox is asked again: `STATUS_TTL`, or `DEAD_SWARM_RECHECK` for a
+    /// torrent that has sat stalled with no seeds and no progress for `DEAD_SWARM_AFTER`.
+    ///
+    /// A download nobody can seed is polled for as long as some client keeps it: one TV polled Rebecka Martinsson
+    /// S02E01 (0 seeds, 0 %) every 20 s for hours, 1,391 answers a day, each a ~300 ms mylist call that could only
+    /// say the same thing. Past `DEAD_SWARM_AFTER` the answer is held instead, so the polls cost no upstream call
+    /// and TorBox is asked again every `DEAD_SWARM_RECHECK` in case the swarm came back. Any progress, any seed or
+    /// any rate starts the clock over, as does anything that clears the snapshot (an add, a resolve, a reannounce).
+    pub(super) fn status_ttl(&self, t: &ResolveTarget, answer: &ProviderStatus) -> Duration {
+        let Some(cache) = &self.cache else { return STATUS_TTL };
+        let key = torbox_dead_swarm_key(&self.account_identity(), &t.info_hash);
+        let dead = match answer {
+            ProviderStatus::Downloading(st) => {
+                (st.state == FETCH_STALLED && st.seeds == Some(0) && st.bytes_per_second.unwrap_or(0) <= 0)
+                    .then(|| format!("{:.4}", st.progress))
+            }
+            _ => None,
+        };
+        let Some(progress) = dead else {
+            clear(cache.as_ref(), &key);
+            return STATUS_TTL;
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let first = cache
+            .get(&key)
+            .and_then(|raw| {
+                let (at, seen) = raw.split_once(':')?;
+                (seen == progress).then(|| at.parse::<u64>().ok()).flatten()
+            })
+            .unwrap_or(now);
+        // Rewritten on every dead answer, so the clock lasts as long as the polling does.
+        cache.put_class(&key, &format!("{first}:{progress}"), DEAD_SWARM_AFTER * 2, CacheClass::Volatile);
+        if now.saturating_sub(first) < DEAD_SWARM_AFTER.as_millis() as u64 {
+            return STATUS_TTL;
+        }
+        log_limited(
+            "torbox-dead-swarm",
+            &format!(
+                "torbox {}: stalled with no seeds and no progress for {}; answering from the last status, asking \
+                 again every {}",
+                short_hash(&t.info_hash),
+                go_duration(Duration::from_millis(now - first)),
+                go_duration(DEAD_SWARM_RECHECK)
+            ),
+        );
+        DEAD_SWARM_RECHECK
     }
 
     /// Go `torBoxStore.statusAnswerUncached`.
