@@ -143,8 +143,8 @@ pub(crate) fn test_deps(over: impl FnOnce(&mut Deps)) -> Deps {
 }
 
 #[derive(Default)]
-struct FixedManagedHls {
-    targets: Mutex<Vec<ResolveTarget>>,
+pub(crate) struct FixedManagedHls {
+    pub(crate) targets: Mutex<Vec<ResolveTarget>>,
 }
 
 #[async_trait]

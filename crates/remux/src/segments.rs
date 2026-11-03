@@ -887,7 +887,7 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
     let secrets = [base.clone()];
     let scrub = |text: &str| crate::redact::scrub(text, &[secrets[0].as_str()]);
     let src = crate::scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
-    let list = crate::scout::list(st.scout_via(), &src, &ep.id(), None)
+    let list = crate::scout::list(st.scout_via(), &src, &ep.id(), None, false)
         .await
         .map_err(|e| Failure::Failed(format!("scout: {}", scrub(&e.detail))))?;
     let picks = cheapest(&list);

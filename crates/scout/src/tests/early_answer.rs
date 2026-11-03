@@ -206,6 +206,77 @@ fn slow_second_indexer() -> crate::handler::Handler {
     }))
 }
 
+/// A managed-playback handler whose torrentio answers in `fast` ms with a cached 1080p and mediafusion in `slow` ms
+/// with a cached 4K copy.
+fn managed_play(fast: u64, slow: u64) -> crate::handler::Handler {
+    let resolver = Arc::new(crate::tests::handler::FixedManagedHls::default());
+    new_handler(test_deps(move |d| {
+        d.scrape_timeout = TIMEOUT;
+        d.managed_hls = Some(resolver);
+        d.make_scrapers = Arc::new(move |_| {
+            vec![
+                fake_scraper("torrentio", move || {
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(fast)).await;
+                        Ok(vec![release('b', "Movie 1080p WEB-DL")])
+                    })
+                }),
+                fake_scraper("mediafusion", move || {
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(slow)).await;
+                        Ok(vec![release('a', "Movie 2160p WEB-DL HDR")])
+                    })
+                }),
+            ]
+        });
+    }))
+}
+
+/// Play through Hearth's managed path, until the release it plays is chosen: the list is the wait, and a viewer's
+/// Play (`early_answer`) is answered a grace after the first indexer. A named release still waits for every one.
+#[tokio::test(start_paused = true)]
+async fn a_viewers_play_is_answered_a_grace_after_the_first_indexer() {
+    use crate::managed_hls::ManagedHlsRequest;
+    eprintln!("early_answer play: profile (ms) | waits for all | answers early");
+    for [fast, slow] in PROFILES {
+        let mut took = Vec::new();
+        for early_answer in [false, true] {
+            let h = managed_play(fast, slow);
+            let request = ManagedHlsRequest { imdb: "tt1234567".into(), early_answer, ..Default::default() };
+            let start = Instant::now();
+            let played = h.managed_hls(&valid_blob(), &request).await.expect("a release plays");
+            took.push(start.elapsed());
+            // Early, the 4K copy the slow indexer had is not in the list; waiting, it is, and it plays — unless the
+            // indexer never answers inside the scrape timeout.
+            let waited_for =
+                if early_answer { fast + LATE_GRACE.as_millis() as u64 } else { TIMEOUT.as_millis() as u64 };
+            let want = if slow <= waited_for { "Movie 2160p WEB-DL HDR" } else { "Movie 1080p WEB-DL" };
+            assert_eq!(played.release.filename, want, "{fast}/{slow} early={early_answer}");
+        }
+        eprintln!(
+            "early_answer play: {fast}/{slow} | {} ms | {} ms",
+            took[0].as_millis(),
+            took[1].as_millis()
+        );
+        let all = Duration::from_millis(slow).min(TIMEOUT);
+        assert_eq!(took[0], all, "{fast}/{slow}");
+        assert_eq!(took[1], all.min(Duration::from_millis(fast) + LATE_GRACE), "{fast}/{slow}");
+    }
+    let h = managed_play(400, 4000);
+    let named = ManagedHlsRequest {
+        imdb: "tt1234567".into(),
+        early_answer: true,
+        filename: Some("Movie 2160p WEB-DL HDR".into()),
+        ..Default::default()
+    };
+    let start = Instant::now();
+    assert_eq!(
+        h.managed_hls(&valid_blob(), &named).await.unwrap().release.filename,
+        "Movie 2160p WEB-DL HDR"
+    );
+    assert_eq!(start.elapsed(), Duration::from_millis(4000), "a named release waits for every indexer");
+}
+
 fn list_path() -> String {
     format!("/{}/stream/movie/tt1234567.json", valid_blob())
 }

@@ -107,6 +107,9 @@ pub struct ManagedHlsRequest {
     pub platform: Option<String>,
     /// TorBox's zero-based position in `metadata.subtitles`. None keeps subtitles out of the managed playlist.
     pub subtitle: Option<i64>,
+    /// A viewer pressed Play and is waiting (`X-Den-Early-Answer`): the release list may go out before the slowest
+    /// indexer (`LATE_GRACE`). Not for a release named by `filename`, which only a complete list is sure to hold.
+    pub early_answer: bool,
 }
 
 /// Non-secret release metadata returned beside a managed URL.
