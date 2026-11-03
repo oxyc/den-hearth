@@ -29,9 +29,11 @@ const LATENCY: Duration = Duration::from_millis(150);
 const PACK: &str = "e83a1825cfc4000000000000000000000000beef";
 const ID: i64 = 42;
 
-/// A TorBox account and its CDN, answering after `LATENCY`. `held` is whether the account's listing names the pack.
+/// A TorBox account and its CDN, answering after `LATENCY`. `held` is whether the account's listing names the pack,
+/// `queued` whether TorBox's own queue does (so createtorrent answers "already queued").
 struct Upstream {
     held: bool,
+    queued: bool,
     calls: Mutex<Vec<String>>,
 }
 
@@ -71,7 +73,13 @@ impl Upstream {
             return (name("mylist_account"), ok(body));
         }
         if path.ends_with("/queued/getqueued") {
-            return (name("getqueued"), ok(r#"{"success":true,"data":[]}"#.to_owned()));
+            let data = if self.queued { format!(r#"[{{"id":5,"hash":"{PACK}"}}]"#) } else { "[]".to_owned() };
+            return (name("getqueued"), ok(format!(r#"{{"success":true,"data":{data}}}"#)));
+        }
+        if path.ends_with("/torrents/createtorrent") && self.queued {
+            let body = r#"{"success":false,"error":"DIFF_ISSUE","detail":"Download already queued."}"#;
+            let r = http::Response::builder().status(400).body(body.to_owned()).expect("a response");
+            return (name("createtorrent"), r);
         }
         if path.ends_with("/torrents/createtorrent") {
             return (
@@ -128,6 +136,8 @@ enum Before {
     HeldForgotten,
     /// In the account and remembered.
     HeldRemembered,
+    /// Reported cached, yet waiting in TorBox's own queue: a stale cache answer, or an add parked by hand.
+    CachedButQueued,
 }
 
 struct Played {
@@ -138,8 +148,11 @@ struct Played {
 }
 
 async fn play(before: Before) -> Played {
-    let upstream =
-        Arc::new(Upstream { held: !matches!(before, Before::CachedNotHeld), calls: Mutex::new(Vec::new()) });
+    let upstream = Arc::new(Upstream {
+        held: matches!(before, Before::HeldForgotten | Before::HeldRemembered),
+        queued: matches!(before, Before::CachedButQueued),
+        calls: Mutex::new(Vec::new()),
+    });
     let cache = Arc::new(MemoryCache::new(1 << 20));
     let store = Arc::new(TorBoxStore {
         token: "tb-secret".to_owned(),
@@ -177,43 +190,49 @@ fn report(before: Before, p: &Played) {
     );
 }
 
-fn assert_calls(before: Before, p: &Played, want: &[&str]) {
+fn assert_calls(before: Before, p: &Played, status: u16, want: &[&str]) {
     report(before, p);
-    assert_eq!(p.status, 302, "{before:?} plays: {}", p.log);
+    assert_eq!(p.status, status, "{before:?}: {}", p.log);
     assert_eq!(p.calls, want, "{before:?}");
     assert!(p.took >= LATENCY * want.len() as u32, "{before:?}: calls ran one after another");
 }
 
 /// An episode cached at TorBox and not in the account: the listing must still be read (an add of a torrent the
 /// account already has would be marked ours, which is what the cancel route trusts), the add made, the pack's
-/// files listed to pick the episode, its link minted and checked.
+/// files listed to pick the episode, its link minted and checked. TorBox's queue is not asked: a cached torrent
+/// waits for no download slot.
 #[tokio::test]
 async fn cached_not_held() {
     let p = play(Before::CachedNotHeld).await;
     assert_calls(
         Before::CachedNotHeld,
         &p,
-        &["mylist_account", "getqueued", "createtorrent", "mylist_id", "requestdl", "cdn"],
+        302,
+        &["mylist_account", "createtorrent", "mylist_id", "requestdl", "cdn"],
     );
 }
 
-/// An episode the account holds that Scout has forgotten: the listing finds it, the status read sees it finished,
-/// and the pack's files are listed again to pick the episode.
+/// The queue not asked up front is still found when it matters: the add hears "already queued", the queue is read
+/// then, and the play answers "queued" rather than a dead link.
+#[tokio::test]
+async fn cached_but_queued() {
+    let p = play(Before::CachedButQueued).await;
+    assert_calls(Before::CachedButQueued, &p, 202, &["mylist_account", "createtorrent", "getqueued"]);
+}
+
+/// An episode the account holds that Scout has forgotten: the listing finds it, and the status read's answer,
+/// which lists the pack's files, picks the episode without asking for the list again.
 #[tokio::test]
 async fn held_forgotten() {
     let p = play(Before::HeldForgotten).await;
-    assert_calls(
-        Before::HeldForgotten,
-        &p,
-        &["mylist_account", "mylist_id", "mylist_id", "requestdl", "cdn"],
-    );
+    assert_calls(Before::HeldForgotten, &p, 302, &["mylist_account", "mylist_id", "requestdl", "cdn"]);
 }
 
 /// An episode the account holds and Scout remembers: the held path, a file list and a link.
 #[tokio::test]
 async fn held_remembered() {
     let p = play(Before::HeldRemembered).await;
-    assert_calls(Before::HeldRemembered, &p, &["mylist_id", "requestdl", "cdn"]);
+    assert_calls(Before::HeldRemembered, &p, 302, &["mylist_id", "requestdl", "cdn"]);
 }
 
 /// The play's log line names each step and each TorBox call it waited on.

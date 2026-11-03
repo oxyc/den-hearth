@@ -868,6 +868,8 @@ impl From<CachedStream> for RawStream {
             seeders: s.seeders,
             cached: s.cached,
             cache_known: s.cache_known,
+            // What an account holds changes by the minute; it is read fresh for each list, never cached with one.
+            held: false,
             source: s.source,
             probe: s.probe,
             traits: Default::default(),

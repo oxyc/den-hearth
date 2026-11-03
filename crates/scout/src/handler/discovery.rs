@@ -641,6 +641,9 @@ impl Inner {
                 // rest of the list is perfectly well known. Stamping the request-wide `truthOK` on all of them
                 // asserted the answer for exactly the hashes nobody had an answer for.
                 s.cache_known = truth.known(&s.info_hash);
+                // A cache read per store (a remembered torrent id), never a request.
+                let target = ResolveTarget { info_hash: s.info_hash.clone(), ..Default::default() };
+                s.held = !pool.holding_services(&target).is_empty();
             }
         }
         // A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a

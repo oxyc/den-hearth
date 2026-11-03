@@ -87,6 +87,20 @@ impl TorBoxStore {
             if live(self.cache(), &torbox_queued_miss_key(&identity, &t.info_hash)).is_some() {
                 return ProviderStatus::NotFetching;
             }
+            // Nor for a release TorBox said moments ago it has cached (the stream list's checkcached, remembered
+            // for CACHED_TTL). TorBox's queue holds adds waiting for a download slot, and a cached torrent needs
+            // none, so asking costs a round trip on every first play of a cached release to learn nothing. Were
+            // it there anyway, the add that follows hears "already queued" and finds it in the queue then
+            // (addMagnet's DIFF_ISSUE branch), so nothing is bought twice.
+            let (believed_cached, _) = known_cached(
+                self.cache(),
+                DebridService::TorBox,
+                &identity,
+                std::slice::from_ref(&t.info_hash),
+            );
+            if believed_cached.contains_key(&t.info_hash) {
+                return ProviderStatus::NotFetching;
+            }
             if let Ok((qid, found)) = self.find_queued_by_hash(&t.info_hash).await {
                 if found {
                     self.cache().put_class(
@@ -146,6 +160,16 @@ impl TorBoxStore {
         };
         // Finished but Resolve still failed → not a wait we can promise anything about; reads as dead.
         if st.download_finished == Some(true) {
+            // The same answer lists the torrent's files, which is what the resolve after this read would ask
+            // mylist for again to pick the episode: a held torrent Scout had forgotten paid for that list twice in
+            // a row. Kept as the resolve entry, so the resolve goes straight to requestdl. Only a non-empty list,
+            // the rule resolveHeldTorrent keeps, so a list-less answer cannot poison the pack.
+            let files = finished_files(obj.get("data"), torrent_id);
+            if let (Some(cache), false) = (&self.cache, files.is_empty()) {
+                if let Ok(raw) = serde_json::to_string(&ResolveEntry::new(torrent_id, &files)) {
+                    cache.put(&resolve_key(&identity, &t.info_hash), &raw, RESOLVE_CACHE_TTL);
+                }
+            }
             return ProviderStatus::NotFetching;
         }
         // Nothing said about the download at all (an empty object, a deleted torrent) — not a wait either.

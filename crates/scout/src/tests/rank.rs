@@ -656,3 +656,54 @@ fn lookaround_patterns_answer_for_a_title_of_any_length() {
     let chain = "E01".repeat(1 << 17);
     assert!(names_episode(&format!("S01{chain}"), 1, 1));
 }
+
+// Tracker S04E04's list: two cached 2160p copies, two cached 1080p, and the 1080p season pack the account already
+// held from the episode before. A held copy plays from a link (0.74 s measured) where an unheld one needs an add and
+// a file listing first (4.4-7.2 s), so within its own tier it goes first — and no further: the 4K copies stay above
+// it, and a held release that is sunk (another episode) stays sunk.
+#[test]
+fn rank_streams_a_held_release_leads_its_own_tier_only() {
+    let cached = |title: &str, held: bool| {
+        rs(title, |s| {
+            s.cached = true;
+            s.cache_known = true;
+            s.held = held;
+            s.size_bytes = intp(3 * GIB);
+        })
+    };
+    let streams = [
+        cached("Tracker 2024 S04E04 Purification 2160p AMZN WEB-DL DDP5 1 H 265-NTb.mkv", false),
+        cached("Tracker 2024 S04E04 Purification 2160p AMZN WEB-DL DDP5 1 H 265-Kitsune.mkv", false),
+        cached("Tracker 2024 S04E04 Purification 1080p AMZN WEB-DL DDP5 1 H 264-NTb.mkv", false),
+        cached("Tracker 2024 S04E04 Purification 1080p AMZN WEB-DL DDP5 1 H 264-FLUX.mkv", false),
+        cached("Tracker.S04E04.1080p.WEB-DL.RGzsRutracker.mkv", true),
+        cached("Tracker.S04E05.1080p.WEB-DL.RGzsRutracker.mkv", true),
+    ];
+    let filters = || RankFilters { result_cap: 20, episode: Some([4, 4]), ..Default::default() };
+    let unheld: Vec<RawStream> = streams
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.held = false;
+            s
+        })
+        .collect();
+    let before = titles(&prod::rank_streams(&unheld, filters()));
+    let got = titles(&prod::rank_streams(&streams, filters()));
+
+    let rgzs = "Tracker.S04E04.1080p.WEB-DL.RGzsRutracker.mkv";
+    let first_1080 = before.iter().position(|t| t.contains("1080p")).expect("a 1080p copy");
+    assert_ne!(before[first_1080], rgzs, "unheld, the pack ranks below the AMZN copies: {before:#?}");
+    assert_eq!(got[first_1080], rgzs, "the held copy leads the 1080p tier: {got:#?}");
+    assert_eq!(got[..first_1080], before[..first_1080], "nothing crosses into the 4K tier: {got:#?}");
+    assert_eq!(
+        got.last().map(String::as_str),
+        Some("Tracker.S04E05.1080p.WEB-DL.RGzsRutracker.mkv"),
+        "{got:#?}"
+    );
+    let mut sorted_before = before.clone();
+    let mut sorted_got = got.clone();
+    sorted_before.sort();
+    sorted_got.sort();
+    assert_eq!(sorted_got, sorted_before, "reordered, nothing dropped");
+}
