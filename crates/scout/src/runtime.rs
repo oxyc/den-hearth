@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 use crate::addbudget::{AddBudget, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
 use crate::metrics::{new_metric_set, MetricSet};
+use crate::publication::{Authority, Publication, PublicationFence};
 use crate::scrape::Doer;
 use crate::stores::torbox::TorboxRuntime;
 
@@ -39,6 +40,7 @@ pub struct ScoutRuntime {
     metrics: Arc<MetricSet>,
     list_builds: Arc<Semaphore>,
     scraper_requests: Arc<Semaphore>,
+    publications: Arc<PublicationFence>,
     pub(crate) torbox: TorboxRuntime,
     play_observer: std::sync::OnceLock<PlayObserver>,
 }
@@ -94,6 +96,7 @@ impl ScoutRuntime {
             metrics: Arc::new(new_metric_set()),
             list_builds: Arc::new(Semaphore::new(list_build_limit)),
             scraper_requests: Arc::new(Semaphore::new(scraper_request_limit)),
+            publications: Arc::new(PublicationFence::default()),
             torbox,
             play_observer: std::sync::OnceLock::new(),
         })
@@ -167,6 +170,13 @@ impl ScoutRuntime {
                 None
             }
         }
+    }
+
+    /// Orders eventual cache writes for overlapping work by freshness authority, then admission generation. The
+    /// namespace distinguishes list entries from provider answers; the runtime scopes hosted Scout instances.
+    pub(crate) fn begin_publication(&self, namespace: &str, key: &str, fresh: bool) -> Publication {
+        let authority = if fresh { Authority::Fresh } else { Authority::Ordinary };
+        self.publications.begin(format!("{namespace}:{key}"), authority)
     }
 
     #[cfg(test)]

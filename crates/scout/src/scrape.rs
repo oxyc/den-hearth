@@ -999,9 +999,19 @@ async fn ask_shared(
     if let Some(streams) = kept_answer(cache.as_deref(), &*sc, &q) {
         return ScrapeAttempt { streams, err: None, cached: true, latency_ms: 0, observed_at: None };
     }
+    // This is the actual upstream-work admission point. Callers that joined the detached flight never get a
+    // generation of their own. Fresh and ordinary flights may overlap; fresh authority wins in either start order,
+    // while generation orders peers. Failure/cancellation advances nothing.
+    let publication = answer_cache_key(&*sc, &q)
+        .filter(|_| cache.is_some() && !ttl.is_zero())
+        .map(|key| crate::runtime::current_runtime().begin_publication("answer", &key, q.fresh));
     let attempt = ask(&*sc, &q, deadline).await;
     if attempt.err.is_none() {
-        keep_answer(cache.as_deref(), ttl, &*sc, &q, &attempt.streams);
+        if let Some(publication) = publication {
+            publication.publish(|| keep_answer(cache.as_deref(), ttl, &*sc, &q, &attempt.streams));
+        } else {
+            keep_answer(cache.as_deref(), ttl, &*sc, &q, &attempt.streams);
+        }
     }
     attempt
 }

@@ -32,6 +32,7 @@ pub mod probe;
 pub mod probe_avi;
 pub mod probe_fanout;
 pub mod probe_mp4;
+mod publication;
 pub mod rank;
 pub mod releaselog;
 pub mod reqlog;
