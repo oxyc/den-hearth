@@ -1,7 +1,7 @@
 //! Port of `internal/scout/rank.go`: release-title parsing, filtering and ranking. Scrapers produce
 //! `RawStream`, and the handler and probes consume it.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{LazyLock, OnceLock};
 
@@ -208,13 +208,25 @@ pub(crate) fn cap_seeds(streams: &[RawStream], limit: i64) -> Vec<RawStream> {
     // Rank references, not owned streams. This cap exists specifically for hostile/accidental
     // multi-thousand-result scrapes; cloning every title, source and probe before throwing nearly all
     // of them away made the safety valve itself scale with the input it was meant to contain.
-    let mut all: Vec<(usize, i64, i64)> = streams
-        .iter()
-        .enumerate()
-        .map(|(idx, s)| (idx, quality_score_ref(s), s.seeders.unwrap_or(0)))
-        .collect();
+    let mut all: Vec<(usize, i64, i64)> =
+        streams.iter().enumerate().map(|(idx, s)| (idx, seed_cap_score(s), s.seeders.unwrap_or(0))).collect();
     all.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
     all.into_iter().take(limit as usize).map(|(idx, _, _)| streams[idx].clone()).collect()
+}
+
+/// The foreground seed-cap order: best title-derived quality first, then most seeders. Callers that need a
+/// deterministic final tie keep their stable input order (as [`cap_seeds`] does) or append that order explicitly.
+/// Late-source diagnostics use this same comparator so their safety cap cannot preserve a different candidate
+/// population from the production decision it measures.
+pub(crate) fn seed_cap_order(a: &RawStream, b: &RawStream) -> Ordering {
+    seed_cap_score(b).cmp(&seed_cap_score(a)).then(b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
+}
+
+/// The cap runs before cache truth in the foreground. A post-response diagnostic receives foreground streams
+/// after that truth was annotated, so remove the cache bonus to compare both populations at the same authority
+/// point. All other cap inputs (title traits, indexer size and seeders) are the foreground inputs too.
+fn seed_cap_score(s: &RawStream) -> i64 {
+    quality_score_ref(s) - if s.cached { 8000 } else { 0 }
 }
 
 /// Go `qualityScore`: additive, higher wins.

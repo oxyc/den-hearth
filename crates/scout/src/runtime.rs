@@ -30,6 +30,14 @@ pub(crate) const MAX_CONCURRENT_LIST_BUILDS: usize = 16;
 /// admission bounds keep its waiter set finite.
 pub(crate) const MAX_CONCURRENT_SCRAPER_REQUESTS: usize = 24;
 
+/// Maximum number of post-response late-source diagnostics retained by one hosted Scout runtime.
+///
+/// These tasks are observation only: they await sources the viewer did not wait for, cache-check the bounded
+/// candidate set, and report whether its leader would have changed. They must never compete with a foreground
+/// list for admission or make a viewer wait. Eight preserves useful samples across an ordinary burst while
+/// bounding retained candidates to `8 * MAX_SEEDS`; excess diagnostics are skipped rather than queued.
+pub(crate) const MAX_CONCURRENT_LATE_DIAGNOSTICS: usize = 8;
+
 /// Told of each episode a viewer starts playing through a play route: its IMDb id, season and episode.
 pub type PlayObserver = Arc<dyn Fn(&str, u32, u32) + Send + Sync>;
 
@@ -41,6 +49,7 @@ pub struct ScoutRuntime {
     list_builds: Arc<Semaphore>,
     scraper_requests: Arc<Semaphore>,
     publications: Arc<PublicationFence>,
+    late_diagnostics: Arc<Semaphore>,
     pub(crate) torbox: TorboxRuntime,
     play_observer: std::sync::OnceLock<PlayObserver>,
 }
@@ -57,6 +66,13 @@ pub(crate) struct ScraperRequestAdmission {
     metrics: Arc<MetricSet>,
 }
 
+/// One admitted post-response late-source diagnostic. Dropping it returns the slot on completion, timeout,
+/// cancellation, panic, or runtime shutdown.
+pub(crate) struct LateDiagnosticAdmission {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<MetricSet>,
+}
+
 impl Drop for ScraperRequestAdmission {
     fn drop(&mut self) {
         self.metrics.scraper_request_active.fetch_sub(1, Ordering::Relaxed);
@@ -66,6 +82,12 @@ impl Drop for ScraperRequestAdmission {
 impl Drop for ListBuildAdmission {
     fn drop(&mut self) {
         self.metrics.list_build_active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for LateDiagnosticAdmission {
+    fn drop(&mut self) {
+        self.metrics.late_diagnostic_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -80,12 +102,18 @@ impl ScoutRuntime {
     }
 
     fn build_with_limits(list_build_limit: usize, scraper_request_limit: usize) -> Arc<Self> {
-        Self::with_components(list_build_limit, scraper_request_limit, TorboxRuntime::new())
+        Self::with_components(
+            list_build_limit,
+            scraper_request_limit,
+            MAX_CONCURRENT_LATE_DIAGNOSTICS,
+            TorboxRuntime::new(),
+        )
     }
 
     fn with_components(
         list_build_limit: usize,
         scraper_request_limit: usize,
+        late_diagnostic_limit: usize,
         torbox: TorboxRuntime,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -97,6 +125,7 @@ impl ScoutRuntime {
             list_builds: Arc::new(Semaphore::new(list_build_limit)),
             scraper_requests: Arc::new(Semaphore::new(scraper_request_limit)),
             publications: Arc::new(PublicationFence::default()),
+            late_diagnostics: Arc::new(Semaphore::new(late_diagnostic_limit)),
             torbox,
             play_observer: std::sync::OnceLock::new(),
         })
@@ -179,6 +208,22 @@ impl ScoutRuntime {
         self.publications.begin(format!("{namespace}:{key}"), authority)
     }
 
+    /// Nonblocking admission for diagnostic-only work after an early response. Refusal deliberately creates no
+    /// waiter and cannot affect foreground list admission or response latency.
+    pub(crate) fn try_admit_late_diagnostic(&self) -> Option<LateDiagnosticAdmission> {
+        match Arc::clone(&self.late_diagnostics).try_acquire_owned() {
+            Ok(permit) => {
+                self.metrics.late_diagnostic_admitted.fetch_add(1, Ordering::Relaxed);
+                self.metrics.late_diagnostic_active.fetch_add(1, Ordering::Relaxed);
+                Some(LateDiagnosticAdmission { _permit: permit, metrics: Arc::clone(&self.metrics) })
+            }
+            Err(_) => {
+                self.metrics.late_diagnostic_refused.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_list_build_limit(list_build_limit: usize) -> Arc<Self> {
         Self::with_list_build_limit(list_build_limit)
@@ -190,10 +235,21 @@ impl ScoutRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_with_late_diagnostic_limit(late_diagnostic_limit: usize) -> Arc<Self> {
+        Self::with_components(
+            MAX_CONCURRENT_LIST_BUILDS,
+            MAX_CONCURRENT_SCRAPER_REQUESTS,
+            late_diagnostic_limit,
+            TorboxRuntime::new(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_account_listing_limit(account_listing_limit: usize) -> Arc<Self> {
         Self::with_components(
             MAX_CONCURRENT_LIST_BUILDS,
             MAX_CONCURRENT_SCRAPER_REQUESTS,
+            MAX_CONCURRENT_LATE_DIAGNOSTICS,
             TorboxRuntime::new_with_listing_limit(account_listing_limit),
         )
     }
@@ -353,6 +409,33 @@ mod tests {
         assert_eq!(answer, Some((Some(true), false)));
         assert_eq!(flight.active(), 0, "timed work leaked its flight key");
         assert_eq!(slots.available_permits(), 1, "timed work leaked its admission permit");
+    }
+
+    #[tokio::test]
+    async fn late_diagnostic_admission_never_queues_and_recovers_after_cancellation() {
+        let runtime = ScoutRuntime::new_with_late_diagnostic_limit(1);
+        let first = runtime.try_admit_late_diagnostic().expect("the first diagnostic is admitted");
+        assert!(runtime.try_admit_late_diagnostic().is_none(), "a second diagnostic queued past the bound");
+        assert_eq!(runtime.metrics().late_diagnostic_active.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert_eq!(runtime.metrics().late_diagnostic_active.load(Ordering::SeqCst), 0);
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let owner = tokio::spawn({
+            let runtime = runtime.clone();
+            let entered = entered.clone();
+            async move {
+                let _admission = runtime.try_admit_late_diagnostic().expect("the replacement is admitted");
+                entered.wait().await;
+                std::future::pending::<()>().await;
+            }
+        });
+        entered.wait().await;
+        assert_eq!(runtime.metrics().late_diagnostic_active.load(Ordering::SeqCst), 1);
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        assert_eq!(runtime.metrics().late_diagnostic_active.load(Ordering::SeqCst), 0);
+        drop(runtime.try_admit_late_diagnostic().expect("cancellation leaked the only diagnostic permit"));
     }
 
     #[tokio::test]
