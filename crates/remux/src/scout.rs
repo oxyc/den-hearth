@@ -131,7 +131,7 @@ pub(crate) fn grid_by_name(s: &Stream) -> bool {
 /// probe decides those), or MPEG-4 Part 2 in an MPEG-TS or AVI, which is transcoded. AV1 or VP9 for any other
 /// player, and VC-1, need the video re-encoded from a container this service copies. Some containers are left out by
 /// name (`left_out_by_name`).
-fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
+pub(crate) fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
     let codec_ok = match s.attributes.codec.as_deref().map(str::to_ascii_lowercase) {
         None => true,
         Some(c) => {
