@@ -4,20 +4,23 @@
 //! exact and the run is instant. `cargo test -p den-scout early_answer -- --nocapture` prints the before/after
 //! table the profiles below produce.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::time::Instant;
 
 use crate::cache::{Cache, MemoryCache};
+use crate::config::DebridService;
 use crate::config::Indexer;
 use crate::coverage::{OUTCOME_ANSWERED, OUTCOME_LATE};
 use crate::handler::new_handler;
 use crate::loglimit::Capture;
 use crate::rank::{RawStream, GIB};
 use crate::scrape::{scrape_covered_until, DoError, ScrapeQuery, Scraper, LATE_GRACE};
+use crate::stores::{ProviderStatus, ResolveTarget, Store, StoreError};
 use crate::tests::handler::{fake_scraper, get, test_deps, valid_blob};
 
 fn release(hash: char, title: &str) -> RawStream {
@@ -340,4 +343,268 @@ async fn the_route_answers_early_and_counts_what_the_late_indexer_would_have_cha
     let line = line.unwrap_or_else(|| panic!("no late line: {}", log.text()));
     assert!(line.contains("upstream=mediafusion"), "{line}");
     assert!(line.contains("new=1 top_changed=true"), "{line}");
+}
+
+/// A real stream-route load source: one fast foreground release, then `count` late releases. The useful 4K
+/// releases deliberately come last, after thousands of CAMs, so a first-N truncation cannot pass this test.
+struct DiagnosticLoadScraper {
+    id: &'static str,
+    latency: Duration,
+    late_count: usize,
+}
+
+#[async_trait]
+impl Scraper for DiagnosticLoadScraper {
+    fn id(&self) -> Indexer {
+        Indexer(self.id.to_owned())
+    }
+
+    async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+        tokio::time::sleep(self.latency).await;
+        if self.late_count == 0 {
+            return Ok(vec![RawStream {
+                info_hash: diagnostic_hash(q, 0),
+                title: "Movie 1080p WEB-DL".to_owned(),
+                size_bytes: Some(8 * GIB),
+                seeders: Some(50),
+                file_idx: Some(0),
+                ..RawStream::default()
+            }]);
+        }
+        Ok((1..=self.late_count)
+            .map(|i| {
+                let useful = i > self.late_count.saturating_sub(crate::handler::MAX_SEEDS);
+                RawStream {
+                    info_hash: diagnostic_hash(q, i),
+                    title: if useful {
+                        "Movie 2160p REMUX HDR".to_owned()
+                    } else {
+                        "Movie 2160p HDCAM".to_owned()
+                    },
+                    size_bytes: Some(if useful { 18 } else { 2 } * GIB),
+                    seeders: Some(i as i64),
+                    file_idx: Some(0),
+                    ..RawStream::default()
+                }
+            })
+            .collect())
+    }
+}
+
+fn diagnostic_hash(q: &ScrapeQuery, i: usize) -> String {
+    let title = q.imdb.trim_start_matches("tt").parse::<u64>().expect("numeric test imdb");
+    format!("{:040x}", title * 10_000 + i as u64)
+}
+
+struct DiagnosticChecks {
+    foreground_requests: AtomicUsize,
+    late_requests: AtomicUsize,
+    late_hashes: Mutex<Vec<Vec<String>>>,
+    release: tokio::sync::Semaphore,
+    block_late: bool,
+}
+
+impl Default for DiagnosticChecks {
+    fn default() -> Self {
+        Self {
+            foreground_requests: AtomicUsize::new(0),
+            late_requests: AtomicUsize::new(0),
+            late_hashes: Mutex::new(Vec::new()),
+            release: tokio::sync::Semaphore::new(0),
+            block_late: false,
+        }
+    }
+}
+
+struct DiagnosticStore(Arc<DiagnosticChecks>);
+
+#[async_trait]
+impl Store for DiagnosticStore {
+    fn service(&self) -> DebridService {
+        DebridService::TorBox
+    }
+
+    async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+        if hashes.len() == 1 {
+            self.0.foreground_requests.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.0.late_requests.fetch_add(1, Ordering::SeqCst);
+            self.0.late_hashes.lock().expect("late hashes").push(hashes.to_vec());
+            if self.0.block_late {
+                self.0.release.acquire().await.expect("release semaphore").forget();
+            }
+        }
+        Ok(hashes.iter().map(|hash| (hash.clone(), true)).collect())
+    }
+
+    async fn resolve(&self, _target: &ResolveTarget) -> Result<String, StoreError> {
+        Err(StoreError::Other("diagnostic store does not resolve".to_owned()))
+    }
+
+    async fn provider_status(&self, _target: &ResolveTarget) -> ProviderStatus {
+        ProviderStatus::NotFetching
+    }
+}
+
+fn diagnostic_handler(
+    late_count: usize,
+    task_limit: usize,
+    checks: Arc<DiagnosticChecks>,
+) -> (crate::handler::Handler, Arc<crate::runtime::ScoutRuntime>) {
+    let runtime = crate::runtime::ScoutRuntime::new_with_late_diagnostic_limit(task_limit);
+    let inspect_runtime = runtime.clone();
+    let h = new_handler(test_deps(move |d| {
+        d.runtime = runtime;
+        d.scrape_timeout = TIMEOUT;
+        d.make_scrapers = Arc::new(move |_| {
+            vec![
+                Box::new(DiagnosticLoadScraper {
+                    id: "torrentio",
+                    latency: Duration::from_millis(10),
+                    late_count: 0,
+                }),
+                Box::new(DiagnosticLoadScraper {
+                    id: "mediafusion",
+                    latency: Duration::from_secs(2),
+                    late_count,
+                }),
+            ]
+        });
+        d.make_stores = Arc::new(move |_| vec![Box::new(DiagnosticStore(checks.clone()))]);
+    }));
+    (h, inspect_runtime)
+}
+
+async fn wait_for_count(counter: &AtomicUsize, want: usize) {
+    for _ in 0..1000 {
+        if counter.load(Ordering::SeqCst) == want {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("counter = {}, want {want}", counter.load(Ordering::SeqCst));
+}
+
+async fn run_late_diagnostic_profile(late_count: usize) {
+    let checks = Arc::new(DiagnosticChecks::default());
+    let (h, runtime) = diagnostic_handler(late_count, 1, checks.clone());
+    let log = Capture::start();
+    let path = format!("/{}/stream/movie/tt9000001.json", valid_blob());
+    let start = Instant::now();
+    let response = get(&h, &path, &[EARLY]).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(start.elapsed(), Duration::from_millis(1010), "late diagnostics delayed the viewer");
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_for_count(&checks.late_requests, 1).await;
+    for _ in 0..1000 {
+        if runtime.metrics().late_diagnostic_active.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runtime.metrics().late_diagnostic_active.load(Ordering::SeqCst), 0);
+    assert_eq!(checks.foreground_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(checks.late_requests.load(Ordering::SeqCst), 1);
+    let asked = checks.late_hashes.lock().expect("late hashes");
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].len(), crate::handler::MAX_SEEDS);
+    let first_useful = late_count.saturating_sub(crate::handler::MAX_SEEDS) + 1;
+    let expected_query = ScrapeQuery { imdb: "tt9000001".to_owned(), ..query() };
+    assert!(
+        asked[0].iter().all(|hash| {
+            (first_useful..=late_count).any(|i| *hash == diagnostic_hash(&expected_query, i))
+        }),
+        "cache check did not retain the foreground cap's best-scored tail"
+    );
+
+    let dropped = late_count + 1 - crate::handler::MAX_SEEDS;
+    let metrics = runtime.metrics();
+    assert_eq!(metrics.late_diagnostic_retained.load(Ordering::SeqCst), crate::handler::MAX_SEEDS as i64);
+    assert_eq!(metrics.late_diagnostic_dropped.load(Ordering::SeqCst), dropped as i64);
+    assert_eq!(
+        metrics.late_diagnostic_cache_checked.load(Ordering::SeqCst),
+        crate::handler::MAX_SEEDS as i64
+    );
+    let line = log
+        .text()
+        .lines()
+        .find(|line| line.starts_with("event=scrape outcome=late"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no late line: {}", log.text()));
+    assert!(line.contains(&format!("new={late_count}")), "{line}");
+    assert!(line.contains("top_changed=true retained=500 late_retained=500"), "{line}");
+    assert!(line.contains(&format!("truncated={dropped} cache_checked=500")), "{line}");
+    assert!(line.contains("top_changed=true"), "{line}");
+}
+
+/// The matched low workload for the #207 resource profile. It traverses the production stream route, source
+/// cutoff, late cache check and ranking; the test binary is also run directly under `/usr/bin/time -l`.
+#[tokio::test(start_paused = true)]
+async fn late_diagnostic_profile_500() {
+    run_late_diagnostic_profile(500).await;
+}
+
+/// Five thousand late releases still make one cache-check request for the same best 500 candidates, and retain
+/// no more candidates than the 500-release workload.
+#[tokio::test(start_paused = true)]
+async fn late_diagnostic_profile_5000() {
+    run_late_diagnostic_profile(5000).await;
+}
+
+/// Distinct early answers do not share a list flight. This exercises the real task boundary and proves excess
+/// diagnostics are refused without queueing, while admitted work stays bounded until its cache checks are released.
+#[tokio::test(start_paused = true)]
+async fn concurrent_late_diagnostics_bound_tasks_requests_and_retained_candidates() {
+    const REQUESTS: usize = crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS + 4;
+    let checks = Arc::new(DiagnosticChecks { block_late: true, ..DiagnosticChecks::default() });
+    let (h, runtime) =
+        diagnostic_handler(5000, crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS, checks.clone());
+    let h = Arc::new(h);
+    let start = Instant::now();
+    let mut requests = Vec::new();
+    for i in 0..REQUESTS {
+        let h = h.clone();
+        requests.push(tokio::spawn(async move {
+            let path = format!("/{}/stream/movie/tt{:07}.json", valid_blob(), 9_100_000 + i);
+            get(&h, &path, &[EARLY]).await
+        }));
+    }
+    for request in requests {
+        assert_eq!(request.await.expect("request task").status(), 200);
+    }
+    assert_eq!(start.elapsed(), Duration::from_millis(1010), "diagnostic admission delayed early responses");
+    let metrics = runtime.metrics();
+    assert_eq!(
+        metrics.late_diagnostic_active.load(Ordering::SeqCst),
+        crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS as i64
+    );
+    assert_eq!(
+        metrics.late_diagnostic_refused.load(Ordering::SeqCst),
+        (REQUESTS - crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS) as i64
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_for_count(&checks.late_requests, crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS).await;
+    let asked = checks.late_hashes.lock().expect("late hashes");
+    assert_eq!(asked.len(), crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS);
+    assert!(asked.iter().all(|hashes| hashes.len() == crate::handler::MAX_SEEDS));
+    drop(asked);
+    assert_eq!(
+        metrics.late_diagnostic_retained.load(Ordering::SeqCst),
+        (crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS * crate::handler::MAX_SEEDS) as i64
+    );
+    assert_eq!(
+        metrics.late_diagnostic_cache_checked.load(Ordering::SeqCst),
+        (crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS * crate::handler::MAX_SEEDS) as i64
+    );
+
+    checks.release.add_permits(crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS);
+    for _ in 0..1000 {
+        if metrics.late_diagnostic_active.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(metrics.late_diagnostic_active.load(Ordering::SeqCst), 0, "released tasks retained permits");
 }

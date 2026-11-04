@@ -61,7 +61,8 @@ use crate::probe_fanout::{
     PROBE_BUDGET, PROBE_TOP_N, PROBE_TTL,
 };
 use crate::rank::{
-    cap_seeds, rank_streams_debug, real_debrid_blocked, title_tokens, RankDebug, RankFilters, RawStream,
+    cap_seeds, rank_streams_debug, real_debrid_blocked, seed_cap_order, title_tokens, RankDebug, RankFilters,
+    RawStream,
 };
 use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;

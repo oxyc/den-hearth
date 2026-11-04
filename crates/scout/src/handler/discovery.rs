@@ -785,10 +785,11 @@ impl Inner {
             client: client.cloned(),
             languages,
         };
-        let late_check = late.map(|late| (late, seeds.clone(), filters.clone()));
+        let seed_count = seeds.len();
+        let late_check = late.map(|late| (late, filters.clone()));
         let ranked = rank_streams_debug(&seeds, filters, Some(&mut *log_dbg));
         log_rank_decision(sid, candidates, &ranked, log_dbg, rank_start.elapsed(), rid);
-        if let Some((late, seeds, filters)) = late_check {
+        if let Some((late, filters)) = late_check {
             let top = ranked.first().map(|s| s.info_hash.clone());
             self.judge_late_answers(config, sid, rid, late, seeds, filters, top);
         }
@@ -842,7 +843,7 @@ impl Inner {
                     "{} {}: scraped {} → ranked {} (cachedOnly={} year={} filters: res={:?} minSeed={} maxGB={} cam={} hdr={})",
                     sid.kind,
                     sid.imdb,
-                    seeds.len(),
+                    seed_count,
                     ranked.len(),
                     eff_cached_only,
                     year,
@@ -878,39 +879,28 @@ impl Inner {
         sid: &StreamId,
         rid: &str,
         late: LateAnswers,
-        mut seeds: Vec<RawStream>,
+        seeds: Vec<RawStream>,
         filters: RankFilters,
         served_top: Option<String>,
     ) {
+        let Some(admission) = self.deps.runtime.try_admit_late_diagnostic() else {
+            log_limited(
+                "late-diagnostic-cap",
+                &format!(
+                    "{} {}: late-source diagnostic skipped; {} task ceiling reached",
+                    sid.kind,
+                    sid.imdb,
+                    crate::runtime::MAX_CONCURRENT_LATE_DIAGNOSTICS
+                ),
+            );
+            return;
+        };
         let (this, config, sid, rid) = (self.clone(), config.clone(), sid.clone(), rid.to_owned());
         spawn_background(self.deps.runtime.clone(), "late indexer check", async move {
+            let _admission = admission;
             let LateAnswers { ids, waited, answers } = late;
             let Ok(answers) = answers.await else { return };
-            let mut known: HashSet<String> = seeds.iter().map(|s| s.info_hash.clone()).collect();
-            let mut fresh: Vec<RawStream> = Vec::new();
-            for s in answers.iter().filter_map(|a| a.streams.as_ref()).flatten() {
-                if known.insert(s.info_hash.clone()) {
-                    fresh.push(s.clone());
-                }
-            }
-            let new = fresh.len();
-            if new > 0 {
-                let pool = StorePool { stores: (this.deps.make_stores)(&config) };
-                let hashes: Vec<String> = fresh.iter().map(|s| s.info_hash.clone()).collect();
-                if let Ok((truth, _)) = timeout(this.status_budget(), pool.cache_check(&hashes)).await {
-                    for s in fresh.iter_mut() {
-                        s.cached = truth.cached(&s.info_hash);
-                        s.cache_known = truth.known(&s.info_hash);
-                    }
-                }
-                for s in fresh.iter_mut() {
-                    let target = ResolveTarget { info_hash: s.info_hash.clone(), ..Default::default() };
-                    s.held = !pool.holding_services(&target).is_empty();
-                }
-                seeds.extend(fresh);
-            }
-            let top = rank_streams_debug(&seeds, filters, None).first().map(|s| s.info_hash.clone());
-            let changed = new > 0 && top != served_top;
+
             let answered: Vec<String> = answers
                 .iter()
                 .map(|a| {
@@ -919,6 +909,69 @@ impl Inner {
                 })
                 .collect();
             let longest = answers.iter().map(|a| a.latency_ms).max().unwrap_or(0);
+
+            // Move the upstream answers into one compact candidate set: cloning every late title/hash used to
+            // retain a second unbounded copy beside `answers`. `order` is the exact old first-seen order, used
+            // both for duplicate ownership and the foreground cap's stable final tie.
+            struct Candidate {
+                order: usize,
+                late: bool,
+                stream: RawStream,
+            }
+            let mut candidates = Vec::with_capacity(seeds.len());
+            for (order, stream) in seeds.into_iter().enumerate() {
+                candidates.push(Candidate { order, late: false, stream });
+            }
+            let mut order = candidates.len();
+            for answer in answers {
+                if let Some(streams) = answer.streams {
+                    for stream in streams {
+                        candidates.push(Candidate { order, late: true, stream });
+                        order += 1;
+                    }
+                }
+            }
+
+            // The old path kept the first appearance of a hash. Sorting by hash then original order makes that
+            // rule deterministic without retaining an unbounded second hash set; the following quality sort
+            // restores the exact cap order used by the foreground path.
+            candidates
+                .sort_by(|a, b| a.stream.info_hash.cmp(&b.stream.info_hash).then(a.order.cmp(&b.order)));
+            candidates.dedup_by(|a, b| a.stream.info_hash == b.stream.info_hash);
+            let new = candidates.iter().filter(|candidate| candidate.late).count();
+            let before_cap = candidates.len();
+            candidates.sort_by(|a, b| seed_cap_order(&a.stream, &b.stream).then(a.order.cmp(&b.order)));
+            candidates.truncate(MAX_SEEDS);
+            let retained = candidates.len();
+            let truncated = before_cap - retained;
+            let late_retained = candidates.iter().filter(|candidate| candidate.late).count();
+            let metric = metrics();
+            metric.late_diagnostic_retained.fetch_add(retained as i64, Ordering::Relaxed);
+            metric.late_diagnostic_dropped.fetch_add(truncated as i64, Ordering::Relaxed);
+            metric.late_diagnostic_cache_checked.fetch_add(late_retained as i64, Ordering::Relaxed);
+
+            if late_retained > 0 {
+                let pool = StorePool { stores: (this.deps.make_stores)(&config) };
+                let hashes: Vec<String> = candidates
+                    .iter()
+                    .filter(|candidate| candidate.late)
+                    .map(|candidate| candidate.stream.info_hash.clone())
+                    .collect();
+                if let Ok((truth, _)) = timeout(this.status_budget(), pool.cache_check(&hashes)).await {
+                    for candidate in candidates.iter_mut().filter(|candidate| candidate.late) {
+                        candidate.stream.cached = truth.cached(&candidate.stream.info_hash);
+                        candidate.stream.cache_known = truth.known(&candidate.stream.info_hash);
+                    }
+                }
+                for candidate in candidates.iter_mut().filter(|candidate| candidate.late) {
+                    let target =
+                        ResolveTarget { info_hash: candidate.stream.info_hash.clone(), ..Default::default() };
+                    candidate.stream.held = !pool.holding_services(&target).is_empty();
+                }
+            }
+            let seeds: Vec<RawStream> = candidates.into_iter().map(|candidate| candidate.stream).collect();
+            let top = rank_streams_debug(&seeds, filters, None).first().map(|s| s.info_hash.clone());
+            let changed = new > 0 && top != served_top;
             let mut identity = format!("imdb={} type={}", sid.imdb, sid.kind);
             if sid.has_ep {
                 identity.push_str(&format!(" season={} episode={}", sid.season, sid.episode));
@@ -932,7 +985,11 @@ impl Inner {
                 &rid,
                 &identity,
             );
-            line.push_str(&format!(" sources={} new={new} top_changed={changed}", answered.join(",")));
+            line.push_str(&format!(
+                " sources={} new={new} top_changed={changed} retained={retained} \
+                 late_retained={late_retained} truncated={truncated} cache_checked={late_retained}",
+                answered.join(",")
+            ));
             emit(&line);
         });
     }

@@ -85,6 +85,14 @@ pub struct MetricSet {
     pub list_build_active: AtomicI64,
     pub scraper_request_admitted: AtomicI64,
     pub scraper_request_active: AtomicI64,
+    pub late_diagnostic_admitted: AtomicI64,
+    pub late_diagnostic_refused: AtomicI64,
+    pub late_diagnostic_active: AtomicI64,
+    /// Combined foreground/late candidates retained and truncated by post-response diagnostics.
+    pub late_diagnostic_retained: AtomicI64,
+    pub late_diagnostic_dropped: AtomicI64,
+    /// Late candidates that survived the combined cap and were submitted to cache truth stores.
+    pub late_diagnostic_cache_checked: AtomicI64,
 
     pub probe_cache_hit: AtomicI64,
     pub probe_cache_miss: AtomicI64,
@@ -151,6 +159,12 @@ pub fn new_metric_set() -> MetricSet {
         list_build_active: AtomicI64::new(0),
         scraper_request_admitted: AtomicI64::new(0),
         scraper_request_active: AtomicI64::new(0),
+        late_diagnostic_admitted: AtomicI64::new(0),
+        late_diagnostic_refused: AtomicI64::new(0),
+        late_diagnostic_active: AtomicI64::new(0),
+        late_diagnostic_retained: AtomicI64::new(0),
+        late_diagnostic_dropped: AtomicI64::new(0),
+        late_diagnostic_cache_checked: AtomicI64::new(0),
         probe_cache_hit: AtomicI64::new(0),
         probe_cache_miss: AtomicI64::new(0),
         background_panic: AtomicI64::new(0),
@@ -325,6 +339,33 @@ impl MetricSet {
             "Scraper requests currently holding process-wide body admission.",
             "",
             ld(&self.scraper_request_active),
+        );
+        counter(
+            &mut b,
+            "scout_late_diagnostic_admission_total",
+            "Post-response late-source diagnostic admission decisions.",
+            &[
+                (r#"result="admitted""#.to_owned(), ld(&self.late_diagnostic_admitted)),
+                (r#"result="refused""#.to_owned(), ld(&self.late_diagnostic_refused)),
+            ],
+        );
+        prom::series(
+            &mut b,
+            "scout_late_diagnostics_active",
+            "gauge",
+            "Post-response late-source diagnostics currently admitted.",
+            "",
+            ld(&self.late_diagnostic_active),
+        );
+        counter(
+            &mut b,
+            "scout_late_diagnostic_candidates_total",
+            "Combined candidates retained or truncated by post-response late-source diagnostics.",
+            &[
+                (r#"result="retained""#.to_owned(), ld(&self.late_diagnostic_retained)),
+                (r#"result="dropped""#.to_owned(), ld(&self.late_diagnostic_dropped)),
+                (r#"result="cache_checked""#.to_owned(), ld(&self.late_diagnostic_cache_checked)),
+            ],
         );
         counter(
             &mut b,
