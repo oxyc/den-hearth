@@ -58,7 +58,7 @@ impl PublicationFence {
             // published and removed the state — losing the very authority it needs to observe.
             let generation = self
                 .next
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| generation.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |generation| generation.checked_add(1))
                 .expect("cache publication generation space exhausted")
                 + 1;
             let state = Arc::clone(live.entry(key.clone()).or_default());
