@@ -1713,8 +1713,8 @@ pub struct Want<'a> {
     /// can be joined back to the request that started it with one grep.
     pub rid: Option<&'a str>,
     /// A viewer is waiting on this Play (`X-Den-Early-Answer: 1`): scout's list may go out before its slowest
-    /// indexer. Only to pick what to open: a list with nothing to open is asked for again, waiting for every indexer,
-    /// before the answer is that nothing plays (`select::create`).
+    /// indexer. Only to pick what to open: when that incomplete list produces no session, selection asks once more,
+    /// waiting for every indexer, before the answer is that nothing plays (`select::create`).
     pub early_answer: bool,
 }
 

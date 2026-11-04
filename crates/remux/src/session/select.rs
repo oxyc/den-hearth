@@ -2,6 +2,41 @@
 
 use super::*;
 
+/// The evidence selection used to reject one release. Scout mints a new play ticket for every list, so its URL is
+/// deliberately not identity: a fresh ticket alone is no reason to repeat an exclusion, capability verdict, probe,
+/// or fit verdict. Changed attributes are new evidence and may be reconsidered.
+#[derive(Hash, PartialEq, Eq)]
+struct CandidateEvidence {
+    filename: String,
+    cached: Option<bool>,
+    size: Option<u64>,
+    codec: Option<String>,
+    three_d: bool,
+    resolution: Option<String>,
+    hdr: bool,
+    bit_depth: u32,
+    dv_profile: u32,
+    probed: bool,
+}
+
+impl CandidateEvidence {
+    fn of(stream: &scout::Stream) -> Self {
+        let a = &stream.attributes;
+        Self {
+            filename: stream.filename().to_string(),
+            cached: a.cached,
+            size: a.size_bytes,
+            codec: a.codec.clone(),
+            three_d: a.three_d,
+            resolution: a.resolution.clone(),
+            hdr: a.hdr,
+            bit_depth: a.bit_depth,
+            dv_profile: a.dv_profile,
+            probed: a.probed,
+        }
+    }
+}
+
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
 pub async fn create(
     st: &Arc<AppState>,
@@ -85,107 +120,124 @@ pub async fn create(
     // release they named, which only a complete list is sure to hold.
     let early = want.early_answer && want.filename.is_none();
     let mut list = scout_list(st, &source, imdb, by_install, want.playable, early).await?;
-    // Nothing to open in an early list is no verdict: the indexer it went without may have the cached release.
-    // Asked again, waiting for all of them, before the answer is that nothing plays.
-    let openable = |list: &[scout::Stream]| {
-        list.iter().any(|s| s.attributes.cached == Some(true) && scout::left_out_by_name(s).is_none())
-    };
-    if early && !openable(&list) {
-        eprintln!(
-            "session {short}: {imdb} early list has nothing to open; asking for every source{rid_suffix}"
-        );
-        list = scout_list(st, &source, imdb, by_install, want.playable, false).await?;
-    }
-    let resolve_ms = resolve_started.elapsed().as_millis() as u64;
-    let candidates = scout::candidates(
-        &list,
-        want.filename,
-        want.playable.is_some_and(Playable::takes_av1),
-        want.playable.is_some_and(Playable::takes_vp9),
-    );
+    let mut resolve_ms = resolve_started.elapsed().as_millis() as u64;
+    let av1 = want.playable.is_some_and(Playable::takes_av1);
+    let vp9 = want.playable.is_some_and(Playable::takes_vp9);
+    let takes_hevc = player_takes_hevc(want.playable, want.video_codecs);
+    let may_convert = !want.no_transcode && !want.fits_only;
     // Why the release the player named was passed over, where it was: `release.requested` in the answer.
     let mut requested_why: Option<String> = None;
     // The containers of what was left out by name, for an answer that ends with nothing to play.
     let mut formats: Vec<&'static str> = Vec::new();
-    // Left out of `candidates` by their names, which a person reading the log should see was on purpose.
-    for s in list.iter().filter(|s| s.attributes.cached == Some(true) && !s.attributes.three_d) {
-        if let Some(ext) = scout::left_out_by_name(s) {
-            eprintln!(
-                "session {short}: {imdb} skipped \"{}\" unopened: {ext} is not a container this service opens{rid_suffix}",
-                s.attributes.label
-            );
-            if !formats.contains(&ext) {
-                formats.push(ext);
-            }
-            if want.filename == Some(s.filename()) {
-                requested_why = Some(format!("{ext} files can't be played here"));
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return Err(ApiError {
-            formats,
-            ..api(StatusCode::NOT_FOUND, "no_release", "No cached release in a codec this service can remux.")
-        });
-    }
-    let takes_hevc = player_takes_hevc(want.playable, want.video_codecs);
-    // What scout says of each release decides, before any is opened, which are tried first — those that play as
-    // they are, then those that play only converted, scout's ranking holding within each — and which aren't
-    // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
-    // browser that sent its report in the same order; this is what orders one for a player that sent none.
-    let mut ranked: Vec<(Fit, &scout::Stream)> = Vec::new();
-    // A transcode is chosen here, before playback, or not at all: never for a player replacing a session mid-film.
-    let may_convert = !want.no_transcode && !want.fits_only;
-    for c in &candidates {
-        if want.exclude.iter().any(|f| f == c.filename()) {
-            eprintln!(
-                "session {short}: {imdb} skipped \"{}\" unopened: the player is switching away from it{rid_suffix}",
-                c.attributes.label
-            );
-            continue;
-        }
-        let remembered = unplayable_key(imdb, c).and_then(|k| st.unplayable().get(&k, unix_now()));
-        if let Some(why) = remembered {
-            eprintln!(
-                "session {short}: {imdb} skipped \"{}\" unopened: remembered: {why}{rid_suffix}",
-                c.attributes.label
-            );
-            if want.filename == Some(c.filename()) {
-                requested_why = Some(why);
-            }
-            continue;
-        }
-        match fit(&c.attributes, want.playable, takes_hevc) {
-            Fit::Never => {
+    let mut had_candidates = false;
+    let mut asked_complete = !early;
+    // Only conclusive rejections enter this set. A passing open failure may be retried with the complete list's new
+    // ticket; an exclusion, capability/probe verdict, remembered file failure, or fit verdict may not.
+    let mut rejected = std::collections::HashSet::new();
+    let mut tried = 0;
+    let mut open_spent = Duration::ZERO;
+    let mut no_transcode = false;
+    let mut chosen: Option<(scout::Stream, (scout::Resolved, MediaInfo), bool)> = None;
+    // The first release that plays only converted: the last resort, taken once nothing tried plays as it is.
+    let mut fallback: Option<(scout::Stream, (scout::Resolved, MediaInfo))> = None;
+    // Releases that play as they are but need more than the player's `maxBitrate`, in rank order.
+    let mut too_big: Vec<(scout::Stream, (scout::Resolved, MediaInfo))> = Vec::new();
+    let mut fallback_seen = false;
+    // Nothing plays as it is with a head start of `MAX_PREBUFFER` or less. What comes next, in order: a copy that asks
+    // at most `LONG_PREBUFFER` of it, a transcode, the copy that starves least — and else a refusal, up front, which a
+    // retry would not change.
+    let fitting = job::preset_for(max_bitrate);
+    let preset = fitting.unwrap_or(job::SD540);
+    // Waited out at the link with its headroom, as fitting is weighed: a copy that only the whole link would carry
+    // is the one that stalls when the link dips, and a wait up front does not make it fit.
+    let usable = max_bitrate.map(|m| (m as f64 * LINK_HEADROOM) as u64);
+    let who = if guest { "a guest" } else { "a member" };
+    // Set only on the branch that actually converts, for the end-of-session summary line.
+    let mut transcode_reason: Option<String> = None;
+
+    loop {
+        // Left out of `candidates` by their names, which a person reading the log should see was on purpose.
+        for s in list.iter().filter(|s| s.attributes.cached == Some(true) && !s.attributes.three_d) {
+            if let Some(ext) = scout::left_out_by_name(s) {
                 eprintln!(
-                    "session {short}: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here{rid_suffix}",
+                    "session {short}: {imdb} skipped \"{}\" unopened: {ext} is not a container this service opens{rid_suffix}",
+                    s.attributes.label
+                );
+                if !formats.contains(&ext) {
+                    formats.push(ext);
+                }
+                if want.filename == Some(s.filename()) {
+                    requested_why = Some(format!("{ext} files can't be played here"));
+                }
+            }
+        }
+        let candidates = scout::candidates(&list, want.filename, av1, vp9);
+        had_candidates |= !candidates.is_empty();
+        // What scout says of each release decides, before any is opened, which are tried first — those that play as
+        // they are, then those that play only converted, scout's ranking holding within each — and which aren't
+        // opened at all. The named release stays first unless it can't play. Scout has already ranked a list for a
+        // browser that sent its report in the same order; this is what orders one for a player that sent none.
+        let mut ranked: Vec<(Fit, scout::Stream)> = Vec::new();
+        for c in candidates {
+            if want.exclude.iter().any(|f| f == c.filename()) {
+                eprintln!(
+                    "session {short}: {imdb} skipped \"{}\" unopened: the player is switching away from it{rid_suffix}",
+                    c.attributes.label
+                );
+                if !asked_complete {
+                    rejected.insert(CandidateEvidence::of(&c));
+                }
+                continue;
+            }
+            let remembered = unplayable_key(imdb, &c).and_then(|k| st.unplayable().get(&k, unix_now()));
+            if let Some(why) = remembered {
+                eprintln!(
+                    "session {short}: {imdb} skipped \"{}\" unopened: remembered: {why}{rid_suffix}",
                     c.attributes.label
                 );
                 if want.filename == Some(c.filename()) {
-                    requested_why = scouted_verdict(&c.attributes, want.playable, takes_hevc).1;
+                    requested_why = Some(why);
                 }
+                if !asked_complete {
+                    rejected.insert(CandidateEvidence::of(&c));
+                }
+                continue;
             }
-            // Only a transcode could play it, and none may be started: not worth opening.
-            Fit::Convert if !may_convert => {}
-            f => ranked.push((f, c)),
+            match fit(&c.attributes, want.playable, takes_hevc) {
+                Fit::Never => {
+                    eprintln!(
+                        "session {short}: {imdb} skipped \"{}\" unopened: scout's attributes say it can't play here{rid_suffix}",
+                        c.attributes.label
+                    );
+                    if want.filename == Some(c.filename()) {
+                        requested_why = scouted_verdict(&c.attributes, want.playable, takes_hevc).1;
+                    }
+                    if !asked_complete {
+                        rejected.insert(CandidateEvidence::of(&c));
+                    }
+                }
+                // Only a transcode could play it, and none may be started: not worth opening.
+                Fit::Convert if !may_convert => {
+                    if !asked_complete {
+                        rejected.insert(CandidateEvidence::of(&c));
+                    }
+                }
+                f => ranked.push((f, c)),
+            }
         }
-    }
-    let named_first = usize::from(ranked.first().is_some_and(|(_, c)| want.filename == Some(c.filename())));
-    ranked[named_first..].sort_by_key(|(f, _)| *f);
-    let mut no_transcode = false;
-    let (mut chosen, fallback, mut too_big, open_ms, tried) = {
+        let named_first =
+            usize::from(ranked.first().is_some_and(|(_, c)| want.filename == Some(c.filename())));
+        ranked[named_first..].sort_by_key(|(f, _)| *f);
+
         let source = &source;
         let started = Instant::now();
         let mut queue = ranked.into_iter().peekable();
         let mut opening = FuturesOrdered::new();
-        let mut tried = 0;
-        let mut chosen = None;
-        // The first release that plays only converted: the last resort, taken once nothing tried plays as it is.
-        let mut fallback = None;
-        // Releases that play as they are but need more than the player's `maxBitrate`, in rank order.
-        let mut too_big: Vec<(&scout::Stream, (scout::Resolved, MediaInfo))> = Vec::new();
         loop {
-            while opening.len() < PARALLEL_OPENS && tried < MAX_TRIES && started.elapsed() < PICK_BUDGET {
+            while opening.len() < PARALLEL_OPENS
+                && tried < MAX_TRIES
+                && open_spent.saturating_add(started.elapsed()) < PICK_BUDGET
+            {
                 // With a converted release in hand, one scout says plays only converted can't do better.
                 if fallback.is_some() && queue.peek().is_some_and(|(f, _)| *f == Fit::Convert) {
                     break;
@@ -193,7 +245,7 @@ pub async fn create(
                 let Some((_, c)) = queue.next() else { break };
                 tried += 1;
                 opening.push_back(async move {
-                    let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, imdb, c)).await;
+                    let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, imdb, &c)).await;
                     let late = || OpenFailure::passing(format!("not open after {}s", OPEN_TIMEOUT.as_secs()));
                     (c, opened.unwrap_or_else(|_| Err(late())))
                 });
@@ -216,6 +268,9 @@ pub async fn create(
                     );
                     if want.filename == Some(c.filename()) {
                         requested_why = probed_verdict(&info, want.playable, takes_hevc).1;
+                    }
+                    if !asked_complete {
+                        rejected.insert(CandidateEvidence::of(&c));
                     }
                 }
                 // HEVC the player can't take as it is, and every MPEG-TS and AVI, plays only converted on the GPU: kept
@@ -253,6 +308,9 @@ pub async fn create(
                     if want.filename == Some(c.filename()) {
                         requested_why = probed_verdict(&info, want.playable, takes_hevc).1;
                     }
+                    if !asked_complete {
+                        rejected.insert(CandidateEvidence::of(&c));
+                    }
                 }
                 // A copy needing more than the player's link carries is kept aside while one that fits is looked for —
                 // unless the player named it, which is then decided on below as the only one.
@@ -285,8 +343,11 @@ pub async fn create(
                         "session {short}: {imdb} skipped \"{}\": {why}{rid_suffix}",
                         c.attributes.label
                     );
-                    if let Some(key) = unplayable_key(imdb, c).filter(|_| failure.lasting) {
+                    if let Some(key) = unplayable_key(imdb, &c).filter(|_| failure.lasting) {
                         st.remember_unplayable(key, why);
+                    }
+                    if failure.lasting && !asked_complete {
+                        rejected.insert(CandidateEvidence::of(&c));
                     }
                     if want.filename == Some(c.filename()) {
                         requested_why = Some("it could not be opened".into());
@@ -294,101 +355,126 @@ pub async fn create(
                 }
             }
         }
-        (chosen, fallback, too_big, started.elapsed().as_millis() as u64, tried)
-    };
-    // Nothing plays as it is with a head start of `MAX_PREBUFFER` or less. What comes next, in order: a copy that asks
-    // at most `LONG_PREBUFFER` of it, a transcode, the copy that starves least — and else a refusal, up front, which a
-    // retry would not change.
-    // The transcode the link carries at its peak; none fits a link below the floor's, and one that would starve ranks
-    // below the copy that starves least — taken only where no copy plays at all.
-    let fitting = job::preset_for(max_bitrate);
-    let preset = fitting.unwrap_or(job::SD540);
-    let fallback_seen = fallback.is_some();
-    let delivery = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want)
-    };
-    let bitrate =
-        |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| need(&t.1 .1, &delivery(t)).map(|n| n.bitrate);
-    // Waited out at the link with its headroom, as fitting is weighed: a copy that only the whole link would carry
-    // is the one that stalls when the link dips, and a wait up front does not make it fit.
-    let usable = max_bitrate.map(|m| (m as f64 * LINK_HEADROOM) as u64);
-    let head_start = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-        prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
-    };
-    if chosen.is_none() && !want.fits_only {
-        let longer = (0..too_big.len())
-            .filter(|&i| head_start(&too_big[i]) <= LONG_PREBUFFER)
-            .min_by(|&a, &b| head_start(&too_big[a]).total_cmp(&head_start(&too_big[b])));
-        if let Some(i) = longer {
-            let (c, found) = too_big.swap_remove(i);
-            chosen = Some((c, found, false));
-        }
-    }
-    let who = if guest { "a guest" } else { "a member" };
-    // Set only on the branch that actually converts, for the end-of-session summary line.
-    let mut transcode_reason: Option<String> = None;
-    if chosen.is_none() && may_convert && (fitting.is_some() || too_big.is_empty()) {
-        // A conversion at the preset the link takes — of the first release that plays only converted, else of the
-        // first HEVC copy too big for the link that the preset comes in under.
-        let from_too_big = fallback.is_none();
-        let nearest = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX));
-        let why = match (from_too_big, nearest.map(|i| &too_big[i])) {
-            (true, Some(t)) => format!(
-                "no copy plays within a {LONG_PREBUFFER:.0}s head start on the {} kbit/s link; the nearest, \"{}\", \
-                 needs {}",
-                max_bitrate.unwrap_or(0) / 1000,
-                t.0.attributes.label,
-                need(&t.1.1, &delivery(t)).map_or_else(|| "an unknown rate".to_string(), |n| n.to_string())
-            ),
-            _ => "no release plays in this player as it is".to_string(),
+        open_spent = open_spent.saturating_add(started.elapsed());
+        // The transcode the link carries at its peak; none fits a link below the floor's, and one that would starve ranks
+        // below the copy that starves least — taken only where no copy plays at all.
+        fallback_seen |= fallback.is_some();
+        let delivery = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
+            Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want)
         };
-        let convert = fallback.or_else(|| {
-            let hevc = |t: &(&scout::Stream, (scout::Resolved, MediaInfo))| {
-                t.1 .1.video == VideoCodec::Hevc
-                    && bitrate(t).is_some_and(|b| b > preset.bitrate && source_within_reach(b, max_bitrate))
+        let bitrate = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
+            need(&t.1 .1, &delivery(t)).map(|n| n.bitrate)
+        };
+        let head_start = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
+            prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
+        };
+        if chosen.is_none() && !want.fits_only {
+            let longer = (0..too_big.len())
+                .filter(|&i| head_start(&too_big[i]) <= LONG_PREBUFFER)
+                .min_by(|&a, &b| head_start(&too_big[a]).total_cmp(&head_start(&too_big[b])));
+            if let Some(i) = longer {
+                let (c, found) = too_big.swap_remove(i);
+                chosen = Some((c, found, false));
+            }
+        }
+        if chosen.is_none() && may_convert && (fitting.is_some() || too_big.is_empty()) {
+            // A conversion at the preset the link takes — of the first release that plays only converted, else of the
+            // first HEVC copy too big for the link that the preset comes in under.
+            let from_too_big = fallback.is_none();
+            let nearest = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX));
+            let why = match (from_too_big, nearest.map(|i| &too_big[i])) {
+                (true, Some(t)) => format!(
+                    "no copy plays within a {LONG_PREBUFFER:.0}s head start on the {} kbit/s link; the nearest, \"{}\", \
+                 needs {}",
+                    max_bitrate.unwrap_or(0) / 1000,
+                    t.0.attributes.label,
+                    need(&t.1.1, &delivery(t))
+                        .map_or_else(|| "an unknown rate".to_string(), |n| n.to_string())
+                ),
+                _ => "no release plays in this player as it is".to_string(),
             };
-            // The cheapest to read, not the first ranked: a conversion reads the whole source in real time.
-            let i = (0..too_big.len())
-                .filter(|&i| hevc(&too_big[i]))
-                .min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX))?;
-            Some(too_big.remove(i))
-        });
-        if let Some((c, found)) = convert {
-            match st.can_transcode() {
-                true => {
-                    // The GPU is acquired fairly only when the player asks for media; an abandoned session owns none.
-                    eprintln!(
-                        "session {short}: {imdb} converting \"{}\" for {who} to {}p at {} kbit/s (at most {}){}: {why}{rid_suffix}",
-                        c.attributes.label,
-                        preset.height,
-                        preset.bitrate / 1000,
-                        preset.peak / 1000,
-                        if fitting.is_none() { ", more than the link carries" } else { "" }
-                    );
-                    transcode_reason = Some(why.clone());
-                    chosen = Some((c, found, true));
-                }
-                // The GPU is unavailable: it still plays as it is, below.
-                false if from_too_big => too_big.push((c, found)),
-                false => {
-                    no_transcode = true;
-                    eprintln!(
-                        "session {short}: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and \
+            let convert = fallback.take().or_else(|| {
+                let hevc = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
+                    t.1 .1.video == VideoCodec::Hevc
+                        && bitrate(t)
+                            .is_some_and(|b| b > preset.bitrate && source_within_reach(b, max_bitrate))
+                };
+                // The cheapest to read, not the first ranked: a conversion reads the whole source in real time.
+                let i = (0..too_big.len())
+                    .filter(|&i| hevc(&too_big[i]))
+                    .min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX))?;
+                Some(too_big.remove(i))
+            });
+            if let Some((c, found)) = convert {
+                match st.can_transcode() {
+                    true => {
+                        // The GPU is acquired fairly only when the player asks for media; an abandoned session owns none.
+                        eprintln!(
+                            "session {short}: {imdb} converting \"{}\" for {who} to {}p at {} kbit/s (at most {}){}: {why}{rid_suffix}",
+                            c.attributes.label,
+                            preset.height,
+                            preset.bitrate / 1000,
+                            preset.peak / 1000,
+                            if fitting.is_none() { ", more than the link carries" } else { "" }
+                        );
+                        transcode_reason = Some(why.clone());
+                        chosen = Some((c, found, true));
+                    }
+                    // The GPU is unavailable: it still plays as it is, below.
+                    false if from_too_big => too_big.push((c, found)),
+                    false => {
+                        if !asked_complete {
+                            rejected.insert(CandidateEvidence::of(&c));
+                        }
+                        no_transcode = true;
+                        eprintln!(
+                            "session {short}: {imdb} can't play \"{}\" for {who}: it needs converting ({why}), and \
                          transcoding is unavailable{rid_suffix}",
-                        c.attributes.label
-                    );
+                            c.attributes.label
+                        );
+                    }
                 }
             }
         }
-    }
-    if chosen.is_none() && !want.fits_only {
-        // Last, the copy too big for the link that needs the least: a stall now and then beats nothing to play.
-        if let Some(i) = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX)) {
-            let (c, found) = too_big.swap_remove(i);
-            chosen = Some((c, found, false));
+        if chosen.is_none() && !want.fits_only {
+            // Last, the copy too big for the link that needs the least: a stall now and then beats nothing to play.
+            if let Some(i) = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX)) {
+                let (c, found) = too_big.swap_remove(i);
+                chosen = Some((c, found, false));
+            }
         }
+        if chosen.is_some() || asked_complete {
+            break;
+        }
+
+        // The early answer was intentionally incomplete, and every real selection path rejected it. Keep the same
+        // admission and the same opening budgets, but ask once for every source. Releases conclusively rejected on
+        // unchanged evidence are filtered before the second batch; passing open failures may use Scout's new ticket.
+        rejected.extend(list.iter().filter(|s| !scout::remuxable(s, av1, vp9)).map(CandidateEvidence::of));
+        rejected.extend(too_big.iter().map(|(c, _)| CandidateEvidence::of(c)));
+        rejected.extend(fallback.iter().map(|(c, _)| CandidateEvidence::of(c)));
+        eprintln!(
+            "session {short}: {imdb} early list produced no session; asking once for every source{rid_suffix}"
+        );
+        let retry_started = Instant::now();
+        list = scout_list(st, source, imdb, by_install, want.playable, false).await?;
+        resolve_ms = resolve_ms.saturating_add(retry_started.elapsed().as_millis() as u64);
+        list.retain(|stream| !rejected.contains(&CandidateEvidence::of(stream)));
+        asked_complete = true;
     }
+
+    let open_ms = open_spent.as_millis() as u64;
     let Some((c, (resolved, info), transcode)) = chosen else {
+        if !had_candidates {
+            return Err(ApiError {
+                formats,
+                ..api(
+                    StatusCode::NOT_FOUND,
+                    "no_release",
+                    "No cached release in a codec this service can remux.",
+                )
+            });
+        }
         if want.fits_only {
             return Err(api(
                 StatusCode::NOT_FOUND,
@@ -500,7 +586,7 @@ pub async fn create(
     let named: Vec<(String, String)> =
         renditions.iter().map(|r| (r.lang.clone(), crate::subs::name(r))).collect();
     let subtitles_line = crate::subs::describe_subtitles(&info.subtitles, &renditions, dub);
-    let opened_key = opened_key(&source.base, c);
+    let opened_key = opened_key(&source.base, &c);
     // A transcode's keyframes are its encoder's IDRs, in closed GOPs; a copy's are the release's own.
     let closed_gops = transcode || info.closed_gops;
     let mode = if transcode { PlaybackMode::Transcode(preset) } else { PlaybackMode::Direct };

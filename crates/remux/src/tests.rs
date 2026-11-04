@@ -397,12 +397,21 @@ const HELD_FROM_TENTHS: usize = 9;
 /// Whether each list of `tt0000031` / `tt0000032` was asked for early (`x-den-early-answer: 1`).
 static EARLY_LISTS: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
 static EARLY_LISTS_32: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+/// Real list and play requests made by the complete-list selection regressions (`tt000006N`).
+static SELECTION_RETRY_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The cancellation regression holds the complete list until its client has abandoned the session attempt.
+static SELECTION_RETRY_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SELECTION_RETRY_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
 
 /// What the restart tests' titles (`tt000004N`) asked of the fake scout: `list 4N` and `play 4N`.
 static RESUME_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 fn resume_calls(tag: &str) -> usize {
     RESUME_CALLS.lock().unwrap().iter().filter(|c| c.ends_with(tag)).count()
+}
+
+fn selection_retry_calls(call: &str) -> usize {
+    SELECTION_RETRY_CALLS.lock().unwrap().iter().filter(|candidate| candidate.as_str() == call).count()
 }
 
 /// The fake scout's scope=availability config segment ("scoped", base64url) and the service key it
@@ -524,6 +533,85 @@ async fn origin_handle<B>(
         let p = if scoped { "p/s" } else { "p" };
         if imdb.starts_with("tt000004") {
             RESUME_CALLS.lock().unwrap().push(format!("list {}", &imdb[7..]));
+        }
+        if let Some(tag) = match imdb {
+            "tt0000060" => Some("name"),
+            "tt0000061" => Some("capability"),
+            "tt0000062" => Some("remembered"),
+            "tt0000063" => Some("excluded"),
+            "tt0000064" => Some("failed-open"),
+            "tt0000065" => Some("fit"),
+            "tt0000066" => Some("conversion"),
+            "tt0000067" => Some("complete-failure"),
+            "tt0000068" => Some("early-success"),
+            "tt0000069" => Some("cancelled"),
+            _ => None,
+        } {
+            let early = req.headers().get("x-den-early-answer").is_some_and(|v| v == "1");
+            SELECTION_RETRY_CALLS
+                .lock()
+                .unwrap()
+                .push(format!("list:{tag}:{}", if early { "early" } else { "complete" }));
+            if tag == "cancelled" && !early {
+                SELECTION_RETRY_STARTED.add_permits(1);
+                SELECTION_RETRY_RELEASE.acquire().await.unwrap().forget();
+            }
+            let release = |phase: &str, file: &str, filename: &str, codec: Option<&str>| {
+                let mut attributes = serde_json::json!({
+                    "cached": true,
+                    "label": filename,
+                });
+                if let Some(codec) = codec {
+                    attributes["codec"] = codec.into();
+                }
+                serde_json::json!({
+                    "url": format!("http://{addr}/{p}/retry/{tag}/{phase}/{file}"),
+                    "attributes": attributes,
+                    "behaviorHints": {"filename": filename},
+                })
+            };
+            let early_release = match tag {
+                "name" | "complete-failure" | "cancelled" => {
+                    release("early", "h264.mkv", &format!("early-{tag}.iso"), Some("h264"))
+                }
+                "capability" => release("early", "av1.mkv", "early-capability.mkv", None),
+                "remembered" => {
+                    let mut stream = release("early", "h264.mkv", "early-remembered.mkv", Some("h264"));
+                    stream["attributes"]["sizeBytes"] = 816_178.into();
+                    stream
+                }
+                "excluded" => release("early", "h264.mkv", "early-excluded.mkv", Some("h264")),
+                "failed-open" => release("early", "errorpage", "early-failed-open.mkv", Some("h264")),
+                "fit" => release("early", "h264.mkv", "early-fit.mkv", Some("h264")),
+                "conversion" => release("early", "hevc.mkv", "early-conversion.mkv", Some("hevc")),
+                "early-success" => release("early", "h264.mkv", "early-success.mkv", Some("h264")),
+                _ => unreachable!(),
+            };
+            let mut streams = vec![early_release];
+            if !early && !matches!(tag, "complete-failure" | "cancelled") {
+                // The complete answer mints a new ticket for the same early release. Selection must not reopen it
+                // after a conclusive rejection; the passing failed-open case is the deliberate exception.
+                streams[0]["url"] = format!(
+                    "http://{addr}/{p}/retry/{tag}/complete/{}",
+                    if tag == "capability" {
+                        "av1.mkv"
+                    } else if tag == "failed-open" {
+                        "errorpage"
+                    } else if tag == "conversion" {
+                        "hevc.mkv"
+                    } else {
+                        "h264.mkv"
+                    }
+                )
+                .into();
+                let late = if tag == "fit" {
+                    release("late", "hevc.mkv", "late-fit.mkv", Some("hevc"))
+                } else {
+                    release("late", "h264.mkv", &format!("late-{tag}.mkv"), Some("h264"))
+                };
+                streams.push(late);
+            }
+            return origin_full(200, serde_json::json!({"streams": streams}).to_string());
         }
         if imdb == "tt0000031" {
             // An early list (`x-den-early-answer: 1`) went out before the indexer with the cached copy: it lists
@@ -707,6 +795,16 @@ async fn origin_handle<B>(
         if rest.starts_with("never/") {
             NEVER_OPENED.fetch_add(1, Relaxed);
         }
+        let rest = match rest.strip_prefix("retry/") {
+            Some(retry) => {
+                let mut parts = retry.splitn(3, '/');
+                let (tag, phase, file) =
+                    (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
+                SELECTION_RETRY_CALLS.lock().unwrap().push(format!("play:{tag}:{phase}"));
+                file
+            }
+            None => rest,
+        };
         let rest = match rest.strip_prefix("resume").and_then(|r| r.split_once('/')) {
             Some((n, file)) => {
                 RESUME_CALLS.lock().unwrap().push(format!("play {n}"));
@@ -2303,6 +2401,125 @@ async fn an_early_list_with_nothing_to_open_is_asked_again_in_full() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
     assert_eq!(r.json()["release"]["filename"], "h264.mkv");
     assert_eq!(*EARLY_LISTS.lock().unwrap(), [true, false]);
+    state.end_all("test").await;
+}
+
+/// Every terminal decision in real session selection gets one chance to see the intentionally omitted indexer. The
+/// opening count stays shared across the two batches, and a conclusive early rejection is not repeated merely because
+/// Scout minted another ticket for it. A passing open failure is retried once because the complete answer is a fresh
+/// ticket; the late candidate is still opened within the same bounded search.
+#[tokio::test]
+async fn every_early_selection_refusal_gets_one_bounded_complete_list() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    state.remember_unplayable(
+        "tt0000062/816178/early-remembered.mkv".into(),
+        "the file was conclusively unplayable".into(),
+    );
+    let cases = [
+        ("tt0000060", "name", "", 1usize, 0usize),
+        ("tt0000061", "capability", r#", "playable":{"h264":51}"#, 2, 1),
+        ("tt0000062", "remembered", "", 1, 0),
+        ("tt0000063", "excluded", r#", "exclude":["early-excluded.mkv"]"#, 1, 0),
+        ("tt0000064", "failed-open", "", 3, 1),
+        (
+            "tt0000065",
+            "fit",
+            r#", "playable":{"h264":51,"hevcMain":153},"maxBitrate":230000,"fitsOnly":true"#,
+            2,
+            1,
+        ),
+        ("tt0000066", "conversion", r#", "playable":{"h264":51}"#, 2, 1),
+    ];
+    for (imdb, tag, extra, tried, early_plays) in cases {
+        let body = format!(r#"{{"imdb":"{imdb}","scout":"{origin}/cfg"{extra}}}"#);
+        let r =
+            call_with(&state, "POST", "/remux/session", Some(&cookie), &[("x-den-early-answer", "1")], &body)
+                .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{tag}: {}", r.text());
+        assert_eq!(r.json()["release"]["filename"], format!("late-{tag}.mkv"), "{tag}");
+        let timing = r.headers["server-timing"].to_str().unwrap();
+        assert!(timing.contains(&format!("desc=\"{tried} tried\"")), "{tag}: {timing}");
+        assert_eq!(selection_retry_calls(&format!("list:{tag}:early")), 1, "{tag}");
+        assert_eq!(selection_retry_calls(&format!("list:{tag}:complete")), 1, "{tag}");
+        assert_eq!(selection_retry_calls(&format!("play:{tag}:early")), early_plays, "{tag}");
+        assert_eq!(
+            selection_retry_calls(&format!("play:{tag}:complete")),
+            usize::from(tag == "failed-open"),
+            "{tag}: only a passing open failure may be repeated"
+        );
+        assert_eq!(selection_retry_calls(&format!("play:{tag}:late")), 1, "{tag}");
+        state.end_all("test").await;
+    }
+
+    // A complete answer that adds no evidence is the accurate terminal refusal after exactly two lists.
+    let body = format!(r#"{{"imdb":"tt0000067","scout":"{origin}/cfg"}}"#);
+    let r = call_with(&state, "POST", "/remux/session", Some(&cookie), &[("x-den-early-answer", "1")], &body)
+        .await;
+    assert_eq!((r.status, r.json()["error"].clone()), (StatusCode::NOT_FOUND, "no_release".into()));
+    assert_eq!(selection_retry_calls("list:complete-failure:early"), 1);
+    assert_eq!(selection_retry_calls("list:complete-failure:complete"), 1);
+    assert_eq!(selection_retry_calls("play:complete-failure:early"), 0);
+
+    // The success path remains one list and one open: no complete request is issued speculatively.
+    let body = format!(r#"{{"imdb":"tt0000068","scout":"{origin}/cfg"}}"#);
+    let r = call_with(&state, "POST", "/remux/session", Some(&cookie), &[("x-den-early-answer", "1")], &body)
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert!(r.headers["server-timing"].to_str().unwrap().contains("desc=\"1 tried\""));
+    assert_eq!(selection_retry_calls("list:early-success:early"), 1);
+    assert_eq!(selection_retry_calls("list:early-success:complete"), 0);
+    assert_eq!(selection_retry_calls("play:early-success:early"), 1);
+    state.end_all("test").await;
+}
+
+/// A request abandoned while its complete list is in flight owns neither a session nor a stuck replacement/admission
+/// reservation. The old session remains authoritative, and another replacement may start immediately.
+#[tokio::test]
+async fn cancelling_the_complete_list_retry_releases_replacement_admission() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let cookie = login(&state, "phone-key").await;
+    let old_body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg"}}"#);
+    let old = call(&state, "POST", "/remux/session", Some(&cookie), &old_body).await;
+    assert_eq!(old.status, StatusCode::CREATED, "{}", old.text());
+    let old_sid = old.json()["sid"].as_str().unwrap().to_string();
+
+    let retry_body = format!(r#"{{"imdb":"tt0000069","scout":"{origin}/cfg","replaces":"{old_sid}"}}"#);
+    let (task_state, task_cookie) = (state.clone(), cookie.clone());
+    let attempt = tokio::spawn(async move {
+        call_with(
+            &task_state,
+            "POST",
+            "/remux/session",
+            Some(&task_cookie),
+            &[("x-den-early-answer", "1")],
+            &retry_body,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), SELECTION_RETRY_STARTED.acquire())
+        .await
+        .expect("the complete retry was requested")
+        .unwrap()
+        .forget();
+    attempt.abort();
+    match attempt.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("the abandoned retry completed"),
+    }
+    SELECTION_RETRY_RELEASE.add_permits(1);
+    assert_eq!(state.sessions().len(), 1, "the abandoned retry created no session");
+    assert!(state.session(&old_sid).is_some(), "the session being replaced remains authoritative");
+
+    let replacement_body = format!(r#"{{"imdb":"tt0000001","scout":"{origin}/cfg","replaces":"{old_sid}"}}"#);
+    let replacement = call(&state, "POST", "/remux/session", Some(&cookie), &replacement_body).await;
+    assert_eq!(replacement.status, StatusCode::CREATED, "{}", replacement.text());
+    assert_eq!(state.sessions().len(), 2, "the released replacement admission can be used immediately");
+    assert_eq!(selection_retry_calls("list:cancelled:early"), 1);
+    assert_eq!(selection_retry_calls("list:cancelled:complete"), 1);
+    assert_eq!(selection_retry_calls("play:cancelled:early"), 0);
     state.end_all("test").await;
 }
 
