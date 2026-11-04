@@ -319,7 +319,12 @@ impl Inner {
     /// The future of one shared build: everything it needs is owned, so it can outlive the request that started it.
     pub(super) async fn build_task(self: Arc<Self>, job: ListJob, debug: bool) -> BuildResult {
         let deadline = Self::deadline_in(self.deps.scrape_timeout + LIST_BUILD_SLACK);
-        self.build_stream_list(deadline, &job, debug).await
+        // Acquired by the detached task, not by callers that merely join its flight. Separate ordinary/fresh
+        // flights may overlap: a successful fresh build outranks an overlapping ordinary one in either start
+        // order, while later admission orders two builds with the same authority.
+        let publication =
+            (!debug).then(|| self.deps.runtime.begin_publication("list", &job.cache_key, job.fresh));
+        self.build_stream_list(deadline, &job, debug, publication).await
     }
 
     /// Go `sf.Do`: concurrent callers of one key share one run of the build and its result. The build runs on a task
@@ -513,6 +518,7 @@ impl Inner {
         deadline: TokioInstant,
         job: &ListJob,
         debug: bool,
+        publication: Option<crate::publication::Publication>,
     ) -> BuildResult {
         let mut dbg = debug.then(RankDebug::default);
         let opts = RankOpts {
@@ -531,7 +537,7 @@ impl Inner {
         if job.sid.kind == "movie" && list.degraded.is_empty() && dbg.is_none() && job.client.is_none() {
             self.record_list_verdict(&format!("{}{}", verdict_prefix(&job.config), job.sid.imdb), &list);
         }
-        self.finish_stream_list(job, dbg, list).await
+        self.finish_stream_list(job, dbg, list, publication).await
     }
 
     /// rankList scrapes, cache-checks and ranks — for client, when a browser reported what it plays. Nothing here
@@ -938,6 +944,7 @@ impl Inner {
         job: &ListJob,
         dbg: Option<RankDebug>,
         list: RankedList,
+        publication: Option<crate::publication::Publication>,
     ) -> BuildResult {
         let ListJob { config, config_blob, sid, origin, cache_key, .. } = job;
         let RankedList {
@@ -1020,7 +1027,9 @@ impl Inner {
                     ),
                 );
             }
-            self.deps.cache.put(cache_key, &value, hold);
+            if let Some(publication) = publication {
+                publication.publish(|| self.deps.cache.put(cache_key, &value, hold));
+            }
         }
         BuildResult { value, degraded: degraded_reason, complete: scrape_complete, timing, answered_early }
     }
