@@ -1,6 +1,7 @@
 use super::*;
 
 mod den_addon;
+mod outage_recovery;
 mod wanted_downloads;
 
 fn hearth_with(limits: Limits, token: Option<&str>) -> Arc<Hearth> {

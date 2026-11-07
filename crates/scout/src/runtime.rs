@@ -1,8 +1,9 @@
 //! Mutable state shared by every Scout handler hosted in one Hearth process.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -52,6 +53,16 @@ pub struct ScoutRuntime {
     late_diagnostics: Arc<Semaphore>,
     pub(crate) torbox: TorboxRuntime,
     play_observer: std::sync::OnceLock<PlayObserver>,
+    /// Consecutive fully-degraded list builds (every indexer failed), reset by any build in which one answered.
+    /// Surfaced on /health so a scrape outage, which otherwise looks like empty stream lists, is visible to a
+    /// monitor. Held here rather than per handler: every handler of one process asks the same upstreams, and
+    /// Hearth's `/health` reads one of them while clients list through another (`/den`).
+    pub(crate) scrape_fails: AtomicI32,
+    /// Consecutive builds a source missed (coverage incomplete), total failures included. Surfaced on /health as a
+    /// state, never a count: a count that rises per build is a timeline of when the household browses.
+    pub(crate) partial_builds: AtomicI32,
+    /// `handler::REBUILD_COOLOFF`, in milliseconds; only a dependant's test shortens it.
+    rebuild_cooloff_ms: AtomicU64,
 }
 
 /// One admitted list build. Dropping it returns the slot even when the detached task panics or is aborted.
@@ -128,7 +139,23 @@ impl ScoutRuntime {
             late_diagnostics: Arc::new(Semaphore::new(late_diagnostic_limit)),
             torbox,
             play_observer: std::sync::OnceLock::new(),
+            scrape_fails: AtomicI32::new(0),
+            partial_builds: AtomicI32::new(0),
+            rebuild_cooloff_ms: AtomicU64::new(crate::handler::REBUILD_COOLOFF.as_millis() as u64),
         })
+    }
+
+    /// How long a list key waits after a build in which no indexer answered before it is rebuilt again.
+    pub(crate) fn rebuild_cooloff(&self) -> Duration {
+        Duration::from_millis(self.rebuild_cooloff_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shortens the cool-off after a degraded build and TorBox's recovery-probe window, so a dependant's outage test
+    /// can watch recovery in seconds instead of waiting out the production minute.
+    #[cfg(feature = "test-support")]
+    pub fn shorten_recovery_for_test(&self, rebuild_cooloff: Duration, torbox_probe_every: Duration) {
+        self.rebuild_cooloff_ms.store(rebuild_cooloff.as_millis() as u64, Ordering::Relaxed);
+        self.torbox.health.set_probe_every(torbox_probe_every);
     }
 
     /// Report every episode play this runtime's handlers serve to `observer`. Set once; a later call is ignored.

@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -932,13 +932,6 @@ pub(crate) struct Inner {
     rebuilds: Mutex<RebuildGate>,
     /// `?fresh=1` rebuilds, by list key.
     fresh: Mutex<FreshGate>,
-    /// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
-    /// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
-    scrape_fails: AtomicI32,
-    /// Consecutive builds a source missed (coverage incomplete), total failures included. Surfaced on /health
-    /// as a state, never a count: a count that rises per build is a timeline of when the household browses,
-    /// which is why the build counters live behind /metrics' token.
-    partial_builds: AtomicI32,
     /// Availability checks running behind replies, by verdict key — never more than maxAvailabilityChecks,
     /// so the set holds only live checks.
     pub(crate) avail_in_flight: Mutex<HashSet<String>>,
@@ -1305,8 +1298,6 @@ impl Inner {
             probe_flight: Flight::new(),
             rebuilds: Mutex::new(RebuildGate::default()),
             fresh: Mutex::new(FreshGate::default()),
-            scrape_fails: AtomicI32::new(0),
-            partial_builds: AtomicI32::new(0),
             avail_in_flight: Mutex::new(HashSet::new()),
             links: LinkMemo::default(),
             legacy_play_noted: AtomicBool::new(false),
@@ -1474,10 +1465,10 @@ impl Inner {
                         "reason": "config_key_invalid",
                         "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
                     });
-                } else if self.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                } else if self.deps.runtime.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                     status =
                         json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
-                } else if self.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                } else if self.deps.runtime.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                     // Which source is withheld: naming it says which indexers this install uses.
                     status["coverage"] = json!("partial");
                     status["detail"] = json!(SOURCES_MISSING_DETAIL);

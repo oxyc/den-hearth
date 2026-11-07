@@ -70,12 +70,22 @@ impl Scout {
     /// agree on everything but `public_url`. `den` is the combined Den addon's terms for Scout's member.
     /// Call from inside the runtime.
     pub fn new(mount: Settings, legacy: Settings, den: &den_seal::Addon) -> Scout {
+        Self::with_client(mount, legacy, den, client())
+    }
+
+    /// `new` over an outbound client the caller built: production passes `client()`, an outage test one whose
+    /// upstreams are local fakes.
+    pub(crate) fn with_client(
+        mount: Settings,
+        legacy: Settings,
+        den: &den_seal::Addon,
+        client: Arc<dyn Doer>,
+    ) -> Scout {
         let cache = Arc::new(TieredCache::new_with_disk_bytes(
             legacy.cache_bytes,
             legacy.disk_cache_bytes,
             std::path::Path::new(&legacy.cache_dir),
         ));
-        let client = client();
         // Every handler in this Hearth process shares provider coordination, budgets, and metrics. Keeping
         // the owner explicit prevents the mounted, legacy, combined, and local-origin handlers from silently
         // falling back to separate or process-global state.
