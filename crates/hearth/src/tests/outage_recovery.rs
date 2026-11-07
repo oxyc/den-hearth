@@ -30,6 +30,9 @@ const COOLOFF: Duration = Duration::from_secs(1);
 const PROBE_EVERY: Duration = Duration::from_secs(1);
 /// `SCRAPE_TIMEOUT_SECS` here: a blackholed indexer costs a build this long.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often a new title is listed while an upstream is paused. Every such list spends one of the indexer limiter's
+/// 30-request burst per host, after which each waits a second, which would pace the polling instead of the pause.
+const POLL_DURING_PAUSE: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
@@ -625,7 +628,7 @@ async fn retry_after_is_honoured_and_then_the_upstream_is_asked_again() {
         }
         assert_eq!(list.kind(), "partial", "{list:?}");
         assert!(refused_at.elapsed() < Duration::from_secs(wait + 2), "the indexer was never asked again");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(POLL_DURING_PAUSE).await;
     };
     assert!(
         answered.1 >= Duration::from_secs(wait),
@@ -654,7 +657,7 @@ async fn retry_after_is_honoured_and_then_the_upstream_is_asked_again() {
         }
         assert_eq!(list.degraded, "cache-check", "{list:?}");
         assert!(refused_at.elapsed() < Duration::from_secs(wait + 2), "TorBox was never asked again");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(POLL_DURING_PAUSE).await;
     };
     assert!(
         answered.1 >= Duration::from_secs(wait),
