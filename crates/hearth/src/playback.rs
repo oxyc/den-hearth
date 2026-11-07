@@ -2047,7 +2047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sidecar_capabilities_are_unforgeable_bounded_and_track_scoped() {
+    async fn sidecar_capabilities_are_unforgeable_bounded_track_scoped_and_expire() {
         let playback = Playback::new(true);
         let token = playback
             .put_sidecars("owner", HashMap::from([(2, Arc::<str>::from("WEBVTT\n\ncue"))]))
@@ -2057,6 +2057,12 @@ mod tests {
         assert_eq!(playback.get_sidecar(&token, 2).await.as_deref(), Some("WEBVTT\n\ncue"));
         assert!(playback.get_sidecar(&token, 1).await.is_none());
         assert!(playback.get_sidecar("not-a-capability", 2).await.is_none());
+
+        // Drive the production lookup across its expiry boundary without sleeping for two hours. The next read
+        // performs the same lazy eviction used by the HTTP delivery route and must not return the retained body.
+        playback.sidecars.lock().await.get_mut(&token).unwrap().expires = Instant::now();
+        assert!(playback.get_sidecar(&token, 2).await.is_none());
+        assert!(!playback.sidecars.lock().await.contains_key(&token));
     }
 
     #[tokio::test]
