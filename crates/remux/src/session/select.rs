@@ -657,6 +657,7 @@ pub async fn create(
         opened_key,
         file_key: file_key(&resolved),
         resolve_gate: tokio::sync::Mutex::new(()),
+        renewal_gate: tokio::sync::Mutex::new(()),
         info,
         audio,
         audio_copy,

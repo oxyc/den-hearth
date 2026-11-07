@@ -4651,6 +4651,237 @@ async fn a_scan_does_not_read_an_episode_while_it_is_played() {
     );
 }
 
+// ---- an expired source ------------------------------------------------------------------------------
+
+async fn failed_source_session() -> (FakeScout, Arc<AppState>, Arc<crate::session::Session>) {
+    let origin = origin_counting().await;
+    let state = test_state(&origin.url, 2, Duration::from_secs(600));
+    let (sid, _) = resumable(&state, &origin.url, "tt0000001", "").await;
+    let session = state.session(&sid).unwrap();
+    session.fail_source_for_test();
+    (origin, state, session)
+}
+
+fn local_origin_response(response: Response<OriginBody>) -> Response<crate::httputil::Body> {
+    response.map(|body| body.map_err(|never: Infallible| match never {}).boxed())
+}
+
+async fn held_renewal_response(init: bool) {
+    let (origin, state, session) = failed_source_session().await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed = calls.clone();
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            &origin.url,
+            Arc::new(move |_| {
+                let observed = observed.clone();
+                Box::pin(async move {
+                    observed.fetch_add(1, Relaxed);
+                    std::future::pending().await
+                })
+            }),
+        )
+        .unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+
+    tokio::time::pause();
+    let request = {
+        let (state, session) = (state.clone(), session.clone());
+        tokio::spawn(async move {
+            if init {
+                session.serve_init(&state, false, &hyper::HeaderMap::new()).await
+            } else {
+                session.serve_segment(&state, 0, false, &hyper::HeaderMap::new()).await
+            }
+        })
+    };
+    while calls.load(Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(21)).await;
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "2");
+    assert!(!session.source_renewed_for_test(), "a timed-out fetch published no replacement");
+    tokio::time::resume();
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn segment_and_init_share_their_twenty_second_budget_with_source_renewal() {
+    held_renewal_response(false).await;
+    held_renewal_response(true).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_source_renewal_leaves_the_next_waiter_able_to_publish_it() {
+    let (origin, state, session) = failed_source_session().await;
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed = calls.clone();
+    let (scout, files) = (origin.scout, origin.files);
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            &origin.url,
+            Arc::new(move |request| {
+                let observed = observed.clone();
+                Box::pin(async move {
+                    if observed.fetch_add(1, Relaxed) == 0 {
+                        return std::future::pending().await;
+                    }
+                    local_origin_response(origin_handle(scout, files, request).await)
+                })
+            }),
+        )
+        .unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+
+    let first = {
+        let (state, session) = (state.clone(), session.clone());
+        tokio::spawn(async move {
+            session.renew_source_for_test(&state, Instant::now() + Duration::from_secs(20)).await
+        })
+    };
+    while calls.load(Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(!session.source_renewed_for_test());
+
+    assert!(session.renew_source_for_test(&state, Instant::now() + Duration::from_secs(20)).await);
+    assert!(session.source_renewed_for_test());
+    assert_eq!(calls.load(Relaxed), 2, "the cancelled attempt was retried exactly once");
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn a_failed_ticket_replans_through_the_provider_listing_before_publication() {
+    let (origin, state, session) = failed_source_session().await;
+    let plays = Arc::new(AtomicU32::new(0));
+    let lists = Arc::new(AtomicU32::new(0));
+    let (seen_plays, seen_lists) = (plays.clone(), lists.clone());
+    let (scout, files) = (origin.scout, origin.files);
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            &origin.url,
+            Arc::new(move |request| {
+                let path = request.uri().path().to_owned();
+                let (seen_plays, seen_lists) = (seen_plays.clone(), seen_lists.clone());
+                Box::pin(async move {
+                    if path.starts_with("/p/") && seen_plays.fetch_add(1, Relaxed) == 0 {
+                        return local_origin_response(origin_full(502, "expired"));
+                    }
+                    if path.contains("/stream/movie/") {
+                        seen_lists.fetch_add(1, Relaxed);
+                    }
+                    local_origin_response(origin_handle(scout, files, request).await)
+                })
+            }),
+        )
+        .unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+
+    assert!(session.renew_source_for_test(&state, Instant::now() + Duration::from_secs(20)).await);
+    assert!(session.source_renewed_for_test());
+    assert_eq!(plays.load(Relaxed), 2, "expired ticket then the relisted ticket");
+    assert_eq!(lists.load(Relaxed), 1, "one bounded provider fallback");
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn source_failure_stays_retryable_and_only_a_usable_replacement_marks_success() {
+    let (origin, state, session) = failed_source_session().await;
+    let fail = Arc::new(AtomicBool::new(true));
+    let failing = fail.clone();
+    let (scout, files) = (origin.scout, origin.files);
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            &origin.url,
+            Arc::new(move |request| {
+                let failing = failing.clone();
+                Box::pin(async move {
+                    if failing.load(Relaxed) {
+                        local_origin_response(origin_full(502, "unavailable"))
+                    } else {
+                        local_origin_response(origin_handle(scout, files, request).await)
+                    }
+                })
+            }),
+        )
+        .unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+
+    assert!(!session.renew_source_for_test(&state, Instant::now() + Duration::from_secs(20)).await);
+    assert!(!session.source_renewed_for_test());
+    fail.store(false, Relaxed);
+    assert!(session.renew_source_for_test(&state, Instant::now() + Duration::from_secs(20)).await);
+    assert!(session.source_renewed_for_test());
+    state.end_all("test").await;
+}
+
+#[tokio::test]
+async fn renewal_to_a_different_file_ends_the_session_and_its_durable_record() {
+    let (origin, state, session) = failed_source_session().await;
+    let sid = session.sid.clone();
+    let record = session.dir.join(crate::resume::RECORD_FILE);
+    assert!(record.exists());
+    let files = origin.files;
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            &origin.url,
+            Arc::new(move |_| {
+                Box::pin(async move {
+                    let mut response = origin_full(302, "");
+                    response.headers_mut().insert(
+                        hyper::header::LOCATION,
+                        format!("http://{files}/f/hevc.mkv").parse().unwrap(),
+                    );
+                    local_origin_response(response)
+                })
+            }),
+        )
+        .unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+
+    let response = session.serve_segment(&state, 0, false, &hyper::HeaderMap::new()).await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert!(state.session(&sid).is_none());
+    assert!(!record.exists(), "an unsafe session cannot be revived after restart");
+}
+
+#[tokio::test]
+async fn a_cached_segment_does_not_wait_for_an_unrelated_source_renewal() {
+    let (origin, state, session) = failed_source_session().await;
+    session.cache_segment_for_test(0);
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed = calls.clone();
+    let mut local = den_http::Local::default();
+    local
+        .add(
+            &origin.url,
+            Arc::new(move |_| {
+                let observed = observed.clone();
+                Box::pin(async move {
+                    observed.fetch_add(1, Relaxed);
+                    std::future::pending().await
+                })
+            }),
+        )
+        .unwrap();
+    assert!(state.local_scout.set(local).is_ok());
+
+    let response = session.serve_segment(&state, 0, false, &hyper::HeaderMap::new()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "cached segment");
+    assert_eq!(calls.load(Relaxed), 0, "usable bytes need no renewal");
+    state.end_all("test").await;
+}
+
 // ---- a restart --------------------------------------------------------------------------------------
 
 /// A second process over `old`'s scratch, after `old` has shut down as `finish` does and the new one has started as

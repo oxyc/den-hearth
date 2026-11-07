@@ -179,7 +179,6 @@ impl Session {
     ) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
-            self.reresolve_if_needed(st).await;
             let (paths, start) = {
                 let mut i = self.lock();
                 if i.ended {
@@ -234,6 +233,9 @@ impl Session {
                     return media_response(media, head, self.exp, headers);
                 }
             }
+            if self.reresolve_if_needed(st, deadline).await.is_err() {
+                return if self.lock().ended { gone() } else { busy() };
+            }
             if start && self.start_producer(st, n, deadline).await.is_err() && Instant::now() >= deadline {
                 return busy();
             }
@@ -252,7 +254,6 @@ impl Session {
     ) -> Response<Body> {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
-            self.reresolve_if_needed(st).await;
             let (init, start) = {
                 let mut i = self.lock();
                 if i.ended {
@@ -273,6 +274,9 @@ impl Session {
                 if let Ok(Ok(media)) = tokio::task::spawn_blocking(move || open_parts(&[path])).await {
                     return media_response(media, head, self.exp, headers);
                 }
+            }
+            if self.reresolve_if_needed(st, deadline).await.is_err() {
+                return if self.lock().ended { gone() } else { busy() };
             }
             if start {
                 let want = self.lock().want;
