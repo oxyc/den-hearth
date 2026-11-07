@@ -425,7 +425,7 @@ impl Inner {
             SharedBuild::Panicked => return error(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         if res.degraded == "indexers" && usable {
-            lock(&self.rebuilds).mark_outage(cache_key, now, now + REBUILD_COOLOFF);
+            lock(&self.rebuilds).mark_outage(cache_key, now, now + self.deps.runtime.rebuild_cooloff());
             return serve_held(&format!("{}, cache;desc=stale_list", res.timing));
         }
         self.write_built(start, &res)
@@ -500,7 +500,7 @@ impl Inner {
             // A degraded build caches nothing, so the entry is still stale and the next request would book
             // another rebuild at once. Hold the key until there is some prospect of a different answer.
             if matches!(res, SharedBuild::Ready(ref r) if !r.degraded.is_empty()) {
-                release.cooloff = Some(Instant::now() + REBUILD_COOLOFF);
+                release.cooloff = Some(Instant::now() + this.deps.runtime.rebuild_cooloff());
             }
             drop(release);
         });
@@ -648,8 +648,9 @@ impl Inner {
             let unasked =
                 || (CacheTruth { holders: HashMap::new(), known: HashMap::new(), complete: false }, false);
             // TorBox known down: the list is served at once as "could not check" (degraded `cache-check`), which is
-            // exactly what waiting out the clock would have produced.
-            (truth, truth_ok) = if self.debrid_down(&pool).is_some() {
+            // exactly what waiting out the clock would have produced. Not asked with nothing to check: the gate hands
+            // out TorBox's one recovery probe per window, and a build with no releases would spend it asking nobody.
+            (truth, truth_ok) = if !hashes.is_empty() && self.debrid_down(&pool).is_some() {
                 unasked()
             } else {
                 match timeout_at(deadline, pool.cache_check(&hashes)).await {
@@ -680,18 +681,19 @@ impl Inner {
         // the moment /health changes its answer, once each way, rather than every build that failed: the
         // crossing is exactly one Add landing on the threshold, and the recovery the one Swap that finds the
         // count at or past it.
+        let runtime = &self.deps.runtime;
         if scrape_ok {
-            if self.scrape_fails.swap(0, Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+            if runtime.scrape_fails.swap(0, Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                 emit("health: degraded → ok, an indexer answered again");
             }
-        } else if self.scrape_fails.fetch_add(1, Ordering::Relaxed) + 1 == SCRAPE_FAIL_THRESHOLD {
+        } else if runtime.scrape_fails.fetch_add(1, Ordering::Relaxed) + 1 == SCRAPE_FAIL_THRESHOLD {
             emit(&format!("health: ok → degraded (indexers): {INDEXERS_DOWN_DETAIL}"));
         }
         if !sources_missed {
-            if self.partial_builds.swap(0, Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+            if runtime.partial_builds.swap(0, Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                 emit("health: coverage partial → complete, every source answered again");
             }
-        } else if self.partial_builds.fetch_add(1, Ordering::Relaxed) + 1 == SCRAPE_FAIL_THRESHOLD {
+        } else if runtime.partial_builds.fetch_add(1, Ordering::Relaxed) + 1 == SCRAPE_FAIL_THRESHOLD {
             emit(&format!("health: coverage complete → partial: {SOURCES_MISSING_DETAIL}"));
         }
 

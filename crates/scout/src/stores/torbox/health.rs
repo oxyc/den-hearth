@@ -68,6 +68,8 @@ struct Health {
     next_probe: Instant,
     /// When TorBox went down or the last recovery probe was let through; calls older than this are stragglers.
     probe_at: Instant,
+    /// `RECOVERY_PROBE_EVERY`; only a dependant's test shortens it.
+    probe_every: Duration,
 }
 
 fn now_ms() -> u64 {
@@ -84,6 +86,7 @@ impl Default for DebridHealth {
             failures: 0,
             next_probe: Instant::now(),
             probe_at: Instant::now(),
+            probe_every: RECOVERY_PROBE_EVERY,
         }))
     }
 }
@@ -132,10 +135,10 @@ impl DebridHealth {
                     // started earlier is a straggler from before, and must not keep pushing recovery out.
                     let now = Instant::now();
                     if h.state != DebridState::Down {
-                        h.next_probe = now + RECOVERY_PROBE_EVERY;
+                        h.next_probe = now + h.probe_every;
                         h.probe_at = now;
                     } else if started >= h.probe_at {
-                        h.next_probe = now + RECOVERY_PROBE_EVERY;
+                        h.next_probe = now + h.probe_every;
                     }
                     h.enter(DebridState::Down, reason);
                 } else if h.state != DebridState::Down {
@@ -154,7 +157,7 @@ impl DebridHealth {
         }
         let now = Instant::now();
         if now >= h.next_probe {
-            h.next_probe = now + RECOVERY_PROBE_EVERY;
+            h.next_probe = now + h.probe_every;
             h.probe_at = now;
             return Ok(());
         }
@@ -174,6 +177,11 @@ impl DebridHealth {
 
     pub(crate) fn state(&self) -> DebridState {
         self.lock().state
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_probe_every(&self, every: Duration) {
+        self.lock().probe_every = every;
     }
 
     /// The `/health` block, or `None` before any TorBox call has been made.
