@@ -23,9 +23,11 @@
 //! gemini-flash / haiku) clear the "good enough to follow the movie" bar here.
 //!
 //! The window is what keeps the two guards honest. `buffered` does not start a batch until it enters
-//! the window, so the deadline check at the top of `translate_batch` still gates entry and at most
-//! CONCURRENCY calls are ever past it; and the quality gate's argument — `kept` only grows, so it can
-//! never refuse a film the final verdict would have passed — never depended on batch order at all.
+//! the window, and one absolute deadline follows it through credential admission, provider backoff,
+//! and the final pre-dispatch check. No new paid call starts at or after that instant. A call already
+//! dispatched may finish inside its own `LLM_TIMEOUT`; cached results from earlier paid calls remain
+//! reusable after expiry. The quality gate's argument — `kept` only grows, so it can never refuse a
+//! film the final verdict would have passed — never depended on batch order at all.
 //! What overlap costs there is precision, not soundness: a few batches are already in flight when the
 //! gate fires, bounded by the window's size.
 
@@ -38,6 +40,7 @@ use std::time::Duration;
 use futures_util::stream::{self, StreamExt};
 
 use serde_json::{json, Value};
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::logging::LogGate;
 use crate::ratelimit::{self, Pauses};
@@ -315,8 +318,7 @@ async fn run_translation(
     // untranslated original, which then caches for 60 days as a successful translation.
     // `spend` is the caller's, not ours, so it survives this future being dropped mid-run — see
     // `translate`. Everything else here dies with the run and is owned.
-    let budget =
-        Budget { spend, untranslated: AtomicUsize::new(0), started: tokio::time::Instant::now(), deadline };
+    let budget = Budget::new(spend, deadline);
 
     // Every exit from here down is stamped with the same measurement, once, at the bottom. Asking
     // each `return Err` to remember it is what went wrong before: the upstream-failure exit set it
@@ -341,7 +343,7 @@ async fn run_translation(
                     // free, when that one is paid for in full. DISPATCH is marked inside the impl,
                     // which is the only place that knows whether a request actually goes out — several
                     // of them answer without calling anything.
-                    let built = upstream.glossary(&sample, budget.spend).await;
+                    let built = upstream.glossary(&sample, &budget).await;
                     if built.is_some() {
                         budget.spend.bill();
                     }
@@ -359,7 +361,7 @@ async fn run_translation(
                 }
             },
             _ => {
-                let built = upstream.glossary(&sample, budget.spend).await;
+                let built = upstream.glossary(&sample, &budget).await;
                 if built.is_some() {
                     budget.spend.bill();
                 }
@@ -368,9 +370,9 @@ async fn run_translation(
         };
 
         // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
-        // not start until it enters the window — which is what keeps the two guards below meaningful:
-        // the deadline is checked as a batch starts, so at most CONCURRENCY calls can ever be past it,
-        // and dropping this stream cancels whatever is still in flight.
+        // not start until it enters the window — which is what keeps the two guards below meaningful.
+        // Every future shares the same absolute deadline and dropping this stream cancels whatever is
+        // still in flight. Calls already dispatched may finish; no new one starts after expiry.
         //
         // Results arrive in batch order regardless of which finished first, so a cue can never be
         // reassembled against another cue's timing.
@@ -521,23 +523,34 @@ struct Budget<'b> {
     /// allowance slot charged that it must decide about.
     spend: &'b Spend,
     untranslated: AtomicUsize,
-    /// Tokio's clock rather than `std`'s. Unpaused the two are the same thing, but the deadline is
-    /// now the only bound on a run that concurrency made faster than the wall clock it was tuned
-    /// against, and a test cannot drive a `std::time::Instant` — it would have to sleep for real and
-    /// hope, which is how a timing test becomes a flaky one.
-    started: tokio::time::Instant,
-    deadline: Duration,
+    /// One absolute instant on Tokio's clock, carried through glossary/batch admission, backoff and
+    /// dispatch. Unpaused this is the same wall clock as `std`; paused tests can advance it exactly.
+    deadline: tokio::time::Instant,
 }
 
-impl Budget<'_> {
+impl<'b> Budget<'b> {
+    fn new(spend: &'b Spend, duration: Duration) -> Budget<'b> {
+        Budget { spend, untranslated: AtomicUsize::new(0), deadline: tokio::time::Instant::now() + duration }
+    }
+
     fn spent(&self) -> bool {
-        self.started.elapsed() > self.deadline
+        tokio::time::Instant::now() >= self.deadline
     }
 
     /// What is left of the run's wall clock. Used to refuse a backoff that would outlast the run —
     /// waiting past the deadline is just a slower way to fail.
     fn remaining(&self) -> Duration {
-        self.deadline.saturating_sub(self.started.elapsed())
+        self.deadline.saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    /// Wait for this credential only until the run's absolute deadline. Recheck after admission:
+    /// a permit released exactly on the boundary is not permission to begin a paid request.
+    async fn acquire(&self, pauses: &Pauses, key: u64) -> Option<OwnedSemaphorePermit> {
+        if self.spent() {
+            return None;
+        }
+        let permit = tokio::time::timeout_at(self.deadline, pauses.acquire(key)).await.ok()?;
+        (!self.spent()).then_some(permit)
     }
 }
 
@@ -725,12 +738,12 @@ trait BatchCall: Sync {
     /// Best-effort by construction. The default is no glossary at all, which is what a provider with
     /// no chat path uses and what keeps this out of the way of the contract tests.
     ///
-    /// `spend.dispatch()` is the implementation's job, not the caller's, because only the
+    /// `budget.spend.dispatch()` is the implementation's job, not the caller's, because only the
     /// implementation knows whether a request actually leaves: this default answers `None` without
     /// calling anything, and so does the real one for DeepL or an empty sample. Marked at the call
     /// site instead, a resumed run whose glossary came from the store reported having sent a request
     /// it never sent, and would have lost its refund for it.
-    fn glossary<'a>(&'a self, _sample: &'a [String], _spend: &'a Spend) -> GlossaryFuture<'a> {
+    fn glossary<'a>(&'a self, _sample: &'a [String], _budget: &'a Budget<'_>) -> GlossaryFuture<'a> {
         Box::pin(async { None })
     }
 
@@ -838,7 +851,7 @@ impl BatchCall for Upstream<'_> {
         })
     }
 
-    fn glossary<'a>(&'a self, sample: &'a [String], spend: &'a Spend) -> GlossaryFuture<'a> {
+    fn glossary<'a>(&'a self, sample: &'a [String], budget: &'a Budget<'_>) -> GlossaryFuture<'a> {
         Box::pin(async move {
             // DeepL has no chat path and ignores context entirely, so there is nothing to give it.
             // Nor to a key that is rate limited: the glossary is optional, and asking now would be
@@ -851,7 +864,7 @@ impl BatchCall for Upstream<'_> {
                 return None;
             }
             let key = self.pause_key();
-            let _permit = self.pauses.acquire(key).await;
+            let _permit = budget.acquire(self.pauses, key).await?;
             // A request ahead of the glossary may have installed a pause while this waited.
             if self.pauses.remaining(key).is_some() {
                 return None;
@@ -871,9 +884,12 @@ impl BatchCall for Upstream<'_> {
                 Ok(json) => json,
                 Err(_) => return None,
             };
+            if budget.spent() {
+                return None;
+            }
             // Past every early return, so a request is now genuinely going out. Marked before the
             // await: if the client hangs up during it, this call is charged for and we never learn.
-            spend.dispatch();
+            budget.spend.dispatch();
             let result = call_chat_typed(self.client, self.llm, &system, &user).await;
             record_limit(self.pauses, key, observed, &result);
             match result {
@@ -945,9 +961,6 @@ async fn translate_batch(
     if budget.spent() {
         return Err("translation ran out of time".to_string().into());
     }
-    // Sent, whatever comes of it. Recorded before the await because a client that hangs up now takes
-    // the answer with it, and a request already on the wire is charged for regardless.
-    budget.spend.dispatch();
     let result = call_with_retries(upstream, sources, context, budget).await;
     // A call that came back is a call that was billed, whatever we go on to think of its contents —
     // and `Contract` is exactly that: a 200 the provider charged for, whose body then turned out to
@@ -1052,6 +1065,9 @@ async fn call_with_retries(
     let shared = upstream.pause();
     let mut attempt = 1;
     loop {
+        if budget.spent() {
+            return Err(CallError::upstream("translation ran out of time"));
+        }
         // Held by a rate limit that another batch — or another film on the same key — was told
         // about. Each batch used to wait out only its own 429, so the others kept asking a provider
         // that had already refused the key. Waited out when the run has time for it; otherwise
@@ -1064,7 +1080,12 @@ async fn call_with_retries(
             tokio::time::sleep(wait).await;
         }
         let _permit = match shared {
-            Some((pauses, key)) => Some(pauses.acquire(key).await),
+            Some((pauses, key)) => Some(
+                budget
+                    .acquire(pauses, key)
+                    .await
+                    .ok_or_else(|| CallError::upstream("translation ran out of time"))?,
+            ),
             None => None,
         };
         // A request ahead of this one may have received a 429 while this waited for admission. Do not
@@ -1078,7 +1099,14 @@ async fn call_with_retries(
             tokio::time::sleep(wait).await;
             continue;
         }
+        // This is the paid-work boundary. Admission and every pause/backoff happened before it; a
+        // run canceled while queued has sent nothing, while a call that crosses the deadline after
+        // this point may finish inside its own provider timeout and remains accounted as dispatched.
+        if budget.spent() {
+            return Err(CallError::upstream("translation ran out of time"));
+        }
         let observed = shared.map(|(pauses, key)| pauses.begin(key));
+        budget.spend.dispatch();
         let result = upstream.call(sources, context).await;
         if let (Some((pauses, key)), Some(observed)) = (shared, observed) {
             record_limit(pauses, key, observed, &result);
@@ -1677,6 +1705,14 @@ mod contract_tests {
     /// is covered where it lives.
     fn no_progress(_done: usize, _total: usize) {}
 
+    async fn hold_credential(pauses: &Pauses, key: u64) -> Vec<OwnedSemaphorePermit> {
+        let mut held = Vec::new();
+        for _ in 0..CONCURRENCY {
+            held.push(pauses.acquire(key).await);
+        }
+        held
+    }
+
     /// A batch store in memory, so the resume path is testable without a disk tier.
     #[derive(Default)]
     struct MemStore(Mutex<std::collections::HashMap<String, String>>);
@@ -1713,9 +1749,9 @@ mod contract_tests {
                 let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
                 Box::pin(async move { Ok(out) })
             }
-            fn glossary<'a>(&'a self, _sample: &'a [String], spend: &'a Spend) -> GlossaryFuture<'a> {
+            fn glossary<'a>(&'a self, _sample: &'a [String], budget: &'a Budget<'_>) -> GlossaryFuture<'a> {
                 Box::pin(async move {
-                    spend.dispatch();
+                    budget.spend.dispatch();
                     Some(vec![("Westeros".to_string(), "Västeros".to_string())])
                 })
             }
@@ -2098,12 +2134,7 @@ mod contract_tests {
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, TranslateError> {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
         let spend = Spend::default();
-        let budget = Budget {
-            spend: &spend,
-            untranslated: AtomicUsize::new(0),
-            started: tokio::time::Instant::now(),
-            deadline: Duration::from_secs(600),
-        };
+        let budget = Budget::new(&spend, Duration::from_secs(600));
         translate_batch(upstream, &src, &[], &budget, None).await
     }
 
@@ -2231,8 +2262,8 @@ mod contract_tests {
     /// key. A run stops when its wall clock does, whatever the call count says.
     ///
     /// Still true with batches overlapping: `buffered` does not start a batch's future until it
-    /// enters the window, so the deadline check at the top of `translate_batch` still gates entry
-    /// and at most CONCURRENCY calls can be past it at once.
+    /// enters the window, and the absolute deadline is checked again after admission and backoff.
+    /// Calls that began before the boundary may finish; none may begin on or after it.
     #[tokio::test(start_paused = true)]
     async fn a_run_stops_when_its_deadline_passes() {
         // A call that takes real time, the way a provider does.
@@ -2271,6 +2302,197 @@ mod contract_tests {
         // Whether the run then fails is the ratio's decision, not the clock's. This fake is
         // wrong-length throughout, so everything fell back to source and the ratio refuses it.
         assert!(out.is_err(), "a run that translated almost nothing must not be served");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_admission_expires_without_dispatch_and_releases_cleanly() {
+        struct Queued {
+            pauses: Pauses,
+            calls: AtomicUsize,
+        }
+        impl BatchCall for Queued {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let out = sources.iter().map(|s| format!("T:{s}")).collect();
+                Box::pin(async move { Ok(out) })
+            }
+            fn pause(&self) -> Option<(&Pauses, u64)> {
+                Some((&self.pauses, 7))
+            }
+        }
+
+        let up = Queued { pauses: Pauses::default(), calls: AtomicUsize::new(0) };
+        let held = hold_credential(&up.pauses, 7).await;
+        let spend = Spend::default();
+        let started = tokio::time::Instant::now();
+        let out = run_translation(&up, &cues(40), Duration::from_secs(10), None, &spend, &no_progress).await;
+
+        assert!(out.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(10), "admission outlived the run deadline");
+        assert_eq!(up.calls.load(Ordering::SeqCst), 0, "a provider call began after admission expired");
+        assert!(!spend.was_dispatched(), "waiting for admission was accounted as paid work");
+
+        drop(held);
+        let reacquired = tokio::time::timeout(Duration::from_secs(1), hold_credential(&up.pauses, 7))
+            .await
+            .expect("the expired admission waiter retained credential capacity");
+        assert_eq!(reacquired.len(), CONCURRENCY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_queued_admission_sends_nothing_and_leaks_no_capacity() {
+        struct Queued(Pauses, AtomicUsize);
+        impl BatchCall for Queued {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let out = sources.iter().map(|s| format!("T:{s}")).collect();
+                Box::pin(async move { Ok(out) })
+            }
+            fn pause(&self) -> Option<(&Pauses, u64)> {
+                Some((&self.0, 9))
+            }
+        }
+
+        let up = Queued(Pauses::default(), AtomicUsize::new(0));
+        let held = hold_credential(&up.0, 9).await;
+        let spend = Spend::default();
+        let film = cues(40);
+        let mut run =
+            Box::pin(run_translation(&up, &film, Duration::from_secs(60), None, &spend, &no_progress));
+        tokio::select! {
+            result = &mut run => panic!("queued run unexpectedly finished: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        drop(run);
+        assert_eq!(up.1.load(Ordering::SeqCst), 0);
+        assert!(!spend.was_dispatched(), "a cancelled admission wait was charged as a dispatch");
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), hold_credential(&up.0, 9))
+            .await
+            .expect("the cancelled admission waiter leaked capacity");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn glossary_admission_obeys_the_same_absolute_deadline() {
+        struct QueuedGlossary {
+            pauses: Pauses,
+            glossary_calls: AtomicUsize,
+            batch_calls: AtomicUsize,
+        }
+        impl BatchCall for QueuedGlossary {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                self.batch_calls.fetch_add(1, Ordering::SeqCst);
+                let out = sources.iter().map(|s| format!("T:{s}")).collect();
+                Box::pin(async move { Ok(out) })
+            }
+            fn glossary<'a>(&'a self, _sample: &'a [String], budget: &'a Budget<'_>) -> GlossaryFuture<'a> {
+                Box::pin(async move {
+                    let _permit = budget.acquire(&self.pauses, 11).await?;
+                    if budget.spent() {
+                        return None;
+                    }
+                    budget.spend.dispatch();
+                    self.glossary_calls.fetch_add(1, Ordering::SeqCst);
+                    Some(vec![("name".into(), "namn".into())])
+                })
+            }
+            fn pause(&self) -> Option<(&Pauses, u64)> {
+                Some((&self.pauses, 11))
+            }
+        }
+
+        let up = QueuedGlossary {
+            pauses: Pauses::default(),
+            glossary_calls: AtomicUsize::new(0),
+            batch_calls: AtomicUsize::new(0),
+        };
+        let held = hold_credential(&up.pauses, 11).await;
+        let spend = Spend::default();
+        let started = tokio::time::Instant::now();
+        let out = run_translation(&up, &cues(40), Duration::from_secs(10), None, &spend, &no_progress).await;
+
+        assert!(out.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert_eq!(up.glossary_calls.load(Ordering::SeqCst), 0, "a glossary was bought after expiry");
+        assert_eq!(up.batch_calls.load(Ordering::SeqCst), 0, "a batch was bought after glossary expiry");
+        assert!(!spend.was_dispatched());
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_just_before_deadline_may_dispatch_once() {
+        struct Timed {
+            pauses: Pauses,
+            started: tokio::time::Instant,
+            calls: Mutex<Vec<Duration>>,
+        }
+        impl BatchCall for Timed {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                self.calls.lock().unwrap().push(self.started.elapsed());
+                let out = sources.iter().map(|s| format!("T:{s}")).collect();
+                Box::pin(async move { Ok(out) })
+            }
+            fn pause(&self) -> Option<(&Pauses, u64)> {
+                Some((&self.pauses, 13))
+            }
+        }
+
+        let up = Timed {
+            pauses: Pauses::default(),
+            started: tokio::time::Instant::now(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let held = hold_credential(&up.pauses, 13).await;
+        let release = async move {
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            drop(held);
+        };
+        let spend = Spend::default();
+        let film = cues(40);
+        let run = run_translation(&up, &film, Duration::from_secs(10), None, &spend, &no_progress);
+        let (out, ()) = tokio::join!(run, release);
+
+        assert!(out.is_ok());
+        assert_eq!(*up.calls.lock().unwrap(), vec![Duration::from_secs(9)]);
+        assert!(spend.was_dispatched());
+        assert!(spend.was_billed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_retry_reuses_paid_batches_without_another_call() {
+        let film = cues(40);
+        let sources: Vec<String> = film.iter().map(|cue| cue.text.clone()).collect();
+        let translated: Vec<String> = sources.iter().map(|source| format!("T:{source}")).collect();
+        let store = MemStore::default();
+        let resume = Resume { store: &store, prefix: "paid".into() };
+        store.put(batch_key(&resume.prefix, &sources), serde_json::to_string(&translated).unwrap());
+        let upstream = fake(|source: &[String]| Ok(source.iter().map(|s| format!("NEW:{s}")).collect()));
+        let spend = Spend::default();
+
+        let out = run_translation(&upstream, &film, Duration::ZERO, Some(&resume), &spend, &no_progress)
+            .await
+            .expect("an already-paid batch should remain reusable after expiry");
+        assert_eq!(out[0].text, "T:line 0");
+        assert_eq!(*upstream.calls.lock().unwrap(), 0, "the retry re-bought a reusable batch");
+        assert!(!spend.was_dispatched());
+        assert!(!spend.was_billed());
     }
 
     /// A forced-narrative track is mostly place names and proper nouns that legitimately come back
@@ -2415,9 +2637,9 @@ mod contract_tests {
         let out = run_translation(&up, &cues(2000), deadline, None, &Spend::default(), &no_progress).await;
 
         let called = *up.0.lock().unwrap();
-        // Groups that fit inside the deadline, plus one: `spent()` is strictly-greater, so the group
-        // that starts exactly ON the deadline is still let through.
-        let sent = (groups as usize + 1) * CONCURRENCY;
+        // Only groups that begin before the absolute deadline may be sent. A group already in flight
+        // may finish on the boundary, but the next group must not start there.
+        let sent = groups as usize * CONCURRENCY;
         assert!(called < 50, "it kept calling past the deadline ({called} calls)");
         assert!(called <= sent, "more batches went out than the deadline allowed ({called} calls)");
         assert!(called > 10, "the deadline tripped too early to test the ratio ({called} calls)");
@@ -2829,6 +3051,31 @@ mod contract_tests {
                 .await;
         assert!(out.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
+    }
+
+    /// Once one refusal has been dispatched, its retry may not turn a bounded run into another paid
+    /// call beyond the absolute deadline. The long backoff is rejected immediately, which bounds
+    /// both cost (one call) and added latency (no wait that cannot lead to a legal dispatch).
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_reaching_the_deadline_never_dispatches_a_retry() {
+        let up = fake(|_: &[String]| {
+            Err(CallError::Upstream {
+                message: "provider 429".into(),
+                retry: Some(Duration::from_secs(30)),
+                fatal: false,
+                key_certain: false,
+                limited: true,
+            })
+        });
+        let spend = Spend::default();
+        let started = tokio::time::Instant::now();
+        let out = run_translation(&up, &cues(40), Duration::from_secs(10), None, &spend, &no_progress).await;
+
+        assert!(out.is_err());
+        assert_eq!(*up.calls.lock().unwrap(), 1, "backoff dispatched a second paid attempt");
+        assert_eq!(started.elapsed(), Duration::ZERO, "an impossible backoff consumed the remaining latency");
+        assert!(spend.was_dispatched(), "the first provider attempt was not accounted");
+        assert!(!spend.was_billed(), "a rate-limit refusal was counted as billed work");
     }
 
     /// A rate limit is the KEY's. Each batch used to wait out only its own 429, so the other batches in
