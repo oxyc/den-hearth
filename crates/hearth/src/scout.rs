@@ -58,6 +58,16 @@ pub struct Scout {
 /// to another host (see `GuardedClient`).
 fn client() -> Arc<dyn Doer> {
     let guarded = GuardedClient::from_profile(&shared_profile()).expect("scout http client");
+    // Cross-repo e2e builds only (`stub-upstreams`): TorBox's fixed API origin goes to the fake HEARTH_STUB_TORBOX
+    // names, under the pause layer `shared_http` adds, as the real network is.
+    #[cfg(feature = "stub-upstreams")]
+    if let Ok(base) = std::env::var("HEARTH_STUB_TORBOX") {
+        eprintln!("stub-upstreams: TorBox's API is {base} (cross-repo e2e build)");
+        return Arc::new(den_scout::upstreampause::pause_on_refusal(crate::stub::ToFakeTorbox {
+            inner: Arc::new(guarded),
+            base,
+        }));
+    }
     shared_http(guarded)
 }
 

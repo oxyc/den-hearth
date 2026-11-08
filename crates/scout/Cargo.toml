@@ -69,6 +69,9 @@ bench = []
 # `ScoutRuntime::torbox_health_for_test` and `shorten_recovery_for_test`, for Hearth's tests (its dev-dependency).
 # Off in every build that ships.
 test-support = []
+# Cross-repo e2e builds (den-hearth's `stub-upstreams`): the managed-HLS playlist probe reaches a local TorBox CDN
+# fake named by HEARTH_STUB_TORBOX_CDN. Off in every build that ships.
+stub-upstreams = []
 
 [[bench]]
 name = "scout"

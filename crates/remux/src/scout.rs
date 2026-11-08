@@ -206,14 +206,15 @@ impl SourceGuard {
         SourceGuard(AddressGuard::strict())
     }
 
-    /// What the running service uses. Only this crate's own tests are exempt (their sources are 127.0.0.1
-    /// servers); there is no switch for it in a build that ships.
-    #[cfg(not(test))]
+    /// What the running service uses. Only this crate's own tests and den-hearth's cross-repo e2e build
+    /// (`stub-upstreams`, whose media fake is a 127.0.0.1 server) are exempt; there is no switch for it in a build
+    /// that ships.
+    #[cfg(not(any(test, feature = "stub-upstreams")))]
     pub const fn for_build() -> SourceGuard {
         SourceGuard::strict()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "stub-upstreams"))]
     pub const fn for_build() -> SourceGuard {
         SourceGuard(AddressGuard::permissive())
     }

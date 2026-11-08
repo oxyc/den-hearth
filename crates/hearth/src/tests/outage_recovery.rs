@@ -18,9 +18,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use den_scout::deps::{settings_from_env, shared_profile, GuardedClient};
-use den_scout::scrape::{DoError, Doer};
-use den_scout::stores::torbox::TORBOX_API;
 use den_scout::upstreampause::pause_on_refusal;
+
+use crate::stub::ToFakeTorbox;
 
 use super::*;
 
@@ -173,35 +173,6 @@ fn torbox() -> Reply {
     })
 }
 
-/// Scout's production client, with TorBox's fixed origin rewritten to the fake: below the pause layer, as the real
-/// network is.
-struct ToFakeTorbox {
-    inner: GuardedClient,
-    base: String,
-}
-
-/// `Doer` is an `async_trait`; this is the method it expands to, written out so Hearth needs no macro crate of its own.
-impl Doer for ToFakeTorbox {
-    fn do_request<'life0, 'async_trait>(
-        &'life0 self,
-        mut req: reqwest::Request,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<reqwest::Response, DoError>> + Send + 'async_trait>,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(async move {
-            let origin = TORBOX_API.trim_end_matches("/v1/api");
-            if let Some(rest) = req.url().as_str().strip_prefix(origin) {
-                *req.url_mut() = reqwest::Url::parse(&format!("{}{rest}", self.base)).unwrap();
-            }
-            self.inner.do_request(req).await
-        })
-    }
-}
-
 struct Answer {
     status: u16,
     degraded: String,
@@ -262,7 +233,7 @@ impl Node {
             s
         };
         let client = ToFakeTorbox {
-            inner: GuardedClient::from_profile(&shared_profile()).unwrap(),
+            inner: Arc::new(GuardedClient::from_profile(&shared_profile()).unwrap()),
             base: torbox.base.clone(),
         };
         let den = den::Den::new(None, false, Default::default(), None, "none");

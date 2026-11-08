@@ -7,8 +7,9 @@ publish = false
 license = "MIT"
 
 [features]
-# Benchmark builds only: the upstream bases come from HEARTH_STUB_* (see bootstrap.rs). Never in a shipped image.
-stub-upstreams = []
+# Benchmark and cross-repo e2e builds only (bench/http, den-edge's web/e2e-stack): the upstream bases come from
+# HEARTH_STUB_* (see bootstrap.rs). Never in a shipped image.
+stub-upstreams = ["den-scout/stub-upstreams", "den-remux/stub-upstreams"]
 
 [dependencies]
 den-reel = { path = "../reel" }
