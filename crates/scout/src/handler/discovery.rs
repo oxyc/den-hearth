@@ -25,11 +25,20 @@ pub(super) fn managed_candidates<'a>(
     // renderer: never silently trade correctness for the direct path. An automatic choice can take the next
     // non-DV release, and an explicitly selected DV release falls through to Remux unchanged. Atmos alone remains
     // eligible; it cannot account for damaged picture.
+    // A release that is listed but left out by one of these rules is not one TorBox lacks: the answer names the rule,
+    // so a viewer is not told "TorBox no longer has this release" about one it holds perfectly well.
+    let listed = !candidates.is_empty();
     candidates.retain(|candidate| !cost_attributes(candidate).dolby_vision);
+    if listed && candidates.is_empty() {
+        return Err(ManagedHlsError::DolbyVision);
+    }
     if let Some(client) = request.playable.as_ref().filter(|_| request.receiver) {
         candidates.retain(|candidate| {
             client.cost_ref(candidate, cost_attributes(candidate)) < crate::client::VIDEO_CONVERTED_COST
         });
+        if listed && candidates.is_empty() {
+            return Err(ManagedHlsError::ReceiverUnsupported);
+        }
     }
     // An explicit choice is an instruction, not a hint. For automatic playback, however, a release whose probe
     // names one of the viewer's wanted languages is safer than an unknown file, and an unknown file is safer than a

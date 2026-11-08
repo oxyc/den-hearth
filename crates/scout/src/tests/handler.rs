@@ -237,8 +237,18 @@ async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
             Arc::new(move |_| vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]);
     }));
 
+    // Said as what it is: TorBox holds the release, the receiver can't take it as it is. Answered as
+    // `torbox_item_not_found` this read in the page as "TorBox no longer has this release" (2026-11-08 cast failure).
     let refused = h.managed_hls(&valid_blob(), &ask(&first_chromecast, true)).await;
-    assert!(matches!(refused, Err(ManagedHlsError::NotFound)), "{refused:?}");
+    assert!(matches!(refused, Err(ManagedHlsError::ReceiverUnsupported)), "{refused:?}");
+    assert_eq!(ManagedHlsError::ReceiverUnsupported.code(), "torbox_receiver_unsupported");
+    let unlisted = h
+        .managed_hls(
+            &valid_blob(),
+            &ManagedHlsRequest { filename: Some("Not in the list".to_owned()), ..ask(&google_tv, true) },
+        )
+        .await;
+    assert!(matches!(unlisted, Err(ManagedHlsError::NotFound)), "a release not listed: {unlisted:?}");
     assert!(inspect.targets.lock().unwrap().is_empty(), "no TorBox stream was made for it");
 
     let cast =
@@ -297,11 +307,11 @@ async fn managed_hls_leaves_dolby_vision_to_remux_on_every_renderer() {
     assert_eq!(automatic.release.filename, ATMOS, "Atmos itself remains eligible");
 
     let explicit_dv = h.managed_hls(&valid_blob(), &ask(Some(DV), Some("webos"), false)).await;
-    assert!(matches!(explicit_dv, Err(ManagedHlsError::NotFound)), "{explicit_dv:?}");
+    assert!(matches!(explicit_dv, Err(ManagedHlsError::DolbyVision)), "{explicit_dv:?}");
 
     for (platform, receiver) in [(Some("tizen"), false), (None, false), (Some("webos"), true)] {
         let direct = h.managed_hls(&valid_blob(), &ask(Some(DV), platform, receiver)).await;
-        assert!(matches!(direct, Err(ManagedHlsError::NotFound)), "{direct:?}");
+        assert!(matches!(direct, Err(ManagedHlsError::DolbyVision)), "{direct:?}");
     }
     assert_eq!(inspect.targets.lock().unwrap().len(), 1, "TorBox was asked only for the non-DV fallback");
 }
