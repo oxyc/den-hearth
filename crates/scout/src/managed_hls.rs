@@ -36,6 +36,10 @@ const MANAGED_HLS_CDN_SUFFIXES: [&str; 7] =
 pub enum ManagedHlsError {
     /// The selected TorBox item or file does not exist. Another candidate may still work.
     NotFound,
+    /// Every listed release asked for is Dolby Vision, whose managed rendition is known to be damaged. Remux plays it.
+    DolbyVision,
+    /// A Cast receiver would need every listed release asked for converted (its `playable` says so). Remux can.
+    ReceiverUnsupported,
     /// The account was not authorized to create the stream.
     Refused,
     /// TorBox rejected the API credential. Kept separate so the caller can tell the user to fix their key.
@@ -64,6 +68,8 @@ impl ManagedHlsError {
     pub fn code(self) -> &'static str {
         match self {
             Self::NotFound => "torbox_item_not_found",
+            Self::DolbyVision => "torbox_dolby_vision_unsupported",
+            Self::ReceiverUnsupported => "torbox_receiver_unsupported",
             Self::Refused => "torbox_refused",
             Self::Authentication => "torbox_authentication_failed",
             Self::Entitlement => "torbox_managed_streaming_unavailable_for_plan",

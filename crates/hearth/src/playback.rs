@@ -264,7 +264,9 @@ impl DirectFailure {
         use den_scout::managed_hls::ManagedHlsError;
 
         let class = match error {
-            ManagedHlsError::NotFound => DirectFailureClass::NotFound,
+            ManagedHlsError::NotFound
+            | ManagedHlsError::DolbyVision
+            | ManagedHlsError::ReceiverUnsupported => DirectFailureClass::NotFound,
             ManagedHlsError::Refused | ManagedHlsError::Authentication | ManagedHlsError::Entitlement => {
                 DirectFailureClass::Refused
             }
