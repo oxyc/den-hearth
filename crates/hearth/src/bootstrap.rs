@@ -158,10 +158,11 @@ async fn run(c: Configs) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Benchmark builds only (`--features stub-upstreams`, `bench/http/`): the services' upstream bases are fixed to
-/// the public APIs, so a load test that must make no external call points them at local stubs here. The feature
-/// is off in every image that ships, because a base taken from the environment would let whoever sets it
-/// collect the TMDB and OpenSubtitles keys.
+/// Benchmark and cross-repo e2e builds only (`--features stub-upstreams`: `bench/http/`, and den-edge's
+/// `web/e2e-stack/`): the services' upstream bases are fixed to the public APIs, so a load test or an e2e that must
+/// make no external call points them at local stubs here (TorBox's in `scout.rs` and den-scout's managed HLS, and a
+/// release's download host through den-remux's source guard). The feature is off in every image that ships, because
+/// a base taken from the environment would let whoever sets it collect the TMDB, OpenSubtitles and TorBox keys.
 #[cfg(feature = "stub-upstreams")]
 fn stub_upstreams(reel: &mut den_reel::Config, subs: &mut den_subtitles::Config) {
     if let Ok(base) = std::env::var("HEARTH_STUB_TMDB") {
@@ -173,7 +174,7 @@ fn stub_upstreams(reel: &mut den_reel::Config, subs: &mut den_subtitles::Config)
     if let Ok(base) = std::env::var("HEARTH_STUB_OPENSUBTITLES") {
         subs.os_api_base = base;
     }
-    eprintln!("stub-upstreams: the TMDB, KinoCheck and OpenSubtitles bases come from HEARTH_STUB_* (benchmark build)");
+    eprintln!("stub-upstreams: the TMDB, KinoCheck and OpenSubtitles bases come from HEARTH_STUB_* (benchmark or e2e build)");
 }
 
 /// `raw`, the value of variable `name`, parsed as a `T`; `default` when it is unset, and also when it

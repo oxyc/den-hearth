@@ -218,9 +218,10 @@ impl TorBoxManagedHls {
     pub fn new(create_client: Arc<dyn Doer>, cache: Arc<dyn Cache>) -> Result<Self, ManagedHlsError> {
         let probe_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(PLAYLIST_PROBE_TIMEOUT)
-            .build()
-            .map_err(|_| ManagedHlsError::Unavailable)?;
+            .timeout(PLAYLIST_PROBE_TIMEOUT);
+        #[cfg(feature = "stub-upstreams")]
+        let probe_client = stub_cdn(probe_client);
+        let probe_client = probe_client.build().map_err(|_| ManagedHlsError::Unavailable)?;
         Ok(Self {
             create_client,
             cache,
@@ -394,6 +395,16 @@ impl TorBoxManagedHls {
         probe_playlist(&self.probe_client, &prepared.url.0).await.map_err(report_probe_failure)?;
         Ok(prepared)
     }
+}
+
+/// Cross-repo e2e builds only: `HEARTH_STUB_TORBOX_CDN=<cdn host>=<ip:port>` sends the playlist probe for that
+/// TorBox CDN name to a local https fake with a self-signed certificate. The URL's own checks are unchanged.
+#[cfg(feature = "stub-upstreams")]
+fn stub_cdn(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Ok(stub) = std::env::var("HEARTH_STUB_TORBOX_CDN") else { return builder };
+    let Some((host, addr)) = stub.split_once('=') else { return builder };
+    let Ok(addr) = addr.parse::<std::net::SocketAddr>() else { return builder };
+    builder.resolve(host, addr).danger_accept_invalid_certs(true)
 }
 
 fn report_sidecar_skipped(reason: &'static str, selected: Option<i64>) {

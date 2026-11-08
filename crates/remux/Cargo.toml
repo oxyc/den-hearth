@@ -54,6 +54,9 @@ libc.workspace = true
 [features]
 # Forwards to the private modules' hot paths for benches/remux.rs (src/bench_api.rs). Off in every build that ships.
 bench = []
+# Cross-repo e2e builds (den-hearth's `stub-upstreams`): a play URL may lead to a loopback media fake. Off in every
+# build that ships.
+stub-upstreams = []
 
 [[bench]]
 name = "remux"
