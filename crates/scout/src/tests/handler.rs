@@ -194,8 +194,9 @@ async fn managed_hls_is_title_level_and_keeps_provider_ids_inside_scout() {
     assert!(!targets[0].no_add, "managed playback must reuse the ordinary add-budgeted resolve path");
 }
 
-// A Cast receiver plays TorBox's stream as it is. A release whose video it can't take is left to Remux, which can
-// convert it or choose another; one it takes goes to the receiver as TorBox's own. In the page, nothing changes.
+// A Cast receiver plays TorBox's stream as it is. A release whose video it can't take — any HEVC one, from TorBox's
+// MPEG-TS — is left to Remux, which can convert it or choose another; one it takes goes to the receiver as TorBox's
+// own. In the page, nothing changes.
 #[tokio::test]
 async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
     const UHD: &str = "Movie 2160p WEB-DL HDR10 HEVC x265";
@@ -251,9 +252,15 @@ async fn managed_hls_for_a_receiver_offers_only_a_release_it_plays_as_it_is() {
     assert!(matches!(unlisted, Err(ManagedHlsError::NotFound)), "a release not listed: {unlisted:?}");
     assert!(inspect.targets.lock().unwrap().is_empty(), "no TorBox stream was made for it");
 
-    let cast =
-        h.managed_hls(&valid_blob(), &ask(&google_tv, true)).await.expect("a receiver that takes HEVC");
-    assert_eq!(cast.release.filename, UHD);
+    // A TV that decodes HEVC still can't take it from TorBox's MPEG-TS: the HEVC release is refused by name, and an
+    // automatic cast takes the H.264 one.
+    let hevc = h.managed_hls(&valid_blob(), &ask(&google_tv, true)).await;
+    assert!(matches!(hevc, Err(ManagedHlsError::ReceiverUnsupported)), "HEVC over TS: {hevc:?}");
+    let cast = h
+        .managed_hls(&valid_blob(), &ManagedHlsRequest { filename: None, ..ask(&google_tv, true) })
+        .await
+        .expect("the H.264 release");
+    assert_eq!(cast.release.filename, "Movie 1080p WEB-DL x264");
 
     let in_page = h.managed_hls(&valid_blob(), &ask(&first_chromecast, false)).await.expect("the page's own");
     assert_eq!(in_page.release.filename, UHD);
