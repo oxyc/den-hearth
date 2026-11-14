@@ -168,10 +168,43 @@ pub(crate) fn detect_resolution(title: &str) -> &'static str {
 /// starved of bitrate), so it ranks as 1080p.
 const FAKE_4K_FLOOR: i64 = 700 * MIB;
 
+/// The least average bitrate, bits a second, at which a 2160p encode in a codec the title names is 4K worth the
+/// name. Below it the picture is a 1080p one's or worse — a 3.5 GB H.264 "4K" episode runs about 9 Mbit/s and
+/// costs a 4K download for it — so it ranks as 1080p. Set low enough that no real streaming 4K falls under it.
+pub(crate) const MIN_4K_AVC_BPS: i64 = 15_000_000;
+pub(crate) const MIN_4K_HEVC_BPS: i64 = 6_000_000;
+/// The runtime a 2160p floor assumes, seconds: short for each kind, so a short title is never judged starved.
+pub(crate) const FLOOR_EPISODE_SECS: i64 = 45 * 60;
+pub(crate) const FLOOR_MOVIE_SECS: i64 = 100 * 60;
+/// A probed picture this short or shorter under a "2160p" title is a 1080p file mislabelled.
+pub(crate) const MAX_MISLABELLED_HEIGHT: i32 = 1600;
+
+/// Whether a "2160p" release is 4K in name only: too small for any 4K (FAKE_4K_FLOOR), a probed picture no taller
+/// than 1080p's, or too few bits a second for the codec its title names over the shortest runtime of its kind.
+pub(crate) fn starved_4k(t: &ReleaseTraits, s: &RawStream) -> bool {
+    let Some(size) = s.size_bytes else { return false };
+    if size < FAKE_4K_FLOOR {
+        return true;
+    }
+    if s.probe.as_ref().is_some_and(|p| p.height > 0 && p.height <= MAX_MISLABELLED_HEIGHT) {
+        return true;
+    }
+    let min_bps = if t.has(Pat::Avc) && !t.has(Pat::Hevc) {
+        MIN_4K_AVC_BPS
+    } else if t.has(Pat::Hevc) {
+        MIN_4K_HEVC_BPS
+    } else {
+        return false;
+    };
+    let secs = if declares_episode(&s.title) { FLOOR_EPISODE_SECS } else { FLOOR_MOVIE_SECS };
+    size * 8 < min_bps * secs
+}
+
 /// Go `resolutionBase`.
-fn resolution_base(t: &ReleaseTraits, size_bytes: Option<i64>) -> i64 {
+fn resolution_base(t: &ReleaseTraits, s: &RawStream) -> i64 {
+    let size_bytes = s.size_bytes;
     if t.has(Pat::Res2160) {
-        if size_bytes.is_some_and(|s| s < FAKE_4K_FLOOR) {
+        if starved_4k(t, s) {
             return 1080;
         }
         return 4000;
@@ -194,6 +227,9 @@ fn resolution_base(t: &ReleaseTraits, size_bytes: Option<i64>) -> i64 {
         100
     }
 }
+
+/// Rank points per GiB of the file, capped at 600.
+pub(crate) const SIZE_POINTS_PER_GIB: f64 = 50.0;
 
 /// Go `capSeeds`: keeps the best `limit` releases, not the first ones.
 ///
@@ -249,7 +285,7 @@ pub(crate) fn quality_score_traits(t: &ReleaseTraits, s: &RawStream) -> i64 {
     if s.cached {
         score += 8000;
     }
-    score += resolution_base(t, s.size_bytes);
+    score += resolution_base(t, s);
 
     if t.has(Pat::Remux) {
         score += 230;
@@ -302,8 +338,10 @@ pub(crate) fn quality_score_traits(t: &ReleaseTraits, s: &RawStream) -> i64 {
         score += 20; // Atmos with no identifiable codec token: assume DD+ (most streaming Atmos is)
     }
 
+    // More bits at one resolution is a better picture: a 4.4 GB Blu-ray episode over a 0.9 GB re-encode of it is
+    // worth more than its source tag, so size counts for as much, up to the 600-point ceiling (12 GiB).
     if let Some(size) = s.size_bytes {
-        let add = ((size as f64 / GIB as f64) * 6.0).round() as i64;
+        let add = ((size as f64 / GIB as f64) * SIZE_POINTS_PER_GIB).round() as i64;
         score += add.min(600);
     }
 

@@ -130,9 +130,29 @@ mod legacy {
 
     const FAKE_4K_FLOOR: i64 = 700 * MIB;
 
-    fn resolution_base(t: &str, size_bytes: Option<i64>) -> i64 {
+    fn starved_4k(t: &str, s: &RawStream) -> bool {
+        let Some(size) = s.size_bytes else { return false };
+        if size < FAKE_4K_FLOOR {
+            return true;
+        }
+        if s.probe.as_ref().is_some_and(|p| p.height > 0 && p.height <= 1600) {
+            return true;
+        }
+        let min_bps = if RE_AVC.is_match(t) && !RE_HEVC.is_match(t) {
+            15_000_000
+        } else if RE_HEVC.is_match(t) {
+            6_000_000
+        } else {
+            return false;
+        };
+        let secs = if crate::season::declares_episode(&s.title) { 45 * 60 } else { 100 * 60 };
+        size * 8 < min_bps * secs
+    }
+
+    fn resolution_base(t: &str, s: &RawStream) -> i64 {
+        let size_bytes = s.size_bytes;
         if RES_2160.is_match(t) {
-            if size_bytes.is_some_and(|s| s < FAKE_4K_FLOOR) {
+            if starved_4k(t, s) {
                 return 1080;
             }
             return 4000;
@@ -191,7 +211,7 @@ mod legacy {
         if s.cached {
             score += 8000;
         }
-        score += resolution_base(t, s.size_bytes);
+        score += resolution_base(t, s);
 
         if RE_REMUX.is_match(t) {
             score += 230;
@@ -242,7 +262,7 @@ mod legacy {
         }
 
         if let Some(size) = s.size_bytes {
-            let add = ((size as f64 / GIB as f64) * 6.0).round() as i64;
+            let add = ((size as f64 / GIB as f64) * 50.0).round() as i64;
             score += add.min(600);
         }
 
