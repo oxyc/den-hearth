@@ -25,6 +25,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `xvid.avi` | AVI with `idx1`: XviD (MPEG-4 Part 2, no B-frames) and MP3, decoded on the CPU for a transcode. libxvid's one frame of delay leaves the index's second chunk empty, a drop frame, which a transcode shows as the first | 0, 10.042, 20.042 | 30.042 |
 | `noindex.avi` | The first 4 s of `xvid.avi`, cut just before its `idx1`: an AVI with no index, refused | — | — |
 | `scout-streams.json` | A den-scout stream list: uncached, AV1, VP9, an XviD AVI to try, 3D and cache-unknown releases | — | — |
+| `aac71.mp4` | 30 ms of silent 7.1 AAC as FFmpeg 9 writes it, fragmented (init and one fragment): its AudioSpecificConfig names channel configuration 12, which `job::aac_config_7` rewrites to 7 | — | 0.03 |
 
 ## Regenerating
 
@@ -108,6 +109,9 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=30 -f lavfi -i sine
   -map 0:v -map 1:a -c:v libxvid -q:v 25 -g 240 -bf 0 -c:a libmp3lame -b:a 32k -ac 2 xvid.avi
 # noindex.avi: 4 s of it, cut where its idx1 starts (69030 here: the offset of the chunk named idx1 after LIST movi).
 ffmpeg -y -i xvid.avi -t 4 -c copy short.avi && head -c 69030 short.avi > noindex.avi && rm short.avi
+# FFmpeg 9 (9.0.2, nixpkgs) names 7.1 configuration 12; an FFmpeg 8 writes 7 here, and the test then fails.
+ffmpeg -y -f lavfi -i anullsrc=channel_layout=7.1:sample_rate=48000 -t 0.03 -c:a aac -b:a 512k -f mp4 \
+  -movflags frag_keyframe+empty_moov+default_base_moof aac71.mp4
 ```
 
 Three subtitle files, muxed with `h264.mkv`'s streams copied (`-c copy`, so the keyframes are `h264.mkv`'s):

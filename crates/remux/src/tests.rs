@@ -1754,6 +1754,25 @@ async fn surround_matroska_end_to_end() {
     }
 }
 
+/// 7.1 for a player that plays 8-channel AAC: surround.mkv's 7.1 track comes out as eight-channel AAC, named in the
+/// master with CHANNELS="8", and the init the session serves names channel configuration 7 — what Chrome's
+/// MediaSource takes — where the image's FFmpeg 9 writes 12 (`job::aac_config_7`).
+#[tokio::test]
+#[ignore]
+async fn surround_7_1_end_to_end_names_channel_configuration_7() {
+    let extra = r#","audioTrack":1,"playable":{"h264":51,"aacMultichannel":true,"aac71":true}"#;
+    let (master, init, _) = end_to_end("tt0000013", "surround.mkv", "avc1.64", true, extra).await;
+    assert!(master.contains("CHANNELS=\"8\""), "{master}");
+    assert_eq!(crate::job::aac_channel_configs(&init), [7]);
+    let file = temp_dir().join("init.mp4");
+    std::fs::write(&file, &init).unwrap();
+    let stream = ffprobe(
+        &["-select_streams", "a:0", "-show_entries", "stream=codec_name,channels", "-of", "csv=p=0"],
+        &file,
+    );
+    assert_eq!(stream.trim(), "aac,8", "the init alone describes eight-channel AAC");
+}
+
 /// The ffmpeg and render node a grid session's transcode runs on: where there is a GPU (`VAAPI_DEVICE`, default
 /// renderD128), `FFMPEG_PATH`'s own VAAPI; else, where that ffmpeg has libx264, a stand-in that runs it with the VAAPI
 /// flags swapped for libx264's and the software scaler's — the same seek, cuts, forced keyframes and audio, encoded on

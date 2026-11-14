@@ -503,7 +503,8 @@ dependabot cannot bump it, so bump both lines by hand.
   192-byte packets), MPEG-4 Part 2 (XviD, DivX), H.264 or HEVC in an AVI with an index. Each holds the one transcode slot;
   their subtitles are not carried, the session plays one audio track converted to AAC, interlaced MPEG-2 shows combing
   (nothing deinterlaces), and a transport stream whose timestamps jump may drift.
-- **Audio is AAC**, one track per session: 7.1 for a player that reports `aac71`, 5.1 for one that reports
+- **Audio is AAC**, one track per session: 7.1 for a player that reports `aac71` (its init names channel
+  configuration 7, which Chrome's MediaSource takes, where FFmpeg 9 writes 12: `job::aac_config_7`), 5.1 for one that reports
   `aacMultichannel` (a 7.1 track folds down to it), stereo for every other — or, for a player that plays them,
   E-AC-3/AC-3 or FLAC copied with no stereo alternate beside it (Apple's authoring spec asks for AC-3 beside E-AC-3 for
   devices without it). A 5.1 or 7.1 variant carries no stereo alternate either: the player downmixes it for stereo
