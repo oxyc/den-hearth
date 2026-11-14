@@ -94,15 +94,16 @@ fn state_of(resp: &Resp) -> Option<ReleaseAnswer> {
 
 /// Logs `resp` as `rt`'s new state when it differs from the last one this release answered for this episode:
 /// `event=download outcome=changed reason=<route>: <from> -> <to> upstream=<service> … rid=… imdb=… season=…
-/// episode=… hash=… release=…`. `route` is `probe` or `play`.
-pub(crate) fn observe(rt: &ResolveTarget, rid: &str, route: &str, dur: Duration, resp: &Resp) {
+/// episode=… hash=… release=… phases="…"`. `route` is `probe` or `play`. `phases` is the answer's Server-Timing
+/// (each step and each TorBox call it made, see `calltrace`), so a slow first play names the call it waited on.
+pub(crate) fn observe(rt: &ResolveTarget, rid: &str, route: &str, dur: Duration, phases: &str, resp: &Resp) {
     if rt.info_hash.is_empty() {
         return;
     }
     let Some(answer) = state_of(resp) else { return };
     let key = format!("{}:{:?}:{:?}", rt.info_hash, rt.season, rt.episode);
     let Some(from) = with_states(|s| s.change(&key, &answer.state)) else { return };
-    emit(&decision_line(
+    let mut line = decision_line(
         "download",
         "changed",
         &format!("{route}: {from} -> {}", answer.state),
@@ -110,5 +111,9 @@ pub(crate) fn observe(rt: &ResolveTarget, rid: &str, route: &str, dur: Duration,
         dur,
         rid,
         &resolve_identity(rt),
-    ));
+    );
+    if !phases.is_empty() {
+        line.push_str(&format!(" phases=\"{phases}\""));
+    }
+    emit(&line);
 }

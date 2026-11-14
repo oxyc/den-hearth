@@ -300,7 +300,13 @@ impl Inner {
             prefetch: query_is(req, "prefetch", "1"),
             ..Default::default()
         };
-        let mut resp = self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases).await;
+        let trace = crate::calltrace::new_trace();
+        let mut resp = crate::calltrace::scope(
+            Some(trace.clone()),
+            self.answer_play(req, config, target, rt.clone(), rid.clone(), start, phases),
+        )
+        .await;
+        push_phase(phases, &crate::calltrace::timings(&trace));
         if matches!(resp.status(), StatusCode::OK | StatusCode::FOUND | StatusCode::ACCEPTED) {
             crate::continuity::remember_held(&*self.deps.cache, config, &rt);
         } else if resp.status() == StatusCode::NOT_FOUND {
@@ -308,7 +314,7 @@ impl Inner {
         }
         mark_debrid_health(&mut resp, config, self.deps.runtime.torbox.health.state());
         let route = if query_is(req, "probe", "1") { "probe" } else { "play" };
-        crate::releaselog::observe(&rt, &rid, route, start.elapsed(), &resp);
+        crate::releaselog::observe(&rt, &rid, route, start.elapsed(), phases, &resp);
         // A viewer's player now reads this episode straight from the debrid, past this service; the redirect is
         // the only sign of it there is. A probe, a prefetch and a service's own read play nothing. A legacy
         // `/<config>/play` token names no title, so only a ticket's play is reported.
@@ -461,9 +467,9 @@ impl Inner {
                 let held_start = Instant::now();
                 let resolved =
                     timeout(self.warm_resolve_budget(), pool.resolve_cached_only(&read_only, &holders)).await;
-                *phases = den_http::timing("held", held_start.elapsed());
+                push_phase(phases, &den_http::timing("held", held_start.elapsed()));
                 match resolved {
-                    Ok(Ok(link)) => return self.serve_play_link(&pool, &rt, &memo_key, link).await,
+                    Ok(Ok(link)) => return self.serve_play_link(&pool, &rt, &memo_key, link, phases).await,
                     other => {
                         held_unresolved = matches!(
                             &other,
@@ -502,7 +508,9 @@ impl Inner {
         // forty-five seconds against a slow debrid — the thing statusBudget's own comment forbids. Two of its
         // three siblings already agreed; this was the third.
         let status_deadline = Self::deadline_in(status_budget);
+        let status_start = Instant::now();
         let outcome = pool.status_outcome(&rt, Some(status_deadline)).await;
+        push_phase(phases, &den_http::timing("status", status_start.elapsed()));
         if let ProviderStatus::Downloading(status) = &outcome.result {
             return self.write_play_queued(&pending_key, &rt, &rid, start.elapsed(), status);
         }
@@ -665,12 +673,9 @@ impl Inner {
                 status: 0,
             })),
         };
-        if !phases.is_empty() {
-            phases.push_str(", ");
-        }
-        phases.push_str(&den_http::timing("resolve", resolve_start.elapsed()));
+        push_phase(phases, &den_http::timing("resolve", resolve_start.elapsed()));
         let err = match resolved {
-            Ok(link) => return self.serve_play_link(&pool, &rt, &memo_key, link).await,
+            Ok(link) => return self.serve_play_link(&pool, &rt, &memo_key, link, phases).await,
             Err(err) => err,
         };
         // Queued is not dead. An uncached release is added to the debrid by the Resolve above and then
@@ -818,8 +823,11 @@ impl Inner {
         rt: &ResolveTarget,
         memo_key: &str,
         mut link: String,
+        phases: &mut String,
     ) -> Resp {
+        let check_start = Instant::now();
         let mut verdict = self.verify_link(pool, rt, &link).await;
+        push_phase(phases, &den_http::timing("link_check", check_start.elapsed()));
         if verdict == LinkVerdict::WrongFile {
             self.links.forget(memo_key);
             verdict = LinkVerdict::Unverified;
@@ -1284,6 +1292,17 @@ impl Inner {
         );
         error(StatusCode::NOT_FOUND, "not_queued")
     }
+}
+
+/// Appends one Server-Timing entry (or several, already joined) to `phases`.
+fn push_phase(phases: &mut String, entry: &str) {
+    if entry.is_empty() {
+        return;
+    }
+    if !phases.is_empty() {
+        phases.push_str(", ");
+    }
+    phases.push_str(entry);
 }
 
 pub(super) fn write_play_redirect(link: &str) -> Resp {

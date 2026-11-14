@@ -7,7 +7,8 @@
 # Main CI has already built, behavior-probed and scanned an immutable candidate image for its exact SHA, and the
 # vX.Y.Z workflow only verifies and promotes that digest. Protected main means the VERSION commit must pass through
 # a pull request. Preparation creates that version-only PR; publishing waits for its merged commit's main CI and
-# tags only once it is green.
+# tags only once it is green. That CI includes playback through this commit and den-edge's latest release
+# (`stack-e2e`, den-edge's web/e2e-stack/), so a release that breaks playback across the two is never tagged.
 #
 # That ordering is the point. A tag on a red commit produces NO image, and `den-update` then reports "already at
 # <digest>" — which means "the registry is unchanged" and reads as "nothing to deploy". The tag exists, the deploy

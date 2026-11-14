@@ -316,6 +316,8 @@ pub struct Session {
     file_key: Option<String>,
     /// One fetch of the release at a time (`ensure_resolved`).
     resolve_gate: tokio::sync::Mutex<()>,
+    /// One refresh of a running session's expired source at a time (`reresolve_if_needed`).
+    renewal_gate: tokio::sync::Mutex<()>,
     inner: Mutex<Inner>,
     /// One request at a time may queue for and start this session's producer.
     producer_gate: tokio::sync::Mutex<()>,
@@ -499,8 +501,9 @@ impl Session {
         let Some(job) = job.as_mut() else { return };
         let newly_exited = job.exit.is_none() && job.poll_exit().is_some();
         // After the exit check, so everything written before the exit is read.
-        let text = std::fs::read_to_string(job.dir.join("gops.m3u8")).unwrap_or_default();
-        for (name, dur) in job::parse_gops(&text).into_iter().skip(job.read) {
+        let (listed, list_at) = job::read_gops(&job.dir.join("gops.m3u8"), job.list_at, job.read);
+        job.list_at = list_at;
+        for (name, dur) in listed {
             let start = snap(&self.info.keyframes, job.next_start);
             job.next_start = start + dur;
             job.read += 1;
@@ -919,31 +922,65 @@ impl Session {
     /// After a run that produced nothing, fetch a fresh link through scout, once: a debrid link can
     /// expire inside a long session. Done here rather than by handing ffmpeg scout's play URL, because
     /// following scout's redirect is where the service key has to be kept away from the debrid.
-    async fn reresolve_if_needed(&self, st: &AppState) {
-        {
-            let mut i = self.lock();
-            if i.ended || i.failures == 0 || i.reresolved {
-                return;
+    async fn reresolve_if_needed(&self, st: &AppState, deadline: Instant) -> Result<(), ()> {
+        let _gate =
+            tokio::time::timeout_at(deadline.into(), self.renewal_gate.lock()).await.map_err(|_| ())?;
+        let play_url = {
+            let i = self.lock();
+            if i.ended {
+                return Err(());
             }
-            i.reresolved = true;
-        }
+            if i.failures == 0 || i.reresolved {
+                return Ok(());
+            }
+            i.play_url.clone()
+        };
         // The next session for this release must not be handed the link that just failed.
         st.opened().forget(&self.opened_key);
-        let play_url = crate::config::local(&self.lock().play_url, &st.cfg.origin_aliases);
-        match scout::resolve(st.scout_via(), &play_url, &self.source, st.source_guard).await {
-            Ok(r) => {
-                if let Some(door) = self.door.get().and_then(Option::as_ref) {
-                    door.set_upstream(r.client.clone(), &r.url);
-                }
-                self.lock().input = r.url;
+        let fetched = tokio::time::timeout_at(deadline.into(), self.fetch_release(st, &play_url))
+            .await
+            .map_err(|_| ())?;
+        let (r, relisted) = match fetched {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                eprintln!(
+                    "session {}: re-resolving the release failed: {}{}",
+                    self.short(),
+                    crate::redact::scrub(&e, &[&self.source.base]),
+                    rid_tail(self.rid.as_deref())
+                );
+                return Err(());
             }
-            Err(e) => eprintln!(
-                "session {}: re-resolving the release failed: {}{}",
+        };
+        if self.file_key.as_ref().is_some_and(|key| file_key(&r).as_ref() != Some(key))
+            || (self.file_key.is_none() && relisted.is_some())
+        {
+            eprintln!(
+                "session {}: the renewed release can't be shown to be the file the session was made from; ending it{}",
                 self.short(),
-                crate::redact::scrub(&e, &[&self.source.base]),
                 rid_tail(self.rid.as_deref())
-            ),
+            );
+            let _ =
+                tokio::time::timeout_at(deadline.into(), st.end_session(&self.sid, "release changed")).await;
+            return Err(());
         }
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        // Publish the vetted replacement to the Door before allowing a producer to observe `reresolved`.
+        if let Some(door) = self.door.get().and_then(Option::as_ref) {
+            door.set_upstream(r.client.clone(), &r.url);
+        }
+        let mut i = self.lock();
+        if i.ended {
+            return Err(());
+        }
+        i.input = r.url;
+        if let Some(url) = relisted {
+            i.play_url = url;
+        }
+        i.reresolved = true;
+        Ok(())
     }
 
     /// A session rebuilt after a restart (`revive`) serves what scratch holds without its release; this fetches a
@@ -1045,7 +1082,7 @@ impl Session {
                 Ok(r) => return Ok((r, None)),
                 Err(e) => e,
             };
-        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None)
+        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None, false)
             .await
             .map_err(|e| format!("{first}; listing the title again: {}", e.detail))?;
         let again = list
@@ -1066,6 +1103,39 @@ impl Session {
     #[cfg(test)]
     pub async fn resolve_again(&self, st: &AppState) -> bool {
         self.ensure_resolved(st).await.is_ok()
+    }
+
+    #[cfg(test)]
+    pub fn fail_source_for_test(&self) {
+        self.lock().failures = 1;
+    }
+
+    #[cfg(test)]
+    pub fn source_renewed_for_test(&self) -> bool {
+        self.lock().reresolved
+    }
+
+    #[cfg(test)]
+    pub async fn renew_source_for_test(&self, st: &AppState, deadline: Instant) -> bool {
+        self.reresolve_if_needed(st, deadline).await.is_ok()
+    }
+
+    #[cfg(test)]
+    pub fn cache_segment_for_test(&self, n: usize) {
+        let segment = self.segments[n];
+        let path = self.dir.join(format!("cached-{n}.m4s"));
+        std::fs::write(&path, b"cached segment").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let mut i = self.lock();
+        i.gops.push(Gop {
+            job: 99,
+            idx: 0,
+            start: segment.start,
+            dur: segment.end - segment.start,
+            path,
+            size,
+        });
+        i.finished.push(99);
     }
 
     /// Rendition `n`'s playlist: a segment per video segment from the release's own track where `subs::plan` chose
@@ -1510,6 +1580,7 @@ impl Session {
             opened_key: rec.opened_key,
             file_key: rec.file_key,
             resolve_gate: tokio::sync::Mutex::new(()),
+            renewal_gate: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner {
                 job: None,
                 next_job: adopted.next_job,
@@ -1711,6 +1782,10 @@ pub struct Want<'a> {
     /// including the ones this call writes before the session exists, while still picking a release —
     /// can be joined back to the request that started it with one grep.
     pub rid: Option<&'a str>,
+    /// A viewer is waiting on this Play (`X-Den-Early-Answer: 1`): scout's list may go out before its slowest
+    /// indexer. Only to pick what to open: when that incomplete list produces no session, selection asks once more,
+    /// waiting for every indexer, before the answer is that nothing plays (`select::create`).
+    pub early_answer: bool,
 }
 
 /// What the player decodes (`playable` in `POST /remux/session`). An HEVC release beyond it is transcoded on the GPU;
@@ -1756,9 +1831,10 @@ async fn scout_list(
     id: &str,
     by_install: bool,
     playable: Option<&Playable>,
+    early_answer: bool,
 ) -> Result<Vec<scout::Stream>, ApiError> {
     let secrets = [source.base.as_str()];
-    scout::list(st.scout_via(), source, id, playable).await.map_err(|e| match e.status {
+    scout::list(st.scout_via(), source, id, playable, early_answer).await.map_err(|e| match e.status {
         // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
         // logged-in browser alone.
         Some(403) if by_install => api(
@@ -1890,7 +1966,7 @@ pub async fn releases(
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
     // Without a capability report no AV1 or VP9: nothing says the player decodes them.
-    let list = scout_list(st, &source, id, by_install, playable).await?;
+    let list = scout_list(st, &source, id, by_install, playable, false).await?;
     let candidates = scout::candidates(
         &list,
         None,
@@ -2327,6 +2403,7 @@ mod tests {
             fits_only: false,
             replaces: None,
             rid: None,
+            early_answer: false,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -2635,6 +2712,7 @@ mod tests {
             fits_only: false,
             replaces: None,
             rid: None,
+            early_answer: false,
         }
     }
 

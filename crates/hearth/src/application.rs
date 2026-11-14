@@ -308,8 +308,14 @@ async fn health(hearth: &Hearth) -> serde_json::Value {
         services.insert("remux".into(), report);
     }
     let services = serde_json::Value::Object(services);
-    let all_ok = services.as_object().is_some_and(|all| all.values().all(|s| s["status"] == "ok"));
-    let mut out = serde_json::json!({"status": if all_ok { "ok" } else { "degraded" }, "services": services});
+    let persistence = hearth.wanted.persistence_health();
+    let all_ok = services.as_object().is_some_and(|all| all.values().all(|s| s["status"] == "ok"))
+        && persistence["status"] == "ok";
+    let mut out = serde_json::json!({
+        "status": if all_ok { "ok" } else { "degraded" },
+        "services": services,
+        "wantedPersistence": persistence,
+    });
     // Scout's account of the debrid, at the top as well, so a client deciding whether to warn the viewer reads one
     // field rather than knowing which service owns it.
     if let Some(debrid) = out["services"]["scout"].get("debrid").cloned() {

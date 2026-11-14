@@ -58,6 +58,16 @@ pub struct Scout {
 /// to another host (see `GuardedClient`).
 fn client() -> Arc<dyn Doer> {
     let guarded = GuardedClient::from_profile(&shared_profile()).expect("scout http client");
+    // Cross-repo e2e builds only (`stub-upstreams`): TorBox's fixed API origin goes to the fake HEARTH_STUB_TORBOX
+    // names, under the pause layer `shared_http` adds, as the real network is.
+    #[cfg(feature = "stub-upstreams")]
+    if let Ok(base) = std::env::var("HEARTH_STUB_TORBOX") {
+        eprintln!("stub-upstreams: TorBox's API is {base} (cross-repo e2e build)");
+        return Arc::new(den_scout::upstreampause::pause_on_refusal(crate::stub::ToFakeTorbox {
+            inner: Arc::new(guarded),
+            base,
+        }));
+    }
     shared_http(guarded)
 }
 
@@ -70,12 +80,22 @@ impl Scout {
     /// agree on everything but `public_url`. `den` is the combined Den addon's terms for Scout's member.
     /// Call from inside the runtime.
     pub fn new(mount: Settings, legacy: Settings, den: &den_seal::Addon) -> Scout {
+        Self::with_client(mount, legacy, den, client())
+    }
+
+    /// `new` over an outbound client the caller built: production passes `client()`, an outage test one whose
+    /// upstreams are local fakes.
+    pub(crate) fn with_client(
+        mount: Settings,
+        legacy: Settings,
+        den: &den_seal::Addon,
+        client: Arc<dyn Doer>,
+    ) -> Scout {
         let cache = Arc::new(TieredCache::new_with_disk_bytes(
             legacy.cache_bytes,
             legacy.disk_cache_bytes,
             std::path::Path::new(&legacy.cache_dir),
         ));
-        let client = client();
         // Every handler in this Hearth process shares provider coordination, budgets, and metrics. Keeping
         // the owner explicit prevents the mounted, legacy, combined, and local-origin handlers from silently
         // falling back to separate or process-global state.

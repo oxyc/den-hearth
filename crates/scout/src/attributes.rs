@@ -1,17 +1,11 @@
 //! Port of `internal/scout/attributes.go`.
 
-use std::sync::LazyLock;
-
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::label::clean_label_lower;
+use crate::label::clean_label_traits;
 use crate::probe::Probe;
-use crate::rank::{
-    detect_resolution_lower, junk_class_of, re2, RawStream, RE_3D, RE_AC3, RE_ATMOS, RE_AV1, RE_BLURAY,
-    RE_BR_RIP, RE_DTS, RE_DTSHD_MA, RE_DTSX, RE_DVD_RIP, RE_EAC3, RE_HDR10P, RE_HDTV, RE_KORSUB_HC, RE_REMUX,
-    RE_TRUEHD, RE_WEB, RE_WEB_DL, RE_WEB_RIP,
-};
+use crate::rank::{resolution_bucket, RawStream};
+use crate::traits::{Pat, ReleaseTraits};
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
@@ -86,35 +80,6 @@ pub(crate) struct StreamAttributes {
     pub frame_rate: f64,
 }
 
-// The patterns below are attributes.go's own; the ones shared with rank.go are imported from `rank`.
-
-static RE_DOVI_ATTR: LazyLock<Regex> = LazyLock::new(|| re2(r"dolby vision|dolbyvision|dovi|\bdv\b"));
-static RE_HDR_EXTRA: LazyLock<Regex> = LazyLock::new(|| re2(r"hdr10|\bhdr\b|\bhlg\b"));
-static RE_HLG: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhlg\b"));
-/// Matches "hdr10" and the "hdr10" in "hdr10+"; check RE_HDR10P first.
-static RE_HDR10_ANY: LazyLock<Regex> = LazyLock::new(|| re2(r"hdr10"));
-static RE_HDR_PLAIN: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhdr\b"));
-static RE_CH71: LazyLock<Regex> = LazyLock::new(|| re2(r"7\.1|7 1|\b8ch\b"));
-static RE_CH51: LazyLock<Regex> = LazyLock::new(|| re2(r"5\.1|5 1|\b6ch\b"));
-static RE_CH20: LazyLock<Regex> = LazyLock::new(|| re2(r"2\.0|2 0|stereo|\b2ch\b"));
-static RE_HEVC: LazyLock<Regex> = LazyLock::new(|| re2(r"x265|h\.?265|hevc"));
-static RE_AVC: LazyLock<Regex> = LazyLock::new(|| re2(r"x264|h\.?264|\bavc\b"));
-static RE_DTSHD_ATTR: LazyLock<Regex> = LazyLock::new(|| re2(r"dts-hd|dts hd|dtshd"));
-static RE_FLAC: LazyLock<Regex> = LazyLock::new(|| re2(r"flac|lpcm|pcm"));
-/// A digit or a boundary after "aac" ("AAC2.0", "AAC5 1", "HE-AAC"), so "Aachen" is not audio.
-static RE_AAC: LazyLock<Regex> = LazyLock::new(|| re2(r"\baac(?:[0-9]|\b)"));
-/// Opus counts only once the technical half of the name has begun: "Mr.Hollands.Opus.1995.1080p" is a film
-/// title, and a bare \bopus\b would call it Opus audio. RE2's `.` is a whole codepoint but its `\d` and `\b` are
-/// ASCII, so this stays in Unicode mode (for the dots) and spells the ASCII classes out with `(?-u:…)`.
-static RE_OPUS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:(?-u:\d){3,4}p|x26[45]|h\.?26[45]|hevc|av1|10.?bits?|web-?dl|webrip|bluray)(?-u:\b).*(?-u:\bopus\b)")
-        .expect("static pattern")
-});
-static RE_MP3: LazyLock<Regex> = LazyLock::new(|| re2(r"\bmp3\b"));
-static RE_HI10: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhi10p?\b"));
-static RE_TEN_BIT: LazyLock<Regex> = LazyLock::new(|| re2(r"\b10[ .\-_]?bits?\b|\bhi10p?\b|\bmain ?10\b"));
-static RE_HYBRID: LazyLock<Regex> = LazyLock::new(|| re2(r"\bhybrid\b"));
-
 /// Go `strPtr`: "" is nil.
 fn str_opt(s: &str) -> Option<String> {
     if s.is_empty() {
@@ -125,24 +90,24 @@ fn str_opt(s: &str) -> Option<String> {
 }
 
 /// Go `detectSourceAttr`.
-pub(crate) fn detect_source_attr(t: &str) -> &'static str {
-    let junk = junk_class_of(t);
+pub(crate) fn detect_source_attr(t: &ReleaseTraits) -> &'static str {
+    let junk = t.junk_class();
     if matches!(junk, "cam" | "telesync" | "screener") {
         return junk;
     }
-    if RE_REMUX.is_match(t) {
+    if t.has(Pat::Remux) {
         "remux"
-    } else if RE_BLURAY.is_match(t) || RE_BR_RIP.is_match(t) {
+    } else if t.has(Pat::Bluray) || t.has(Pat::BrRip) {
         "bluray"
-    } else if RE_WEB_DL.is_match(t) {
+    } else if t.has(Pat::WebDl) {
         "webdl"
-    } else if RE_WEB_RIP.is_match(t) {
+    } else if t.has(Pat::WebRip) {
         "webrip"
-    } else if RE_WEB.is_match(t) {
+    } else if t.has(Pat::Web) {
         "web"
-    } else if RE_HDTV.is_match(t) {
+    } else if t.has(Pat::Hdtv) {
         "hdtv"
-    } else if RE_DVD_RIP.is_match(t) {
+    } else if t.has(Pat::DvdRip) {
         "dvdrip"
     } else {
         ""
@@ -152,12 +117,12 @@ pub(crate) fn detect_source_attr(t: &str) -> &'static str {
 /// Go `detectCodec`: the codec off the release title. Its spellings must match the probe's, because
 /// `with_probe` overwrites this field rather than merging with it. h264 is the spelling that wins because
 /// three container parsers already produce it.
-fn detect_codec(t: &str) -> &'static str {
-    if RE_AV1.is_match(t) {
+fn detect_codec(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Av1) {
         "av1"
-    } else if RE_HEVC.is_match(t) {
+    } else if t.has(Pat::Hevc) {
         "hevc"
-    } else if RE_AVC.is_match(t) || RE_HI10.is_match(t) {
+    } else if t.has(Pat::Avc) || t.has(Pat::Hi10) {
         // Hi10P is H.264's High 10 profile by name; anime releases give it instead of "x264".
         "h264"
     } else {
@@ -167,8 +132,8 @@ fn detect_codec(t: &str) -> &'static str {
 
 /// Go `detectBitDepth`: 10 when the title says so or the release is HDR or Dolby Vision (both 10-bit by
 /// definition). Otherwise 0: a title that says nothing is not evidence of 8-bit.
-fn detect_bit_depth(t: &str, hdr: bool) -> i64 {
-    if hdr || RE_TEN_BIT.is_match(t) {
+fn detect_bit_depth(t: &ReleaseTraits, hdr: bool) -> i64 {
+    if hdr || t.has(Pat::TenBit) {
         10
     } else {
         0
@@ -177,45 +142,51 @@ fn detect_bit_depth(t: &str, hdr: bool) -> i64 {
 
 /// Go `detectHDRFormat`: the HDR10-family label, or "". HDR10+ wins over a bare "hdr10", HLG over generic
 /// "hdr". Dolby Vision is reported separately.
-fn detect_hdr_format(t: &str) -> &'static str {
-    if RE_HDR10P.is_match(t) {
+fn detect_hdr_format(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Hdr10p) {
         "HDR10+"
-    } else if RE_HLG.is_match(t) {
+    } else if t.has(Pat::Hlg) {
         "HLG"
-    } else if RE_HDR10_ANY.is_match(t) {
+    } else if t.has(Pat::Hdr10Any) {
         "HDR10"
-    } else if RE_HDR_PLAIN.is_match(t) {
+    } else if t.has(Pat::HdrPlain) {
         "HDR"
     } else {
         ""
     }
 }
 
+/// Go `detectAudioCodec` on an already-lowercased title.
+#[cfg(test)]
+pub(crate) fn detect_audio_codec(t: &str) -> &'static str {
+    audio_codec(&ReleaseTraits::parse_lower(t))
+}
+
 /// Go `detectAudioCodec`: the normalized source audio family, or "". Most specific first, so "DTS-HD MA" is
 /// not caught by the bare "dts" rule. The browser codecs come last: a release naming DD+ and AAC carries
 /// DD+ as its main track and AAC as the stereo companion.
-pub(crate) fn detect_audio_codec(t: &str) -> &'static str {
-    if RE_DTSX.is_match(t) {
+fn audio_codec(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Dtsx) {
         "dtsx"
-    } else if RE_TRUEHD.is_match(t) {
+    } else if t.has(Pat::Truehd) {
         "truehd"
-    } else if RE_DTSHD_MA.is_match(t) {
+    } else if t.has(Pat::DtshdMa) {
         "dtshdma"
-    } else if RE_DTSHD_ATTR.is_match(t) {
+    } else if t.has(Pat::DtshdAttr) {
         "dtshd"
-    } else if RE_FLAC.is_match(t) {
+    } else if t.has(Pat::Flac) {
         "flac"
-    } else if RE_EAC3.is_match(t) {
+    } else if t.has(Pat::Eac3) {
         "eac3"
-    } else if RE_DTS.is_match(t) {
+    } else if t.has(Pat::Dts) {
         "dts"
-    } else if RE_AC3.is_match(t) {
+    } else if t.has(Pat::Ac3) {
         "ac3"
-    } else if RE_AAC.is_match(t) {
+    } else if t.has(Pat::Aac) {
         "aac"
-    } else if RE_OPUS.is_match(t) {
+    } else if t.opus() {
         "opus"
-    } else if RE_MP3.is_match(t) {
+    } else if t.has(Pat::Mp3) {
         "mp3"
     } else {
         ""
@@ -223,12 +194,12 @@ pub(crate) fn detect_audio_codec(t: &str) -> &'static str {
 }
 
 /// Go `detectChannels`: "7.1", "5.1", "2.0", or "" (e.g. "DDP5.1" and "DDP5 1" give "5.1").
-fn detect_channels(t: &str) -> &'static str {
-    if RE_CH71.is_match(t) {
+fn detect_channels(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Ch71) {
         "7.1"
-    } else if RE_CH51.is_match(t) {
+    } else if t.has(Pat::Ch51) {
         "5.1"
-    } else if RE_CH20.is_match(t) {
+    } else if t.has(Pat::Ch20) {
         "2.0"
     } else {
         ""
@@ -236,22 +207,22 @@ fn detect_channels(t: &str) -> &'static str {
 }
 
 /// Go `detectAudio`: the display string for the audio.
-fn detect_audio(t: &str) -> &'static str {
-    if RE_ATMOS.is_match(t) {
+fn detect_audio(t: &ReleaseTraits) -> &'static str {
+    if t.has(Pat::Atmos) {
         "Atmos"
-    } else if RE_DTSX.is_match(t) {
+    } else if t.has(Pat::Dtsx) {
         "DTS:X"
-    } else if RE_TRUEHD.is_match(t) {
+    } else if t.has(Pat::Truehd) {
         "TrueHD"
-    } else if RE_DTSHD_ATTR.is_match(t) {
+    } else if t.has(Pat::DtshdAttr) {
         "DTS-HD"
-    } else if RE_FLAC.is_match(t) {
+    } else if t.has(Pat::Flac) {
         "FLAC"
-    } else if RE_EAC3.is_match(t) {
+    } else if t.has(Pat::Eac3) {
         "EAC3"
-    } else if RE_DTS.is_match(t) {
+    } else if t.has(Pat::Dts) {
         "DTS"
-    } else if RE_AC3.is_match(t) {
+    } else if t.has(Pat::Ac3) {
         "AC3"
     } else {
         ""
@@ -259,39 +230,46 @@ fn detect_audio(t: &str) -> &'static str {
 }
 
 /// Go `streamAttributes`: the attributes of one stream, read from its title and, when probed, the file.
+#[cfg(test)]
 pub(crate) fn stream_attributes(s: RawStream) -> StreamAttributes {
     stream_attributes_ref(&s)
 }
 
 /// Borrowed form for ranking and presentation paths that retain ownership of the stream.
 pub(crate) fn stream_attributes_ref(s: &RawStream) -> StreamAttributes {
-    let t = str::to_lowercase(&s.title);
-    let dolby_vision = RE_DOVI_ATTR.is_match(&t);
-    let hdr = dolby_vision || RE_HDR_EXTRA.is_match(&t);
+    let mut attrs = cost_attributes(s);
+    attrs.label = clean_label_traits(s.traits(), s);
+    attrs
+}
+
+/// `stream_attributes_ref` without the display label, which nothing that weighs a release reads.
+pub(crate) fn cost_attributes(s: &RawStream) -> StreamAttributes {
+    let t = s.traits();
+    let dolby_vision = t.has(Pat::Dovi);
+    let hdr = dolby_vision || t.has(Pat::Hdr10Any) || t.has(Pat::HdrPlain) || t.has(Pat::Hlg);
     let mut attrs = StreamAttributes {
-        resolution: str_opt(detect_resolution_lower(&t)),
-        source: str_opt(detect_source_attr(&t)),
-        codec: str_opt(detect_codec(&t)),
+        resolution: str_opt(resolution_bucket(t)),
+        source: str_opt(detect_source_attr(t)),
+        codec: str_opt(detect_codec(t)),
         hdr,
         dolby_vision,
-        hdr_format: str_opt(detect_hdr_format(&t)),
-        audio: str_opt(detect_audio(&t)),
-        audio_codec: str_opt(detect_audio_codec(&t)),
-        audio_channels: str_opt(detect_channels(&t)),
-        atmos: RE_ATMOS.is_match(&t),
-        hardcoded_subs: RE_KORSUB_HC.is_match(&t),
-        three_d: RE_3D.is_match(&t),
+        hdr_format: str_opt(detect_hdr_format(t)),
+        audio: str_opt(detect_audio(t)),
+        audio_codec: str_opt(audio_codec(t)),
+        audio_channels: str_opt(detect_channels(t)),
+        atmos: t.has(Pat::Atmos),
+        hardcoded_subs: t.has(Pat::KorsubHc),
+        three_d: t.has(Pat::ThreeD),
         size_bytes: s.size_bytes,
         pack_size_bytes: s.pack_size_bytes,
         seeders: s.seeders,
         cached: cached_claim(s),
-        label: clean_label_lower(&t, s), // reuse the title we already lowercased
-        bit_depth: detect_bit_depth(&t, hdr),
+        bit_depth: detect_bit_depth(t, hdr),
         ..Default::default()
     };
     attrs = with_probe(attrs, s.probe.as_ref());
     if attrs.dolby_vision && attrs.dv_profile == 0 {
-        attrs.dv_profile_guess = guess_dv_profile(&t, attrs.hdr_format.is_some());
+        attrs.dv_profile_guess = guess_dv_profile(t, attrs.hdr_format.is_some());
     }
     attrs
 }
@@ -300,12 +278,12 @@ pub(crate) fn stream_attributes_ref(s: &RawStream) -> StreamAttributes {
 /// one. A remux keeps profile 7. An encode from Blu-ray is converted to 8.1, as is a HYBRID, and a name that
 /// also gives an HDR10-family base names the base layer profile 8 has. A web release naming no base is taken
 /// as a streaming service's profile 5. Nothing else is guessed.
-fn guess_dv_profile(t: &str, names_hdr_base: bool) -> i64 {
-    if RE_REMUX.is_match(t) {
+fn guess_dv_profile(t: &ReleaseTraits, names_hdr_base: bool) -> i64 {
+    if t.has(Pat::Remux) {
         7
-    } else if names_hdr_base || RE_HYBRID.is_match(t) || RE_BLURAY.is_match(t) || RE_BR_RIP.is_match(t) {
+    } else if names_hdr_base || t.has(Pat::Hybrid) || t.has(Pat::Bluray) || t.has(Pat::BrRip) {
         8
-    } else if RE_WEB_DL.is_match(t) || RE_WEB_RIP.is_match(t) || RE_WEB.is_match(t) {
+    } else if t.has(Pat::WebDl) || t.has(Pat::WebRip) || t.has(Pat::Web) {
         5
     } else {
         0
@@ -373,28 +351,17 @@ fn resolution_of_width(w: i64) -> &'static str {
 /// "". `notWebReady` and a browser's ranking both ask this, so they cannot disagree about a file.
 #[cfg(test)]
 pub(crate) fn container_of(s: RawStream) -> String {
-    container_of_ref(&s)
+    container_of_ref(&s).to_string()
 }
 
 /// Borrowed form for callers that only need to inspect a retained stream.
-pub(crate) fn container_of_ref(s: &RawStream) -> String {
+pub(crate) fn container_of_ref(s: &RawStream) -> &str {
     if let Some(p) = &s.probe {
         if !p.container.is_empty() {
-            return p.container.clone();
+            return &p.container;
         }
     }
-    let t = str::to_lowercase(&s.title);
-    if t.ends_with(".mp4") || t.ends_with(".m4v") {
-        "mp4".to_string()
-    } else if t.ends_with(".mkv") {
-        "matroska".to_string()
-    } else if t.ends_with(".webm") {
-        "webm".to_string()
-    } else if t.ends_with(".avi") {
-        "avi".to_string()
-    } else {
-        String::new()
-    }
+    s.traits().name_container().as_str()
 }
 
 /// Go `cachedClaim`: cachedness only when it was actually observed. A failed cache check is nil, and sending

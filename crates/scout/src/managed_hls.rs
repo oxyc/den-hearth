@@ -4,6 +4,7 @@
 //! and fallback to Remux. It is deliberately not wired into Scout's existing play route.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -15,6 +16,7 @@ use crate::cache::{Cache, CacheClass};
 use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::loglimit::log_limited;
+use crate::managed_subtitles::Sidecar;
 use crate::metrics::metrics;
 use crate::scrape::Doer;
 use crate::stores::refusal::{is_torrent_gone, refusal_is_about_the_account};
@@ -36,6 +38,10 @@ const MANAGED_HLS_CDN_SUFFIXES: [&str; 7] =
 pub enum ManagedHlsError {
     /// The selected TorBox item or file does not exist. Another candidate may still work.
     NotFound,
+    /// Every listed release asked for is Dolby Vision, whose managed rendition is known to be damaged. Remux plays it.
+    DolbyVision,
+    /// A Cast receiver would need every listed release asked for converted (its `playable` says so). Remux can.
+    ReceiverUnsupported,
     /// The account was not authorized to create the stream.
     Refused,
     /// TorBox rejected the API credential. Kept separate so the caller can tell the user to fix their key.
@@ -64,6 +70,8 @@ impl ManagedHlsError {
     pub fn code(self) -> &'static str {
         match self {
             Self::NotFound => "torbox_item_not_found",
+            Self::DolbyVision => "torbox_dolby_vision_unsupported",
+            Self::ReceiverUnsupported => "torbox_receiver_unsupported",
             Self::Refused => "torbox_refused",
             Self::Authentication => "torbox_authentication_failed",
             Self::Entitlement => "torbox_managed_streaming_unavailable_for_plan",
@@ -107,6 +115,9 @@ pub struct ManagedHlsRequest {
     pub platform: Option<String>,
     /// TorBox's zero-based position in `metadata.subtitles`. None keeps subtitles out of the managed playlist.
     pub subtitle: Option<i64>,
+    /// A viewer pressed Play and is waiting (`X-Den-Early-Answer`): the release list may go out before the slowest
+    /// indexer (`LATE_GRACE`). Not for a release named by `filename`, which only a complete list is sure to hold.
+    pub early_answer: bool,
 }
 
 /// Non-secret release metadata returned beside a managed URL.
@@ -209,9 +220,10 @@ impl TorBoxManagedHls {
     pub fn new(create_client: Arc<dyn Doer>, cache: Arc<dyn Cache>) -> Result<Self, ManagedHlsError> {
         let probe_client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(PLAYLIST_PROBE_TIMEOUT)
-            .build()
-            .map_err(|_| ManagedHlsError::Unavailable)?;
+            .timeout(PLAYLIST_PROBE_TIMEOUT);
+        #[cfg(feature = "stub-upstreams")]
+        let probe_client = stub_cdn(probe_client);
+        let probe_client = probe_client.build().map_err(|_| ManagedHlsError::Unavailable)?;
         Ok(Self {
             create_client,
             cache,
@@ -257,76 +269,50 @@ impl TorBoxManagedHls {
                 file_id.map_or_else(|| "single".to_owned(), |value| value.to_string())
             )
         });
-        let cached_sidecar = sidecar_key
+        let cached = sidecar_key
             .as_deref()
             .and_then(|key| self.cache.get(key))
-            .and_then(|vtt| (vtt.starts_with("WEBVTT\n") && vtt.len() <= 2 * 1024 * 1024).then_some(vtt));
-        // A hit never competes for the extraction slot. This also makes switching back to a track instant after
-        // its first complete extraction, across sessions and service restarts when the configured cache persists.
-        let subtitle_slot =
-            cached_sidecar.is_none().then(|| self.subtitle_slots.clone().try_acquire_owned().ok()).flatten();
-        let cache = self.cache.clone();
-        let extract = async move {
-            match (direct_file, subtitle_slot, subtitle, cached_sidecar) {
-                (_, _, Some(ordinal), Some(vtt)) => {
-                    vec![crate::managed_subtitles::Sidecar { ordinal, vtt: vtt.to_string() }]
-                }
-                // The metadata-only request has no selected track to attach. Extracting every track here both
-                // delays initial playback and repeats the chosen track's work when the player applies its
-                // default immediately afterwards.
-                (_, _, None, _) => Vec::new(),
-                (Some(direct_file), Some(_slot), Some(_), None) => {
-                    let sidecars = crate::managed_subtitles::sidecars(&direct_file, subtitle).await;
-                    if let (Some(key), [sidecar]) = (sidecar_key.as_deref(), sidecars.as_slice()) {
-                        cache.put_class(key, &sidecar.vtt, SUBTITLE_SIDECAR_TTL, CacheClass::Durable);
+            .filter(|vtt| vtt.starts_with("WEBVTT\n") && vtt.len() <= 2 * 1024 * 1024)
+            .zip(subtitle)
+            .map(|(vtt, ordinal)| Sidecar { ordinal, vtt: vtt.to_string() });
+        // The metadata-only request has no selected track to extract, and a cache hit has nothing left to extract.
+        // Neither competes for the extraction slot.
+        let extraction = match (subtitle, &cached) {
+            (Some(ordinal), None) => {
+                match (direct_file, self.subtitle_slots.clone().try_acquire_owned().ok()) {
+                    (Some(direct_file), Some(slot)) => {
+                        let cache = self.cache.clone();
+                        Some(async move {
+                            let _slot = slot;
+                            let sidecars =
+                                crate::managed_subtitles::sidecars(&direct_file, Some(ordinal)).await;
+                            if let (Some(key), [sidecar]) = (sidecar_key.as_deref(), sidecars.as_slice()) {
+                                cache.put_class(key, &sidecar.vtt, SUBTITLE_SIDECAR_TTL, CacheClass::Durable);
+                            }
+                            sidecars
+                        })
                     }
-                    sidecars
-                }
-                (None, _, _, None) => {
-                    report_sidecar_skipped("direct_file_unavailable", subtitle);
-                    Vec::new()
-                }
-                _ => {
-                    report_sidecar_skipped("extractor_busy", subtitle);
-                    Vec::new()
-                }
-            }
-        };
-        // A successful sidecar must sit beside a subtitle-free TorBox stream. Asking TorBox for the same
-        // subtitle here burns it into the video, leaving the browser to draw a second copy over it. Start the
-        // clean stream while the indexed extraction runs; only ask TorBox for its legacy selected-subtitle
-        // stream when extraction cannot produce a complete sidecar.
-        let (created, sidecars) =
-            tokio::join!(self.create(token, torrent_id, file_id, None, target.audio_track), extract);
-        let created = match (created, subtitle, sidecars.is_empty()) {
-            (Ok(_), Some(ordinal), true) => {
-                self.create(token, torrent_id, file_id, Some(ordinal), target.audio_track).await
-            }
-            (created, _, _) => created,
-        };
-        match created {
-            Err(ManagedHlsError::NotFound) => {
-                store.forget_torrent_id(&target.info_hash);
-                Err(ManagedHlsError::NotFound)
-            }
-            Ok(mut prepared) => {
-                if !sidecars.is_empty() {
-                    log_limited(
-                        "managed-subtitle-sidecar-ready",
-                        &format!("managed HLS: prepared {} indexed subtitle sidecar(s)", sidecars.len()),
-                    );
-                }
-                for sidecar in sidecars {
-                    if let Some(track) =
-                        prepared.subtitles.iter_mut().find(|track| track.index == sidecar.ordinal)
-                    {
-                        track.sidecar = Some(sidecar.vtt);
+                    (None, _) => {
+                        report_sidecar_skipped("direct_file_unavailable", subtitle);
+                        None
+                    }
+                    (Some(_), None) => {
+                        report_sidecar_skipped("extractor_busy", subtitle);
+                        None
                     }
                 }
-                Ok(prepared)
             }
-            Err(error) => Err(error),
+            _ => None,
+        };
+        let audio_track = target.audio_track;
+        let created = with_selected_subtitle(subtitle, cached, extraction, |selected| {
+            self.create(token, torrent_id, file_id, selected, audio_track)
+        })
+        .await;
+        if created == Err(ManagedHlsError::NotFound) {
+            store.forget_torrent_id(&target.info_hash);
         }
+        created
     }
 
     async fn create(
@@ -385,6 +371,61 @@ impl TorBoxManagedHls {
         probe_playlist(&self.probe_client, &prepared.url.0).await.map_err(report_probe_failure)?;
         Ok(prepared)
     }
+}
+
+/// The stream a subtitle choice plays. A cached sidecar sits beside TorBox's subtitle-free stream: asking TorBox for
+/// the same track there would burn it into the video, under the browser's own copy. Without one, the answer is TorBox's
+/// stream with the track burned in, and a cold extraction runs on after it only to fill the cache for the next choice
+/// of this track. The answer never waits for that extraction: against a slow TorBox CDN node it runs to its minute-long
+/// deadline (`managed_subtitles::DEADLINE`) and then produces nothing, while the viewer is left at "Switching subtitles".
+async fn with_selected_subtitle<Create, Created, Extraction>(
+    subtitle: Option<i64>,
+    cached: Option<Sidecar>,
+    extraction: Option<Extraction>,
+    create: Create,
+) -> Result<ManagedHlsPrepared, ManagedHlsError>
+where
+    Create: FnOnce(Option<i64>) -> Created,
+    Created: Future<Output = Result<ManagedHlsPrepared, ManagedHlsError>>,
+    Extraction: Future<Output = Vec<Sidecar>> + Send + 'static,
+{
+    match (subtitle, cached) {
+        (Some(_), Some(sidecar)) => create(None).await.map(|mut prepared| {
+            attach(&mut prepared, vec![sidecar]);
+            prepared
+        }),
+        (Some(ordinal), None) => {
+            if let Some(extraction) = extraction {
+                tokio::spawn(extraction);
+            }
+            create(Some(ordinal)).await
+        }
+        (None, _) => create(None).await,
+    }
+}
+
+fn attach(prepared: &mut ManagedHlsPrepared, sidecars: Vec<Sidecar>) {
+    if !sidecars.is_empty() {
+        log_limited(
+            "managed-subtitle-sidecar-ready",
+            &format!("managed HLS: prepared {} indexed subtitle sidecar(s)", sidecars.len()),
+        );
+    }
+    for sidecar in sidecars {
+        if let Some(track) = prepared.subtitles.iter_mut().find(|track| track.index == sidecar.ordinal) {
+            track.sidecar = Some(sidecar.vtt);
+        }
+    }
+}
+
+/// Cross-repo e2e builds only: `HEARTH_STUB_TORBOX_CDN=<cdn host>=<ip:port>` sends the playlist probe for that
+/// TorBox CDN name to a local https fake with a self-signed certificate. The URL's own checks are unchanged.
+#[cfg(feature = "stub-upstreams")]
+fn stub_cdn(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Ok(stub) = std::env::var("HEARTH_STUB_TORBOX_CDN") else { return builder };
+    let Some((host, addr)) = stub.split_once('=') else { return builder };
+    let Ok(addr) = addr.parse::<std::net::SocketAddr>() else { return builder };
+    builder.resolve(host, addr).danger_accept_invalid_certs(true)
 }
 
 fn report_sidecar_skipped(reason: &'static str, selected: Option<i64>) {
@@ -734,6 +775,89 @@ mod tests {
     const SUCCESS: &[u8] = include_bytes!("../testdata/torbox-stream/create-success.json");
     const NOT_FOUND: &[u8] = include_bytes!("../testdata/torbox-stream/create-item-not-found.json");
     const PLAYLIST: &[u8] = include_bytes!("../testdata/torbox-stream/media-playlist.m3u8");
+
+    /// A createstream answer that takes `secs` of TorBox's time, for the track asked for, with a second subtitle.
+    async fn created_after(secs: u64, selected: Option<i64>) -> Result<ManagedHlsPrepared, ManagedHlsError> {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let track = |index| ManagedHlsSubtitle {
+            index,
+            language: Some("eng".to_owned()),
+            name: None,
+            codec: Some("subrip".to_owned()),
+            sidecar: None,
+        };
+        Ok(ManagedHlsPrepared {
+            url: ManagedHlsUrl::fixture("https://flux-002.wnam.tb-cdn.io/opaque/index.m3u8?token=secret"),
+            subtitles: vec![track(0), track(1)],
+            selected_subtitle: selected,
+        })
+    }
+
+    // Production, 2026-11-09: a switch to a built-in subtitle on a TorBox stream waited 61.8 s for its answer while
+    // the extraction made 762 range reads against a TorBox CDN node that timed out, and the viewer gave up first.
+    #[tokio::test(start_paused = true)]
+    async fn a_subtitle_switch_is_answered_without_waiting_for_its_extraction() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let extracted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = extracted.clone();
+        let extraction = async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        };
+        let started = tokio::time::Instant::now();
+        let prepared = with_selected_subtitle(Some(1), None, Some(extraction), |selected| {
+            asked.lock().unwrap().push(selected);
+            created_after(2, selected)
+        })
+        .await
+        .expect("TorBox's stream with the subtitle");
+
+        assert!(started.elapsed() < Duration::from_secs(5), "answered after {:?}", started.elapsed());
+        assert_eq!(prepared.selected_subtitle, Some(1), "TorBox burns the chosen track in");
+        assert_eq!(*asked.lock().unwrap(), vec![Some(1)], "one createstream, for the chosen track");
+        // The extraction carries on, so the next choice of this track finds its sidecar cached.
+        assert!(!extracted.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(extracted.load(std::sync::atomic::Ordering::SeqCst), "the extraction ran to its end");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_sidecar_plays_beside_the_subtitle_free_stream() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let cached = Sidecar { ordinal: 1, vtt: "WEBVTT\n\n00:01.000 --> 00:02.000\nHi\n".to_owned() };
+        let prepared = with_selected_subtitle(
+            Some(1),
+            Some(cached),
+            None::<std::future::Ready<Vec<Sidecar>>>,
+            |selected| {
+                asked.lock().unwrap().push(selected);
+                created_after(2, selected)
+            },
+        )
+        .await
+        .expect("TorBox's subtitle-free stream");
+
+        assert_eq!(*asked.lock().unwrap(), vec![None]);
+        assert_eq!(prepared.selected_subtitle, None);
+        assert!(prepared.subtitles[1].sidecar.as_deref().is_some_and(|vtt| vtt.contains("Hi")));
+        assert!(prepared.subtitles[0].sidecar.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_subtitle_asks_for_the_subtitle_free_stream_alone() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let prepared =
+            with_selected_subtitle(None, None, None::<std::future::Ready<Vec<Sidecar>>>, |selected| {
+                asked.lock().unwrap().push(selected);
+                created_after(2, selected)
+            })
+            .await
+            .expect("TorBox's stream");
+
+        assert_eq!(*asked.lock().unwrap(), vec![None]);
+        assert!(prepared.subtitles.iter().all(|track| track.sidecar.is_none()));
+    }
 
     #[test]
     fn skipped_sidecar_log_names_the_reason_without_provider_details() {

@@ -1,6 +1,7 @@
 use super::*;
 
 mod den_addon;
+mod outage_recovery;
 mod wanted_downloads;
 
 fn hearth_with(limits: Limits, token: Option<&str>) -> Arc<Hearth> {
@@ -616,6 +617,8 @@ async fn health_reports_all_four() {
     for service in ["scout", "reel", "subs", "remux"] {
         assert!(body["services"][service]["status"].is_string(), "{service}: {body}");
     }
+    assert_eq!(body["wantedPersistence"]["status"], "ok");
+    assert!(body["wantedPersistence"]["pending"].is_boolean());
     let all_ok = ["scout", "reel", "subs", "remux"].iter().all(|s| body["services"][s]["status"] == "ok");
     assert_eq!(body["status"], if all_ok { "ok" } else { "degraded" });
 

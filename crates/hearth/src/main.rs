@@ -29,6 +29,8 @@ mod scout;
 mod server;
 mod services;
 mod sock;
+#[cfg(any(test, feature = "stub-upstreams"))]
+mod stub;
 mod wake;
 mod wanted;
 

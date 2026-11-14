@@ -54,6 +54,8 @@ const MAX_DIRECT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 const DEGRADED_HEADER: &str = "x-den-degraded";
 const FINALIZE_HEADER: &str = "x-den-playback-finalize";
 const FINALIZATION_PROTOCOL_HEADER: &str = "x-den-playback-finalization";
+/// A viewer is waiting on this Play (Scout's `X-Den-Early-Answer`). Remux reads it off the same request headers.
+const EARLY_ANSWER_HEADER: &str = "x-den-early-answer";
 const SIDECAR_FOR: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_SIDECAR_SESSIONS: usize = 256;
 const MAX_SIDECAR_SESSIONS_PER_OWNER: usize = 32;
@@ -262,7 +264,9 @@ impl DirectFailure {
         use den_scout::managed_hls::ManagedHlsError;
 
         let class = match error {
-            ManagedHlsError::NotFound => DirectFailureClass::NotFound,
+            ManagedHlsError::NotFound
+            | ManagedHlsError::DolbyVision
+            | ManagedHlsError::ReceiverUnsupported => DirectFailureClass::NotFound,
             ManagedHlsError::Refused | ManagedHlsError::Authentication | ManagedHlsError::Entitlement => {
                 DirectFailureClass::Refused
             }
@@ -688,6 +692,7 @@ fn managed_request(
         receiver: object.get("player").and_then(Value::as_str) == Some("cast"),
         platform: object.get("platform").and_then(Value::as_str).map(str::to_owned),
         subtitle,
+        early_answer: false,
     })
 }
 
@@ -1354,7 +1359,12 @@ where
     let finalization_protocol = edge_managed
         && parts.headers.get(FINALIZATION_PROTOCOL_HEADER).is_some_and(|value| value.as_bytes() == b"1");
     let managed = edge_managed && direct_config.is_some() && !direct_failed;
-    let direct = managed_request(&request, subtitle_track);
+    // A viewer waiting on Play may be answered from a list that went out before the slowest indexer: only where a
+    // miss on it still reaches Remux, which asks for every indexer before it answers that nothing plays.
+    let early_answer =
+        !direct_only && parts.headers.get(EARLY_ANSWER_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+    let direct = managed_request(&request, subtitle_track)
+        .map(|direct| den_scout::managed_hls::ManagedHlsRequest { early_answer, ..direct });
     // The install whose Scout plays this: Remux's, unless only the managed stream may answer.
     let signal_install = match remux_scout {
         Some(scout) if !direct_only => Some(scout.to_string()),
@@ -2039,7 +2049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sidecar_capabilities_are_unforgeable_bounded_and_track_scoped() {
+    async fn sidecar_capabilities_are_unforgeable_bounded_track_scoped_and_expire() {
         let playback = Playback::new(true);
         let token = playback
             .put_sidecars("owner", HashMap::from([(2, Arc::<str>::from("WEBVTT\n\ncue"))]))
@@ -2049,6 +2059,12 @@ mod tests {
         assert_eq!(playback.get_sidecar(&token, 2).await.as_deref(), Some("WEBVTT\n\ncue"));
         assert!(playback.get_sidecar(&token, 1).await.is_none());
         assert!(playback.get_sidecar("not-a-capability", 2).await.is_none());
+
+        // Drive the production lookup across its expiry boundary without sleeping for two hours. The next read
+        // performs the same lazy eviction used by the HTTP delivery route and must not return the retained body.
+        playback.sidecars.lock().await.get_mut(&token).unwrap().expires = Instant::now();
+        assert!(playback.get_sidecar(&token, 2).await.is_none());
+        assert!(!playback.sidecars.lock().await.contains_key(&token));
     }
 
     #[tokio::test]

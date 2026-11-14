@@ -131,7 +131,7 @@ pub(crate) fn grid_by_name(s: &Stream) -> bool {
 /// probe decides those), or MPEG-4 Part 2 in an MPEG-TS or AVI, which is transcoded. AV1 or VP9 for any other
 /// player, and VC-1, need the video re-encoded from a container this service copies. Some containers are left out by
 /// name (`left_out_by_name`).
-fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
+pub(crate) fn remuxable(s: &Stream, av1: bool, vp9: bool) -> bool {
     let codec_ok = match s.attributes.codec.as_deref().map(str::to_ascii_lowercase) {
         None => true,
         Some(c) => {
@@ -206,14 +206,15 @@ impl SourceGuard {
         SourceGuard(AddressGuard::strict())
     }
 
-    /// What the running service uses. Only this crate's own tests are exempt (their sources are 127.0.0.1
-    /// servers); there is no switch for it in a build that ships.
-    #[cfg(not(test))]
+    /// What the running service uses. Only this crate's own tests and den-hearth's cross-repo e2e build
+    /// (`stub-upstreams`, whose media fake is a 127.0.0.1 server) are exempt; there is no switch for it in a build
+    /// that ships.
+    #[cfg(not(any(test, feature = "stub-upstreams")))]
     pub const fn for_build() -> SourceGuard {
         SourceGuard::strict()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "stub-upstreams"))]
     pub const fn for_build() -> SourceGuard {
         SourceGuard(AddressGuard::permissive())
     }
@@ -353,13 +354,18 @@ pub struct ListError {
 /// The header carrying the browser's capability report to scout, which ranks the list for that browser.
 pub const PLAYABLE_HEADER: &str = "x-den-playable";
 
+/// The header asking scout for an early stream list: a viewer is waiting on it (scout's `X_DEN_EARLY_ANSWER`).
+pub const EARLY_ANSWER_HEADER: &str = "x-den-early-answer";
+
 /// The stream list for `imdb`, with the service key when the source has one, ranked for the browser whose report
-/// `playable` is.
+/// `playable` is. With `early_answer`, scout may answer before its slowest indexer; such a list is for picking what
+/// to open, never for deciding that nothing exists.
 pub async fn list(
     via: Via<'_>,
     src: &ScoutSource,
     imdb: &str,
     playable: Option<&crate::session::Playable>,
+    early_answer: bool,
 ) -> Result<Vec<Stream>, ListError> {
     let fail = |status: Option<u16>, detail: String| ListError { status, detail };
     let url = reqwest::Url::parse(&stream_list_url(&src.base, imdb))
@@ -375,6 +381,9 @@ pub async fn list(
         // Integers and booleans only: there is nothing in a Playable that fails to serialise, or that is not ASCII.
         let report = serde_json::to_string(p).expect("a Playable serialises");
         headers.insert(PLAYABLE_HEADER, report.parse().expect("a Playable report is a header value"));
+    }
+    if early_answer {
+        headers.insert(EARLY_ANSWER_HEADER, reqwest::header::HeaderValue::from_static("1"));
     }
     let resp = via.get_scout(&url, headers).await.map_err(|d| fail(None, d))?;
     if !resp.status().is_success() {

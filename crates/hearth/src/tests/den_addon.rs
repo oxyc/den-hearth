@@ -585,10 +585,220 @@ async fn edge_playback(hearth: &Arc<Hearth>, segment: &str, key: &str, body: Val
         .header("idempotency-key", key)
         .header("x-den-edge-secret", "edge-secret")
         .header("x-den-managed-playback", "1")
+        .header("x-den-early-answer", "1")
         .extension(den_remux::Peer("10.0.0.2".parse().unwrap()))
         .body(http_body_util::Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
         .unwrap();
     handle(hearth.clone(), None, false, request).await
+}
+
+struct FacadeScoutCalls {
+    lists: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    plays: std::sync::Mutex<Vec<String>>,
+    cancelled_list_started: tokio::sync::Semaphore,
+    cancelled_list_release: tokio::sync::Semaphore,
+}
+
+impl Default for FacadeScoutCalls {
+    fn default() -> Self {
+        Self {
+            lists: std::sync::Mutex::new(Vec::new()),
+            plays: std::sync::Mutex::new(Vec::new()),
+            cancelled_list_started: tokio::sync::Semaphore::new(0),
+            cancelled_list_release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+/// A production-shaped `/playback` fixture: the facade rewrites into the real Remux handler, while only Scout's
+/// list/play boundary is replaced. The fake records what Remux asked, rather than reading the facade request itself,
+/// so losing or changing the viewer header before `Want::early_answer` makes the assertion fail.
+async fn facade_early_answer_hearth(
+    segment: &str,
+    calls: Arc<FacadeScoutCalls>,
+) -> (Arc<Hearth>, tempfile::TempDir) {
+    let scratch = tempfile::tempdir().unwrap();
+    let media = Arc::new(Bytes::from(
+        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../remux/testdata/h264.mkv"))
+            .unwrap(),
+    ));
+    let segment = segment.to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let calls = calls.clone();
+            let media = media.clone();
+            let segment = segment.clone();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |req: Request<Incoming>| {
+                            let calls = calls.clone();
+                            let media = media.clone();
+                            let segment = segment.clone();
+                            async move {
+                                let path = req.uri().path();
+                                if let Some(imdb) = path
+                                    .strip_prefix(&format!("/den/{segment}/stream/movie/"))
+                                    .and_then(|path| path.strip_suffix(".json"))
+                                {
+                                    let early = req
+                                        .headers()
+                                        .get("x-den-early-answer")
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_string);
+                                    let first_cancelled = {
+                                        let mut lists = calls.lists.lock().unwrap();
+                                        let first =
+                                            imdb == "tt0000071" && !lists.iter().any(|(id, _)| id == imdb);
+                                        lists.push((imdb.to_string(), early));
+                                        first
+                                    };
+                                    if first_cancelled {
+                                        calls.cancelled_list_started.add_permits(1);
+                                        calls.cancelled_list_release.acquire().await.unwrap().forget();
+                                    }
+                                    let body = serde_json::json!({"streams": [{
+                                        "url": format!("{}/{segment}/p/{imdb}", crate::playback::DEN_ADDON_BASE),
+                                        "attributes": {"cached": true, "codec": "h264", "label": "facade early success"},
+                                        "behaviorHints": {"filename": format!("facade-{imdb}.mkv")}
+                                    }]});
+                                    return Ok::<_, std::convert::Infallible>(
+                                        Response::builder()
+                                            .header("content-type", "application/json")
+                                            .body(http_body_util::Full::new(Bytes::from(
+                                                serde_json::to_vec(&body).unwrap(),
+                                            )))
+                                            .unwrap(),
+                                    );
+                                }
+                                if let Some(imdb) = path.strip_prefix(&format!("/den/{segment}/p/")) {
+                                    if req
+                                        .headers()
+                                        .get(den_http::X_DEN_SERVICE_READ)
+                                        .is_some_and(|value| value == "1")
+                                    {
+                                        calls.plays.lock().unwrap().push(imdb.to_string());
+                                    }
+                                    let size = media.len();
+                                    let range = req
+                                        .headers()
+                                        .get("range")
+                                        .and_then(|value| value.to_str().ok())
+                                        .and_then(|value| value.strip_prefix("bytes="))
+                                        .and_then(|value| value.split_once('-'))
+                                        .and_then(|(start, end)| {
+                                            let start = start.parse::<usize>().ok()?;
+                                            let end = end
+                                                .parse::<usize>()
+                                                .ok()
+                                                .unwrap_or(size.saturating_sub(1))
+                                                .min(size.saturating_sub(1));
+                                            (start <= end).then_some((start, end))
+                                        });
+                                    let (status, start, end) =
+                                        range.map_or((StatusCode::OK, 0, size - 1), |(start, end)| {
+                                            (StatusCode::PARTIAL_CONTENT, start, end)
+                                        });
+                                    let bytes = Bytes::copy_from_slice(&media[start..=end]);
+                                    let mut response = Response::builder()
+                                        .status(status)
+                                        .header("content-type", "video/x-matroska")
+                                        .header("accept-ranges", "bytes")
+                                        .header("content-length", bytes.len());
+                                    if status == StatusCode::PARTIAL_CONTENT {
+                                        response = response
+                                            .header("content-range", format!("bytes {start}-{end}/{size}"));
+                                    }
+                                    return Ok(response.body(http_body_util::Full::new(bytes)).unwrap());
+                                }
+                                Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(http_body_util::Full::new(Bytes::new()))
+                                    .unwrap())
+                            }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let mut hearth = playback_hearth();
+    let state = Arc::get_mut(&mut hearth).unwrap();
+    let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
+    remux.cfg.public_session_proxy = Some("10.0.0.2".parse().unwrap());
+    remux.cfg.edge_secret = Some("edge-secret".into());
+    remux.cfg.scout_origins.push(crate::playback::DEN_SCOUT_ORIGIN.to_string());
+    remux.cfg.origin_aliases = vec![(crate::playback::DEN_SCOUT_ORIGIN.to_string(), origin)];
+    remux.cfg.scratch_dir = scratch.path().to_path_buf();
+    (hearth, scratch)
+}
+
+#[tokio::test]
+async fn playback_facade_preserves_early_answer_replay_and_cancellation_ownership() {
+    let segment = plain(&config(0, &[SCOUT]));
+    let calls = Arc::new(FacadeScoutCalls::default());
+    let (hearth, scratch) = facade_early_answer_hearth(&segment, calls.clone()).await;
+    let success = serde_json::json!({"imdb": "tt0000070", "directFailed": true});
+
+    let first =
+        response_bytes(edge_playback(&hearth, &segment, "facade-success", success.clone()).await).await;
+    assert_eq!(
+        first.0,
+        StatusCode::OK,
+        "{}; lists={:?}; plays={:?}",
+        String::from_utf8_lossy(&first.2),
+        calls.lists.lock().unwrap(),
+        calls.plays.lock().unwrap()
+    );
+    assert!(serde_json::from_slice::<Value>(&first.2).unwrap()["session"]["id"].is_string());
+    assert_eq!(*calls.lists.lock().unwrap(), [("tt0000070".into(), Some("1".into()))]);
+    assert_eq!(*calls.plays.lock().unwrap(), ["tt0000070"]);
+    assert_eq!(hearth.remux.as_ref().unwrap().sessions().len(), 1);
+
+    // The same browser operation is Hearth's replay, not another Remux selection or session.
+    let replay = response_bytes(edge_playback(&hearth, &segment, "facade-success", success).await).await;
+    assert_eq!((replay.0, &replay.2), (first.0, &first.2));
+    assert_eq!(calls.lists.lock().unwrap().len(), 1);
+    assert_eq!(calls.plays.lock().unwrap().len(), 1);
+    assert_eq!(hearth.remux.as_ref().unwrap().sessions().len(), 1);
+
+    // Cancellation while Remux awaits the early list publishes no session and releases both the facade's
+    // idempotency reservation and Remux admission. Retrying that same operation owns the one successful session.
+    let cancel_body = serde_json::json!({"imdb": "tt0000071", "directFailed": true});
+    let (task_hearth, task_segment, task_body) = (hearth.clone(), segment.clone(), cancel_body.clone());
+    let attempt =
+        tokio::spawn(
+            async move { edge_playback(&task_hearth, &task_segment, "facade-cancel", task_body).await },
+        );
+    tokio::time::timeout(std::time::Duration::from_secs(2), calls.cancelled_list_started.acquire())
+        .await
+        .expect("the facade reached Remux's early Scout list")
+        .unwrap()
+        .forget();
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    calls.cancelled_list_release.add_permits(1);
+    assert_eq!(hearth.remux.as_ref().unwrap().sessions().len(), 1, "the cancelled attempt made no session");
+
+    let recovered =
+        response_bytes(edge_playback(&hearth, &segment, "facade-cancel", cancel_body).await).await;
+    assert_eq!(recovered.0, StatusCode::OK, "{}", String::from_utf8_lossy(&recovered.2));
+    assert_eq!(
+        *calls.lists.lock().unwrap(),
+        [
+            ("tt0000070".into(), Some("1".into())),
+            ("tt0000071".into(), Some("1".into())),
+            ("tt0000071".into(), Some("1".into())),
+        ]
+    );
+    assert_eq!(*calls.plays.lock().unwrap(), ["tt0000070", "tt0000071"]);
+    assert_eq!(hearth.remux.as_ref().unwrap().sessions().len(), 2);
+    drop(hearth);
+    drop(scratch);
 }
 
 // Den Web asks again with `player: "cast"` and `transcode: "never"` when a title playing from TorBox is cast (every

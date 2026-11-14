@@ -25,5 +25,10 @@ fail-fast = false
 failure-output = "immediate-final"
 status-level = "slow"
 
+# The outage tests print how long recovery took (den-hearth#215); keep that in the log of every run, passing or not.
+[[profile.ci.overrides]]
+filter = "test(outage_recovery)"
+success-output = "final"
+
 [profile.ci.junit]
 path = "junit.xml"

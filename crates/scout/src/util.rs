@@ -251,9 +251,12 @@ impl<T: Clone + Send + Sync + 'static> DetachedFlight<T> {
             let work = make();
             let what = self.what;
             let runtime = crate::runtime::current_runtime();
+            // The leader's call trace goes with the work, so the request that started it can name its calls.
+            let trace = crate::calltrace::current();
             tokio::spawn(crate::runtime::scope(runtime.clone(), async move {
                 // Admission belongs to detached work, not to the request that happened to create it.
                 let _permit = permit;
+                let work = crate::calltrace::scope(trace, work);
                 let answer = match tokio::spawn(crate::runtime::scope(runtime, work)).await {
                     Ok(answer) => Some(answer),
                     Err(e) => {

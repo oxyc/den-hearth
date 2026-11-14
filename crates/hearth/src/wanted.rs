@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -151,8 +151,28 @@ struct Install {
 #[derive(Default)]
 struct State {
     installs: HashMap<String, Install>,
-    dirty: bool,
-    flushed: i64,
+    generation: u64,
+    persisted: u64,
+    attempted: i64,
+    persistence_error: bool,
+}
+
+impl State {
+    fn changed(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+trait Store: Send + Sync {
+    fn write(&self, file: &Path, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+struct PrivateFile;
+
+impl Store for PrivateFile {
+    fn write(&self, file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        write_private(file, bytes)
+    }
 }
 
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -224,9 +244,11 @@ fn ticket_path(url: &str) -> Option<&str> {
 
 pub struct Wanted {
     state: Mutex<State>,
+    writer: Mutex<()>,
     finder: Box<dyn Finder>,
     /// Where the lists are kept across a restart; None keeps them in RAM only.
     file: Option<PathBuf>,
+    store: Arc<dyn Store>,
 }
 
 /// A due search, taken out of the state so the lock is not held across Scout.
@@ -249,8 +271,25 @@ enum Outcome {
 
 impl Wanted {
     pub fn new(finder: Box<dyn Finder>, file: Option<PathBuf>) -> Wanted {
-        let installs = file.as_ref().map(load).unwrap_or_default();
-        Wanted { state: Mutex::new(State { installs, ..State::default() }), finder, file }
+        let installs = file.as_ref().map(|path| load(path)).unwrap_or_default();
+        Wanted {
+            state: Mutex::new(State { installs, ..State::default() }),
+            writer: Mutex::new(()),
+            finder,
+            file,
+            store: Arc::new(PrivateFile),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_store(finder: Box<dyn Finder>, file: PathBuf, store: Arc<dyn Store>) -> Wanted {
+        Wanted {
+            state: Mutex::new(State::default()),
+            writer: Mutex::new(()),
+            finder,
+            file: Some(file),
+            store,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -279,11 +318,15 @@ impl Wanted {
         let mut state = self.lock();
         if items.is_empty() {
             if state.installs.remove(key).is_some() {
-                state.dirty = true;
+                state.changed();
             }
             drop(state);
-            self.flush(now, true);
-            return Ok(json!({"items": []}));
+            let mut answer = json!({"items": []});
+            let persistence = self.flush(now, true);
+            if self.file.is_some() {
+                answer["persistence"] = json!(persistence);
+            }
+            return Ok(answer);
         }
         if !state.installs.contains_key(key) && state.installs.len() >= MAX_INSTALLS {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "wanted_full"));
@@ -328,26 +371,37 @@ impl Wanted {
             })
             .collect();
         install.config = config.to_owned();
+        let touched = install.touched != now;
         install.touched = now;
         let changed = before != serde_json::to_vec(&(&install.config, &install.items)).unwrap_or_default();
         let answer = statuses(install, now);
-        state.dirty |= changed;
+        if changed || touched {
+            state.changed();
+        }
         drop(state);
-        if changed {
-            self.flush(now, true);
+        let mut answer = answer;
+        let persistence = self.flush(now, changed);
+        if self.file.is_some() {
+            answer["persistence"] = json!(persistence);
         }
         Ok(answer)
     }
 
     fn read(&self, key: &str, now: i64) -> Value {
         let mut state = self.lock();
-        match state.installs.get_mut(key) {
+        let (answer, touched) = match state.installs.get_mut(key) {
             Some(install) => {
+                let touched = install.touched != now;
                 install.touched = now;
-                statuses(install, now)
+                (statuses(install, now), touched)
             }
-            None => json!({"items": []}),
+            None => (json!({"items": []}), false),
+        };
+        if touched {
+            state.changed();
         }
+        drop(state);
+        answer
     }
 
     /// The searches due now, the earliest first, at most `SEARCHES_PER_TICK`; installs past their expiry dropped.
@@ -356,7 +410,7 @@ impl Wanted {
         let before = state.installs.len();
         state.installs.retain(|_, install| now - install.touched < EXPIRY_MS);
         if state.installs.len() != before {
-            state.dirty = true;
+            state.changed();
         }
         let mut due: Vec<(i64, Job)> = Vec::new();
         for (key, install) in &state.installs {
@@ -431,27 +485,56 @@ impl Wanted {
                 true
             }
         };
-        state.dirty = true;
+        state.changed();
         drop(state);
         self.flush(now, urgent);
     }
 
-    /// Write the lists down, when there is a file and something changed: at once when `urgent`, else at most every
-    /// `FLUSH_EVERY_MS`.
-    pub fn flush(&self, now: i64, urgent: bool) {
-        let Some(file) = &self.file else { return };
-        let bytes = {
+    /// Write the newest generation down. The writer lock orders snapshots without holding the state lock over
+    /// disk I/O, so mutations continue but an older snapshot cannot replace a newer one. Failed generations
+    /// remain pending; non-urgent retries and activity renewals are bounded to one attempt per `FLUSH_EVERY_MS`.
+    pub fn flush(&self, now: i64, urgent: bool) -> &'static str {
+        let Some(file) = &self.file else { return "memory" };
+        let _writer = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (generation, bytes) = {
             let mut state = self.lock();
-            if !state.dirty || (!urgent && now - state.flushed < FLUSH_EVERY_MS) {
-                return;
+            if state.generation == state.persisted {
+                return "durable";
             }
-            state.dirty = false;
-            state.flushed = now;
-            serde_json::to_vec(&state.installs).unwrap_or_default()
+            // Substantive changes normally write at once. Once storage has refused a write, however, even an
+            // urgent caller observes pending until the retry bound: a busy client must not turn an outage into
+            // an unbounded stream of filesystem attempts and logs.
+            if (!urgent || state.persistence_error) && now - state.attempted < FLUSH_EVERY_MS {
+                return "pending";
+            }
+            state.attempted = now;
+            (state.generation, serde_json::to_vec(&state.installs).unwrap_or_default())
         };
-        if let Err(e) = write_private(file, &bytes) {
-            eprintln!("wanted: couldn't keep the lists at {}: {e}", file.display());
+        let result = self.store.write(file, &bytes);
+        let mut state = self.lock();
+        match result {
+            Ok(()) => {
+                state.persisted = generation;
+                state.persistence_error = false;
+                "durable"
+            }
+            Err(e) => {
+                state.persistence_error = true;
+                eprintln!("wanted: couldn't keep the lists at {}: {e}", file.display());
+                "pending"
+            }
         }
+    }
+
+    /// Persistence is part of aggregate health: a normal coalesced renewal is pending, not degraded; a write
+    /// failure remains degraded until a later retry commits the pending generation.
+    pub fn persistence_health(&self) -> Value {
+        let state = self.lock();
+        json!({
+            "status": if state.persistence_error { "degraded" } else { "ok" },
+            "mode": if self.file.is_some() { "disk" } else { "memory" },
+            "pending": self.file.is_some() && state.generation != state.persisted,
+        })
     }
 }
 
@@ -586,7 +669,7 @@ fn statuses(install: &Install, now: i64) -> Value {
     json!({ "items": items })
 }
 
-fn load(file: &PathBuf) -> HashMap<String, Install> {
+fn load(file: &Path) -> HashMap<String, Install> {
     match std::fs::read(file) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             eprintln!("wanted: {} is unreadable ({e}); starting with no lists", file.display());
@@ -601,7 +684,7 @@ fn load(file: &PathBuf) -> HashMap<String, Install> {
 }
 
 /// Write `bytes` to `file` whole or not at all, readable by this user alone: it holds sealed config segments.
-fn write_private(file: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+fn write_private(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = file.with_extension("json.tmp");
@@ -710,14 +793,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Condvar;
 
-    #[test]
-    fn the_lists_outlive_a_restart_in_a_file_only_this_user_reads() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("hearth-wanted.json");
-        let item = Item {
-            key: "tv:70742:2:3".into(),
+    fn item(key: &str) -> Item {
+        Item {
+            key: key.into(),
             imdb: "tt6189176".into(),
             season: Some(2),
             episode: Some(3),
@@ -729,7 +809,52 @@ mod tests {
             in_flight: Vec::new(),
             original_language: Some("sv".into()),
             preferred_language: None,
-        };
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingStore {
+        writes: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Store for RecordingStore {
+        fn write(&self, _file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct HeldFirstStore {
+        writes: Mutex<Vec<Vec<u8>>>,
+        entered: (Mutex<bool>, Condvar),
+        release: (Mutex<bool>, Condvar),
+    }
+
+    impl Store for HeldFirstStore {
+        fn write(&self, _file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            let first = self.writes.lock().unwrap().is_empty();
+            if first {
+                let (entered, wake) = &self.entered;
+                *entered.lock().unwrap() = true;
+                wake.notify_all();
+                let (release, wake) = &self.release;
+                let mut released = release.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_lists_outlive_a_restart_in_a_file_only_this_user_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hearth-wanted.json");
+        let item = item("tv:70742:2:3");
         let before = Wanted::new(Box::new(InProcess), Some(file.clone()));
         before.replace("iid", "SEALED", vec![item.clone()], 2_000).unwrap();
         // Written at once: a list change is not left to the next 15-minute flush.
@@ -744,6 +869,102 @@ mod tests {
         // An empty list clears the file's copy too.
         after.replace("iid", "SEALED", Vec::new(), 4_000).unwrap();
         assert_eq!(Wanted::new(Box::new(InProcess), Some(file)).read("iid", 5_000), json!({"items": []}));
+    }
+
+    #[test]
+    fn a_failed_write_remains_pending_and_an_urgent_retry_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("temporarily-unavailable");
+        let file = parent.join("hearth-wanted.json");
+        let wanted = Wanted::new(Box::new(InProcess), Some(file.clone()));
+
+        let answer = wanted.replace("iid", "SEALED", vec![item("movie:42:-1:-1")], 2_000).unwrap();
+        assert_eq!(answer["persistence"], "pending");
+        assert_eq!(wanted.persistence_health()["status"], "degraded");
+        assert!(!file.exists());
+
+        std::fs::create_dir(&parent).unwrap();
+        assert_eq!(wanted.flush(2_001, true), "pending");
+        assert!(!file.exists(), "an urgent retry ignored the failure backoff");
+        assert_eq!(wanted.flush(2_000 + FLUSH_EVERY_MS, true), "durable");
+        assert_eq!(wanted.persistence_health(), json!({"status": "ok", "mode": "disk", "pending": false}));
+        let restarted = Wanted::new(Box::new(InProcess), Some(file));
+        assert_eq!(restarted.read("iid", 3_000)["items"][0]["key"], "movie:42:-1:-1");
+    }
+
+    #[test]
+    fn reads_and_identical_replacements_renew_durably_with_bounded_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hearth-wanted.json");
+        let wanted = Wanted::new(Box::new(InProcess), Some(file.clone()));
+        let listed = item("movie:42:-1:-1");
+        wanted.replace("iid", "SEALED", vec![listed.clone()], 2_000).unwrap();
+
+        for now in 2_001..2_101 {
+            wanted.read("iid", now);
+            wanted.replace("iid", "SEALED", vec![listed.clone()], now).unwrap();
+        }
+        let renewed = 2_000 + EXPIRY_MS - 60_000;
+        wanted.read("iid", renewed);
+        assert_eq!(wanted.flush(renewed, false), "durable");
+
+        let restarted = Wanted::new(Box::new(InProcess), Some(file));
+        let after_old_expiry = 2_000 + EXPIRY_MS + 60_000;
+        assert_eq!(restarted.due(after_old_expiry).len(), 1);
+        assert_eq!(restarted.read("iid", after_old_expiry)["items"][0]["key"], "movie:42:-1:-1");
+
+        let store = Arc::new(RecordingStore::default());
+        let counted = Wanted::with_store(Box::new(InProcess), PathBuf::from("unused"), store.clone());
+        counted.replace("iid", "SEALED", vec![listed.clone()], 1_000).unwrap();
+        for now in 1_001..1_101 {
+            counted.read("iid", now);
+            counted.replace("iid", "SEALED", vec![listed.clone()], now).unwrap();
+        }
+        assert_eq!(store.writes.lock().unwrap().len(), 1, "polling before the bound wrote more than once");
+        counted.replace("iid", "SEALED", vec![listed], 1_000 + FLUSH_EVERY_MS).unwrap();
+        assert_eq!(store.writes.lock().unwrap().len(), 2, "the bounded renewal was not written");
+    }
+
+    #[test]
+    fn a_cancelled_caller_and_concurrent_update_cannot_commit_an_older_snapshot_last() {
+        let store = Arc::new(HeldFirstStore::default());
+        let wanted =
+            Arc::new(Wanted::with_store(Box::new(InProcess), PathBuf::from("unused"), store.clone()));
+        let first = wanted.clone();
+        let abandoned = std::thread::spawn(move || {
+            first.replace("iid", "SEALED", vec![item("movie:1:-1:-1")], 1_000).unwrap();
+        });
+        let (entered, wake) = &store.entered;
+        let mut has_entered = entered.lock().unwrap();
+        while !*has_entered {
+            has_entered = wake.wait(has_entered).unwrap();
+        }
+        drop(has_entered);
+        drop(abandoned); // The request task's caller is gone while its durable write is still held.
+
+        let second = wanted.clone();
+        let newest = std::thread::spawn(move || {
+            second.replace("iid", "SEALED", vec![item("movie:2:-1:-1")], 2_000).unwrap();
+        });
+        let mut updated_while_old_write_was_held = false;
+        for _ in 0..10_000 {
+            if wanted.read("iid", 2_000)["items"][0]["key"] == "movie:2:-1:-1" {
+                updated_while_old_write_was_held = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(updated_while_old_write_was_held, "the newer mutation was blocked on old disk I/O");
+        let (release, wake) = &store.release;
+        *release.lock().unwrap() = true;
+        wake.notify_all();
+        newest.join().unwrap();
+
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        let durable: HashMap<String, Install> = serde_json::from_slice(writes.last().unwrap()).unwrap();
+        assert_eq!(durable["iid"].items[0].item.key, "movie:2:-1:-1");
+        assert_eq!(wanted.read("iid", 3_000)["items"][0]["key"], "movie:2:-1:-1");
     }
 
     #[test]

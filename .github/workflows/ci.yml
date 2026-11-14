@@ -10,9 +10,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
   # Superseded PR revisions are disposable. A main SHA is a potential release and its candidate must finish even
   # when another merge follows it, otherwise a tag could name a commit whose exact image was cancelled midway.
+  # Main therefore gets one group per SHA: within a shared group GitHub keeps one running and one pending run and
+  # cancels the older pending run when a third queues, even with cancel-in-progress off.
+  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -24,7 +26,84 @@ env:
   CONTROLLER_IMAGE: ghcr.io/${{ github.repository_owner }}/den-hearth-controller
 
 jobs:
-  test:
+  # Test a source tree once. When a ci.yml run in this repository already passed every blocking test job on
+  # byte-identical source (the commit's tree without VERSION; see scripts/ci-verdict.sh), the tests are skipped and
+  # the `test` gate accepts that. That covers a merge commit whose PR run tested the same merge result, and
+  # release.sh's version commit, whose predecessor tested the same source. The candidate job still builds, probes and
+  # scans an image for every main SHA, so its version, revision label and digests are that commit's.
+  scope:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_changed: ${{ steps.diff.outputs.source_changed }}
+      stack_due: ${{ steps.stack.outputs.due }}
+      tree: ${{ steps.diff.outputs.tree }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # The cross-repo playback e2e is decided apart from reuse: its result depends on den-edge's latest release as
+      # well as on this tree, so a verdict recorded for the same tree against another release proves nothing about
+      # this one. It runs on every main commit (each is a release candidate, VERSION-only ones included) and on a pull
+      # request touching what a play crosses.
+      - name: Is the playback e2e due?
+        id: stack
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then echo "due=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          files=$(git diff --name-only "$BASE" "$GITHUB_SHA")
+          if grep -Eq '^(crates/hearth/src/(playback|guest|den|scout|stub|inproc|route|application)\.rs$|crates/remux/|crates/scout/src/(managed_hls|managed_subtitles|play|handler|stores/torbox)|crates/subtitles/|Cargo\.lock$|\.github/workflows/ci\.yml$)' <<<"$files"; then
+            echo "due=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "due=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Look for a recorded pass on this source
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tree=$(scripts/ci-verdict.sh tree HEAD)
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "source_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Main SHAs run side by side, so a version commit's predecessor may still be testing the same source: wait
+          # for its verdict rather than test it a second time. Any other change looks once and otherwise runs in full.
+          before_tree=""
+          if [ "$EVENT" = push ]; then
+            before_tree=$(scripts/ci-verdict.sh tree "$BEFORE" 2>/dev/null || true)
+          fi
+          run=""
+          for _ in $(seq 1 90); do
+            run=$(scripts/ci-verdict.sh find "$REPO" "$tree")
+            [ -z "$run" ] && [ "$before_tree" = "$tree" ] || break
+            pending=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?event=push&head_sha=$BEFORE" \
+              --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            [ "$pending" -gt 0 ] || break
+            sleep 20
+          done
+          if [ -n "$run" ]; then
+            url="https://github.com/$REPO/actions/runs/$run"
+            echo "::notice title=Tests reused::source tree $tree already passed in $url"
+            echo "Tests skipped: source tree \`$tree\` already passed in $url" >> "$GITHUB_STEP_SUMMARY"
+            echo "source_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  checks:
+    needs: scope
+    if: needs.scope.outputs.source_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -85,6 +164,8 @@ jobs:
   # version seeks differently and the segment alignment depends on exactly how it seeks. The stage builds no
   # release binary, and its own cache scope (docker-bake.hcl) keeps it from racing the image build's.
   e2e:
+    needs: scope
+    if: needs.scope.outputs.source_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -101,8 +182,125 @@ jobs:
           files: docker-bake.hcl
           targets: e2e
 
+  # Playback through the real den-hearth (this commit, its `stub-upstreams` build) and the real den-edge (its latest
+  # release), driven through den-edge's web app with fakes only at the outside edges. The suite and its runner live in
+  # den-edge (`web/e2e-stack/`). It never takes a reused verdict (see `scope`), and the `test` gate requires it
+  # wherever it was due, so `scripts/release.sh` tags only a main commit it passed on.
+  stack-e2e:
+    name: Playback with den-edge
+    needs: scope
+    if: needs.scope.outputs.stack_due == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      edge: ${{ steps.edge.outputs.tag }}
+    steps:
+      # Beside den-edge's checkout, not around it: nested, Cargo takes den-edge for a member of this workspace.
+      - uses: actions/checkout@v7
+        with:
+          path: den-hearth
+      # den-edge's latest release, the one the box runs. Until a release carries the suite, its main, or a pull
+      # request's paired den-edge branch of the same name.
+      - name: Check out den-edge's latest release
+        id: edge
+        env:
+          PAIRED: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none https://github.com/oxyc/den-edge.git den-edge
+          has() { git -C den-edge cat-file -e "$1:web/e2e-stack/ci.sh" 2>/dev/null; }
+          ref=$(git -C den-edge for-each-ref --count=1 --sort=-v:refname --format='%(refname:short)' 'refs/tags/v*')
+          if [ -z "$ref" ] || ! has "$ref"; then
+            echo "::warning::no den-edge release carries web/e2e-stack yet"
+            ref=origin/main
+            if ! has "$ref" && [ -n "$PAIRED" ] && has "origin/$PAIRED"; then ref="origin/$PAIRED"; fi
+          fi
+          has "$ref" || { echo "::error::no den-edge ref carries web/e2e-stack"; exit 1; }
+          git -C den-edge checkout --quiet "$ref"
+          echo "tag=${ref#origin/}@$(git -C den-edge rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            den-hearth
+            den-edge
+          key: stack-e2e
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: den-edge/web/package-lock.json
+      - name: Playback through den-hearth and den-edge ${{ steps.edge.outputs.tag }}
+        run: den-edge/web/e2e-stack/ci.sh den-edge den-hearth
+      - name: Retain failure evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: stack-e2e-failures
+          path: den-edge/web/test-results-stack
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Preserve the existing required `test` status while the Rust/Python checks and the e2e stage run as separate
+  # jobs that a recorded pass can skip. A failed or skipped scope must not read as a pass. The playback e2e is never
+  # reused: wherever it was due it must have run and passed in this run.
+  test:
+    needs: [scope, checks, e2e, stack-e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the playback e2e with den-edge wherever it was due
+        env:
+          STACK_DUE: ${{ needs.scope.outputs.stack_due }}
+          STACK: ${{ needs.stack-e2e.result }}
+        run: |
+          if [ "$STACK_DUE" = true ]; then test "$STACK" = success; else test "$STACK" = skipped; fi
+      - name: Require every test job, or a recorded pass
+        env:
+          SOURCE_CHANGED: ${{ needs.scope.outputs.source_changed }}
+          CHECKS: ${{ needs.checks.result }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          if [ "$SOURCE_CHANGED" = false ]; then
+            test "$CHECKS" = skipped && test "$E2E" = skipped
+          else
+            test "$CHECKS" = success && test "$E2E" = success
+          fi
+
+  # Record that this exact source tree passed every blocking job, for a later run on byte-identical source. Only a
+  # run that actually tested it records one; a PR's verdict also needs its image builds to have succeeded.
+  # The playback e2e is recorded beside the tree (`stack`: the den-edge it ran against, or `not-run`) but never reused
+  # from it (see `scope`).
+  verdict:
+    needs: [scope, checks, e2e, controller-image, build-pr, stack-e2e]
+    if: >-
+      always() && needs.scope.outputs.source_changed == 'true' && needs.checks.result == 'success'
+      && needs.e2e.result == 'success'
+      && (needs.stack-e2e.result == 'success' || needs.stack-e2e.result == 'skipped')
+      && (needs.build-pr.result == 'success' || (github.event_name == 'push' && needs.build-pr.result == 'skipped'))
+      && (needs.controller-image.result == 'success' || (github.event_name == 'push' && needs.controller-image.result == 'skipped'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the verdict
+        env:
+          TREE: ${{ needs.scope.outputs.tree }}
+          EVENT: ${{ github.event_name }}
+          STACK: ${{ needs.stack-e2e.result == 'success' && needs.stack-e2e.outputs.edge || 'not-run' }}
+        run: |
+          jq -n --arg tree "$TREE" --arg sha "$GITHUB_SHA" --arg event "$EVENT" --arg run "$GITHUB_RUN_ID" \
+            --arg stack "$STACK" '{tree: $tree, sha: $sha, event: $event, run: $run, stack: $stack}' > verdict.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-verdict-${{ needs.scope.outputs.tree }}
+          path: verdict.json
+          if-no-files-found: error
+          retention-days: 14
+
   controller-image:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: scope
+    if: >-
+      needs.scope.outputs.source_changed == 'true'
+      && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

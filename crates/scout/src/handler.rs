@@ -18,7 +18,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,19 +35,20 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
 
 use crate::addbudget::{global_add_budget, is_play_reserve, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
-use crate::attributes::stream_attributes;
+use crate::attributes::{cost_attributes, stream_attributes_ref};
 use crate::availability::verdict_prefix;
 use crate::client::{web_ready, ClientPlayable};
 use crate::config::{Config, DebridService, SCOPE_AVAILABILITY};
 use crate::coverage::{
-    decide_answer_kind, quarantined_reports, stale_body, AnswerEnvelope, Coverage, ANSWER_ENVELOPE_VERSION,
+    decide_answer_kind, excused_from_quorum, quarantined_reports, stale_body, AnswerEnvelope, Coverage,
+    ANSWER_ENVELOPE_VERSION, OUTCOME_ANSWERED,
 };
-use crate::decisionlog::{log_rank_decision, play_decision};
+use crate::decisionlog::{decision_line, log_rank_decision, play_decision};
 use crate::deps::{Deps, ReqwestDoer};
 use crate::hostlimit::{new_host_limiter, HostLimiter};
 use crate::id::{parse_stream_id, StreamId};
 use crate::indexerconfig::Flight;
-use crate::label::binge_group;
+use crate::label::binge_group_of;
 use crate::linkcheck::LinkVerdict;
 use crate::linkmemo::{link_memo_key, LinkMemo, LINK_MEMO_TTL};
 use crate::loglimit::{emit, log_limited};
@@ -60,11 +61,12 @@ use crate::probe_fanout::{
     PROBE_BUDGET, PROBE_TOP_N, PROBE_TTL,
 };
 use crate::rank::{
-    cap_seeds, rank_streams_debug, real_debrid_blocked, title_tokens, RankDebug, RankFilters, RawStream,
+    cap_seeds, rank_streams_debug, real_debrid_blocked, seed_cap_order, title_tokens, RankDebug, RankFilters,
+    RawStream,
 };
 use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;
-use crate::scrape::{scrape_covered_until, Doer, ScrapeQuery, Scraper};
+use crate::scrape::{scrape_covered_until, Doer, LateAnswers, ScrapeQuery, Scraper, LATE_GRACE};
 use crate::stores::pool::{has_cache_truth, status_outcome_among, StorePool};
 use crate::stores::refusal::{as_unavailable, scout_side_reason};
 use crate::stores::torbox::health::{DebridDown, DebridState};
@@ -146,6 +148,23 @@ pub(crate) const REBUILD_COOLOFF: Duration = Duration::from_secs(60);
 /// handful of titles at once; anything beyond that is not a viewer, and a rebuild skipped now is simply
 /// rebuilt by the next request for that title, which is the same outcome as never having booked it.
 pub(crate) const MAX_CONCURRENT_REBUILDS: usize = 8;
+
+/// How often one list (a title under one config, origin and variant) may be rebuilt on request with `?fresh=1`.
+pub(crate) const FRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Says whether `?fresh=1` was honoured: `rebuilt`, or `limited` (answered as a plain request).
+pub(crate) const X_DEN_FRESH: HeaderName = HeaderName::from_static("x-den-fresh");
+
+/// `X-Den-Early-Answer: 1` on a stream list request: a viewer is waiting on this list (the Sources screen, a Play
+/// press), so it may go out `LATE_GRACE` after the first indexer answers rather than on the slowest, with what it
+/// went without reported as `late`. Without it a list waits for every indexer, which is what every request that
+/// judges a list complete (a download's search, race or fallback, an availability check) needs, and what a client
+/// that has never heard of the header keeps getting.
+pub(crate) const X_DEN_EARLY_ANSWER: &str = "x-den-early-answer";
+
+/// How many lists the `?fresh=1` ledger remembers. Entries are only added once the config opens and are swept when
+/// older than FRESH_INTERVAL; past the bound a fresh request is served like a plain one.
+pub(crate) const MAX_FRESH_KEYS: usize = 4096;
 
 /// What /health says about that state, and what the log line marking the flip says too.
 pub(crate) const INDEXERS_DOWN_DETAIL: &str =
@@ -376,6 +395,37 @@ impl RebuildGate {
     #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.live
+    }
+}
+
+/// When each list was last rebuilt on `?fresh=1`: at most one rebuild per key per FRESH_INTERVAL, and never more
+/// than MAX_FRESH_KEYS keys held.
+#[derive(Default)]
+pub(crate) struct FreshGate {
+    at: HashMap<String, Instant>,
+}
+
+impl FreshGate {
+    /// Records a rebuild of `key` at `now`. False when one ran within FRESH_INTERVAL, or when the ledger is full of
+    /// entries still inside it.
+    pub(crate) fn claim(&mut self, key: &str, now: Instant) -> bool {
+        let live = |at: &Instant| now.saturating_duration_since(*at) < FRESH_INTERVAL;
+        if self.at.get(key).is_some_and(live) {
+            return false;
+        }
+        if self.at.len() >= MAX_FRESH_KEYS {
+            self.at.retain(|_, at| live(at));
+            if self.at.len() >= MAX_FRESH_KEYS {
+                return false;
+            }
+        }
+        self.at.insert(key.to_owned(), now);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.at.len()
     }
 }
 
@@ -664,7 +714,7 @@ fn to_stremio_stream(s: &RawStream, sid: &StreamId, play_url: &dyn Fn(&PlayTarge
         target.release_size = n;
     }
     let url = play_url(&target);
-    let attrs = stream_attributes(s.clone());
+    let attrs = stream_attributes_ref(s);
     // Counted here rather than at the scrape: this is the one place every stream a client is actually
     // offered passes through, which is the population oxyc/den#26 estimates and nothing measures.
     metrics().release(&attrs);
@@ -672,7 +722,7 @@ fn to_stremio_stream(s: &RawStream, sid: &StreamId, play_url: &dyn Fn(&PlayTarge
         name: "Den Scout".to_owned(),
         title: s.title.clone(), // raw release name
         behavior_hints: StreamHints {
-            binge_group: binge_group(&str::to_lowercase(&s.title), &s.title),
+            binge_group: binge_group_of(s),
             not_web_ready: !web_ready(s, &url),
             filename: s.title.clone(),
         },
@@ -765,6 +815,8 @@ pub(crate) struct BuildResult {
     complete: bool,
     /// The build's phases as Server-Timing entries — scrape, cache-check, and probe when it ran.
     timing: String,
+    /// It went out without a `late` source: answered to its own requester only, with `no-store`.
+    answered_early: bool,
 }
 
 /// Outcome of consulting the list-build singleflight. Busy is deliberately distinct from a failed build: no
@@ -786,6 +838,8 @@ pub(crate) struct RankedList {
     pub(crate) complete: bool,
     pub(crate) coverage: Coverage,
     pub(crate) timing: String,
+    /// Some source was left `late` (an early answer the request asked for).
+    pub(crate) answered_early: bool,
 }
 
 /// Where a stream list lives: the config segment and title the request named, the origin its play URLs name, and
@@ -807,6 +861,10 @@ struct ListJob {
     cache_key: String,
     client: Option<ClientPlayable>,
     rid: String,
+    /// Built past the kept indexer answers (`?fresh=1`).
+    fresh: bool,
+    /// The request asked for an early answer (`X_DEN_EARLY_ANSWER`).
+    early: bool,
 }
 
 impl ListJob {
@@ -819,7 +877,19 @@ impl ListJob {
             cache_key: key.cache_key.to_owned(),
             client,
             rid,
+            fresh: false,
+            early: false,
         }
+    }
+
+    fn fresh(mut self) -> ListJob {
+        self.fresh = true;
+        self
+    }
+
+    fn early(mut self) -> ListJob {
+        self.early = true;
+        self
     }
 }
 
@@ -839,6 +909,11 @@ pub(crate) struct RankOpts<'a> {
     pub(crate) rid: &'a str,
     /// The viewer's preferred audio languages, most wanted first; empty where the request names none (a stream list).
     pub(crate) audio: &'a [String],
+    /// Ask every indexer again instead of answering from its kept answer.
+    pub(crate) fresh: bool,
+    /// The request asked for an early answer: go out once the indexers that have answered have had `LATE_GRACE` to
+    /// be joined, rather than on the slowest (see `scrape_covered_until`, `X_DEN_EARLY_ANSWER`).
+    pub(crate) answer_early: bool,
 }
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
@@ -855,13 +930,8 @@ pub(crate) struct Inner {
     /// The probe fan-out's own singleflight (Go shares `sf` and prefixes the key with "probe:").
     probe_flight: Flight<()>,
     rebuilds: Mutex<RebuildGate>,
-    /// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
-    /// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
-    scrape_fails: AtomicI32,
-    /// Consecutive builds a source missed (coverage incomplete), total failures included. Surfaced on /health
-    /// as a state, never a count: a count that rises per build is a timeline of when the household browses,
-    /// which is why the build counters live behind /metrics' token.
-    partial_builds: AtomicI32,
+    /// `?fresh=1` rebuilds, by list key.
+    fresh: Mutex<FreshGate>,
     /// Availability checks running behind replies, by verdict key — never more than maxAvailabilityChecks,
     /// so the set holds only live checks.
     pub(crate) avail_in_flight: Mutex<HashSet<String>>,
@@ -1109,7 +1179,7 @@ impl Handler {
 fn add_cors(resp: &mut Resp) {
     den_http::cors_stamp(
         resp.headers_mut(),
-        "Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy",
+        "Server-Timing, X-Den-Degraded, X-Den-Fresh, Retry-After, ETag, RateLimit, RateLimit-Policy",
     );
 }
 
@@ -1227,8 +1297,7 @@ impl Inner {
             flights: Mutex::new(HashMap::new()),
             probe_flight: Flight::new(),
             rebuilds: Mutex::new(RebuildGate::default()),
-            scrape_fails: AtomicI32::new(0),
-            partial_builds: AtomicI32::new(0),
+            fresh: Mutex::new(FreshGate::default()),
             avail_in_flight: Mutex::new(HashSet::new()),
             links: LinkMemo::default(),
             legacy_play_noted: AtomicBool::new(false),
@@ -1289,6 +1358,10 @@ impl Inner {
                     check_cache: true,
                     rid: "",
                     audio: &request.audio,
+                    fresh: false,
+                    // The list picks what to play and nothing else: it is not cached, and a miss falls back to
+                    // Remux, which asks again for every indexer before saying there is nothing.
+                    answer_early: request.early_answer && request.filename.is_none(),
                 },
             )
             .await;
@@ -1318,10 +1391,7 @@ impl Inner {
                         subtitles: prepared.subtitles,
                         selected_subtitle: prepared.selected_subtitle,
                         release: ManagedHlsRelease {
-                            label: crate::label::clean_label_lower(
-                                &str::to_lowercase(&candidate.title),
-                                candidate,
-                            ),
+                            label: crate::label::clean_label_traits(candidate.traits(), candidate),
                             filename: candidate.title.clone(),
                             size: candidate.size_bytes.filter(|size| *size > 0),
                         },
@@ -1395,10 +1465,10 @@ impl Inner {
                         "reason": "config_key_invalid",
                         "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
                     });
-                } else if self.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                } else if self.deps.runtime.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                     status =
                         json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
-                } else if self.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                } else if self.deps.runtime.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
                     // Which source is withheld: naming it says which indexers this install uses.
                     status["coverage"] = json!("partial");
                     status["detail"] = json!(SOURCES_MISSING_DETAIL);

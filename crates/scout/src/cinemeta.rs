@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::Cache;
 use crate::indexerconfig::{null_default, read_capped, Flight};
-use crate::rank::YEAR_TOKEN;
 use crate::scrape::{Doer, MAX_SCRAPE_BYTES, SCRAPE_USER_AGENT};
+use crate::traits::YEAR_TOKEN;
 use crate::util::key_hash;
 
 /// Go `cinemetaBase`: the public Cinemeta service.

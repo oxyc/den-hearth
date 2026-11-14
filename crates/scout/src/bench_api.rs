@@ -52,6 +52,31 @@ pub fn rank_episode(streams: &[RawStream]) -> Vec<RawStream> {
     )
 }
 
+/// `rank_movie` ranked for a browser (X-Den-Playable) with a known original language, so every release also
+/// pays the client cost and the audio-language check.
+pub fn rank_movie_web(streams: &[RawStream]) -> Vec<RawStream> {
+    rank::rank_streams(
+        streams,
+        RankFilters {
+            exclude_cam: true,
+            result_cap: 100,
+            expected_year: Some(2024),
+            min_seeders: Some(3),
+            expected_title_tokens: rank::title_tokens("Dune Part Two"),
+            client: Some(crate::client::ClientPlayable {
+                h264: 51,
+                hevc_main: 150,
+                hevc_main10: 150,
+                hdr: true,
+                eac3: true,
+                ..Default::default()
+            }),
+            languages: ["en".to_owned()].into_iter().collect(),
+            ..Default::default()
+        },
+    )
+}
+
 pub fn parse_stremio_streams(body: &[u8]) -> Vec<RawStream> {
     crate::scrape::parse_stremio_streams(body, "torrentio")
 }

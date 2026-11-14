@@ -11,6 +11,8 @@ pub(crate) mod health;
 mod listing;
 mod public_status;
 mod status;
+#[cfg(test)]
+pub(crate) use status::{DEAD_SWARM_AFTER, DEAD_SWARM_RECHECK};
 pub(crate) mod support;
 mod transport;
 
@@ -1436,15 +1438,7 @@ impl TorBoxStore {
                 arr.into_iter().nth(i).unwrap_or_default()
             }
         };
-        Ok(entry
-            .files
-            .into_iter()
-            .map(|f| TorrentFile {
-                index: f.id,
-                name: if f.name.is_empty() { f.short_name } else { f.name },
-                size_bytes: f.size,
-            })
-            .collect())
+        Ok(entry.into_files())
     }
 
     /// Go `torBoxStore.resolveHeldTorrent` turns a torrent the account HAS into a playable link: list its files if
@@ -1598,9 +1592,21 @@ pub(crate) fn torbox_status_key(identity: &str, info_hash: &str) -> String {
     )
 }
 
-/// Go `clearTorboxStatus`.
+/// Go `clearTorboxStatus`. The dead-swarm clock goes with the snapshot: whatever made the snapshot stale (an add,
+/// a resolve, a reannounce) is a new start for the swarm too.
 pub(crate) fn clear_torbox_status(cache: &dyn Cache, identity: &str, info_hash: &str) {
     clear(cache, &torbox_status_key(identity, info_hash));
+    clear(cache, &torbox_dead_swarm_key(identity, info_hash));
+}
+
+/// When a torrent was first seen stalled with no seeds, and at what progress: `<unix ms>:<progress>`. See
+/// `TorBoxStore::status_ttl`.
+pub(crate) fn torbox_dead_swarm_key(identity: &str, info_hash: &str) -> String {
+    format!(
+        "torbox:deadswarm:{}:{}",
+        key_hash(&canonical_torbox_identity(identity)),
+        str::to_lowercase(info_hash)
+    )
 }
 
 /// Go `torboxAddedKey` records that THIS process is the one that asked TorBox to fetch a hash, as opposed to
@@ -2052,6 +2058,31 @@ impl ListEntry {
         }
         ListEntry::read(v)
     }
+
+    fn into_files(self) -> Vec<TorrentFile> {
+        self.files
+            .into_iter()
+            .map(|f| TorrentFile {
+                index: f.id,
+                name: if f.name.is_empty() { f.short_name } else { f.name },
+                size_bytes: f.size,
+            })
+            .collect()
+    }
+}
+
+/// The file list a by-id mylist answer carries for torrent `torrent_id`, read the way `listFiles` reads it but
+/// stricter where it has a choice: in a listing-shaped answer only an entry naming this exact id is taken, never an
+/// unlabelled one. Empty when the answer lists nothing usable, which a caller treats as "not known".
+pub(super) fn finished_files(data: Option<&Value>, torrent_id: i64) -> Vec<TorrentFile> {
+    let Some(data) = data else { return Vec::new() };
+    let data = fold_entry_keys(data.clone(), &LIST_FILES_ENTRY, &LIST_FILES_ENTRIES);
+    let entry = match &data {
+        Value::Object(_) => ListEntry::read(&data).filter(|e| e.id == 0 || e.id == torrent_id),
+        Value::Array(items) => items.iter().filter_map(ListEntry::read).find(|e| e.id == torrent_id),
+        _ => None,
+    };
+    entry.map(ListEntry::into_files).unwrap_or_default()
 }
 
 /// Go `torboxResolveEntry`. The cache holds it as JSON in Go's spelling, so a value written by either side reads
@@ -2708,6 +2739,8 @@ impl TorBoxStore {
         };
         if reannounce {
             self.control_torrent(torrent_id, "reannounce").await?;
+            // A reannounce is a new chance at a swarm: the next poll asks TorBox rather than a held snapshot.
+            clear_torbox_status(cache, &identity, info_hash);
             return Ok(CancelOutcome { done: true, reannounced: true, status, ..Default::default() });
         }
         self.control_torrent(torrent_id, "delete").await?;

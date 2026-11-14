@@ -313,6 +313,24 @@ mod tests {
     /// h264.mkv's keyframes, as ffprobe reports them (testdata/README.md).
     const KF: [f64; 11] = [0.0, 2.5, 5.0, 8.0, 10.5, 13.0, 16.0, 19.5, 22.0, 24.0, 27.5];
 
+    /// `cargo test --release stretch_rate_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stretch_rate_timing() {
+        // Two hours in ~6 s segments, with the sizes of a film that has heavy scenes.
+        let segs: Vec<Segment> =
+            (0..1200).map(|i| Segment { start: i as f64 * 6.0, end: (i + 1) as f64 * 6.0 }).collect();
+        let bytes: Vec<f64> = (0..1200).map(|i| 3_000_000.0 + ((i * 7919) % 1000) as f64 * 9_000.0).collect();
+        for buffer in [Buffer { secs: 30.0, bytes: None }, Buffer { secs: 30.0, bytes: Some(150_000_000) }] {
+            let t = std::time::Instant::now();
+            let mut rate = 0.0;
+            for _ in 0..20 {
+                rate = std::hint::black_box(stretch_rate(&segs, &bytes, 0, buffer));
+            }
+            eprintln!("stretch_rate {buffer:?}: {:?} per call -> {rate}", t.elapsed() / 20);
+        }
+    }
+
     #[test]
     fn cuts_land_on_the_first_keyframe_at_or_after_each_target() {
         let segs = segments(&KF, 30.021, TARGET_SECS);
