@@ -46,15 +46,16 @@ pub struct ClientDolbyVision {
 
 /// What a release costs in rank, for this browser, by what den-remux will have to do for it to play.
 ///
-/// Converted audio costs about a source bonus: den-remux does it on the CPU as it goes, and the picture is the
-/// release's own, so a 4K release whose TrueHD becomes AAC still ranks above a 1080p one. Video nobody named
-/// costs the same, since den-remux's probe settles it when the file is opened.
+/// Converted audio costs less than a source bonus: den-remux does it on the CPU as it goes and the picture is the
+/// release's own, so a Blu-ray whose DTS becomes AAC still ranks above a smaller re-encode whose AAC plays as it
+/// is. Video nobody named costs more, since it may yet turn out to need the GPU; den-remux's probe settles it
+/// when the file is opened.
 ///
 /// Converted video costs more than the widest spread quality alone produces (4860, see preferenceSink), so every
 /// release that plays as it is ranks above every one that has to be transcoded — one at a time on the box's GPU,
 /// at most 1080p, tone-mapped — while staying under the cached bonus, so a cached conversion still beats a
 /// download. A release that can't play here at all sinks below every one that can, and stays above junk.
-pub(crate) const AUDIO_CONVERTED_COST: i64 = 300;
+pub(crate) const AUDIO_CONVERTED_COST: i64 = 50;
 pub(crate) const VIDEO_UNNAMED_COST: i64 = 300;
 pub(crate) const VIDEO_CONVERTED_COST: i64 = 6000;
 pub(crate) const NEVER_PLAYS_COST: i64 = 60000;

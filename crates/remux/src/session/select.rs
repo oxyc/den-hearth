@@ -368,10 +368,13 @@ pub async fn create(
         let head_start = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
             prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
         };
+        // A Cast receiver shows no countdown and its sender returns at once, so nothing covers a wait past the short
+        // budget there: a receiver left on a black screen for a minute reads as broken.
+        let countdown = if want.player == Some("cast") { MAX_PREBUFFER } else { LONG_PREBUFFER };
         if chosen.is_none() && !want.fits_only {
             // The best-ranked copy the countdown covers, not the one with the shortest wait: that is only ever the
             // smallest, and a longer wait at the start is the price of the better picture.
-            let longer = (0..too_big.len()).find(|&i| head_start(&too_big[i]) <= LONG_PREBUFFER);
+            let longer = (0..too_big.len()).find(|&i| head_start(&too_big[i]) <= countdown);
             if let Some(i) = longer {
                 let (c, found) = too_big.swap_remove(i);
                 chosen = Some((c, found, false));
@@ -384,7 +387,7 @@ pub async fn create(
             let nearest = (0..too_big.len()).min_by_key(|&i| bitrate(&too_big[i]).unwrap_or(u64::MAX));
             let why = match (from_too_big, nearest.map(|i| &too_big[i])) {
                 (true, Some(t)) => format!(
-                    "no copy plays within a {LONG_PREBUFFER:.0}s head start on the {} kbit/s link; the nearest, \"{}\", \
+                    "no copy plays within a {countdown:.0}s head start on the {} kbit/s link; the nearest, \"{}\", \
                  needs {}",
                     max_bitrate.unwrap_or(0) / 1000,
                     t.0.attributes.label,

@@ -72,15 +72,71 @@ fn rank_streams_for_the_browser_that_asked() {
             vec![web.title.clone(), remux.title.clone(), xvid.title.clone(), dv5.title.clone()],
         ),
         (
-            "Dolby Vision 5 shown: the 4K web release copies whole, ahead of the remux whose TrueHD is converted",
+            "Dolby Vision 5 shown: it plays, but the 4K remux whose TrueHD is converted is still the better picture",
             Some(a_browser(|p| p.dolby_vision.p5 = true)),
-            vec![dv5.title.clone(), remux.title.clone(), web.title.clone(), xvid.title.clone()],
+            vec![remux.title.clone(), dv5.title.clone(), web.title.clone(), xvid.title.clone()],
         ),
     ];
     for (name, client, want) in cases {
         let got = rank(client);
         assert_eq!(got.join("|"), want.join("|"), "{name}: order\n got {got:?}\nwant {want:?}");
     }
+}
+
+/// A guest's Chrome on macOS, one episode's list (The Sopranos S02E05, 2026-11-14): a 3.5 GB H.264 "4K" ranked
+/// first and never played, and a 0.9 GB 10-bit x265 re-encode won the pick over the Blu-ray and web releases,
+/// because converting their DTS or DD+ cost more than their source and three times their size were worth.
+#[test]
+fn rank_a_bigger_release_of_one_resolution_above_a_small_re_encode() {
+    let gb = |n: f64| Some((n * crate::rank::GIB as f64) as i64);
+    let release = |title: &str, size: Option<i64>| {
+        rs(title, |s| {
+            s.info_hash = title.into();
+            s.size_bytes = size;
+        })
+    };
+    let remux = release("The.Sopranos.S02E05.1080p.BluRay.REMUX.AVC.DTS-HD.MA.5.1-EPSiLON.mkv", gb(10.4));
+    let bluray = release("The.Sopranos.S02E05.1080p.BluRay.x264.DTS-SbR.mkv", gb(4.4));
+    let web = release("The.Sopranos.S02E05.1080p.WEB-DL.DD+5.1.H.264-NTb.mkv", gb(2.9));
+    let fake_4k = release("The.Sopranos.S02E05.2160p.WEB-DL.H.264.AAC-XEBEC.mp4", gb(3.5));
+    let hazmatt = release("The Sopranos S02E05 1080p Bluray 10bit x265 AAC 5.1 HazMatt.mkv", gb(0.87));
+    let small = release("The.Sopranos.S02E05.1080p.BluRay.x264.AAC-YTS.mp4", gb(0.41));
+    let all = [fake_4k.clone(), hazmatt.clone(), small.clone(), web.clone(), bluray.clone(), remux.clone()];
+    let got = titles(&rank_streams(
+        &all,
+        RankFilters { result_cap: 10, client: Some(a_browser(|_| {})), ..Default::default() },
+    ));
+    let at = |s: &RawStream| got.iter().position(|t| *t == s.title).unwrap();
+    assert_eq!(got[0], remux.title, "the remux leads: {got:?}");
+    assert!(at(&bluray) < at(&hazmatt), "the 4.4 GB Blu-ray above the re-encode: {got:?}");
+    assert!(at(&hazmatt) < at(&small), "{got:?}");
+    assert!(at(&web) < at(&small), "{got:?}");
+    assert!(at(&fake_4k) > at(&bluray), "a 9 Mbit/s H.264 “4K” ranks as the 1080p it is: {got:?}");
+}
+
+#[test]
+fn a_2160p_release_is_judged_by_its_bitrate_for_the_codec_it_names() {
+    use crate::rank::starved_4k;
+    let gib = |n: f64| Some((n * crate::rank::GIB as f64) as i64);
+    let starved = |title: &str, size: Option<i64>, height: i32| {
+        let s = rs(title, |s| {
+            s.size_bytes = size;
+            if height > 0 {
+                s.probe = Some(Probe { height, ..Default::default() });
+            }
+        });
+        starved_4k(s.traits(), &s)
+    };
+    assert!(starved("Show.S01E01.2160p.WEB-DL.H.264-X.mkv", gib(3.5), 0), "H.264 episode at ~11 Mbit/s");
+    assert!(!starved("Show.S01E01.2160p.WEB-DL.H.264-X.mkv", gib(6.0), 0), "H.264 episode at ~19 Mbit/s");
+    assert!(!starved("Show.S01E01.2160p.WEB-DL.HEVC-X.mkv", gib(3.5), 0), "HEVC episode at ~11 Mbit/s");
+    assert!(starved("Show.S01E01.2160p.WEB-DL.HEVC-X.mkv", gib(1.5), 0), "HEVC episode at ~4.8 Mbit/s");
+    assert!(starved("Film.2024.2160p.WEB-DL.H.264-X.mkv", gib(9.0), 0), "H.264 film at ~13 Mbit/s");
+    assert!(!starved("Film.2024.2160p.WEB-DL.HEVC-X.mkv", gib(9.0), 0), "HEVC film at ~13 Mbit/s");
+    assert!(!starved("Film.2024.2160p.WEB-DL-X.mkv", gib(3.5), 0), "no codec named: only the size floor");
+    assert!(starved("Film.2024.2160p.WEB-DL-X.mkv", gib(0.5), 0), "under the size floor");
+    assert!(starved("Film.2024.2160p.WEB-DL.HEVC-X.mkv", gib(20.0), 1080), "probed at 1080 lines");
+    assert!(!starved("Film.2024.2160p.WEB-DL.HEVC-X.mkv", None, 0), "size unknown: no judgement");
 }
 
 #[test]
