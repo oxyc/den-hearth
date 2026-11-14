@@ -784,6 +784,12 @@ impl Job {
         pull_summary(self.id, self.start, media, self.bytes, running.as_secs_f64(), paused.as_secs_f64(), why)
     }
 
+    /// Whether the run is still starting: under `within` old, still running, and not one GOP taken from it yet.
+    /// Replacing such a run wastes its seek into the source and the new one's too.
+    pub fn starting(&self, within: Duration) -> bool {
+        self.read == 0 && self.exit.is_none() && !self.stopped && self.began.elapsed() < within
+    }
+
     /// Has ffmpeg exited? Reaps it if so.
     pub fn poll_exit(&mut self) -> Option<bool> {
         if self.exit.is_none() {

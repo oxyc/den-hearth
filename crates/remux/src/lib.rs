@@ -498,8 +498,9 @@ where
         );
     };
     if let Some((code, message)) = r.failure() {
+        let context = state.session(sid).map(|s| format!(" — {}", s.failure_context())).unwrap_or_default();
         eprintln!(
-            "session {short}: the player couldn't play it: error {code} \"{}\"",
+            "session {short}: the player couldn't play it: error {code} \"{}\"{context}",
             redact::player_message(message)
         );
         state.end_session(sid, "player_error").await;

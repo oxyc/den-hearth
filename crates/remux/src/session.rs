@@ -61,6 +61,10 @@ const INIT_WAIT: Duration = Duration::from_secs(15);
 /// against a native player's own, much shorter patience for a stalled request.
 const RESTART_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
+/// A job younger than this that has not produced a GOP yet is waited for rather than replaced. Two readers asking
+/// for segments far apart (a second tab, Cast beside the browser) otherwise replace each other's run before either
+/// produces anything, over and over; this lets each run give its reader something first.
+const STARTING_JOB_GRACE: Duration = Duration::from_secs(4);
 /// How often the supervisor looks at a RUNNING job. A paused one is not looked at at all.
 const TICK: Duration = Duration::from_millis(500);
 /// Timestamps within this of each other name the same keyframe. Keyframes are at least a few frames
@@ -461,6 +465,20 @@ impl Session {
         format!("private, max-age={}", self.exp.saturating_sub(unix_now()))
     }
 
+    /// Where the session stood, for a player's fatal error: the newest segment asked for and the run producing, so a
+    /// decode failure can be set against a run's start (a cut) or a seek.
+    pub fn failure_context(&self) -> String {
+        let i = self.lock();
+        let run = match &i.job {
+            Some(job) => format!("job {} from {:.1}s", job.id, job.start),
+            None => "no job".to_string(),
+        };
+        format!(
+            "newest segment asked seg{}, {run}, {} jobs started, {} segments served",
+            i.want, i.next_job, i.segments_served
+        )
+    }
+
     /// The segment production follows. Tests use it to see where a resume's first job will start.
     #[cfg(test)]
     pub fn wanted(&self) -> usize {
@@ -826,13 +844,25 @@ impl Session {
         tokio::time::timeout_at(deadline.into(), self.ensure_resolved(st)).await.map_err(|_| ())??;
         let gate =
             tokio::time::timeout_at(deadline.into(), self.producer_gate.lock()).await.map_err(|_| ())?;
-        let old = {
-            let mut i = self.lock();
-            self.refresh(&mut i, st);
-            if !self.producer_needed(&i, n)? {
-                return Ok(());
+        let old = loop {
+            let taken = {
+                let mut i = self.lock();
+                self.refresh(&mut i, st);
+                if !self.producer_needed(&i, n)? {
+                    return Ok(());
+                }
+                match i.job.as_ref().is_some_and(|job| job.starting(STARTING_JOB_GRACE)) {
+                    true => None,
+                    false => Some(i.job.take()),
+                }
+            };
+            if let Some(old) = taken {
+                break old;
             }
-            i.job.take()
+            if Instant::now() + POLL >= deadline {
+                return Err(());
+            }
+            tokio::time::sleep(POLL).await;
         };
         if let Some(old) = old {
             if old.exit.is_none() {
@@ -2615,25 +2645,25 @@ mod tests {
         let (info, size) = front_loaded();
         assert_eq!(average_bitrate(Some(size), info.duration), Some(2_500_000));
         // hls.js holds two minutes and 150 MB: all of the heavy stretch. Everything to its end, 1320 Mbit, must be in by
-        // the time its last 6 s segment plays (234 s) plus the 10 s allowed: 1320 / 244.
+        // the time its last 6 s segment plays (234 s) plus the 20 s allowed: 1320 / 254.
         let deep = delivery(size, 0.0, Some("hls.js"));
         let from_start = need(&info, &deep).unwrap();
         assert!(from_start.indexed);
-        assert!((5_400_000..5_420_000).contains(&from_start.bitrate), "{from_start:?}");
+        assert!((5_180_000..5_200_000).contains(&from_start.bitrate), "{from_start:?}");
         assert!(over(Some(4_000_000), Some(from_start)), "4 Mbit/s carries the average, not the film");
         assert!(
             over(Some(6_000_000), Some(from_start)),
-            "6 Mbit/s carries it with 10% to spare, short of the 30%"
+            "6 Mbit/s carries it with 15% to spare, short of the 20%"
         );
         assert!(!over(Some(8_000_000), Some(from_start)));
         let wait = prebuffer(&info, &deep, Some(6_000_000)).unwrap();
         assert!((0.0..=MAX_PREBUFFER).contains(&wait), "{wait}");
         // At 4 Mbit/s even two minutes ahead can't carry the 1200 Mbit stretch (it needs 5.1): no wait up front would do.
         assert_eq!(prebuffer(&info, &deep, Some(4_000_000)), None);
-        assert!(prebuffer(&info, &deep, Some(5_300_000)).unwrap() > MAX_PREBUFFER);
+        assert!(prebuffer(&info, &deep, Some(5_150_000)).unwrap() > MAX_PREBUFFER);
         // Resumed at the heavy stretch, the cheap opening no longer builds a lead: 6 Mbit/s isn't enough there.
         let resumed = need(&info, &delivery(size, 121.0, Some("hls.js"))).unwrap();
-        assert!(resumed.bitrate > 9_000_000, "{resumed:?}");
+        assert!(resumed.bitrate > 8_500_000, "{resumed:?}");
         assert!(over(Some(6_000_000), Some(resumed)));
     }
 
@@ -2730,8 +2760,8 @@ mod tests {
         assert_eq!(n, Need { bitrate: 1_500_000, indexed: false });
         assert!(n.to_string().contains("no byte index"), "the log says it is a guess: {n}");
         assert!(!over(None, Some(n)), "no maxBitrate: every release fits");
-        assert!(!over(Some(2_142_858), Some(n)), "at the limit, which keeps its headroom, fits");
-        assert!(over(Some(2_142_000), Some(n)));
+        assert!(!over(Some(1_875_000), Some(n)), "at the limit, which keeps its headroom, fits");
+        assert!(over(Some(1_874_000), Some(n)));
         let unknown = Delivery { bytes: None, ..delivery(0, 0.0, None) };
         assert_eq!(need(&plain, &unknown), None, "an unknown size says nothing");
         assert!(!over(Some(1), None), "and nothing said fits");

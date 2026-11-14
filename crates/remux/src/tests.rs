@@ -2445,7 +2445,7 @@ async fn every_early_selection_refusal_gets_one_bounded_complete_list() {
         (
             "tt0000065",
             "fit",
-            r#", "playable":{"h264":51,"hevcMain":153},"maxBitrate":230000,"fitsOnly":true"#,
+            r#", "playable":{"h264":51,"hevcMain":153},"maxBitrate":160000,"fitsOnly":true"#,
             2,
             1,
         ),
@@ -3892,6 +3892,31 @@ async fn hevc_for_a_player_without_it_takes_the_one_transcode() {
     state.end_all("test").await;
 }
 
+/// Two readers of one session asking for segments far apart at once — a second tab, Cast beside the browser — each
+/// used to replace the run the other had just started, before either produced a GOP: 748 runs in a minute, none with
+/// a picture in it. A run still starting is waited for (`STARTING_JOB_GRACE`), so the restarts stay a handful.
+#[tokio::test]
+async fn two_readers_far_apart_do_not_replace_each_others_starting_run() {
+    let origin = origin().await;
+    let state = test_state(&origin, 1, Duration::from_secs(600));
+    let body = format!(r#"{{"imdb":"tt0000009","scout":"{origin}/cfg"}}"#);
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let base = r.json()["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+    let last = extinfs(&call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text()).len() - 1;
+    assert!(last > 3, "the fixture needs segments far enough apart to restart for: {last}");
+    let before = state.jobs_started.load(Relaxed);
+    let get = |n: usize| {
+        let (state, base) = (state.clone(), base.clone());
+        async move { call(&state, "GET", &format!("{base}seg{n}.m4s"), None, "").await.status }
+    };
+    let both = futures_util::future::join(get(0), get(last));
+    let _ = tokio::time::timeout(Duration::from_secs(8), both).await;
+    let started = state.jobs_started.load(Relaxed) - before;
+    assert!(started <= 4, "{started} runs started in 8 s for two readers");
+    state.end_all("test").await;
+}
+
 /// A player's fatal report — `error 3 "Media failed to decode"` and its like — frees the session's slot at
 /// once rather than waiting SESSION_IDLE_SECS for a tab that already gave up on it: the box's own cap is
 /// just one session here, so only ending the first on its report leaves room for the second.
@@ -4008,7 +4033,7 @@ async fn a_player_naming_its_link_gets_a_release_that_fits_it() {
     };
     let cases = [
         (hevc.to_string(), "h264.mkv"),
-        (format!(r#"{hevc},"maxBitrate":190000"#), "hevc.mkv"),
+        (format!(r#"{hevc},"maxBitrate":160000"#), "hevc.mkv"),
         (format!(r#"{hevc},"maxBitrate":100000"#), "hevc.mkv"),
         (format!(r#"{h264},"maxBitrate":100000"#), "h264.mkv"),
     ];
@@ -4047,12 +4072,12 @@ async fn a_player_naming_its_link_gets_a_release_that_fits_it() {
     assert_eq!(call(&state, "POST", "/remux/session", None, &body).await.status, StatusCode::BAD_REQUEST);
 }
 
-/// Selection's order once nothing fits within ten seconds' head start: a copy that asks at most thirty, then a
+/// Selection's order once nothing fits within twenty seconds' head start: a copy that asks at most sixty, then a
 /// transcode sized to the link, then the copy that starves least — a transcode that would starve too ranks below it.
 /// h264.mkv, the one copy an H.264-only player takes of tt0000014, is made ten minutes long with a heavy first minute by
 /// seeding what its opening found; hevc.mkv plays for it only converted.
 #[tokio::test]
-async fn a_copy_within_thirty_seconds_then_a_transcode_then_the_least_starving_copy() {
+async fn a_copy_within_sixty_seconds_then_a_transcode_then_the_least_starving_copy() {
     let origin = origin().await;
     let bytes = fixture("h264.mkv");
     let probed = probe_with_head(&bytes, crate::scout::HEAD_BYTES as usize).await;
@@ -4095,11 +4120,11 @@ async fn a_copy_within_thirty_seconds_then_a_transcode_then_the_least_starving_c
     let picked = |j: &serde_json::Value| {
         (j["release"]["filename"].as_str().map(String::from), j["video"]["transcoded"].as_bool())
     };
-    // 8.1 Mbit/s for a minute on a 10 Mbit/s link, 7 of it with headroom: about 16 s of head start, which the copy is
+    // 11 Mbit/s for a minute on a 10 Mbit/s link, 8 of it with headroom: about 29 s of head start, which the copy is
     // given over a conversion.
-    let j = start(8.14e6, 10_000_000).await;
+    let j = start(11e6, 10_000_000).await;
     assert_eq!(picked(&j), (Some("h264.mkv".into()), Some(false)), "{j}");
-    assert!(j["prebuffer"].as_f64().is_some_and(|p| (10.0..=30.0).contains(&p)), "{j}");
+    assert!(j["prebuffer"].as_f64().is_some_and(|p| (20.0..=60.0).contains(&p)), "{j}");
     // 12 Mbit/s: no head start carries it, and a 1080p conversion at the link's rate does.
     let j = start(12e6, 6_600_000).await;
     assert_eq!(picked(&j), (Some("hevc.mkv".into()), Some(true)), "{j}");
