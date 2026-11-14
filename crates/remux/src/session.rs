@@ -465,6 +465,20 @@ impl Session {
         format!("private, max-age={}", self.exp.saturating_sub(unix_now()))
     }
 
+    /// Where the session stood, for a player's fatal error: the newest segment asked for and the run producing, so a
+    /// decode failure can be set against a run's start (a cut) or a seek.
+    pub fn failure_context(&self) -> String {
+        let i = self.lock();
+        let run = match &i.job {
+            Some(job) => format!("job {} from {:.1}s", job.id, job.start),
+            None => "no job".to_string(),
+        };
+        format!(
+            "newest segment asked seg{}, {run}, {} jobs started, {} segments served",
+            i.want, i.next_job, i.segments_served
+        )
+    }
+
     /// The segment production follows. Tests use it to see where a resume's first job will start.
     #[cfg(test)]
     pub fn wanted(&self) -> usize {
