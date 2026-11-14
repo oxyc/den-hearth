@@ -20,8 +20,9 @@ struct Configs {
     scout_mount: Option<den_scout::deps::Settings>,
     scout_own: Option<den_scout::deps::Settings>,
     den: den::Den,
-    /// Where Remux and Subtitles reach Scout in process (`inproc`).
+    /// Where Remux and Subtitles reach Scout, and the combined addon, in process (`inproc`).
     scout_bases: Vec<inproc::Base>,
+    den_bases: Vec<String>,
     metrics_token: Option<String>,
     managed_playback: bool,
     wanted_file: Option<std::path::PathBuf>,
@@ -60,7 +61,7 @@ async fn run(c: Configs) -> std::io::Result<()> {
     if looks_for_downloads {
         wanted::start(hearth.clone());
     }
-    let in_process = inproc::install(&hearth, &c.scout_bases);
+    let in_process = inproc::install(&hearth, &c.scout_bases, &c.den_bases);
     let (stop, shutdown) = watch::channel(false);
     let signal = shutdown_signal();
     tokio::spawn(async move {
@@ -176,6 +177,23 @@ fn stub_upstreams(reel: &mut den_reel::Config, subs: &mut den_subtitles::Config)
     eprintln!("stub-upstreams: the TMDB, KinoCheck and OpenSubtitles bases come from HEARTH_STUB_* (benchmark build)");
 }
 
+/// Let Remux take Den installs and subtitles at `origin`, and Subtitles follow resync targets there: an origin that
+/// is this process (see `main`).
+pub(crate) fn trust_own_origin(
+    remux: &mut den_remux::Config,
+    subs: Option<&mut den_subtitles::Config>,
+    origin: &str,
+) {
+    if let Some(subs) = subs {
+        subs.add_scout_origin(origin);
+    }
+    for origins in [&mut remux.scout_origins, &mut remux.subtitle_origins] {
+        if !origins.iter().any(|o| o == origin) {
+            origins.push(origin.to_string());
+        }
+    }
+}
+
 /// `raw`, the value of variable `name`, parsed as a `T`; `default` when it is unset, and also when it
 /// is set but unusable, which is said rather than silently replaced.
 pub(crate) fn parsed_or<T: std::str::FromStr + std::fmt::Display>(
@@ -222,18 +240,16 @@ pub(crate) fn main() {
     let mut remux = services
         .has(Service::Remux)
         .then(|| den_remux::Config::from_lookup(|name| env::lookup("REMUX_", None, name)));
-    // This reserved origin never leaves the process. Remux still applies its ordinary origin SSRF guards, then
-    // `inproc` serves only the combined addon's Scout and Subtitles resource slices for it.
+    let hearth_public = std::env::var("HEARTH_PUBLIC_BASE_URL").ok();
+    // Origins that are this process: the reserved playback origin, which never leaves it, and the public origin a
+    // browser saves this node's own Den installs at. Remux still applies its ordinary origin SSRF guards, then
+    // `inproc` serves only the combined addon's Scout and Subtitles resource slices for them, so no request to
+    // either crosses a socket and no operator setting can fall out of step with `HEARTH_PUBLIC_BASE_URL`.
     if services.playback() {
-        if let Some(subs) = subs.as_mut() {
-            subs.add_scout_origin(playback::DEN_SCOUT_ORIGIN);
-        }
+        let own = inproc::own_den_origin(hearth_public.as_deref());
         let remux = remux.as_mut().expect("playback selection has remux");
-        if !remux.scout_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
-            remux.scout_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
-        }
-        if !remux.subtitle_origins.iter().any(|origin| origin == playback::DEN_SCOUT_ORIGIN) {
-            remux.subtitle_origins.push(playback::DEN_SCOUT_ORIGIN.to_string());
+        for origin in std::iter::once(playback::DEN_SCOUT_ORIGIN).chain(own.as_deref()) {
+            trust_own_origin(remux, subs.as_mut(), origin);
         }
     }
     #[cfg(feature = "stub-upstreams")]
@@ -258,12 +274,14 @@ pub(crate) fn main() {
         inproc::scout_bases(
             port,
             scout_port,
-            std::env::var("HEARTH_PUBLIC_BASE_URL").ok().as_deref(),
+            hearth_public.as_deref(),
             &scout_own.as_ref().expect("selected Scout has settings").public_url,
         )
     } else {
         Vec::new()
     };
+    let den_bases =
+        if services.playback() { inproc::den_bases(port, hearth_public.as_deref()) } else { Vec::new() };
 
     // Scout's key as Scout reads it: the Den addon's ring is derived from it when it has none of its own.
     let den = den::Den::from_env(
@@ -306,6 +324,7 @@ pub(crate) fn main() {
         scout_own,
         den,
         scout_bases,
+        den_bases,
         metrics_token,
         managed_playback,
         wanted_file,

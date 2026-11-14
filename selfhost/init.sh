@@ -27,7 +27,6 @@ if [ -n "$public_base" ]; then
             ;;
     esac
 fi
-origin_alias=${public_base:+$public_base=http://127.0.0.1:8090}
 
 umask 077
 tmp=$(mktemp "${target}.XXXXXX")
@@ -48,8 +47,6 @@ sed \
     -e "s|^REEL_PLAY_SECRET=$|REEL_PLAY_SECRET=$reel_play|" \
     -e "s|^REMUX_URL_KEY=$|REMUX_URL_KEY=$remux_url|" \
     -e "s|^HEARTH_PUBLIC_BASE_URL=$|HEARTH_PUBLIC_BASE_URL=$public_base|" \
-    -e "s|^REMUX_SCOUT_ORIGINS=$|REMUX_SCOUT_ORIGINS=$public_base|" \
-    -e "s|^REMUX_ORIGIN_ALIASES=$|REMUX_ORIGIN_ALIASES=$origin_alias|" \
     "$here/.env.example" >"$tmp"
 mv "$tmp" "$target"
 trap - EXIT HUP INT TERM

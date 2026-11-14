@@ -28,17 +28,18 @@ sealed in addon URLs. Losing or changing one breaks that addon's installed URLs.
 also prevents editing signed media links, and the Remux URL key keeps browser sessions valid across restarts. The
 debrid account belongs in the configure page, not in the server environment.
 
-`selfhost/init.sh` also sets `REMUX_SCOUT_ORIGINS` to `HEARTH_PUBLIC_BASE_URL`. Remux deliberately refuses a Den or
-Scout install URL at any other origin, so the combined node can play its own installs without weakening its SSRF
-guard. The generated `REMUX_ORIGIN_ALIASES` maps that public origin back to `http://127.0.0.1:8090` inside the
-container, avoiding public DNS, TLS and router-hairpin dependencies when Remux calls Scout through `/den`.
+Remux plays the installs this node's configure page produces with no further setting. Hearth knows
+`HEARTH_PUBLIC_BASE_URL/den` is itself, so Remux takes those install URLs and reaches Scout in process: no public
+DNS, TLS or router hairpin, and nothing to update when the address changes. Remux still refuses an install URL at
+any other origin, which is its SSRF guard. A public base with a path (behind a path-prefix proxy) is not trusted
+this way; use a bare origin.
 
-If den-edge relays this Hearth and the saved install URL names Edge instead, append that bare origin to the
-comma-separated `REMUX_SCOUT_ORIGINS`. It must be reachable from inside the Hearth container; `localhost` there
-means the container itself. Add a corresponding `public-origin=container-reachable-origin` pair to
-`REMUX_ORIGIN_ALIASES` when Edge's public address cannot be reached directly. For guest or managed playback through
-den-edge, set `REMUX_EDGE_SECRET` in this file to the same private random value used as den-edge's
-`REMUX_EDGE_SECRET`.
+When den-edge relays this Hearth and saved install URLs name Edge's origin instead, list that origin in
+`REMUX_SCOUT_ORIGINS` and map it to this node in `REMUX_ORIGIN_ALIASES`, for example
+`https://den.example=http://127.0.0.1:8090`. The alias is what Remux fetches: inside this container `localhost` is
+the container itself, so map the origin to `127.0.0.1:8090` (served in process) rather than relying on Edge's
+address being reachable from here. For guest or managed playback through den-edge, set `REMUX_EDGE_SECRET` to the
+same private random value as den-edge's `REMUX_EDGE_SECRET`.
 
 ## Choose services
 

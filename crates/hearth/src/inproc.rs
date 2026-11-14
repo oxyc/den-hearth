@@ -11,6 +11,9 @@
 //!     Scout writes into every play URL it hands out), and at the host of `HEARTH_PUBLIC_BASE_URL` when that names
 //!     this process directly (`http://<host>:<PORT>`, no path), which is how the LAN address is known.
 //!   * The main listener's `/scout`, at the loopback names and under `HEARTH_PUBLIC_BASE_URL`.
+//!   * The combined addon's `/den`, at the loopback names and under `HEARTH_PUBLIC_BASE_URL` (`den_bases`): the
+//!     install URL a browser saves from this node's own configure page. Only its Scout and Subtitles resources are
+//!     served there (`call_den`), so the Remux key a call carries never reaches Reel.
 //!
 //! Any other scout URL — someone else's scout, or a name hearth was not told is its own — is fetched over HTTP as it
 //! was, and every hop after scout (the debrid's CDN) always is.
@@ -65,16 +68,43 @@ pub fn scout_bases(
     if let Some(b) = hearth_public {
         bases.push(main(format!("{b}/scout")));
     }
-    // `/den` (the combined addon) is deliberately not a base. If it ever becomes one, it must be limited to Scout's
-    // routes (stream, p, play, account, availability, validate): `/den` also routes to Subtitles and Reel, and the
-    // Remux key a call carries must never reach either.
+    // `/den` (the combined addon) is not a Scout base: it also routes to Subtitles and Reel. `den_bases` serves it
+    // through `call_den`, which admits only the resources Remux and Subtitles ask for.
     let mut seen = std::collections::HashSet::new();
     bases.retain(|b| seen.insert(b.url.clone()));
     bases
 }
 
-/// Serve `bases` in process to Remux and Subtitles. Returns the bases that were taken, for the startup line.
-pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
+/// The origin of `HEARTH_PUBLIC_BASE_URL` when it is a bare http(s) origin, lower-cased as Remux compares origins.
+/// A base with a path (a node behind a path-prefix proxy) has none: a Den install URL under it is not
+/// `<origin>/den/<config>`, the only shape Remux accepts.
+pub fn own_den_origin(hearth_public: Option<&str>) -> Option<String> {
+    let base = hearth_public?.trim().trim_end_matches('/');
+    let uri: Uri = base.parse().ok()?;
+    let scheme = uri.scheme_str().filter(|s| matches!(*s, "http" | "https"))?;
+    let authority = uri.authority().filter(|a| !a.as_str().contains('@'))?;
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return None;
+    }
+    Some(format!("{scheme}://{}", authority.as_str().to_ascii_lowercase()))
+}
+
+/// Where the combined addon is this process: `/den` on the main listener's loopback names, and under the public
+/// origin (`own_den_origin`) a browser saves this node's installs at.
+pub fn den_bases(port: u16, hearth_public: Option<&str>) -> Vec<String> {
+    let mut bases: Vec<String> = LOOPBACK.iter().map(|host| format!("http://{host}:{port}/den")).collect();
+    if let Some(origin) = own_den_origin(hearth_public) {
+        let public = format!("{origin}/den");
+        if !bases.contains(&public) {
+            bases.push(public);
+        }
+    }
+    bases
+}
+
+/// Serve Scout's `bases` and the combined addon's `den_bases` in process to Remux and Subtitles. Returns the bases
+/// that were taken, for the startup line.
+pub fn install(hearth: &Arc<Hearth>, bases: &[Base], den_bases: &[String]) -> Vec<String> {
     if hearth.remux.is_none() && hearth.subs.is_none() {
         return Vec::new();
     }
@@ -100,6 +130,15 @@ pub fn install(hearth: &Arc<Hearth>, bases: &[Base]) -> Vec<String> {
         let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call(weak.clone(), false, req)));
         if let Err(e) = local.add(crate::playback::LEGACY_SCOUT_BASE, serve) {
             eprintln!("scout in process: skipping guest fallback Scout base: {e}");
+        }
+    }
+    if hearth.scout.is_some() && hearth.remux.is_some() {
+        for base in den_bases {
+            let weak = Arc::downgrade(hearth);
+            let serve: den_http::local::Serve = Arc::new(move |req| Box::pin(call_den(weak.clone(), req)));
+            if let Err(e) = local.add(base, serve) {
+                eprintln!("scout in process: skipping a den base: {e}");
+            }
         }
     }
     if hearth.subs.is_some() && hearth.remux.is_some() {
@@ -155,6 +194,32 @@ async fn call_den_scout(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Res
         };
     }
     den_http::not_found()
+}
+
+/// One request to the combined addon at one of `den_bases`, through hearth's own request path under `/den`: the same
+/// admission, revocation, request log and metrics as on the socket, and play URLs written on the public base, which
+/// this same `Local` serves. Only Scout's resources and Subtitles' are reachable, and the Remux key is stripped
+/// before Subtitles; every other path, Reel's included, is a 404 that never reaches the router.
+async fn call_den(hearth: Weak<Hearth>, req: Request<Bytes>) -> hyper::Response<crate::Body> {
+    let Some(hearth) = hearth.upgrade() else {
+        return crate::json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({"error": "shutting_down"}));
+    };
+    let (mut parts, body) = req.into_parts();
+    let ticket = parts.uri.path().starts_with("/p/");
+    match parts.uri.path().trim_start_matches('/').split('/').nth(1) {
+        _ if ticket => {}
+        Some("stream" | "play" | "account" | "availability") => {}
+        Some("subtitles" | "subtitle" | "translate") => {
+            parts.headers.remove("x-den-remux-key");
+        }
+        _ => return den_http::not_found(),
+    }
+    let rooted = format!("/den{}", parts.uri.path_and_query().map_or("/", |p| p.as_str()));
+    match rooted.parse() {
+        Ok(uri) => parts.uri = uri,
+        Err(_) => return crate::bad_path(),
+    }
+    crate::handle(hearth, None, false, Request::from_parts(parts, Full::new(body))).await
 }
 
 /// One request through hearth's own request path, as if it had arrived on Scout's listener (`own`) or on the main
@@ -356,7 +421,7 @@ mod tests {
         let upstream = upstream_stub().await;
         let hearth = hearth_with(crate::admit::Limits::default(), &upstream);
         let (claimed, accepted) = counting_port().await;
-        install(&hearth, &scout_bases(1, Some(claimed), None, ""));
+        install(&hearth, &scout_bases(1, Some(claimed), None, ""), &[]);
         // The same hearth, really listening on Scout's own port elsewhere, for the HTTP side.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let real = listener.local_addr().unwrap().port();
@@ -418,7 +483,7 @@ mod tests {
             "env",
         );
         let hearth = hearth_with_den(crate::admit::Limits::default(), &upstream, den);
-        install(&hearth, &[]);
+        install(&hearth, &[], &[]);
 
         let member =
             r#"{"scout":{"debrid":[{"service":"realdebrid","token":"t"}],"indexers":["torrentio"]}}"#;
@@ -441,6 +506,122 @@ mod tests {
         assert_ne!(ticket.await.unwrap().status(), StatusCode::NOT_FOUND, "the facade routes the ticket");
     }
 
+    /// The install a browser saves from this node's own configure page, `<HEARTH_PUBLIC_BASE_URL>/den/<config>`.
+    /// The public host does not resolve, so only an in-process answer can list it.
+    const NODE: &str = "http://hearth.lan:8090";
+
+    fn node_hearth(trusted: bool, upstream: &str) -> (Arc<Hearth>, String) {
+        const DEN_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let keyring = || den_seal::Keyring::from_env(DEN_PRIV, "").unwrap().unwrap();
+        let den = crate::den::Den::new(
+            Some(keyring()),
+            false,
+            Default::default(),
+            Some(format!("{NODE}/den")),
+            "own",
+        );
+        let mut hearth = hearth_with_den(crate::admit::Limits::default(), upstream, den);
+        let state = Arc::get_mut(&mut hearth).unwrap();
+        let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
+        remux.cfg.scout_origins.clear();
+        remux.cfg.scout_key = Some(REMUX_KEY.into());
+        if trusted {
+            let origin = own_den_origin(Some(&format!("{NODE}/"))).expect("a bare origin");
+            crate::bootstrap::trust_own_origin(&mut remux.cfg, None, &origin);
+        }
+        install(&hearth, &[], &den_bases(8090, Some(NODE)));
+
+        let member =
+            r#"{"scout":{"debrid":[{"service":"realdebrid","token":"t"}],"indexers":["torrentio"]}}"#;
+        let mut framed = vec![den_seal::SEALED_VERSION];
+        framed.extend(den_seal::seal(&keyring().keys[0].pub_key, member.as_bytes()).unwrap());
+        (hearth, den_scout::util::b64url_encode(&framed))
+    }
+
+    async fn releases(hearth: &Arc<Hearth>, install: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({"imdb": "tt0111161", "scout": install}).to_string();
+        let request = Request::post("/remux/releases")
+            .header("content-type", "application/json")
+            .extension(den_remux::Peer("127.0.0.1".parse().unwrap()))
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        let resp = crate::handle(hearth.clone(), None, false, request).await;
+        let status = resp.status();
+        let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A browser on a self-hosted node plays the install it saved from that node's configure page with no operator
+    /// setting: Remux takes `<HEARTH_PUBLIC_BASE_URL>/den/<config>` and lists it in process. The same node without
+    /// the trust is the control, refused by Remux's origin guard, as every such node was before.
+    #[tokio::test]
+    async fn a_node_plays_its_own_public_den_install_with_no_setting() {
+        let upstream = upstream_stub().await;
+        let (hearth, segment) = node_hearth(true, &upstream);
+        let (status, body) = releases(&hearth, &format!("{NODE}/den/{segment}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["releases"].is_array(), "{body}");
+
+        let (untrusted, segment) = node_hearth(false, &upstream);
+        let (status, body) = releases(&untrusted, &format!("{NODE}/den/{segment}")).await;
+        assert_eq!((status, &body["error"]), (StatusCode::BAD_REQUEST, &serde_json::json!("bad_scout")));
+    }
+
+    /// At the public `/den` base, the stream list Remux asks for, and the play ticket it names on that same base, are
+    /// both answered in process; Reel, also under `/den`, is not reachable there with the Remux key.
+    #[tokio::test]
+    async fn the_public_den_base_serves_scout_and_its_tickets_but_never_reel() {
+        let upstream = upstream_stub().await;
+        let (hearth, segment) = node_hearth(true, &upstream);
+        let base = format!("{NODE}/den");
+        let local = hearth.remux.as_ref().unwrap().local_scout.get().expect("installed");
+        assert!(local.serves(&format!("http://127.0.0.1:8090/den/{segment}/stream/movie/tt0111161.json")));
+
+        let list = local
+            .get(&format!("{base}/{segment}/stream/movie/tt0111161.json"), headers(Some(REMUX_KEY)), 1 << 20)
+            .expect("the public den base is served in process")
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK, "{}", String::from_utf8_lossy(list.body()));
+        let list: serde_json::Value = serde_json::from_slice(list.body()).unwrap();
+        let play = list["streams"][0]["url"].as_str().expect("a release with a play URL").to_string();
+        assert!(play.starts_with(&format!("{base}/p/")), "{play}");
+        let ticket =
+            local.get(&play, headers(Some(REMUX_KEY)), 1 << 20).expect("the ticket is served in process");
+        assert_ne!(ticket.await.unwrap().status(), StatusCode::NOT_FOUND, "the den base routes the ticket");
+
+        let reel = local
+            .get(&format!("{base}/{segment}/meta/movie/tt0111161.json"), headers(Some(REMUX_KEY)), 1 << 20)
+            .expect("under the base")
+            .await
+            .unwrap();
+        assert_eq!(reel.status(), StatusCode::NOT_FOUND, "Reel is not reachable at the den base");
+    }
+
+    #[test]
+    fn only_a_bare_public_origin_is_this_nodes_den_origin() {
+        assert_eq!(
+            own_den_origin(Some("http://Hearth.LAN:8090/")).as_deref(),
+            Some("http://hearth.lan:8090")
+        );
+        assert_eq!(own_den_origin(Some(" https://node.example ")).as_deref(), Some("https://node.example"));
+        for not in [
+            "",
+            "hearth.lan:8090",
+            "ftp://node.example",
+            "https://node.example/hearth",
+            "https://u@node.example",
+        ] {
+            assert_eq!(own_den_origin(Some(not)), None, "{not:?}");
+        }
+        assert_eq!(own_den_origin(None), None);
+        assert_eq!(
+            den_bases(8090, Some("http://127.0.0.1:8090")),
+            ["http://127.0.0.1:8090/den", "http://localhost:8090/den", "http://[::1]:8090/den"],
+            "a public base that is a loopback name is listed once"
+        );
+    }
+
     /// The in-process call is admitted like a request on the socket: with the bulk lane full it is refused in the
     /// stable shape, and Scout's control routes still answer.
     #[tokio::test]
@@ -454,7 +635,7 @@ mod tests {
             body_idle: Duration::from_secs(30),
         };
         let hearth = hearth_with(tiny, "http://127.0.0.1:9");
-        install(&hearth, &scout_bases(8090, Some(8080), None, ""));
+        install(&hearth, &scout_bases(8090, Some(8080), None, ""), &[]);
         let _bulk = hearth.admission.admit(crate::route::Lane::Bulk).await.unwrap();
         let (status, _, body) =
             in_process(&hearth, "http://127.0.0.1:8080/cfg/stream/movie/tt1.json", None).await;
@@ -473,7 +654,7 @@ mod tests {
         let upstream = upstream_stub().await;
         let hearth = hearth_with(crate::admit::Limits::default(), &upstream);
         let (claimed, _) = counting_port().await;
-        install(&hearth, &scout_bases(1, Some(claimed), None, ""));
+        install(&hearth, &scout_bases(1, Some(claimed), None, ""), &[]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let real = listener.local_addr().unwrap().port();
         let (_stop, stopped) = tokio::sync::watch::channel(false);
