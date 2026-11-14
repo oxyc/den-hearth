@@ -564,7 +564,7 @@ fn wired_offline_playback_hearth() -> Arc<Hearth> {
     let state = Arc::get_mut(&mut hearth).unwrap();
     let remux = Arc::get_mut(state.remux.as_mut().unwrap()).unwrap();
     remux.cfg.scout_origins.push(crate::playback::DEN_SCOUT_ORIGIN.to_string());
-    crate::inproc::install(&hearth, &[]);
+    crate::inproc::install(&hearth, &[], &[]);
     hearth
 }
 
