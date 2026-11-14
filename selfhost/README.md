@@ -28,6 +28,18 @@ sealed in addon URLs. Losing or changing one breaks that addon's installed URLs.
 also prevents editing signed media links, and the Remux URL key keeps browser sessions valid across restarts. The
 debrid account belongs in the configure page, not in the server environment.
 
+`selfhost/init.sh` also sets `REMUX_SCOUT_ORIGINS` to `HEARTH_PUBLIC_BASE_URL`. Remux deliberately refuses a Den or
+Scout install URL at any other origin, so the combined node can play its own installs without weakening its SSRF
+guard. The generated `REMUX_ORIGIN_ALIASES` maps that public origin back to `http://127.0.0.1:8090` inside the
+container, avoiding public DNS, TLS and router-hairpin dependencies when Remux calls Scout through `/den`.
+
+If den-edge relays this Hearth and the saved install URL names Edge instead, append that bare origin to the
+comma-separated `REMUX_SCOUT_ORIGINS`. It must be reachable from inside the Hearth container; `localhost` there
+means the container itself. Add a corresponding `public-origin=container-reachable-origin` pair to
+`REMUX_ORIGIN_ALIASES` when Edge's public address cannot be reached directly. For guest or managed playback through
+den-edge, set `REMUX_EDGE_SECRET` in this file to the same private random value used as den-edge's
+`REMUX_EDGE_SECRET`.
+
 ## Choose services
 
 `HEARTH_SERVICES` accepts a comma-separated subset of `scout`, `reel`, `subs`, and `remux`, or `all` (the default).

@@ -38,6 +38,9 @@ services:
       SUBS_CACHE_MAX_BYTES: ${SUBS_CACHE_MAX_BYTES:-268435456}
       REMUX_URL_KEY: ${REMUX_URL_KEY:-}
       REMUX_SCOUT_KEY: ${SCOUT_REMUX_KEY:-}
+      # New environments set the prefixed value. Preserve an older bare setting, then make old generated .env files
+      # work from their public base instead of overriding Remux with an empty prefixed value.
+      REMUX_SCOUT_ORIGINS: ${REMUX_SCOUT_ORIGINS:-${SCOUT_ORIGINS:-${HEARTH_PUBLIC_BASE_URL:-}}}
       REMUX_SCRATCH_MAX_BYTES: ${REMUX_SCRATCH_MAX_BYTES:-1073741824}
       LOG_REQUESTS: ${LOG_REQUESTS:-1}
       LOG_IDENTITY: ${LOG_IDENTITY:-0}
