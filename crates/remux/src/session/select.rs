@@ -369,9 +369,9 @@ pub async fn create(
             prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
         };
         if chosen.is_none() && !want.fits_only {
-            let longer = (0..too_big.len())
-                .filter(|&i| head_start(&too_big[i]) <= LONG_PREBUFFER)
-                .min_by(|&a, &b| head_start(&too_big[a]).total_cmp(&head_start(&too_big[b])));
+            // The best-ranked copy the countdown covers, not the one with the shortest wait: that is only ever the
+            // smallest, and a longer wait at the start is the price of the better picture.
+            let longer = (0..too_big.len()).find(|&i| head_start(&too_big[i]) <= LONG_PREBUFFER);
             if let Some(i) = longer {
                 let (c, found) = too_big.swap_remove(i);
                 chosen = Some((c, found, false));

@@ -940,6 +940,30 @@ fn with_prepare_timing(mut response: Response<Body>, elapsed: Duration) -> Respo
     response
 }
 
+/// One line for every play: who asked (a guest or a member), and whether the viewer's own TorBox stream is tried
+/// first or why not. Without it a guest whose own TorBox was gone looked, in the logs, exactly like one who never
+/// had one — every play quietly on the host's TorBox and Remux.
+fn log_route_choice(
+    scope: &str,
+    edge_managed: bool,
+    personal: bool,
+    direct_failed: bool,
+    direct_shaped: bool,
+    rid: Option<&str>,
+) {
+    let who = if scope.starts_with("[\"guest\"") { "guest" } else { "member" };
+    let direct = match (edge_managed, personal, direct_failed, direct_shaped) {
+        (false, ..) => "skipped: not a managed request",
+        (_, false, ..) => "skipped: no TorBox of the viewer's own",
+        (_, _, true, _) => "skipped: the direct stream already failed",
+        (_, _, _, false) => "skipped: replaces a Remux session or excludes releases",
+        _ => "tried first",
+    };
+    let mut line = format!("playback route: {who}, own TorBox stream {direct}");
+    den_http::log::push_rid(&mut line, rid);
+    eprintln!("{line}");
+}
+
 fn log_direct_fallback(failure: DirectFailure, has_fallback: bool, rid: Option<&str>) {
     LOG.log(&format!("playback_direct_{}", failure.code), || {
         let action = if has_fallback { "remux" } else { "unavailable" };
@@ -1365,6 +1389,14 @@ where
         !direct_only && parts.headers.get(EARLY_ANSWER_HEADER).is_some_and(|v| v.as_bytes() == b"1");
     let direct = managed_request(&request, subtitle_track)
         .map(|direct| den_scout::managed_hls::ManagedHlsRequest { early_answer, ..direct });
+    log_route_choice(
+        scope_config,
+        edge_managed,
+        direct_config.is_some(),
+        direct_failed,
+        direct.is_some(),
+        rid.as_deref(),
+    );
     // The install whose Scout plays this: Remux's, unless only the managed stream may answer.
     let signal_install = match remux_scout {
         Some(scout) if !direct_only => Some(scout.to_string()),

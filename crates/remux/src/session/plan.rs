@@ -265,14 +265,14 @@ pub(super) fn average_bitrate(size: Option<u64>, duration: f64) -> Option<u64> {
     size.filter(|_| duration > 0.0).map(|s| (s as f64 * 8.0 / duration) as u64)
 }
 
-/// The longest a player is asked to wait before a copy plays through: a link that needs more of a wait than this
-/// for a release is too slow for it. Ten seconds is under the thirty that hls.js and Safari hold ahead, so a player
-/// can build that lead at all, and about what a person waits for a start before giving up on it.
-pub(super) const MAX_PREBUFFER: f64 = 10.0;
-/// The hard cap on any head start: a copy that asks at most this ranks next after those within `MAX_PREBUFFER`, and
-/// the player shows a countdown while it waits. Longer than this and a viewer is left in front of a spinner, which is
-/// never acceptable; such a copy ranks below a transcode.
-pub(super) const LONG_PREBUFFER: f64 = 30.0;
+/// The longest a player is asked to wait, unannounced, before a copy plays through: a link that needs more of a wait
+/// than this for a release is too slow for it. A wait at the start is the price of a better picture that then never
+/// stops, so it is twenty seconds — still under the thirty that Safari holds ahead, so a player can build that lead.
+pub(super) const MAX_PREBUFFER: f64 = 20.0;
+/// The hard cap on any head start: the best-ranked copy that asks at most this is taken next after those within
+/// `MAX_PREBUFFER`, and the player shows a countdown while it waits. Longer than this and a viewer is left waiting too
+/// long; such a copy ranks below a transcode.
+pub(super) const LONG_PREBUFFER: f64 = 60.0;
 /// What a release with no byte index is taken to need over its average. An encode at a constant quality peaks at
 /// three or four times its average for seconds at a time, but over the stretches a buffer has to carry, half again is
 /// what the indexed releases measured.
@@ -385,9 +385,10 @@ pub(crate) fn prebuffer(info: &MediaInfo, delivery: &Delivery, max_bitrate: Opti
 /// once, from one moment; it is not a promise. What a player then gets in a session runs below it (a 30 Mbit/s figure,
 /// the box's uplink, against hls.js's own 14-15 Mbit/s estimate), varies by a tenth or more from one minute to the
 /// next, and is shared with whatever else the connection carries. `need` already weighs the heavy stretches, so this
-/// is for the link, not the file: 70% leaves 30% for both. A 12 GB, 3818 s episode (25.3 Mbit/s) does not fit 30
-/// Mbit/s; a 1.5 GB one (3.1) does.
-pub(super) const LINK_HEADROOM: f64 = 0.7;
+/// is for the link, not the file. A browser's link is now what its own past sessions got (den-edge's `learnLink`
+/// keeps 85% of the lowest of its recent playback estimates), so 80% of that leaves room for the dips. A 12 GB, 3818
+/// s episode (25.3 Mbit/s) does not fit 30 Mbit/s; a 1.5 GB one (3.1) does.
+pub(super) const LINK_HEADROOM: f64 = 0.8;
 
 /// Whether a copy of the release needs more than `LINK_HEADROOM` of the player's `maxBitrate`. Without one every
 /// release fits, and so does one whose need isn't known: nothing says it doesn't.
