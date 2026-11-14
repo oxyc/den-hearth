@@ -489,6 +489,100 @@ pub fn add_dovi_record(init: &[u8], profile: u8, level: u8) -> Result<Vec<u8>, S
     walk_boxes(init, &path, &record)?.ok_or_else(|| "no HEVC sample entry in the init segment".to_string())
 }
 
+/// The init segment of a 7.1 AAC session with its AudioSpecificConfig naming channel configuration 7 where ffmpeg
+/// wrote 12.
+///
+/// FFmpeg 9 signals 7.1 as configuration 12, and FFmpeg 8 signalled the same audio as 7: both encode one SCE, three
+/// CPEs and an LFE in the same order (`aac_chan_configs` and `aac_chan_maps` in libavcodec/aacenctab.h), so only the
+/// number differs. Chrome's MediaSource refuses 12 at the first segment (hls.js: `mediaSourceRequiresReset`) and takes
+/// 7, and its decoder plays both (Chrome 156 on macOS, measured on this encoder's own output). A decoder that follows
+/// the standard to the letter places 7's third pair at the front rather than the sides: the samples are the ones
+/// every FFmpeg before 9 sent. One four-bit field changes, so nothing in the init moves; an init that names any other
+/// configuration, or has no AAC entry, is returned as it is.
+pub fn aac_config_7(init: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = init.to_vec();
+    for at in asc_offsets(init)? {
+        let asc = u16::from_be_bytes([init[at], init[at + 1]]);
+        // An explicit 24-bit sample rate (index 15) moves the channel configuration; ffmpeg writes none at 48 kHz.
+        if (asc >> 7) & 0xf != 0xf && (asc >> 3) & 0xf == 12 {
+            out[at..at + 2].copy_from_slice(&((asc & !(0xf << 3)) | (7 << 3)).to_be_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// The channel configuration each AAC entry in `init` names, for the tests that check what a session serves.
+#[cfg(test)]
+pub(crate) fn aac_channel_configs(init: &[u8]) -> Vec<u16> {
+    asc_offsets(init)
+        .unwrap()
+        .into_iter()
+        .map(|at| (u16::from_be_bytes([init[at], init[at + 1]]) >> 3) & 0xf)
+        .collect()
+}
+
+/// The boxes directly inside `data[base..base + len]`: each one's code, and where its body starts and how long it is.
+fn children(data: &[u8], base: usize, len: usize) -> Result<Vec<([u8; 4], usize, usize)>, String> {
+    let (mut found, mut at) = (Vec::new(), base);
+    while at < base + len {
+        let (kind, body, size) = box_at(&data[at..base + len])?;
+        found.push((kind, at + 8, body.len()));
+        at += size;
+    }
+    Ok(found)
+}
+
+/// Where each AudioSpecificConfig of an `mp4a` entry in `init` starts: moov › trak › … › stsd › mp4a › esds.
+fn asc_offsets(init: &[u8]) -> Result<Vec<usize>, String> {
+    const PATH: [[u8; 4]; 8] =
+        [*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd", *b"mp4a", *b"esds"];
+    let mut level = vec![(0, init.len())];
+    for kind in PATH {
+        let mut next = Vec::new();
+        for (base, len) in level {
+            for (found, body, size) in children(init, base, len)? {
+                // A sample description's entries follow its version, flags and count; an AudioSampleEntry's boxes
+                // follow its 28 bytes of fields.
+                let skip = match &found {
+                    b"stsd" => 8,
+                    b"mp4a" => 28,
+                    _ => 0,
+                };
+                if found == kind && size >= skip {
+                    next.push((body + skip, size - skip));
+                }
+            }
+        }
+        level = next;
+    }
+    Ok(level.into_iter().filter_map(|(base, len)| dsi(&init[base..base + len]).map(|at| base + at)).collect())
+}
+
+/// Where the AudioSpecificConfig starts in an `esds` body: version and flags, then ES_Descriptor › DecoderConfig
+/// Descriptor › DecoderSpecificInfo (ISO/IEC 14496-1 §7.2.6). `None` for a layout this does not read.
+fn dsi(esds: &[u8]) -> Option<usize> {
+    // A tag, then a length of up to four bytes of 7 bits each: where the descriptor's body starts.
+    let body = |at: usize, tag: u8| -> Option<usize> {
+        (*esds.get(at)? == tag).then_some(())?;
+        (1..=4).find_map(|n| (*esds.get(at + n)? & 0x80 == 0).then_some(at + n + 1))
+    };
+    let es = body(4, 0x03)?;
+    let flags = *esds.get(es + 2)?;
+    let mut at = es + 3;
+    if flags & 0x80 != 0 {
+        at += 2; // dependsOn_ES_ID
+    }
+    if flags & 0x40 != 0 {
+        at += 1 + *esds.get(at)? as usize; // URL
+    }
+    if flags & 0x20 != 0 {
+        at += 2; // OCR_ES_Id
+    }
+    let config = body(at, 0x04)?;
+    let specific = body(config + 13, 0x05)?;
+    (specific + 2 <= esds.len()).then_some(specific)
+}
+
 /// One box at the start of `b`: its four-character code, its body, and the whole box's length. 32-bit sizes only: a
 /// zero (to the end) or a 64-bit size is not something ffmpeg writes for an init.
 fn box_at(b: &[u8]) -> Result<([u8; 4], &[u8], usize), String> {
@@ -1118,6 +1212,35 @@ mod tests {
         let mut file = boxed(*b"ftyp", b"iso5\0\0\0\0iso5");
         file.extend(boxed(*b"moov", &moov));
         file
+    }
+
+    /// FFmpeg 9's own 7.1 AAC (`testdata/aac71.mp4`, configuration 12) names configuration 7 afterwards: that field
+    /// changes and no other byte, and a second pass changes nothing.
+    #[test]
+    fn a_7_1_aac_init_names_channel_configuration_7() {
+        let init = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/aac71.mp4")).unwrap();
+        assert_eq!(aac_channel_configs(&init), [12], "the fixture is what FFmpeg 9 writes");
+        let fixed = aac_config_7(&init).unwrap();
+        assert_eq!(aac_channel_configs(&fixed), [7]);
+        assert_eq!(fixed.len(), init.len());
+        let changed = (0..init.len()).filter(|&i| init[i] != fixed[i]).count();
+        assert_eq!(changed, 1, "one byte of the AudioSpecificConfig");
+        assert_eq!(aac_config_7(&fixed).unwrap(), fixed);
+    }
+
+    /// Any other configuration, and an init whose audio entry carries no AAC config, is left as it is.
+    #[test]
+    fn only_channel_configuration_12_is_rewritten() {
+        let init = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/aac71.mp4")).unwrap();
+        let at = asc_offsets(&init).unwrap()[0];
+        for other in [0u16, 2, 6, 7, 11, 13] {
+            let mut named = init.clone();
+            let asc = u16::from_be_bytes([named[at], named[at + 1]]);
+            named[at..at + 2].copy_from_slice(&((asc & !(0xf << 3)) | (other << 3)).to_be_bytes());
+            assert_eq!(aac_config_7(&named).unwrap(), named, "configuration {other}");
+        }
+        let no_config = init_with(b"hvc1", 0);
+        assert_eq!(aac_config_7(&no_config).unwrap(), no_config);
     }
 
     /// Every box in `b` walked to the end, recursing into `into`: the sizes all add up or this panics.

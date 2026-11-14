@@ -469,7 +469,8 @@ impl Session {
 
     /// Put a job's init segment where the session serves it. A kept Dolby Vision profile 5 with no record in its
     /// container has no side data for ffmpeg's muxer to write a `dvcC` from, so it is added here; a layout this
-    /// can't patch is not served, and the session fails as any whose init never appears.
+    /// can't patch is not served, and the session fails as any whose init never appears. 7.1 AAC names channel
+    /// configuration 7, which Chrome's MediaSource takes, rather than ffmpeg's 12 (`job::aac_config_7`).
     ///
     /// Written beside it and renamed into place: a process that dies midway leaves no short `init.mp4` for the next
     /// one to rebuild the session with (`resume::adopt`).
@@ -479,6 +480,10 @@ impl Session {
         let init = match self.info.dolby_vision.filter(|_| recordless) {
             Some(dv) => init.and_then(|init| job::add_dovi_record(&init, dv.profile, dv.level)),
             None => init,
+        };
+        let init = match self.audio_out {
+            job::AudioOut::Surround71 => init.and_then(|init| job::aac_config_7(&init)),
+            _ => init,
         };
         let tmp = to.with_extension("mp4.tmp");
         let written = init.and_then(|init| {
