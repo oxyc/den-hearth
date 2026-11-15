@@ -51,6 +51,19 @@ fn redact_path() {
     }
 }
 
+// A readiness poll answers 200 and starts nothing, and a play is the 302 to the debrid: the line says which, so a
+// poll every few seconds is not read as someone streaming. Nothing else of the query is logged.
+#[test]
+fn a_ticket_line_names_a_probe_or_a_prefetch() {
+    use crate::reqlog::ticket_kind;
+    assert_eq!(ticket_kind("/p/<ticket>", Some("probe=1")), "?probe");
+    assert_eq!(ticket_kind("/p/<ticket>", Some("x=secret&prefetch=1")), "?prefetch");
+    assert_eq!(ticket_kind("/p/<ticket>", None), "", "a play");
+    assert_eq!(ticket_kind("/p/<ticket>", Some("probe=0")), "");
+    assert_eq!(ticket_kind("/p/<ticket>", Some("probe=10")), "");
+    assert_eq!(ticket_kind("/<config>/stream/movie/tt1.json", Some("probe=1")), "", "only a ticket route");
+}
+
 // Unset, empty and exactly "0" leave it off; any other value turns it on.
 #[test]
 fn log_requests_setting() {
@@ -82,6 +95,22 @@ async fn request_log() {
         assert!(Regex::new(want).unwrap().is_match(&got), "no line matching {want} in:\n{got}");
     }
     for leak in [blob.as_str(), "tok-secret", "query-secret", "probe"] {
+        assert!(!got.contains(leak), "the request log carried {leak:?}:\n{got}");
+    }
+}
+
+// The request line itself carries the ticket's kind, and nothing else of its query.
+#[tokio::test]
+async fn request_log_names_a_ticket_probe() {
+    let out = LogCapture::start();
+    let h = new_handler(test_deps(|d| d.log_requests = true));
+    get(&h, "/p/secret-ticket?probe=1&token=query-secret", &[]).await;
+    get(&h, "/p/secret-ticket", &[]).await;
+    let got = out.text();
+    for want in [r"(?m)^GET /p/<ticket>\?probe \d{3} \d+ms$", r"(?m)^GET /p/<ticket> \d{3} \d+ms$"] {
+        assert!(Regex::new(want).unwrap().is_match(&got), "no line matching {want} in:\n{got}");
+    }
+    for leak in ["secret-ticket", "query-secret"] {
         assert!(!got.contains(leak), "the request log carried {leak:?}:\n{got}");
     }
 }

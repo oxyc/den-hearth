@@ -1041,6 +1041,7 @@ impl Handler {
         // Decided here, once: with the request log off nothing below is paid.
         let log_line = self.inner.deps.log_requests.then(|| {
             let path = redact_path(&den_http::percent_decode_path(req.uri().path()));
+            let path = format!("{path}{}", crate::reqlog::ticket_kind(&path, req.uri().query()));
             (path, den_http::log::request_id(req.headers()))
         });
         let inner = self.inner.clone();
