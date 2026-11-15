@@ -294,6 +294,9 @@ pub struct Session {
     /// How long a player on the link it named waits before a copy plays through without running dry (`prebuffer`):
     /// its pre-buffer target. `None` for a transcode, or without a link or a byte index.
     pub prebuffer: Option<f64>,
+    /// The seconds of media that wait stands for (`playlist::startup_lead`): what the player holds for, buffered
+    /// ahead, before it starts. `None` wherever `prebuffer` is, and for a transcode.
+    pub prebuffer_lead: Option<f64>,
     /// What a copy asks of a link (`need`); `None` for a transcode, whose rate is its preset's.
     pub need: Option<Need>,
     /// The bits a second the player's own link measured for itself (`Want::max_bitrate`), before any
@@ -1645,6 +1648,7 @@ impl Session {
             segments,
             // What only the answer to `POST /remux/session` carried.
             prebuffer: None,
+            prebuffer_lead: None,
             demand: None,
             need: rec.need,
             max_bitrate: rec.max_bitrate,
