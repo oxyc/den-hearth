@@ -173,7 +173,8 @@ FROM ffmpeg-source AS ffmpeg
 #              MPEG-TS or AVI, setpts and trim/atrim to cut a run to its keyframe, and hwupload (with format, and the
 #              scale that converts to nv12 — swscale) to hand CPU-decoded pictures to the GPU
 #   bsfs       dovi_rpu and filter_units: a copied Dolby Vision stream loses its RPU and enhancement layer
-#              and its configuration record, leaving the HDR10 base layer a browser can play
+#              and its configuration record, leaving the HDR10 base layer a browser can play. setts: every copied
+#              video packet's duration is cut to the step to the next packet's DTS (job::CLAMP_DURATION)
 #   protocols  file, pipe (the fingerprint's PCM on stdout), and http(s) over tcp/tls (OpenSSL); --enable-version3 is
 #              what OpenSSL 3 requires
 # ffmpeg's own libraries are linked in statically; OpenSSL, zlib and libva are the system's.
@@ -191,7 +192,7 @@ RUN ./configure \
       --enable-encoder=aac,h264_vaapi,webvtt,pcm_s16le \
       --enable-parser=av1,h264,hevc,mpegvideo,mpeg4video,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
       --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,setpts,buffer,buffersink,format,scale,hwupload,scale_vaapi,tonemap_vaapi \
-      --enable-bsf=dovi_rpu,filter_units \
+      --enable-bsf=dovi_rpu,filter_units,setts \
       --enable-swresample --enable-swscale \
     && make -j"$(nproc)" && make install
 
