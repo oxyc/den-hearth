@@ -936,7 +936,6 @@ async fn cors() {
         "/".to_owned(),
         "/health".to_owned(),
         "/validate".to_owned(),
-        "/metrics".to_owned(),
         "/nope".to_owned(),
         format!("/{}/stream/movie/tt1234567.json", valid_blob()),
         format!("/{}/play/anything", valid_blob()),

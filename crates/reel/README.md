@@ -137,7 +137,9 @@ GET /hls/seg?u=…&s=…                      →  one googlevideo URL a master 
        without it answers "play the full frame" instead of refusing, the others refuse like /play
 GET /health                               →  200 {status} — ok, or degraded (see below)
 GET /metrics                              →  Prometheus text (bearer METRICS_TOKEN; 404 without it)
-OPTIONS <any path>                        →  204 CORS preflight
+HEAD /metrics                             →  same status/representation headers, no rendered body
+<other> /metrics                          →  405 Allow: GET, HEAD (authorized; otherwise concealed 404)
+OPTIONS <application path>                →  204 CORS preflight
 anything else                             →  404 {"error":"not_found"}
 ```
 

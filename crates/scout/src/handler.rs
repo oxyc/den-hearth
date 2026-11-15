@@ -1415,19 +1415,27 @@ impl Inner {
     // --- routing ----------------------------------------------------------------------------------------
 
     async fn route(self: &Arc<Self>, req: &Request<Bytes>) -> Resp {
-        // A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
-        // refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
-        // does nothing but name what may follow, so it cannot reach /play's resolve.
+        // `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
+        let path = den_http::percent_decode_path(req.uri().path());
+        if path == "/metrics" {
+            return den_http::metrics_response(
+                req.method(),
+                req.headers(),
+                Some(&self.deps.metrics_token),
+                || error(StatusCode::NOT_FOUND, "not_found"),
+                || metrics().render(cache_persistent_gauge(&*self.deps.cache)),
+            );
+        }
+        // A CORS preflight is answered on every application path. Metrics is deliberately handled first:
+        // it is an operational bearer endpoint whose complete vocabulary is GET/HEAD, not a browser API.
         if req.method() == Method::OPTIONS {
             return preflight();
         }
-        // `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
-        let path = den_http::percent_decode_path(req.uri().path());
         // CONFIG_KEY is set but malformed: nothing that carries an install config (a config segment, a play
         // ticket, the availability batch, a cancel) can be trusted, sealed or plaintext, so all of it is a 503
         // until an operator fixes the variable. Only /health, /metrics and /validate (a pasted token,
-        // no config) keep their own handling.
-        if self.deps.config_key_invalid && !matches!(path.as_str(), "/health" | "/metrics" | "/validate") {
+        // no config) keep their own handling. Application preflights above remain credential-free declarations.
+        if self.deps.config_key_invalid && !matches!(path.as_str(), "/health" | "/validate") {
             return config_key_invalid();
         }
         // DELETE cancels (or, with ?op=reannounce, reannounces) the release a ticket or a legacy play token
@@ -1455,71 +1463,43 @@ impl Inner {
         if req.method() != Method::GET && req.method() != Method::HEAD {
             return method_not_allowed("GET, HEAD");
         }
-        match path.as_str() {
-            "/health" => {
-                // Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
-                // state so a monitor sees a total-indexer outage instead of just "empty results".
-                let mut status = json!({"status": "ok", "coverage": "complete"});
-                if self.deps.config_key_invalid {
-                    status = json!({
-                        "status": "degraded",
-                        "reason": "config_key_invalid",
-                        "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
-                    });
-                } else if self.deps.runtime.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
-                    status =
-                        json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
-                } else if self.deps.runtime.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
-                    // Which source is withheld: naming it says which indexers this install uses.
-                    status["coverage"] = json!("partial");
-                    status["detail"] = json!(SOURCES_MISSING_DETAIL);
-                }
-                // A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
-                // other evidence is one log line per refusal. The tightest remaining allowance is what an operator
-                // or a monitor needs; per-account detail is withheld because this route is unauthenticated.
-                let (left, accounts) = global_add_budget().lowest();
-                if accounts > 0 {
-                    status["addBudgetRemaining"] = json!(left);
-                }
-                // How TorBox has been answering, so a client can warn before playback fails. Scout's direct API
-                // observations are authoritative. The separately cached public status page is only corroboration,
-                // or an explicitly sourced fallback before the first API call; it never makes Scout itself
-                // degraded (which would turn an external status-site answer into a rollout/liveness gate).
-                if let Some(debrid) = self.deps.runtime.torbox.health_report() {
-                    if debrid["state"] == "down" && debrid["source"] == "local" && status["status"] == "ok" {
-                        status["status"] = json!("degraded");
-                        status["reason"] = json!("debrid");
-                        status["detail"] = json!(DEBRID_DOWN_DETAIL);
-                    }
-                    status["debrid"] = debrid;
-                }
-                return json_response(StatusCode::OK, &status);
+        if path == "/health" {
+            // Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
+            // state so a monitor sees a total-indexer outage instead of just "empty results".
+            let mut status = json!({"status": "ok", "coverage": "complete"});
+            if self.deps.config_key_invalid {
+                status = json!({
+                    "status": "degraded",
+                    "reason": "config_key_invalid",
+                    "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
+                });
+            } else if self.deps.runtime.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                status = json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
+            } else if self.deps.runtime.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                // Which source is withheld: naming it says which indexers this install uses.
+                status["coverage"] = json!("partial");
+                status["detail"] = json!(SOURCES_MISSING_DETAIL);
             }
-            "/metrics" => {
-                // Prometheus text format, behind a bearer token, and OFF when no token is configured.
-                //
-                // The first version was unauthenticated on the grounds that it carries no debrid service or
-                // account labels. That answered the credential-oracle question addbudget.go raises about /health
-                // and missed two the counters create on their own. scout_list_cache_total{result="miss"} rises
-                // once per title opened cold, so polling this endpoint is a timeline of when the household is
-                // watching and how much it browses — /health exposes nothing comparable. And per-indexer counters
-                // disclose which indexers this install has configured, which IS per-install configuration: with
-                // MINT_INDEXER_CONFIGS on, a nonzero mediafusion counter says the debrid token was minted
-                // and sent to that host.
-                //
-                // Dropping the useful labels would have left an endpoint not worth scraping, so the other option
-                // is taken: a token. Unset means 404 rather than an empty 200, so an operator who has not
-                // configured one is not told there is something here to poke at.
-                if !den_http::metrics_authorized(req.headers(), Some(&self.deps.metrics_token)) {
-                    return error(StatusCode::NOT_FOUND, "not_found");
-                }
-                return Response::builder()
-                    .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
-                    .header(CACHE_CONTROL, NO_STORE)
-                    .body(full(metrics().render(cache_persistent_gauge(&*self.deps.cache))))
-                    .expect("a static response");
+            // A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
+            // other evidence is one log line per refusal. The tightest remaining allowance is what an operator
+            // or a monitor needs; per-account detail is withheld because this route is unauthenticated.
+            let (left, accounts) = global_add_budget().lowest();
+            if accounts > 0 {
+                status["addBudgetRemaining"] = json!(left);
             }
-            _ => {}
+            // How TorBox has been answering, so a client can warn before playback fails. Scout's direct API
+            // observations are authoritative. The separately cached public status page is only corroboration,
+            // or an explicitly sourced fallback before the first API call; it never makes Scout itself
+            // degraded (which would turn an external status-site answer into a rollout/liveness gate).
+            if let Some(debrid) = self.deps.runtime.torbox.health_report() {
+                if debrid["state"] == "down" && debrid["source"] == "local" && status["status"] == "ok" {
+                    status["status"] = json!("degraded");
+                    status["reason"] = json!("debrid");
+                    status["detail"] = json!(DEBRID_DOWN_DETAIL);
+                }
+                status["debrid"] = debrid;
+            }
+            return json_response(StatusCode::OK, &status);
         }
 
         // ["<config>", "stream"|"play", ...]

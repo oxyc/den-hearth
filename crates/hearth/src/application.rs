@@ -168,7 +168,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     match target {
-        Target::Metrics => metrics(hearth, req.headers()),
+        Target::Metrics => metrics(hearth, req.method(), req.headers()),
         Target::Health => json(StatusCode::OK, &health(hearth).await),
         Target::Scout(path) => match with_path(req, &path) {
             Some(req) => match &hearth.scout {
@@ -248,20 +248,14 @@ where
 /// `/reel/metrics`, `/subs/metrics` and `/remux/metrics` (and at `/metrics` on their own ports). Behind a
 /// bearer token and a plain 404 without it, so nobody is told there is something to poke at; the series
 /// are low-cardinality by construction (two lanes, two media classes), never per-route or per-peer.
-fn metrics(hearth: &Hearth, headers: &hyper::HeaderMap) -> Response<Body> {
-    if !den_http::metrics_authorized(headers, hearth.metrics_token.as_deref()) {
-        return den_http::not_found();
-    }
-    let mut text = String::with_capacity(4096);
-    hearth.admission.render(&mut text);
-    hearth.media.render(&mut text);
-    hearth.playback.render(&mut text);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .header("cache-control", "no-store")
-        .body(den_http::full(text))
-        .expect("static response")
+fn metrics(hearth: &Hearth, method: &hyper::Method, headers: &hyper::HeaderMap) -> Response<Body> {
+    den_http::metrics_response(method, headers, hearth.metrics_token.as_deref(), den_http::not_found, || {
+        let mut text = String::with_capacity(4096);
+        hearth.admission.render(&mut text);
+        hearth.media.render(&mut text);
+        hearth.playback.render(&mut text);
+        text
+    })
 }
 
 /// Each service's own `/health` answer, side by side. `degraded` when any of them says anything but

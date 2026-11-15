@@ -1,4 +1,5 @@
 use super::*;
+use hyper::Method;
 
 mod den_addon;
 mod outage_recovery;
@@ -144,6 +145,54 @@ fn tiny() -> Arc<Hearth> {
     hearth_with(limits, Some("secret"))
 }
 
+fn metrics_node() -> Arc<Hearth> {
+    let token = "secret";
+    let settings = || {
+        let mut settings = den_scout::deps::settings_from_env(|_| String::new());
+        settings.cache_dir = String::new();
+        settings.metrics_token = token.into();
+        settings
+    };
+    let den = den::Den::new(None, false, Default::default(), None, "none");
+    let mut reel = den_reel::Config::from_env();
+    reel.metrics_token = Some(token.into());
+    let mut subs = den_subtitles::Config::from_env();
+    subs.metrics_token = token.into();
+    let mut remux = den_remux::Config::from_env();
+    remux.metrics_token = Some(token.into());
+    Hearth::new(
+        Some(den_reel::AppState::new(reel)),
+        Some(den_subtitles::AppState::new(subs)),
+        Some(den_remux::AppState::new(remux)),
+        Some(scout::Scout::new(settings(), settings(), &den.scout)),
+        den,
+        Limits {
+            admission: admit::Limits {
+                requests: 2,
+                bulk_requests: 1,
+                wait: Duration::from_millis(5),
+                ..admit::Limits::default()
+            },
+            media: media::Limits::default(),
+        },
+        Options { metrics_token: Some(token.into()), ..Options::default() },
+    )
+}
+
+async fn metrics_call(
+    hearth: &Arc<Hearth>,
+    own: Option<Service>,
+    method: Method,
+    path: &str,
+    authorized: bool,
+) -> Response<Body> {
+    let mut request = Request::builder().method(method).uri(path);
+    if authorized {
+        request = request.header("authorization", "Bearer secret");
+    }
+    handle(hearth.clone(), own, false, request.body(Empty::<Bytes>::new()).unwrap()).await
+}
+
 #[tokio::test]
 async fn the_control_lane_answers_while_bulk_is_saturated() {
     let hearth = tiny();
@@ -271,6 +320,46 @@ async fn metrics_need_the_token_and_name_the_lanes() {
     }
     // No token configured, no endpoint.
     assert_eq!(send(&hearth_with(Limits::default(), None), "/metrics").await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn every_metrics_mount_has_one_method_contract_and_releases_bulk_admission_on_disconnect() {
+    let hearth = metrics_node();
+    let routes = [
+        (None, "/metrics"),
+        (None, "/scout/metrics"),
+        (None, "/reel/metrics"),
+        (None, "/subs/metrics"),
+        (None, "/remux/metrics"),
+        (Some(Service::Scout), "/metrics"),
+        (Some(Service::Reel), "/metrics"),
+        (Some(Service::Subs), "/metrics"),
+        (Some(Service::Remux), "/metrics"),
+    ];
+
+    for (own, path) in routes {
+        let get = metrics_call(&hearth, own, Method::GET, path, true).await;
+        assert_eq!(get.status(), StatusCode::OK, "GET {own:?} {path}");
+        assert!(!get.into_body().collect().await.unwrap().to_bytes().is_empty(), "GET {own:?} {path}");
+
+        let head = metrics_call(&hearth, own, Method::HEAD, path, true).await;
+        assert_eq!(head.status(), StatusCode::OK, "HEAD {own:?} {path}");
+        assert!(head.into_body().collect().await.unwrap().to_bytes().is_empty(), "HEAD {own:?} {path}");
+
+        let concealed = metrics_call(&hearth, own, Method::POST, path, false).await;
+        assert_eq!(concealed.status(), StatusCode::NOT_FOUND, "anonymous POST {own:?} {path}");
+        drop(concealed);
+
+        // The authorized unsupported request is bulk, and its permit follows the response body. Holding it
+        // saturates the one-position bulk lane; dropping it models a cancelled/disconnected client and must
+        // immediately return that position on the combined and legacy listeners alike.
+        let refused_method = metrics_call(&hearth, own, Method::POST, path, true).await;
+        assert_eq!(refused_method.status(), StatusCode::METHOD_NOT_ALLOWED, "POST {own:?} {path}");
+        assert_eq!(refused_method.headers()[hyper::header::ALLOW], "GET, HEAD", "POST {own:?} {path}");
+        assert_eq!(send(&hearth, "/nope").await.status(), StatusCode::SERVICE_UNAVAILABLE, "{own:?} {path}");
+        drop(refused_method);
+        assert_eq!(send(&hearth, "/nope").await.status(), StatusCode::NOT_FOUND, "{own:?} {path}");
+    }
 }
 
 /// A service's own `/metrics` is the service's, not hearth's: admission counters live on the main port.

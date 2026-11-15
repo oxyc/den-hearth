@@ -71,6 +71,8 @@ DELETE /remux/s/<sid>/<sig>             204; the session's URLs answer 410 from 
 GET    /health, /remux/health           200 {status} — ok, or degraded with a reason (Maintenance); the second is
                                         what a client probes under the /remux mount (den-spec routes-v1)
 GET    /metrics                         Prometheus text (bearer METRICS_TOKEN; 404 without it)
+HEAD   /metrics                         same status/representation headers, without rendering or sending the body
+<other> /metrics                        405 Allow: GET, HEAD when authorized; missing/wrong token remains 404
 POST   /remux/admin/kill                {owner: "grant:<gid>"} → {ended: n}; only with x-den-edge-secret (EDGE_SECRET),
                                         else the same 404 as any unknown route
 POST   /remux/segments/scan             {imdb, season, episode, scout?} → 202

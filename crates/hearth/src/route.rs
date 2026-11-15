@@ -134,9 +134,18 @@ pub fn classify(target: &Target, method: &Method) -> Class {
         media: media.filter(|_| *method == Method::GET),
     };
     match target {
-        Target::Health | Target::Metrics => control,
+        Target::Health => control,
+        Target::Metrics if read => control,
+        Target::Metrics => bulk(None),
         Target::NotFound => bulk(None),
-        // A CORS preflight is answered before routing, from no state.
+        // Metrics has a deliberately narrower vocabulary than the browser routes. Its path must not turn an
+        // unsupported write or OPTIONS request into reserved-control work on either kind of listener.
+        Target::Scout(path) | Target::Reel(path) | Target::Subs(path) | Target::Remux(path)
+            if path == "/metrics" && !read =>
+        {
+            bulk(None)
+        }
+        // An application-route CORS preflight is answered before routing, from no state.
         _ if *method == Method::OPTIONS => control,
         Target::Scout(path) if read && scout_control(path) => control,
         // Scout streams nothing: `/p/<ticket>` and `/play` answer a 302 and a stream list is a buffered
@@ -291,6 +300,17 @@ mod tests {
             (Target::Remux("/remux/admin/kill".into()), Method::POST),
             (Target::Den(Route::Guest), Method::POST),
             (Target::Den(Route::Configure), Method::GET),
+            // A metrics path alone never grants an unsupported method the reserved lane.
+            (Target::Metrics, Method::POST),
+            (Target::Scout("/metrics".into()), Method::POST),
+            (Target::Reel("/metrics".into()), Method::POST),
+            (Target::Subs("/metrics".into()), Method::POST),
+            (Target::Remux("/metrics".into()), Method::POST),
+            (Target::Metrics, Method::OPTIONS),
+            (Target::Scout("/metrics".into()), Method::OPTIONS),
+            (Target::Reel("/metrics".into()), Method::OPTIONS),
+            (Target::Subs("/metrics".into()), Method::OPTIONS),
+            (Target::Remux("/metrics".into()), Method::OPTIONS),
         ] {
             assert_eq!(class(target, method.clone()).0, Bulk, "{method}");
         }

@@ -14,27 +14,10 @@
 use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
-use den_http::prom::series;
-use hyper::header::{HeaderMap, CACHE_CONTROL, CONTENT_TYPE};
-use hyper::{Response, StatusCode};
-
-use crate::httputil::{self, full, Body};
 use crate::state::{AppState, SyncTier};
+use den_http::prom::series;
 
-pub fn handle(state: &AppState, headers: &HeaderMap) -> Response<Body> {
-    // An empty token disables the route rather than matching an empty header.
-    if !den_http::metrics_authorized(headers, Some(state.cfg.metrics_token.as_str())) {
-        return httputil::not_found();
-    }
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
-        .header(CACHE_CONTROL, "no-store")
-        .body(full(render(state)))
-        .unwrap()
-}
-
-fn render(state: &AppState) -> String {
+pub(crate) fn render(state: &AppState) -> String {
     let cache = state.cache.stats();
     let mut out = String::with_capacity(1024);
     let version = format!("version=\"{}\"", crate::release_version());
