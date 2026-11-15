@@ -558,6 +558,8 @@ async fn stale_ordinary_list_completion_cannot_replace_a_fresh_durable_result() 
     let after = get(&handler, &plain, &[]).await;
     assert!(body_str(&after).contains("Fresh generation"), "plain response regressed: {}", body_str(&after));
     assert!(hdr(&after, "server-timing").starts_with("cache;desc=hit"));
+    // A stale completion must not write its read-through availability verdict either. If it did, RecordingCache's
+    // last key would point at that side effect instead of the accepted fresh list publication checked here.
     let key = recording.last_key();
     assert!(recording.get(&key).is_some_and(|entry| entry.contains("Fresh generation")));
 
