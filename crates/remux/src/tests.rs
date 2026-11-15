@@ -203,6 +203,9 @@ async fn open_gops_are_told_from_closed_ones() {
         assert_eq!(info.video, VideoCodec::Hevc, "{name}");
         assert!(!info.closed_gops, "{name}");
     }
+    let h264 = probe_with_head(&fixture("open-gop-h264.mkv"), crate::scout::HEAD_BYTES as usize).await;
+    assert_keyframes(&h264.keyframes, &[0.0, 3.0, 6.0, 9.0]);
+    assert!(h264.video == VideoCodec::H264 && !h264.closed_gops);
     let closed = ["h264.mkv", "hevc.mkv", "hdr10.mkv", "h264.mp4", "moov-at-end.mp4", "av1.mkv", "av1.mp4"];
     for name in closed {
         let info = probe_with_head(&fixture(name), crate::scout::HEAD_BYTES as usize).await;
@@ -1697,17 +1700,34 @@ async fn av1_sdr_matroska_end_to_end() {
 /// history: it writes the CRA late and clamps the RASLs to nearly identical DTS. Starting one GOP earlier must make
 /// the wanted (second) GOP's decode timestamps identical to a continuous run's. This is the job seam Chrome's
 /// VideoToolbox decoder reported as kVTVideoDecoderReferenceMissingErr (-17694).
-#[test]
+#[tokio::test]
 #[ignore = "needs ffmpeg"]
-fn an_open_hevc_matroska_restart_preserves_the_wanted_gops_decode_timestamps() {
-    let source = testdata("open-gop.mkv");
+async fn an_open_hevc_matroska_restart_preserves_the_wanted_gops_decode_timestamps() {
+    open_gop_matroska_restart_preserves_decode_timestamps("open-gop.mkv", Some("hvc1")).await;
+}
+
+/// The same seam for open-GOP H.264 (x264 `open-gop=1`: a recovery-point I picture with B pictures before it in
+/// display order that reference the GOP before). Matroska stores no DTS for it either, so a copy started directly on
+/// that picture gets its leading pictures' DTS clamped just the same; whether the session primes such a restart is
+/// `session::open_gop_preroll`'s decision on the probed file, which this follows.
+#[tokio::test]
+#[ignore = "needs ffmpeg"]
+async fn an_open_h264_matroska_restart_preserves_the_wanted_gops_decode_timestamps() {
+    open_gop_matroska_restart_preserves_decode_timestamps("open-gop-h264.mkv", None).await;
+}
+
+async fn open_gop_matroska_restart_preserves_decode_timestamps(name: &str, tag: Option<&'static str>) {
+    let source = testdata(name);
     let input = source.to_str().unwrap();
+    let info = probe_with_head(&fixture(name), crate::scout::HEAD_BYTES as usize).await;
+    assert!(!info.closed_gops, "{name} must be open-GOP");
+    let preroll = crate::session::open_gop_preroll(&info, false);
     let run = |seek: Option<f64>| {
         let dir = temp_dir();
         let spec = crate::job::Spec {
             input,
             seek,
-            video: crate::job::Video::Copy { tag: Some("hvc1"), dovi: crate::job::Dovi::Absent },
+            video: crate::job::Video::Copy { tag, dovi: crate::job::Dovi::Absent },
             audio: 0,
             audio_out: crate::job::AudioOut::Stereo,
             text: &[],
@@ -1732,17 +1752,18 @@ fn an_open_hevc_matroska_restart_preserves_the_wanted_gops_decode_timestamps() {
     let segments = crate::playlist::segments(&keyframes, 12.0, crate::playlist::TARGET_SECS);
     let (_, direct_seek) = crate::session::restart_point(&segments, &keyframes, 12.0, false, false, 1);
     let (primed_start, primed_seek) =
-        crate::session::restart_point(&segments, &keyframes, 12.0, false, true, 1);
+        crate::session::restart_point(&segments, &keyframes, 12.0, false, preroll, 1);
     let continuous = packet_times(&run(None), 2);
     let direct = packet_times(&run(direct_seek), 0);
     let primed = packet_times(&run(primed_seek), ((6.0 - primed_start) / 3.0) as usize);
 
+    assert!(preroll, "{name}: the session must start an open-GOP restart one GOP early");
     assert_eq!(primed, continuous, "the wanted GOP must retain the source run's PTS and DTS");
     assert_ne!(direct, continuous, "the fixture must expose the direct seek's damaged DTS");
     let direct_steps: Vec<f64> = direct[..4].windows(2).map(|w| w[1].1 - w[0].1).collect();
     assert!(
-        direct_steps.iter().all(|step| *step < 0.001),
-        "ffmpeg should have clamped the CRA/RASL DTS closely enough to reproduce the defect: {direct_steps:?}"
+        direct_steps.iter().any(|step| *step < 0.001),
+        "ffmpeg should have clamped the leading pictures' DTS closely enough to reproduce the defect: {direct_steps:?}"
     );
 }
 
@@ -4707,6 +4728,24 @@ fn segments_state(origin: &str) -> Arc<AppState> {
 
 async fn scan(state: &Arc<AppState>, key: &str, body: &str) -> Reply {
     call_with(state, "POST", "/remux/segments/scan", None, &[("x-den-segments-key", key)], body).await
+}
+
+/// A title request refused with a 400 says what it could not read: a player shows every refusal as "unreachable", and
+/// a body it got wrong was indistinguishable from a server it could not reach.
+#[tokio::test]
+async fn a_refused_title_request_says_what_was_wrong_with_it() {
+    let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));
+    let cases = [
+        ("/remux/session", r#"{"imdb":"tt0000001","playable":{"h264":"high"}}"#, "expected u16"),
+        ("/remux/session", r#"{"imdb":"tt0000001","title":{"type":"tv"}}"#, "unknown field `title`"),
+        ("/remux/releases", r#"{"imdb":"tt0000001","playable":{"hevcMain":-1}}"#, "expected u16"),
+    ];
+    for (path, body, said) in cases {
+        let r = call(&state, "POST", path, None, body).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{path} {body}");
+        let detail = r.json()["detail"].as_str().unwrap().to_string();
+        assert!(detail.contains(said), "{path} {body}: {detail}");
+    }
 }
 
 #[tokio::test]

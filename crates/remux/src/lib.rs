@@ -509,6 +509,27 @@ fn bad_request(detail: &str) -> Response<Body> {
     httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)
 }
 
+/// A 400 to a title request (`POST /remux/session`, `POST /remux/releases`) whose reason the access line alone does
+/// not carry: logged with the request id, and the reason sent back, so a refusal a player reports as "unreachable"
+/// can be told from a body it got wrong. `reason` is a fixed sentence or serde's account of the first field it could
+/// not read, cut short: it names the field and the kind of value, never a credential (`scout` and `subtitles` are
+/// taken out of the body before it is parsed).
+fn bad_title_request(
+    parts: &hyper::http::request::Parts,
+    endpoint: &str,
+    expected: &str,
+    reason: &str,
+) -> Response<Body> {
+    let reason: String = reason.chars().take(160).collect();
+    let rid = redact::request_id(&parts.headers).map(|r| format!(" rid={r}")).unwrap_or_default();
+    let said = if reason.is_empty() { expected } else { reason.as_str() };
+    eprintln!("{endpoint}: refused the request: {said}{rid}");
+    match reason.is_empty() {
+        true => bad_request(expected),
+        false => bad_request(&format!("{expected} ({reason})")),
+    }
+}
+
 async fn login<B>(state: &AppState, body: B) -> Response<Body>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
@@ -642,14 +663,18 @@ where
         video_codecs: Vec<String>,
         playable: Option<session::Playable>,
     }
-    let Some(req) = read_body(body).await.and_then(|b| serde_json::from_slice::<Title>(&b).ok()) else {
-        return bad_request(
-            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"scout\"?: \"…\", \
-             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {…as in /remux/session}}.",
-        );
+    const EXPECTED: &str =
+        "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"scout\"?: \"…\", \
+             \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {…as in /remux/session}}.";
+    let Some(bytes) = read_body(body).await else {
+        return bad_title_request(parts, "POST /remux/releases", EXPECTED, "no body arrived");
+    };
+    let req = match serde_json::from_slice::<Title>(&bytes) {
+        Ok(req) => req,
+        Err(why) => return bad_title_request(parts, "POST /remux/releases", EXPECTED, &why.to_string()),
     };
     if req.video_codecs.len() > 8 || req.video_codecs.iter().any(|c| c.len() > 35) {
-        return bad_request("videoCodecs is at most 8 short tags.");
+        return bad_title_request(parts, "POST /remux/releases", "videoCodecs is at most 8 short tags.", "");
     }
     let admission = match admission_of(state, parts, browser_of(state, parts), &req.scout) {
         Some(a) => a,
@@ -662,12 +687,24 @@ where
         }
     };
     if !scout::is_imdb(&req.imdb) {
-        return bad_request("imdb must be an IMDb id, tt followed by digits.");
+        return bad_title_request(
+            parts,
+            "POST /remux/releases",
+            "imdb must be an IMDb id, tt followed by digits.",
+            &format!("imdb was {} characters", req.imdb.len()),
+        );
     }
     let episode = match (req.season, req.episode) {
         (Some(s), Some(e)) => Some((s, e)),
         (None, None) => None,
-        _ => return bad_request("An episode needs both season and episode."),
+        _ => {
+            return bad_title_request(
+                parts,
+                "POST /remux/releases",
+                "An episode needs both season and episode.",
+                &format!("season {:?}, episode {:?}", req.season, req.episode),
+            )
+        }
     };
     let id = scout::title_id(&req.imdb, episode);
     let listed = session::releases(
@@ -725,20 +762,23 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let browser = browser_of(state, parts);
-    let Some(body) = read_body(body).await else {
-        return bad_request(
-            "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
+    const EXPECTED: &str = "Expected {\"imdb\": \"tt…\", \"season\"?: n, \"episode\"?: n, \"filename\"?: \"…\", \"scout\"?: \"…\", \
              \"audio\"?: [\"en\", …], \"audioTrack\"?: n, \"subtitles\"?: \"…\", \"subtitleLanguages\"?: [\"en\", …], \"originalLanguage\"?: \"en\", \
              \"videoCodecs\"?: [\"h264\", \"hevc\"], \"playable\"?: {\"h264\", \"h264High10\", \"hevcMain\", \"hevcMain10\", \"hevcHighTier\", \"hdr\", \"eac3\", \"aacMultichannel\", \"dolbyVision\": {\"p5\", \"p8\"}, \"av1\", \"av1Main10\", \"av1Hdr\", \"flac\", \"aac71\", \"vp9\", \"vp9Profile2\"}, \
              \"startAt\"?: seconds, \"maxBitrate\"?: bits a second, \"player\"?: \"native\" | \"hls.js\" | \"cast\", \
-             \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool, \"replaces\"?: \"sid\"}.",
-        );
+             \"exclude\"?: [\"filename\", …], \"transcode\"?: \"never\", \"fitsOnly\"?: bool, \"replaces\"?: \"sid\"}.";
+    const ENDPOINT: &str = "POST /remux/session";
+    let Some(body) = read_body(body).await else {
+        return bad_title_request(parts, ENDPOINT, EXPECTED, "no body arrived");
     };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return bad_request("Expected a JSON playback request.");
+    let mut value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(why) => {
+            return bad_title_request(parts, ENDPOINT, "Expected a JSON playback request.", &why.to_string())
+        }
     };
     let Some(object) = value.as_object_mut() else {
-        return bad_request("Expected a JSON playback request.");
+        return bad_title_request(parts, ENDPOINT, "Expected a JSON playback request.", "not an object");
     };
     let take_url =
         |object: &mut serde_json::Map<String, serde_json::Value>, name: &str| match object.remove(name) {
@@ -747,16 +787,29 @@ where
             Some(_) => Err(()),
         };
     let Ok(scout_url) = take_url(object, "scout") else {
-        return bad_request("scout must be a URL string.");
+        return bad_title_request(parts, ENDPOINT, "scout must be a URL string.", "scout is not a string");
     };
     let Ok(subtitles_url) = take_url(object, "subtitles") else {
-        return bad_request("subtitles must be a URL string.");
+        return bad_title_request(
+            parts,
+            ENDPOINT,
+            "subtitles must be a URL string.",
+            "subtitles is not a string",
+        );
     };
-    let Ok(req) = serde_json::from_value::<PlaybackRequest>(value) else {
-        return bad_request("Expected a closed playback request with no unknown fields.");
+    let req = match serde_json::from_value::<PlaybackRequest>(value) {
+        Ok(req) => req,
+        Err(why) => {
+            return bad_title_request(
+                parts,
+                ENDPOINT,
+                "Expected a closed playback request with no unknown fields.",
+                &why.to_string(),
+            )
+        }
     };
     if let Err(detail) = req.validate() {
-        return bad_request(detail);
+        return bad_title_request(parts, ENDPOINT, detail, "");
     }
     let no_transcode = req.transcode.as_deref() == Some("never");
     // A logged-in browser, or — with no cookie — whoever holds the scout install the request names: that
@@ -774,7 +827,14 @@ where
     let episode = match (req.season, req.episode) {
         (Some(s), Some(e)) => Some((s, e)),
         (None, None) => None,
-        _ => return bad_request("An episode needs both season and episode."),
+        _ => {
+            return bad_title_request(
+                parts,
+                ENDPOINT,
+                "An episode needs both season and episode.",
+                &format!("season {:?}, episode {:?}", req.season, req.episode),
+            )
+        }
     };
     let id = scout::title_id(&req.imdb, episode);
     // As the browser reported it, for every player. 10-bit VP9 used to be cleared for a native session because
