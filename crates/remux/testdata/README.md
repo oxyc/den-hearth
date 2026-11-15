@@ -21,6 +21,7 @@ unevenly, and the B-frames are what trigger ffmpeg's seek back-off (see `src/job
 | `open-gop.mkv` | Open GOPs: x265's own keyframes every 3 s are CRAs, each with three RASL leading pictures that reference the GOP before (`closed_gops` false, no `EXT-X-INDEPENDENT-SEGMENTS`) | 0, 3, 6, 9 | 12.0 |
 | `open-gop.mp4` | `open-gop.mkv` copied into MP4: the leading pictures seen in `ctts` | as `open-gop.mkv` | 12.0 |
 | `open-gop-overlong.mkv` | Open GOPs (10-bit x265 CRAs every 48 pictures, each with three RASLs) at 23.976 fps under a default duration of 23.333 fps, as HandBrake wrote the x265 encodes Chrome failed on: every packet claims 42 ms over 41 and 42 ms steps, the overrun `job::CLAMP_DURATION` cuts | 0, 2.002, 4.004, 6.006, 8.008, 10.01 | 12.012 |
+| `open-gop-h264.mkv` | Open GOPs in H.264: x264's keyframes every 3 s are recovery-point I pictures with B pictures before them in display order that reference the GOP before (`closed_gops` false) | 0, 3, 6, 9 | 12.0 |
 | `h264.ts` | MPEG-TS: H.264 with 10 s GOPs, so a run started between them has no source keyframe there; AAC eng. Its clock starts at 1.462 s (the audio), the video at 1.483 s | 0, 10, 20 (from the video's start) | 30.021 |
 | `mpeg2.ts` | MPEG-TS: MPEG-2 (160 × 90, 12-frame GOPs), decoded on the CPU for a transcode; AC-3 5.1 fin | every 0.5 s | 30.005 |
 | `xvid.avi` | AVI with `idx1`: XviD (MPEG-4 Part 2, no B-frames) and MP3, decoded on the CPU for a transcode. libxvid's one frame of delay leaves the index's second chunk empty, a drop frame, which a transcode shows as the first | 0, 10.042, 20.042 | 30.042 |
@@ -96,6 +97,10 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24000/1001:duration=12 -f lavfi
   -x265-params keyint=48:min-keyint=48:scenecut=0:bframes=3:open-gop=1:radl=0:log-level=error -pix_fmt yuv420p10le \
   -c:a eac3 -b:a 64k -ac 2 -metadata:s:a:0 language=eng open-gop-overlong.mkv
 mkvpropedit open-gop-overlong.mkv --edit track:v1 --set default-duration=42857111
+
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=24:duration=12 -f lavfi -i sine=frequency=550:duration=12:sample_rate=48000 \
+  -map 0:v -map 1:a -c:v libx264 -preset veryfast -crf 36 -bf 3 -g 72 -keyint_min 72 -sc_threshold 0 \
+  -x264-params open-gop=1:b-adapt=0:bframes=3 -pix_fmt yuv420p -c:a aac -b:a 64k -ac 2 -metadata:s:a:0 language=eng open-gop-h264.mkv
 
 # A tone on each channel, the LFE's low and quieter, so a listen tells the channels apart. 40 kbit/s keeps the file under
 # 1 MB; what a session does with the tracks is convert them, so their own quality doesn't matter.
