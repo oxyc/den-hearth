@@ -173,7 +173,8 @@ FROM ffmpeg-source AS ffmpeg
 #              MPEG-TS or AVI, setpts and trim/atrim to cut a run to its keyframe, and hwupload (with format, and the
 #              scale that converts to nv12 — swscale) to hand CPU-decoded pictures to the GPU
 #   bsfs       dovi_rpu and filter_units: a copied Dolby Vision stream loses its RPU and enhancement layer
-#              and its configuration record, leaving the HDR10 base layer a browser can play
+#              and its configuration record, leaving the HDR10 base layer a browser can play. setts: every copied
+#              video packet's duration is cut to the step to the next packet's DTS (job::CLAMP_DURATION)
 #   protocols  file, pipe (the fingerprint's PCM on stdout), and http(s) over tcp/tls (OpenSSL); --enable-version3 is
 #              what OpenSSL 3 requires
 # ffmpeg's own libraries are linked in statically; OpenSSL, zlib and libva are the system's.
@@ -191,7 +192,7 @@ RUN ./configure \
       --enable-encoder=aac,h264_vaapi,webvtt,pcm_s16le \
       --enable-parser=av1,h264,hevc,mpegvideo,mpeg4video,aac,ac3,dca,mlp,flac,opus,mpegaudio,vorbis \
       --enable-filter=aresample,aformat,anull,atrim,abuffer,abuffersink,null,trim,setpts,buffer,buffersink,format,scale,hwupload,scale_vaapi,tonemap_vaapi \
-      --enable-bsf=dovi_rpu,filter_units \
+      --enable-bsf=dovi_rpu,filter_units,setts \
       --enable-swresample --enable-swscale \
     && make -j"$(nproc)" && make install
 
@@ -222,6 +223,13 @@ COPY --from=general-e2e /general-e2e-passed /general-e2e-passed
 COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin/
 COPY . .
 RUN cargo test --locked -p den-remux -- --include-ignored
+
+# ---- test: Remux's ffmpeg alone, at the runtime image's path --------------------------------------------
+# The cross-repo playback e2e (den-edge `web/e2e-stack/ci.sh`) copies /usr/local/bin/ffmpeg-remux out of an image.
+# CI hands it this stage, built from the same checkout as the Hearth under test, so Remux's arguments always meet
+# the ffmpeg build they were written for, not the last release's.
+FROM debian:trixie-slim AS stack-ffmpeg
+COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg-remux
 
 # ---- release metadata ---------------------------------------------------------------------------------
 # The runtime copies this marker, so a build without a valid DEN_VERSION fails before an image can be pushed.
