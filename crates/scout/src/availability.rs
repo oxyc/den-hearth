@@ -8,7 +8,8 @@
 //! reply: an uncached title can take the whole scrape timeout, and a row of posters must not wait on its
 //! slowest title. The client asks again for what came back unknown, and unknown never hides a title.
 //!
-//! Movies only, like the TV's own probes — a series needs per-episode resolution.
+//! Movies and resolved series episodes. A series poster still has to choose an episode first; once it has one,
+//! `tt…:S:E` uses the same scrape and verdict key as the ordinary series stream route.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use crate::handler::{
     error, json_response, lock, method_not_allowed, spawn_background, split_path, to_json, Inner, RankOpts,
     RankedList, Resp, LIST_BUILD_SLACK, MAX_SEEDS,
 };
-use crate::id::StreamId;
+use crate::id::{parse_stream_id, StreamId};
 use crate::metrics::metrics;
 use crate::rank::RawStream;
 use crate::stores::pool::{config_has_service, has_cache_truth, StorePool};
@@ -54,9 +55,31 @@ const VERDICT_UNAVAILABLE: &str = "0";
 /// Go `verdictUndetermined`: the marker a failed or partial check leaves, which holds off the next check.
 pub(crate) const VERDICT_UNDETERMINED: &str = "?";
 
-/// Go `imdbRe` (`^tt\d{1,10}$`).
-fn is_imdb_id(s: &str) -> bool {
-    s.strip_prefix("tt").is_some_and(|d| (1..=10).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
+/// Parse the ids accepted by the batch route through the stream route's parser, so the two entry points ask
+/// indexers the same question. A movie has no separators; a resolved series episode has exactly `tt…:S:E`.
+fn parse_availability_id(raw: &str) -> Option<StreamId> {
+    // Unlike the stream route, this JSON contract carries a raw id rather than an `<id>.json` path segment.
+    // Keep the old movie validation strict and do not let the shared route parser silently strip a suffix.
+    if raw.ends_with(".json") {
+        return None;
+    }
+    let separators = raw.bytes().filter(|b| *b == b':').count();
+    match separators {
+        0 => parse_stream_id("movie", raw),
+        2 => parse_stream_id("series", raw),
+        _ => None,
+    }
+}
+
+/// The stable suffix shared by batch checks and stream-list read-through. Numeric aliases such as `01` collapse
+/// to one verdict, avoiding duplicate background scrapes and preventing an episode verdict from becoming a
+/// series-wide verdict.
+pub(crate) fn verdict_id(sid: &StreamId) -> String {
+    if sid.has_ep {
+        format!("{}:{}:{}", sid.imdb, sid.season, sid.episode)
+    } else {
+        sid.imdb.clone()
+    }
 }
 
 /// Go `verdictPrefix` keys a config's verdicts. The scope is left out, so the scoped config a browser holds reads
@@ -102,7 +125,7 @@ impl Drop for CheckDone {
 }
 
 impl Inner {
-    /// handleAvailability — POST /<config>/availability {"ids":["tt…"]} →
+    /// handleAvailability — POST /<config>/availability {"ids":["tt…", "tt…:S:E"]} →
     /// {"availability":{"tt…":"available"|"unavailable"|"unknown"}}.
     pub(crate) fn handle_availability(self: &Arc<Self>, req: &Request<Bytes>, path: &str) -> Resp {
         if req.method() != Method::POST {
@@ -140,18 +163,20 @@ impl Inner {
         if ids.len() > MAX_AVAILABILITY_IDS {
             return error(StatusCode::BAD_REQUEST, "bad_request");
         }
-        if ids.iter().any(|id| !is_imdb_id(id)) {
+        let Some(parsed): Option<Vec<StreamId>> = ids.iter().map(|id| parse_availability_id(id)).collect()
+        else {
             return error(StatusCode::BAD_REQUEST, "bad_id");
-        }
+        };
         let prefix = verdict_prefix(&config);
         let mut out: BTreeMap<&str, &str> = BTreeMap::new();
-        for id in &ids {
-            let verdict = match self.deps.cache.get(&format!("{prefix}{id}")).as_deref() {
+        for (id, sid) in ids.iter().zip(parsed) {
+            let key = format!("{prefix}{}", verdict_id(&sid));
+            let verdict = match self.deps.cache.get(&key).as_deref() {
                 Some(VERDICT_AVAILABLE) => "available",
                 Some(VERDICT_UNAVAILABLE) => "unavailable",
                 Some(VERDICT_UNDETERMINED) => "unknown",
                 _ => {
-                    self.check_behind(&config, id, &format!("{prefix}{id}"));
+                    self.check_behind(&config, sid, &key);
                     "unknown"
                 }
             };
@@ -183,12 +208,12 @@ impl Inner {
         self.record_verdict(key, !list.ranked.is_empty());
     }
 
-    /// checkBehind starts a background check of one movie, unless one is already running for it or the ceiling
+    /// checkBehind starts a background check of one movie or resolved episode, unless one is already running for it or the ceiling
     /// is reached. Booked before the task exists, so a flood of asks costs a map lookup each rather than a
     /// task each.
     ///
     /// Detached from the request: the reply has gone by the time the check finishes, which is the point.
-    fn check_behind(self: &Arc<Self>, config: &Config, imdb: &str, key: &str) {
+    fn check_behind(self: &Arc<Self>, config: &Config, sid: StreamId, key: &str) {
         {
             let mut running = lock(&self.avail_in_flight);
             if running.contains(key) || running.len() >= MAX_AVAILABILITY_CHECKS {
@@ -196,7 +221,7 @@ impl Inner {
             }
             running.insert(key.to_owned());
         }
-        let (this, config, imdb, key) = (self.clone(), config.clone(), imdb.to_owned(), key.to_owned());
+        let (this, config, key) = (self.clone(), config.clone(), key.to_owned());
         // A background task, so the request's recovery cannot see a panic here — and the booking is released from
         // a guard, so a panic cannot strand the key either.
         spawn_background(self.deps.runtime.clone(), "availability check", async move {
@@ -207,7 +232,6 @@ impl Inner {
             if !config.cached_only && config_has_service(&config, DebridService::TorBox) {
                 metrics().torbox_avoid("availability_default");
             }
-            let sid = StreamId { kind: "movie".to_owned(), imdb, season: 0, episode: 0, has_ep: false };
             let list = this.rank_availability(deadline, &config, &sid).await;
             this.record_list_verdict(&key, &list);
         });

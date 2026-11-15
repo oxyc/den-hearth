@@ -546,11 +546,14 @@ impl Inner {
             answer_early: job.early && !debug,
         };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
-        // A movie's list answers the availability route's question too, so a title someone opened needs no
-        // check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
-        // one ranked for a browser, whose cap may have kept different releases.
-        if job.sid.kind == "movie" && list.degraded.is_empty() && dbg.is_none() && job.client.is_none() {
-            self.record_list_verdict(&format!("{}{}", verdict_prefix(&job.config), job.sid.imdb), &list);
+        // A movie or resolved episode list answers the availability route's exact question too, so a title someone
+        // opened needs no check of its own there. Not from a degraded build, which knows nothing either way, nor a
+        // debug one, nor one ranked for a browser, whose cap may have kept different releases.
+        if list.degraded.is_empty() && dbg.is_none() && job.client.is_none() {
+            self.record_list_verdict(
+                &format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid)),
+                &list,
+            );
         }
         self.finish_stream_list(job, dbg, list, publication).await
     }
