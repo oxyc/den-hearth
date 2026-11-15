@@ -689,7 +689,11 @@ fn managed_request(
         audio_track: integer("audioTrack")?,
         filename,
         playable,
-        receiver: object.get("player").and_then(Value::as_str) == Some("cast"),
+        // Both receiver paths fetch TorBox's managed playlist themselves. In particular, an AirPlay 2 TV is not
+        // the iPhone whose WebKit capability report accompanies the request: TorBox serves HEVC in MPEG-TS, while
+        // Apple's TV receiver contract requires HEVC in fMP4. Let Scout apply the existing receiver-safe selection
+        // instead of handing that representation to a stricter television and waiting for it to stall.
+        receiver: matches!(object.get("player").and_then(Value::as_str), Some("cast" | "airplay")),
         platform: object.get("platform").and_then(Value::as_str).map(str::to_owned),
         subtitle,
         early_answer: false,
@@ -1952,6 +1956,18 @@ mod tests {
 
         assert_eq!(request.audio, ["en-US", "sv"]);
         assert_eq!(request.audio_track, Some(1));
+    }
+
+    #[test]
+    fn airplay_is_a_receiver_for_managed_hls_selection() {
+        let request = |player| {
+            managed_request(&json!({"imdb": "tt42", "player": player}), None).expect("managed request")
+        };
+
+        assert!(request("cast").receiver);
+        assert!(request("airplay").receiver);
+        assert!(!request("native").receiver);
+        assert!(!request("hls.js").receiver);
     }
 
     #[test]

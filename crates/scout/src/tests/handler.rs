@@ -194,7 +194,7 @@ async fn managed_hls_is_title_level_and_keeps_provider_ids_inside_scout() {
     assert!(!targets[0].no_add, "managed playback must reuse the ordinary add-budgeted resolve path");
 }
 
-// A Cast receiver plays TorBox's stream as it is. A release whose video it can't take — any HEVC one, from TorBox's
+// A receiver plays TorBox's stream as it is. A release whose video it can't take — any HEVC one, from TorBox's
 // MPEG-TS — is left to Remux, which can convert it or choose another; one it takes goes to the receiver as TorBox's
 // own. In the page, nothing changes.
 #[tokio::test]

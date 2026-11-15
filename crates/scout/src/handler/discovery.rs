@@ -33,9 +33,9 @@ pub(super) fn managed_candidates<'a>(
         return Err(ManagedHlsError::DolbyVision);
     }
     if request.receiver {
-        // TorBox's managed HLS is MPEG-TS, and Cast receivers play no HEVC from a Transport Stream ("HEVC is not
-        // supported on Transport Stream containers", developers.google.com/cast/docs/media): both of Google's players
-        // took such a stream, showed a second of it and failed, whatever the TV itself decodes.
+        // TorBox's managed HLS is MPEG-TS. Cast receivers play no HEVC from a Transport Stream, and Apple's AirPlay
+        // 2 TV contract requires HEVC in fMP4. The sender/browser decoding HEVC cannot make that rendition safe for
+        // either receiver path.
         candidates.retain(|candidate| cost_attributes(candidate).codec.as_deref() != Some("hevc"));
         if let Some(client) = request.playable.as_ref() {
             candidates.retain(|candidate| {

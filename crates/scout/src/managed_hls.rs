@@ -40,7 +40,7 @@ pub enum ManagedHlsError {
     NotFound,
     /// Every listed release asked for is Dolby Vision, whose managed rendition is known to be damaged. Remux plays it.
     DolbyVision,
-    /// A Cast receiver would need every listed release asked for converted (its `playable` says so). Remux can.
+    /// A receiver would need every listed release asked for converted (its `playable` says so). Remux can.
     ReceiverUnsupported,
     /// The account was not authorized to create the stream.
     Refused,
@@ -108,8 +108,8 @@ pub struct ManagedHlsRequest {
     pub filename: Option<String>,
     /// The same browser capability report Scout already uses for stream-list ranking.
     pub playable: Option<ClientPlayable>,
-    /// Asked for a Cast receiver, which plays TorBox's stream as it is: a release `playable` says its video would
-    /// have to be converted for is left to Remux, rather than handed over to fail on the TV.
+    /// Asked for a receiver, which plays TorBox's stream as it is: a release `playable` says its video would have to
+    /// be converted for is left to Remux, rather than handed over to fail on the TV.
     pub receiver: bool,
     /// The packaged TV platform, where one has identified itself. Browser-native HLS remains unspecified.
     pub platform: Option<String>,
