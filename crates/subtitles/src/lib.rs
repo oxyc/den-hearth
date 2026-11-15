@@ -203,18 +203,15 @@ async fn route(
 ) -> Response<Body> {
     let path = parts.uri.path();
 
-    match path {
+    if path == "/health" {
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when OpenSubtitles has been
         // failing so the app's Plugins screen can surface it.
-        "/health" => {
-            let body = if state.config_key_invalid {
-                config_key_invalid_health()
-            } else {
-                health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed))
-            };
-            return httputil::json(StatusCode::OK, &body, "no-store");
-        }
-        _ => {}
+        let body = if state.config_key_invalid {
+            config_key_invalid_health()
+        } else {
+            health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        return httputil::json(StatusCode::OK, &body, "no-store");
     }
 
     let segs = split_path(path);

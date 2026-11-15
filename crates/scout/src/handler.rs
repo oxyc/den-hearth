@@ -1462,47 +1462,43 @@ impl Inner {
         if req.method() != Method::GET && req.method() != Method::HEAD {
             return method_not_allowed("GET, HEAD");
         }
-        match path.as_str() {
-            "/health" => {
-                // Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
-                // state so a monitor sees a total-indexer outage instead of just "empty results".
-                let mut status = json!({"status": "ok", "coverage": "complete"});
-                if self.deps.config_key_invalid {
-                    status = json!({
-                        "status": "degraded",
-                        "reason": "config_key_invalid",
-                        "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
-                    });
-                } else if self.deps.runtime.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
-                    status =
-                        json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
-                } else if self.deps.runtime.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
-                    // Which source is withheld: naming it says which indexers this install uses.
-                    status["coverage"] = json!("partial");
-                    status["detail"] = json!(SOURCES_MISSING_DETAIL);
-                }
-                // A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
-                // other evidence is one log line per refusal. The tightest remaining allowance is what an operator
-                // or a monitor needs; per-account detail is withheld because this route is unauthenticated.
-                let (left, accounts) = global_add_budget().lowest();
-                if accounts > 0 {
-                    status["addBudgetRemaining"] = json!(left);
-                }
-                // How TorBox has been answering, so a client can warn before playback fails. Scout's direct API
-                // observations are authoritative. The separately cached public status page is only corroboration,
-                // or an explicitly sourced fallback before the first API call; it never makes Scout itself
-                // degraded (which would turn an external status-site answer into a rollout/liveness gate).
-                if let Some(debrid) = self.deps.runtime.torbox.health_report() {
-                    if debrid["state"] == "down" && debrid["source"] == "local" && status["status"] == "ok" {
-                        status["status"] = json!("degraded");
-                        status["reason"] = json!("debrid");
-                        status["detail"] = json!(DEBRID_DOWN_DETAIL);
-                    }
-                    status["debrid"] = debrid;
-                }
-                return json_response(StatusCode::OK, &status);
+        if path == "/health" {
+            // Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
+            // state so a monitor sees a total-indexer outage instead of just "empty results".
+            let mut status = json!({"status": "ok", "coverage": "complete"});
+            if self.deps.config_key_invalid {
+                status = json!({
+                    "status": "degraded",
+                    "reason": "config_key_invalid",
+                    "detail": "CONFIG_KEY is set but not a valid base64 32-byte key — install configs are refused until it is fixed",
+                });
+            } else if self.deps.runtime.scrape_fails.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                status = json!({"status": "degraded", "reason": "indexers", "detail": INDEXERS_DOWN_DETAIL});
+            } else if self.deps.runtime.partial_builds.load(Ordering::Relaxed) >= SCRAPE_FAIL_THRESHOLD {
+                // Which source is withheld: naming it says which indexers this install uses.
+                status["coverage"] = json!("partial");
+                status["detail"] = json!(SOURCES_MISSING_DETAIL);
             }
-            _ => {}
+            // A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
+            // other evidence is one log line per refusal. The tightest remaining allowance is what an operator
+            // or a monitor needs; per-account detail is withheld because this route is unauthenticated.
+            let (left, accounts) = global_add_budget().lowest();
+            if accounts > 0 {
+                status["addBudgetRemaining"] = json!(left);
+            }
+            // How TorBox has been answering, so a client can warn before playback fails. Scout's direct API
+            // observations are authoritative. The separately cached public status page is only corroboration,
+            // or an explicitly sourced fallback before the first API call; it never makes Scout itself
+            // degraded (which would turn an external status-site answer into a rollout/liveness gate).
+            if let Some(debrid) = self.deps.runtime.torbox.health_report() {
+                if debrid["state"] == "down" && debrid["source"] == "local" && status["status"] == "ok" {
+                    status["status"] = json!("degraded");
+                    status["reason"] = json!("debrid");
+                    status["detail"] = json!(DEBRID_DOWN_DETAIL);
+                }
+                status["debrid"] = debrid;
+            }
+            return json_response(StatusCode::OK, &status);
         }
 
         // ["<config>", "stream"|"play", ...]
