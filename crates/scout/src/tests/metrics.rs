@@ -14,7 +14,7 @@ use crate::metrics::{
     cache_persistent_gauge, new_metric_set, METRIC_TORBOX_AVOIDED, METRIC_TORBOX_ENDPOINTS,
     METRIC_TORBOX_OUTCOMES,
 };
-use crate::tests::handler::{body_str, get, test_deps, valid_blob, RecordingCache};
+use crate::tests::handler::{body_str, get, hdr, method, test_deps, valid_blob, RecordingCache};
 
 const METRICS_TOKEN: &str = "metrics-shared-secret";
 
@@ -66,6 +66,27 @@ async fn metrics_is_gated() {
     for (name, headers, want) in cases {
         let rr = get(&on, "/metrics", &headers).await;
         assert_eq!(rr.status(), want, "{name}: {}, want {want}", rr.status());
+    }
+}
+
+#[tokio::test]
+async fn metrics_methods_are_bounded_and_authorized_first() {
+    let h = new_handler(test_deps(|d| d.metrics_token = METRICS_TOKEN.to_owned()));
+    let auth = [("authorization", format!("Bearer {METRICS_TOKEN}"))];
+    let borrowed = [(auth[0].0, auth[0].1.as_str())];
+
+    let head = method(&h, http::Method::HEAD, "/metrics", &borrowed).await;
+    assert_eq!(head.status(), 200);
+    assert!(head.body().is_empty(), "HEAD rendered or sent the exposition");
+    assert_eq!(hdr(&head, "content-type"), "text/plain; version=0.0.4; charset=utf-8");
+    assert_eq!(hdr(&head, "cache-control"), NO_STORE);
+
+    for verb in [http::Method::POST, http::Method::PUT, http::Method::DELETE, http::Method::OPTIONS] {
+        let concealed = method(&h, verb.clone(), "/metrics", &[]).await;
+        assert_eq!(concealed.status(), 404, "unauthorized {verb}");
+        let refused = method(&h, verb.clone(), "/metrics", &borrowed).await;
+        assert_eq!(refused.status(), 405, "authorized {verb}");
+        assert_eq!(hdr(&refused, "allow"), "GET, HEAD", "{verb}");
     }
 }
 

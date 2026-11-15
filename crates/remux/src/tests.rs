@@ -977,6 +977,26 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
     }
 }
 
+#[tokio::test]
+async fn metrics_head_is_empty_and_unsupported_methods_are_concealed_then_405() {
+    let mut cfg = test_config("http://127.0.0.1:9", 2, Duration::from_secs(600), None);
+    cfg.metrics_token = Some("scrape-me".into());
+    let state = state_from(cfg);
+    let auth = [("authorization", "Bearer scrape-me")];
+
+    let head = call_with(&state, "HEAD", "/metrics", None, &auth, "").await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert!(head.body.is_empty(), "HEAD rendered or sent the exposition");
+    assert_eq!(head.headers["content-type"], "text/plain; version=0.0.4; charset=utf-8");
+
+    for method in ["POST", "PUT", "DELETE", "OPTIONS"] {
+        assert_eq!(call(&state, method, "/metrics", None, "").await.status, StatusCode::NOT_FOUND);
+        let refused = call_with(&state, method, "/metrics", None, &auth, "").await;
+        assert_eq!(refused.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(refused.headers["allow"], "GET, HEAD", "{method}");
+    }
+}
+
 #[test]
 fn only_the_dedicated_edge_peer_can_mark_a_session_public() {
     let state = test_state("http://127.0.0.1:9", 2, Duration::from_secs(600));

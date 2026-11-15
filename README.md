@@ -336,7 +336,7 @@ twice the requested size, 512 KiB, against the cgroup; at most 24 media bodies s
 The service's own 503s (Remux's `scratch_unavailable` and `scout_unconfigured`, Subtitles' `service_unavailable` and
 `translation_unavailable`) get `Retry-After: 5` from hearth when the service sent none.
 
-The 16 positions bulk cannot take are the control lane: `/health`, `/metrics`, the combined `/den` manifest,
+The 16 positions bulk cannot take are the control lane: `/health`, GET/HEAD `/metrics`, the combined `/den` manifest,
 configuration and revocation routes, Remux's bare `/health` on its own port, Remux's session keep-alive and end,
 and CORS preflights. It is
 an allowlist (`route::classify`); any route not named is bulk, which includes everything of Scout's that asks an
@@ -355,7 +355,11 @@ with a Range when it resumes.
 
 `/metrics` on :8090 (low cardinality: two lanes, two media classes) carries `den_hearth_request_admission_*` by
 `lane`, `den_hearth_connection_admission_*`, and `den_hearth_media_*` by `class`; on a service's own port `/metrics`
-is the service's. `bench/http/run.py` has an `overload` case that holds the node past these limits on every port and
+is the service's. Across Hearth, Scout, Reel, Subtitles and Remux, an authorized GET renders the Prometheus body,
+HEAD returns its status and representation headers without rendering or sending that body, and every other method
+gets 405 with `Allow: GET, HEAD`. A missing or wrong bearer token (including on an unsupported method) remains the
+indistinguishable 404. Unsupported metrics methods use the bulk lane, so their path cannot reserve control capacity.
+`bench/http/run.py` has an `overload` case that holds the node past these limits on every port and
 reports the cgroup's memory and `/health`'s latency (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ## Per-crate tools
