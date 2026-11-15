@@ -21,6 +21,7 @@
 //! - `-ss K+0.135 -noaccurate_seek`: see [`seek_for`]. A file with no index (MPEG-TS, AVI) is transcoded and read
 //!   from `-ss K-12` instead, cut back to K: see [`grid_seek`].
 //! - `-hls_flags temp_file`: a GOP file appears under its final name only once it is complete.
+//! - `-bsf:v setts=…` on a copy: see [`CLAMP_DURATION`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -63,6 +64,17 @@ const GRID_TICKS: &str = "setpts='if(gt(FR,0),round(PTS*TB*FR)/(FR*TB),PTS)'";
 pub fn grid_seek(k: f64) -> Option<f64> {
     (k > GRID_SEEK_PAD).then_some(k - GRID_SEEK_PAD)
 }
+
+/// A copied video packet's duration, cut to the step to the next packet's decode time. The mp4 muxer checks the first
+/// packet of each GOP file against where the file before it ended, its last packet's DTS plus duration. When that
+/// duration reaches past the keyframe's DTS, the muxer logs "Packet duration … out of range" (a warning, under the
+/// run's `-loglevel error`) and drops the keyframe's PTS, writing it at its DTS. A duration does that when Matroska's
+/// millisecond rounding makes it 42 ms over a 41 ms step, or when the file declares a frame rate its timestamps don't
+/// keep (HandBrake's 23.333 fps over 23.976 fps pictures). An open-GOP CRA written at its DTS sorts into the GOP
+/// before it, and Chrome's VideoToolbox decoder then fails on its leading pictures with -17694
+/// (kVTVideoDecoderReferenceMissingErr). `pts` and `dts` are named because `setts` otherwise writes its `ts`, the DTS,
+/// to both. A packet with no later one, or no step to it, keeps its own duration.
+pub const CLAMP_DURATION: &str = r"setts=pts=PTS:dts=DTS:duration=if(gt(NEXT_DTS-DTS\,0)*lt(NEXT_DTS-DTS\,DURATION)\,NEXT_DTS-DTS\,DURATION)";
 
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const STDERR_TAIL: usize = 2048;
@@ -291,13 +303,17 @@ pub fn args(spec: &Spec<'_>, ca_file: Option<&str>) -> Vec<String> {
             if let Some(tag) = tag {
                 a.extend(s(&["-tag:v", tag]));
             }
-            match dovi {
+            let bsf = match dovi {
                 // dovi_rpu drops the configuration record (and a frame's last RPU); filter_units every Dolby
                 // Vision unit — 62 the RPU, 63 the enhancement layer, several of which a profile 7 frame carries.
-                Dovi::Strip => a.extend(s(&["-bsf:v", "dovi_rpu=strip=1,filter_units=remove_types=62|63"])),
-                Dovi::Keep => a.extend(s(&["-strict", "unofficial"])),
-                Dovi::Absent => {}
-            }
+                Dovi::Strip => format!("dovi_rpu=strip=1,filter_units=remove_types=62|63,{CLAMP_DURATION}"),
+                Dovi::Keep => {
+                    a.extend(s(&["-strict", "unofficial"]));
+                    CLAMP_DURATION.to_string()
+                }
+                Dovi::Absent => CLAMP_DURATION.to_string(),
+            };
+            a.extend(["-bsf:v".to_string(), bsf]);
         }
         Video::Transcode { width, height, tonemap, preset, software_decode, keyframes, .. } => {
             let size = match width {
@@ -1042,16 +1058,22 @@ mod tests {
         };
         let a = args(&spec, Some(CA_BUNDLE));
         let joined = a.join(" ");
-        assert!(!joined.contains("-bsf"), "{joined}");
+        assert_eq!(joined.matches("-bsf").count(), 1, "{joined}");
         let dovi = Spec { video: Video::Copy { tag: Some("hvc1"), dovi: Dovi::Strip }, ..spec };
         let d = args(&dovi, None).join(" ");
         assert!(
-            d.contains("-tag:v hvc1 -bsf:v dovi_rpu=strip=1,filter_units=remove_types=62|63 "),
-            "the base layer alone, with no dvcC"
+            d.contains(&format!(
+                "-tag:v hvc1 -bsf:v dovi_rpu=strip=1,filter_units=remove_types=62|63,{CLAMP_DURATION} "
+            )),
+            "the base layer alone, with no dvcC, its durations clamped: {d}"
+        );
+        assert_eq!(d.matches("-bsf").count(), 1, "one chain, or the last -bsf:v replaces the others: {d}");
+        let copy = format!(
+            "-map 0:V:0 -map 0:a:1 -c:v copy -tag:v hvc1 -bsf:v {CLAMP_DURATION} -c:a aac -ac 2 -b:a 192k"
         );
         for want in [
             "-copyts -start_at_zero -noaccurate_seek -ss 13.135000 -i https://cdn.example/f.mkv",
-            "-map 0:V:0 -map 0:a:1 -c:v copy -tag:v hvc1 -c:a aac -ac 2 -b:a 192k",
+            copy.as_str(),
             "-avoid_negative_ts disabled",
             "-f hls -hls_time 0 -hls_segment_type fmp4",
             "-hls_segment_options movflags=+frag_discont+skip_sidx",
@@ -1439,11 +1461,11 @@ mod tests {
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
-        assert!(
-            joined.contains("-c:v copy -tag:v dvh1 -strict unofficial -af atrim=start_sample=1024 -c:a aac"),
-            "{joined}"
+        let want = format!(
+            "-c:v copy -tag:v dvh1 -strict unofficial -bsf:v {CLAMP_DURATION} -af atrim=start_sample=1024"
         );
-        assert!(!joined.contains("-bsf"), "the RPU stays: {joined}");
+        assert!(joined.contains(&want), "{joined}");
+        assert!(!joined.contains("dovi_rpu") && !joined.contains("filter_units"), "the RPU stays: {joined}");
     }
 
     #[test]
@@ -1458,7 +1480,8 @@ mod tests {
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
-        assert!(joined.contains("-map 0:a:2 -c:v copy -tag:v hvc1 -c:a copy -threads 1"), "{joined}");
+        let want = format!("-map 0:a:2 -c:v copy -tag:v hvc1 -bsf:v {CLAMP_DURATION} -c:a copy -threads 1");
+        assert!(joined.contains(&want), "{joined}");
         assert!(!joined.contains("aac") && !joined.contains("-ac 2"), "{joined}");
         let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
         assert!(joined.contains(alignment), "the same alignment: {joined}");
@@ -1476,10 +1499,10 @@ mod tests {
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
-        assert!(
-            joined.contains("-map 0:a:1 -c:v copy -tag:v hvc1 -c:a aac -ac 6 -b:a 384k -threads 1"),
-            "{joined}"
+        let want = format!(
+            "-map 0:a:1 -c:v copy -tag:v hvc1 -bsf:v {CLAMP_DURATION} -c:a aac -ac 6 -b:a 384k -threads 1"
         );
+        assert!(joined.contains(&want), "{joined}");
         let alignment = "-copyts -start_at_zero -noaccurate_seek -ss 13.135000";
         assert!(joined.contains(alignment), "the same alignment: {joined}");
         assert_eq!(
@@ -1616,7 +1639,9 @@ mod tests {
             dir: Path::new("/d"),
         };
         let joined = args(&spec, None).join(" ");
-        assert!(joined.contains("-map 0:a:1 -c:v copy -c:a aac -ac 8 -b:a 512k -threads 1"), "{joined}");
+        let want =
+            format!("-map 0:a:1 -c:v copy -bsf:v {CLAMP_DURATION} -c:a aac -ac 8 -b:a 512k -threads 1");
+        assert!(joined.contains(&want), "{joined}");
     }
 
     #[test]

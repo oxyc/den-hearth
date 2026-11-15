@@ -1726,6 +1726,68 @@ fn an_open_hevc_matroska_restart_preserves_the_wanted_gops_decode_timestamps() {
     );
 }
 
+/// `open-gop-overlong.mkv` has the shape of the HandBrake x265 encodes Chrome failed on: open-GOP CRAs at 23.976 fps
+/// under a Matroska default duration of 23.333 fps, so every packet claims 42 ms over 41 and 42 ms steps. Without
+/// `job::CLAMP_DURATION` the mp4 muxer writes every CRA after the first at its DTS, which puts it among the previous
+/// GOP's pictures, and Chrome's VideoToolbox decoder fails such a stream with -17694. Every copied picture must keep
+/// its source presentation time, keyframes included, across the GOP files of one run.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn copied_pictures_keep_their_presentation_times_when_matroska_durations_overrun() {
+    let source = testdata("open-gop-overlong.mkv");
+    let input = source.to_str().unwrap();
+    let run = |clamp: bool| {
+        let dir = temp_dir();
+        let spec = crate::job::Spec {
+            input,
+            seek: None,
+            video: crate::job::Video::Copy { tag: Some("hvc1"), dovi: crate::job::Dovi::Absent },
+            audio: 0,
+            audio_out: crate::job::AudioOut::Stereo,
+            text: &[],
+            dir: &dir,
+        };
+        let mut args = crate::job::args(&spec, None);
+        if !clamp {
+            let at = args.iter().position(|a| a == crate::job::CLAMP_DURATION).expect("the clamp");
+            args.drain(at - 1..=at);
+        }
+        let out = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg")).args(args).output().unwrap();
+        assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        let list = std::fs::read_to_string(dir.join("gops.m3u8")).unwrap();
+        let gops = crate::job::parse_gops(&list);
+        assert!(gops.len() > 2, "{list}");
+        let mut joined = std::fs::read(dir.join("init.mp4")).unwrap();
+        for (gop, _) in &gops {
+            joined.extend(std::fs::read(dir.join(gop)).unwrap());
+        }
+        let file = dir.join("joined.mp4");
+        std::fs::write(&file, joined).unwrap();
+        video_packets(&file)
+    };
+    // Presentation times in decode order, from the first picture's, so the run's own offset drops out.
+    let relative = |packets: &[(f64, bool)]| -> Vec<(f64, bool)> {
+        let first = packets[0].0;
+        packets.iter().map(|(pts, key)| (pts - first, *key)).collect()
+    };
+    let differs = |got: &[(f64, bool)], want: &[(f64, bool)]| -> Vec<(usize, f64, f64)> {
+        assert_eq!(got.len(), want.len(), "picture count");
+        got.iter()
+            .zip(want)
+            .enumerate()
+            .filter(|(_, (g, w))| (g.0 - w.0).abs() > 0.0015 || g.1 != w.1)
+            .map(|(i, (g, w))| (i, g.0, w.0))
+            .collect()
+    };
+    let want = relative(&video_packets(&source));
+    assert!(want.iter().filter(|(_, key)| *key).count() > 2, "the fixture has GOPs to cut");
+
+    let unclamped = differs(&relative(&run(false)), &want);
+    assert!(!unclamped.is_empty(), "the fixture must expose the muxer dropping a keyframe's PTS");
+    let clamped = differs(&relative(&run(true)), &want);
+    assert!(clamped.is_empty(), "pictures moved (index, got, want): {clamped:?}");
+}
+
 /// A run from the start of the file re-encoding the audio to AAC, as `job::args` has it: its audio begins at or after
 /// 0 and runs on without a gap or an overlap from one GOP file to the next; it writes the init a run from a seek does,
 /// so the first run's serves both; and against the same run without the priming cut, only the first packet differs —
