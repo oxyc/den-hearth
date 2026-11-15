@@ -17,6 +17,7 @@ pub mod diskcache;
 pub mod handler;
 pub mod hostlimit;
 pub mod id;
+mod indexer_health;
 pub mod indexerconfig;
 pub mod label;
 pub mod linkcheck;

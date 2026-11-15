@@ -72,6 +72,12 @@ pub trait Scraper: Send + Sync {
     fn id(&self) -> Indexer;
     async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError>;
 
+    /// Stable origin identity for circuit state and per-origin admission. Production HTTP scrapers override this
+    /// with their host; mocks and non-HTTP scrapers safely fall back to their fixed indexer id.
+    fn origin_key(&self) -> String {
+        self.id().0
+    }
+
     /// Go's `answerKey`: what `scrapeAllCached` keys this scraper's cached answer by. `None` for a scraper
     /// whose answers are not cached.
     fn answer_key(&self) -> Option<String> {
@@ -155,6 +161,19 @@ impl fmt::Display for DeadlineExceeded {
 }
 
 impl Error for DeadlineExceeded {}
+
+/// A known-down indexer skipped until its recovery probe window. It remains an unreachable quorum member rather
+/// than disappearing from coverage or masquerading as an authoritative empty answer.
+#[derive(Debug)]
+struct IndexerCircuitOpen;
+
+impl fmt::Display for IndexerCircuitOpen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("indexer circuit open")
+    }
+}
+
+impl Error for IndexerCircuitOpen {}
 
 /// Go `classifyScrape` (coverage.go), less its type switch on the scraper: what one scrape's error means for
 /// coverage. `None` is a scrape that answered. The unaskable case is read from the error, which
@@ -592,6 +611,10 @@ impl Scraper for StremioScraper {
         self.scrape_paced("", indexer_limiter(), q).await
     }
 
+    fn origin_key(&self) -> String {
+        limiter_host(&self.base_url).unwrap_or_else(|| self.indexer.0.clone())
+    }
+
     /// Go `stremioScraper.answerKey`: every install that asks this URL about a title gets the same answer. Hashed,
     /// because a MediaFusion URL carries its encrypted config.
     fn answer_key(&self) -> Option<String> {
@@ -628,6 +651,10 @@ impl Scraper for SourceScraper {
 
     async fn scrape(&self, q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
         self.stremio.scrape_paced(&self.label, &SOURCE_LIMITER, q).await
+    }
+
+    fn origin_key(&self) -> String {
+        self.stremio.origin_key()
     }
 
     fn answer_key(&self) -> Option<String> {
@@ -952,22 +979,42 @@ fn millis(d: Duration) -> i64 {
 ///
 /// `prepare` runs first and OUTSIDE the timeout: Go builds its scrapers, minting included, before this budget starts.
 async fn ask(sc: &dyn Scraper, q: &ScrapeQuery, deadline: TokioInstant) -> ScrapeAttempt {
+    use crate::indexer_health::CallOutcome;
+
+    let runtime = crate::runtime::current_runtime();
+    let origin = sc.origin_key();
+    let Ok(health_permit) = runtime.indexer_health.admit(&origin) else {
+        metrics().indexer_circuit_avoided(&sc.id().0);
+        return ScrapeAttempt::failed(Arc::new(IndexerCircuitOpen));
+    };
+    let health_started = TokioInstant::now();
     sc.prepare().await;
     let start = Instant::now();
     // Admission covers only a real upstream request: settled cache hits and same-question singleflight followers
     // never consume it. Its FIFO wait is part of the list build's absolute budget, and the owned guard covers the
     // response read/decode inside `scrape` until every raw body byte can be released.
-    let Some(_admission) = crate::runtime::current_runtime().admit_scraper_request_until(deadline).await
-    else {
+    let Some(_admission) = runtime.admit_scraper_request_until(&origin, deadline).await else {
         metrics().indexer_result(&sc.id().0, false, 0);
+        // Admission can expire behind either this origin's queue or unrelated work at the process-wide ceiling.
+        // It is not evidence that the upstream failed, so it must not poison that origin's circuit.
         return ScrapeAttempt::failed(Arc::new(DeadlineExceeded));
     };
+    if runtime.indexer_health.confirm(&origin, health_permit).is_err() {
+        metrics().indexer_circuit_avoided(&sc.id().0);
+        return ScrapeAttempt::failed(Arc::new(IndexerCircuitOpen));
+    }
     let answer = tokio::time::timeout_at(deadline, sc.scrape(q)).await;
     let (streams, err) = match answer {
         Ok(Ok(streams)) => (streams, None),
         Ok(Err(err)) => (Vec::new(), Some(SharedError::from(err))),
         Err(_) => (Vec::new(), Some(Arc::new(DeadlineExceeded) as SharedError)),
     };
+    let health_outcome = match classify_outcome(err.as_deref().map(|e| e as &(dyn Error + 'static))) {
+        OUTCOME_ANSWERED => CallOutcome::Answered,
+        OUTCOME_TIMEOUT | OUTCOME_UNREACHABLE => CallOutcome::Failed,
+        _ => CallOutcome::Neutral,
+    };
+    runtime.indexer_health.record(&origin, health_outcome, health_started);
     metrics().indexer_result(&sc.id().0, err.is_none(), i64::try_from(streams.len()).unwrap_or(i64::MAX));
     ScrapeAttempt {
         streams,

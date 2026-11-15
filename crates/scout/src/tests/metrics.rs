@@ -143,6 +143,7 @@ async fn metrics_reports_what_was_previously_log_only() {
         r#"scout_late_diagnostic_candidates_total{result="cache_checked"}"#,
         r#"scout_indexer_requests_total{indexer="torrentio"}"#,
         r#"scout_indexer_failures_total{indexer="torrentio"}"#,
+        r#"scout_indexer_circuit_avoided_total{indexer="torrentio"}"#,
         r#"scout_probe_cache_total{result="hit"}"#,
         "scout_add_budget_remaining",
         "scout_cache_persistent",
