@@ -269,6 +269,46 @@ enum Outcome {
     Started(Started),
 }
 
+/// Bounded scheduler telemetry. `Job` contains the install/config capability, a stable content key, episode
+/// coordinates and tried release identities; accepting the whole job here makes the sink-boundary invariant
+/// explicit while deliberately reading only its bounded attempt counter.
+#[derive(Clone, Copy)]
+enum SearchDiagnostic {
+    AddRefused(StatusCode),
+    Incomplete,
+    Empty,
+    Started { candidates: usize },
+}
+
+struct SearchDiagnosticLine {
+    attempt: i64,
+    event: SearchDiagnostic,
+}
+
+impl std::fmt::Display for SearchDiagnosticLine {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let attempt = self.attempt;
+        match self.event {
+            SearchDiagnostic::AddRefused(status) => {
+                write!(output, "wanted: search attempt={attempt} add_refused status={}", status.as_u16())
+            }
+            SearchDiagnostic::Incomplete => write!(
+                output,
+                "wanted: search attempt={attempt} incomplete retry_minutes={}",
+                UNANSWERED_WAIT_MS / 60_000
+            ),
+            SearchDiagnostic::Empty => write!(output, "wanted: search attempt={attempt} empty"),
+            SearchDiagnostic::Started { candidates } => {
+                write!(output, "wanted: search attempt={attempt} release_started candidates={candidates}")
+            }
+        }
+    }
+}
+
+fn search_diagnostic(job: &Job, event: SearchDiagnostic) -> SearchDiagnosticLine {
+    SearchDiagnosticLine { attempt: job.attempt + 1, event }
+}
+
 impl Wanted {
     pub fn new(finder: Box<dyn Finder>, file: Option<PathBuf>) -> Wanted {
         let installs = file.as_ref().map(|path| load(path)).unwrap_or_default();
@@ -450,7 +490,7 @@ impl Wanted {
         if status.is_success() || status.is_redirection() {
             Outcome::Started(Started { at: 0, identity, candidates, stream })
         } else {
-            eprintln!("wanted: {} search {}: the add was answered {status}", item.key, job.attempt + 1);
+            eprintln!("{}", search_diagnostic(job, SearchDiagnostic::AddRefused(status)));
             Outcome::Unanswered
         }
     }
@@ -465,21 +505,23 @@ impl Wanted {
             // The list changed while Scout was asked: the next tick decides against what it says now.
             return;
         };
-        let what = format!("wanted: {} search {}", job.item.key, job.attempt + 1);
         let urgent = match outcome {
             Outcome::Unanswered => {
                 tracked.unanswered_until = now + UNANSWERED_WAIT_MS;
-                eprintln!("{what} got no full answer; asking again in {} min", UNANSWERED_WAIT_MS / 60_000);
+                eprintln!("{}", search_diagnostic(job, SearchDiagnostic::Incomplete));
                 return;
             }
             Outcome::Nothing => {
                 tracked.retries = job.attempt + 1;
                 tracked.since = now;
-                eprintln!("{what} found nothing to fetch");
+                eprintln!("{}", search_diagnostic(job, SearchDiagnostic::Empty));
                 false
             }
             Outcome::Started(started) => {
-                eprintln!("{what} started {}", started.identity);
+                eprintln!(
+                    "{}",
+                    search_diagnostic(job, SearchDiagnostic::Started { candidates: started.candidates })
+                );
                 tracked.retries = job.attempt + 1;
                 tracked.started = Some(Started { at: now, ..started });
                 true
@@ -576,7 +618,7 @@ fn core(request: Value) -> Option<Value> {
     match answer.get_mut("ok") {
         Some(ok) => Some(ok.take()),
         None => {
-            eprintln!("wanted: den-core refused {}: {}", request["op"], answer["error"]);
+            eprintln!("wanted: den-core operation refused");
             None
         }
     }
@@ -809,6 +851,43 @@ mod tests {
             in_flight: Vec::new(),
             original_language: Some("sv".into()),
             preferred_language: None,
+        }
+    }
+
+    #[test]
+    fn scheduler_diagnostics_exclude_content_release_and_install_values() {
+        let private =
+            ["PRIVATE_INSTALL", "PRIVATE_CONFIG", "tv:987654:2:3", "tt7654321", "PRIVATE_RELEASE_S02E03.mkv"];
+        let mut listed = item(private[2]);
+        listed.imdb = private[3].into();
+        listed.tried = vec![private[4].into()];
+        let job = Job {
+            install: private[0].into(),
+            config: private[1].into(),
+            item: listed,
+            attempt: 4,
+            row: json!({"name": private[2], "release": private[4]}),
+        };
+        let lines = [
+            search_diagnostic(&job, SearchDiagnostic::AddRefused(StatusCode::TOO_MANY_REQUESTS)),
+            search_diagnostic(&job, SearchDiagnostic::Incomplete),
+            search_diagnostic(&job, SearchDiagnostic::Empty),
+            search_diagnostic(&job, SearchDiagnostic::Started { candidates: 7 }),
+        ]
+        .map(|line| line.to_string());
+        assert_eq!(
+            lines,
+            [
+                "wanted: search attempt=5 add_refused status=429",
+                "wanted: search attempt=5 incomplete retry_minutes=5",
+                "wanted: search attempt=5 empty",
+                "wanted: search attempt=5 release_started candidates=7",
+            ]
+        );
+        for line in lines {
+            for value in private {
+                assert!(!line.contains(value), "leaked {value} in {line}");
+            }
         }
     }
 
