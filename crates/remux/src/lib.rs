@@ -385,24 +385,17 @@ where
         // `/remux/health` too: under tailscale serve and on the LAN the service is mounted at `/remux`, and clients
         // probe each route's `<url>/health` (den-spec routes-v1).
         "/health" | "/remux/health" if get => httputil::json(StatusCode::OK, &health_body(state), &[]),
-        "/metrics" if get => {
-            if !den_http::metrics_authorized(&parts.headers, state.cfg.metrics_token.as_deref()) {
-                return httputil::not_found();
-            }
-            let body = metrics_body(state);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                .header("content-length", body.len())
-                .header("cache-control", "no-store")
-                .body(httputil::full(body))
-                .unwrap()
-        }
+        "/metrics" => den_http::metrics_response(
+            &parts.method,
+            &parts.headers,
+            state.cfg.metrics_token.as_deref(),
+            || metrics_body(state),
+        ),
         "/remux/speed" if get && !state.admit(visitor(state, parts)) => {
             rate_limited("Too many speed tests, logins or new sessions from here; wait a minute.")
         }
         "/remux/speed" if get => speed(parts),
-        "/health" | "/remux/health" | "/metrics" | "/remux/speed" => method_not_allowed("GET, HEAD"),
+        "/health" | "/remux/health" | "/remux/speed" => method_not_allowed("GET, HEAD"),
         "/remux/login" | "/remux/session" | "/remux/releases" if parts.method == Method::OPTIONS => {
             preflight()
         }

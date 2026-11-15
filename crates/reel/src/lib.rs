@@ -484,9 +484,13 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     let start = std::time::Instant::now();
     let log = state.cfg.log_requests;
     let (parts, _body) = req.into_parts();
-    let mut resp = if parts.method == hyper::Method::OPTIONS {
-        // CORS preflight, on any path: everything here is credential-free, and a browser-based
-        // client asks before it sends anything with a header of its own.
+    let mut resp = if parts.uri.path() == "/metrics" {
+        den_http::metrics_response(&parts.method, &parts.headers, state.cfg.metrics_token.as_deref(), || {
+            metrics_body(&state)
+        })
+    } else if parts.method == hyper::Method::OPTIONS {
+        // CORS preflight on application paths: everything there is credential-free, and a browser-based
+        // client asks before it sends anything with a header of its own. Metrics has its narrower contract above.
         den_http::preflight()
     } else if parts.method == hyper::Method::HEAD && head_requires_get(parts.uri.path()) {
         // HEAD is not a cheap probe on these routes: routing it like GET can resolve through yt-dlp,
@@ -692,19 +696,6 @@ async fn route(
     // occupancy polled over time are a timeline of when the household is watching, which /health
     // does not give away. A refusal is the same 404 an unknown path gets, with or without a token
     // configured, so nobody is told there is something here to poke at.
-    if path == "/metrics" {
-        if !den_http::metrics_authorized(&parts.headers, state.cfg.metrics_token.as_deref()) {
-            return httputil::not_found();
-        }
-        let body = metrics_body(&state);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-            .header("content-length", body.len())
-            .header("cache-control", "no-store")
-            .body(httputil::full(body))
-            .unwrap();
-    }
     // Cheap capability validation for the LAN relay. It proves that an `/m/s` URL is a currently
     // valid signed bearer capability without resolving a video or opening an upstream media body.
     // The capability itself is the authority: there is deliberately no member/session check here.

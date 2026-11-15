@@ -121,7 +121,14 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     let started = Instant::now();
     let (parts, _body) = req.into_parts();
     let mut resp = match parts.method {
-        // A CORS preflight is answered for any path, before routing.
+        _ if parts.uri.path() == "/metrics" => den_http::metrics_response(
+            &parts.method,
+            &parts.headers,
+            Some(state.cfg.metrics_token.as_str()),
+            || metrics::render(&state),
+        ),
+        // A CORS preflight is answered for application paths before routing. Metrics is an operational
+        // bearer endpoint with the narrower GET/HEAD vocabulary handled above.
         hyper::Method::OPTIONS => httputil::preflight(),
         // These GET routes can search OpenSubtitles, spend a metered download, run ffmpeg/alass,
         // or invoke an LLM. Body stripping happens only after routing, so HEAD must be stopped here.
@@ -207,8 +214,6 @@ async fn route(
             };
             return httputil::json(StatusCode::OK, &body, "no-store");
         }
-        // Prometheus text behind `METRICS_TOKEN`; 404 without it (see metrics.rs).
-        "/metrics" => return metrics::handle(state, &parts.headers),
         _ => {}
     }
 
@@ -919,6 +924,31 @@ mod tests {
             }
         }
         assert_eq!(body.matches("# HELP subtitles_sync_jobs_total ").count(), 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_head_is_empty_and_unsupported_methods_are_concealed_then_405() {
+        let state = test_state_with("", "s3cret");
+        let authorized = |method: hyper::Method| {
+            Request::builder()
+                .method(method)
+                .uri("/metrics")
+                .header(hyper::header::AUTHORIZATION, "Bearer s3cret")
+                .body(())
+                .unwrap()
+        };
+        let head = handle_request(state.clone(), authorized(hyper::Method::HEAD)).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(body_string(head).await.is_empty());
+
+        for method in [hyper::Method::POST, hyper::Method::PUT, hyper::Method::DELETE, hyper::Method::OPTIONS]
+        {
+            let concealed = handle_request(state.clone(), request(method.clone(), "/metrics")).await;
+            assert_eq!(concealed.status(), StatusCode::NOT_FOUND, "unauthorized {method}");
+            let refused = handle_request(state.clone(), authorized(method.clone())).await;
+            assert_eq!(refused.status(), StatusCode::METHOD_NOT_ALLOWED, "authorized {method}");
+            assert_eq!(refused.headers()[hyper::header::ALLOW], "GET, HEAD", "{method}");
+        }
     }
 
     /// Every route is a read; anything else is refused before it can reach a handler that spends a

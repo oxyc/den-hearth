@@ -869,6 +869,36 @@ async fn metrics_wants_the_bearer_prefix_and_trims_the_token() {
     assert_eq!(with("Bearer  scrape-me").await.unwrap().status(), 200, "the token was not trimmed");
 }
 
+#[tokio::test]
+async fn metrics_head_is_empty_and_unsupported_methods_are_concealed_then_405() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let head = client.head(format!("{base}/metrics")).bearer_auth("scrape-me").send().await.unwrap();
+    assert_eq!(head.status(), 200);
+    assert!(head.bytes().await.unwrap().is_empty());
+
+    for method in
+        [reqwest::Method::POST, reqwest::Method::PUT, reqwest::Method::DELETE, reqwest::Method::OPTIONS]
+    {
+        assert_eq!(
+            client.request(method.clone(), format!("{base}/metrics")).send().await.unwrap().status(),
+            404
+        );
+        let refused = client
+            .request(method.clone(), format!("{base}/metrics"))
+            .bearer_auth("scrape-me")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 405, "{method}");
+        assert_eq!(refused.headers()["allow"], "GET, HEAD", "{method}");
+    }
+}
+
 /// Every route is a read, so anything but GET/HEAD/OPTIONS is refused before routing — a POST to
 /// /play must not start a download.
 #[tokio::test]

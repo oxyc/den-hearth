@@ -134,7 +134,9 @@ key across batches and films. The first successful answer ends a pause.
 
 - `GET /health` — liveness, always 200: `{"status":"ok"}`, or `{"status":"degraded",…}` with reason
   `upstream_unavailable` after three OpenSubtitles failures in a row.
-- `GET /metrics` — Prometheus text for `Authorization: Bearer <METRICS_TOKEN>`; the unknown-path 404
+- `GET /metrics` — Prometheus text for `Authorization: Bearer <METRICS_TOKEN>`; HEAD returns the same
+  status and representation headers without rendering a body, and other authorized methods get 405 with
+  `Allow: GET, HEAD`. The unknown-path 404 applies before method handling
   when the token is unset or wrong. It publishes what the addon already keeps — `subtitles_build_info`,
   the OpenSubtitles failure streak behind `/health`, the memory cache's bytes and entries, whether the
   disk tier is on and how many of its writes failed, translations running now, and fixed-cardinality

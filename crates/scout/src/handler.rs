@@ -1415,12 +1415,6 @@ impl Inner {
     // --- routing ----------------------------------------------------------------------------------------
 
     async fn route(self: &Arc<Self>, req: &Request<Bytes>) -> Resp {
-        // A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
-        // refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
-        // does nothing but name what may follow, so it cannot reach /play's resolve.
-        if req.method() == Method::OPTIONS {
-            return preflight();
-        }
         // `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
         let path = den_http::percent_decode_path(req.uri().path());
         // CONFIG_KEY is set but malformed: nothing that carries an install config (a config segment, a play
@@ -1429,6 +1423,19 @@ impl Inner {
         // no config) keep their own handling.
         if self.deps.config_key_invalid && !matches!(path.as_str(), "/health" | "/metrics" | "/validate") {
             return config_key_invalid();
+        }
+        if path == "/metrics" {
+            return den_http::metrics_response(
+                req.method(),
+                req.headers(),
+                Some(&self.deps.metrics_token),
+                || metrics().render(cache_persistent_gauge(&*self.deps.cache)),
+            );
+        }
+        // A CORS preflight is answered on every application path. Metrics is deliberately handled first:
+        // it is an operational bearer endpoint whose complete vocabulary is GET/HEAD, not a browser API.
+        if req.method() == Method::OPTIONS {
+            return preflight();
         }
         // DELETE cancels (or, with ?op=reannounce, reannounces) the release a ticket or a legacy play token
         // names — den#204. Matched ahead of the GET/HEAD-only gate below, which otherwise answers every other
@@ -1494,30 +1501,6 @@ impl Inner {
                     status["debrid"] = debrid;
                 }
                 return json_response(StatusCode::OK, &status);
-            }
-            "/metrics" => {
-                // Prometheus text format, behind a bearer token, and OFF when no token is configured.
-                //
-                // The first version was unauthenticated on the grounds that it carries no debrid service or
-                // account labels. That answered the credential-oracle question addbudget.go raises about /health
-                // and missed two the counters create on their own. scout_list_cache_total{result="miss"} rises
-                // once per title opened cold, so polling this endpoint is a timeline of when the household is
-                // watching and how much it browses — /health exposes nothing comparable. And per-indexer counters
-                // disclose which indexers this install has configured, which IS per-install configuration: with
-                // MINT_INDEXER_CONFIGS on, a nonzero mediafusion counter says the debrid token was minted
-                // and sent to that host.
-                //
-                // Dropping the useful labels would have left an endpoint not worth scraping, so the other option
-                // is taken: a token. Unset means 404 rather than an empty 200, so an operator who has not
-                // configured one is not told there is something here to poke at.
-                if !den_http::metrics_authorized(req.headers(), Some(&self.deps.metrics_token)) {
-                    return error(StatusCode::NOT_FOUND, "not_found");
-                }
-                return Response::builder()
-                    .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
-                    .header(CACHE_CONTROL, NO_STORE)
-                    .body(full(metrics().render(cache_persistent_gauge(&*self.deps.cache))))
-                    .expect("a static response");
             }
             _ => {}
         }
