@@ -368,6 +368,47 @@ pub(crate) fn start_segment(segments: &[Segment], start_at: f64) -> usize {
     seg_at(segments, (start_at - START_SLACK).max(0.0))
 }
 
+/// The keyframe and input seek for a job producing `n`. Open-GOP HEVC in Matroska needs one GOP of
+/// decode-timestamp history before the wanted CRA: Matroska records presentation timestamps only, so ffmpeg cannot
+/// reconstruct the CRA and its leading RASL pictures' DTS when the CRA is the first packet after an input seek. A
+/// continuous run, or one begun on the preceding GOP, can. The priming GOP is made but need not be served.
+pub(crate) fn restart_point(
+    segments: &[Segment],
+    keyframes: &[f64],
+    duration: f64,
+    grid: bool,
+    hevc_preroll: bool,
+    n: usize,
+) -> (f64, Option<f64>) {
+    let mut start = None;
+    for m in (1..=n).rev() {
+        let k = segments[m].start;
+        let next = keyframes.iter().copied().find(|x| *x > k + 1e-6).unwrap_or(duration);
+        if next - k >= job::MIN_SEEK_GAP {
+            start = Some(k);
+            break;
+        }
+    }
+    let Some(mut start) = start else { return (keyframes.first().copied().unwrap_or(0.0), None) };
+    if hevc_preroll && start > keyframes.first().copied().unwrap_or(start) + 1e-6 {
+        // Back past a cluster of keyframes too close for SEEK_PAST to distinguish, just as the wanted keyframe above
+        // is backed up. Ordinarily the immediately preceding GOP is the first candidate and this loop ends there.
+        let before = keyframes.partition_point(|k| *k < start - 1e-6);
+        for &k in keyframes[..before].iter().rev() {
+            let next = keyframes.iter().copied().find(|x| *x > k + 1e-6).unwrap_or(duration);
+            if next - k >= job::MIN_SEEK_GAP {
+                start = k;
+                break;
+            }
+        }
+    }
+    let seek = match grid {
+        true => job::grid_seek(start),
+        false => job::seek_for(start),
+    };
+    (start, seek)
+}
+
 /// The GOPs that make up `seg`, in order, when they are all on disk: a GOP starting on the segment's
 /// first keyframe, then its job's following GOPs until the segment's end is covered — or until the
 /// job's last GOP, when that job ran to the end of the file.
@@ -592,18 +633,22 @@ impl Session {
 
     /// Where a job has to start to produce segment `n`: `n`'s own keyframe, unless the next keyframe
     /// is too close behind it to land on reliably (see `job::MIN_SEEK_GAP`), in which case an earlier
-    /// segment's. Returns the keyframe and the `-ss` for it.
+    /// segment's. An open-GOP HEVC Matroska copy starts one seekable GOP earlier as decode-timestamp
+    /// preroll: Matroska does not store DTS, and a seek straight to a CRA leaves ffmpeg to invent the
+    /// first reordered pictures' DTS. Returns the keyframe and the `-ss` for it.
     fn restart_point(&self, n: usize) -> (f64, Option<f64>) {
-        let kfs = &self.info.keyframes;
-        for m in (1..=n).rev() {
-            let k = self.segments[m].start;
-            let next = kfs.iter().copied().find(|x| *x > k + 1e-6).unwrap_or(self.info.duration);
-            if next - k >= job::MIN_SEEK_GAP {
-                let seek = if self.info.grid() { job::grid_seek(k) } else { job::seek_for(k) };
-                return (k, seek);
-            }
-        }
-        (kfs.first().copied().unwrap_or(0.0), None)
+        let hevc_preroll = !self.transcoded
+            && self.info.container == "matroska"
+            && self.info.video == VideoCodec::Hevc
+            && !self.info.closed_gops;
+        restart_point(
+            &self.segments,
+            &self.info.keyframes,
+            self.info.duration,
+            self.info.grid(),
+            hevc_preroll,
+            n,
+        )
     }
 
     /// What a job starting on the keyframe at `start` does with the video: a copy, or this session's transcode.
@@ -2947,6 +2992,23 @@ mod tests {
         assert_eq!(start_segment(&segs, 17.0), 2, "13 → 19.5 plays 17");
         assert_eq!(start_segment(&segs, 13.5), 1, "near 13 a player may ask for the segment before it");
         assert_eq!(start_segment(&segs, 0.5), 0);
+    }
+
+    #[test]
+    fn an_open_hevc_restart_primes_its_wanted_cra_with_the_preceding_gop() {
+        let keyframes = [0.0, 3.0, 6.0, 9.0];
+        let segs = playlist::segments(&keyframes, 12.0, playlist::TARGET_SECS);
+        assert_eq!(restart_point(&segs, &keyframes, 12.0, false, false, 1), (6.0, Some(6.135)));
+        assert_eq!(
+            restart_point(&segs, &keyframes, 12.0, false, true, 1),
+            (3.0, Some(3.135)),
+            "one earlier GOP gives ffmpeg the DTS history for the CRA at 6"
+        );
+        assert_eq!(
+            restart_point(&segs, &keyframes, 12.0, false, true, 0),
+            (0.0, None),
+            "the start of the file has no earlier GOP"
+        );
     }
 
     /// A segment asked for again after the job has gone past it and its GOPs were pruned — a seek back, or a player
