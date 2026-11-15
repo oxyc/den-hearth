@@ -167,6 +167,34 @@ pub fn startup_delay(segs: &[Segment], bytes: &[f64], from: usize, rate: f64, bu
     wait
 }
 
+/// `startup_delay` as the player can hold for it: the seconds of media it must have buffered from segment `from`
+/// before it starts, at `rate` bits a second, so that it never runs dry after. A wait and a lead differ wherever the
+/// opening is lighter or heavier than the link: a cheap opening buffers many seconds of media a second, so a player
+/// that held for `startup_delay` seconds of media would let go before the bits a heavy scene later needs were in.
+/// The fewest whole segments from..=m from which `needed_rate`, starting at m + 1 with their length as its head start,
+/// is within `rate`: C(k+1) − C(m+1) ≤ rate · (T(k) − T(from)) for every k past m. Never more than `buffer.secs`, all
+/// a player holds ahead.
+pub fn startup_lead(segs: &[Segment], bytes: &[f64], from: usize, rate: f64, buffer: Buffer) -> f64 {
+    let n = segs.len().min(bytes.len());
+    if from >= n {
+        return 0.0;
+    }
+    let start = segs[from].start;
+    let mut fetched = Vec::with_capacity(n - from);
+    let mut total = 0.0;
+    for b in &bytes[from..n] {
+        total += b * 8.0;
+        fetched.push(total);
+    }
+    // later[i]: the most any segment past i asks to be in already, over what the link brings by its start.
+    let mut later = vec![f64::NEG_INFINITY; fetched.len() + 1];
+    for i in (0..fetched.len()).rev() {
+        later[i] = later[i + 1].max(fetched[i] - rate * (segs[from + i].start - start));
+    }
+    let m = (0..fetched.len()).find(|&i| later[i + 1] <= fetched[i] + 1e-6).unwrap_or(fetched.len() - 1);
+    (segs[from + m].end - start).min(buffer.secs)
+}
+
 /// The media playlist. VOD, so the player knows the whole timeline up front and can seek anywhere
 /// before a single segment exists. A `start` past zero is a resume: `EXT-X-START` with `PRECISE=YES`
 /// has a native HLS player (Safari's) begin there instead of at zero and then seeking.

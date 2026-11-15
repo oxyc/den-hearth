@@ -605,6 +605,7 @@ pub async fn create(
     );
     let session = Arc::new(Session {
         prebuffer: playback.prebuffer,
+        prebuffer_lead: playback.prebuffer_lead,
         need: playback.need,
         max_bitrate: want.max_bitrate,
         demand: playback.demand,

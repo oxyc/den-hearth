@@ -4203,6 +4203,71 @@ async fn a_copy_within_sixty_seconds_then_a_transcode_then_the_least_starving_co
     assert!(j["prebuffer"].is_null(), "no head start carries it: {j}");
 }
 
+/// A light opening before a heavy scene: half a minute at 1 Mbit/s, then a minute at 15, on a 10 Mbit/s link (8 of it
+/// with headroom) in hls.js. The wait, `prebuffer`, buffers more media than its own seconds, so a player that held for
+/// `prebuffer` seconds of media would start short of what the heavy minute needs and stall in it. `prebufferLead` is
+/// the fewest whole segments held from which `needed_rate`, at the link, plays through — worked out here again from
+/// the answer's own `segments`.
+#[tokio::test]
+async fn a_light_opening_holds_for_the_media_a_heavy_scene_later_needs() {
+    use crate::playlist::{needed_rate, Buffer, Segment};
+    let origin = origin().await;
+    let bytes = fixture("h264.mkv");
+    let probed = probe_with_head(&bytes, crate::scout::HEAD_BYTES as usize).await;
+    let keyframes: Vec<f64> = (0..300).map(|i| i as f64 * 2.0).collect();
+    let (mut at, mut index) = (0u64, Vec::new());
+    for &t in &keyframes {
+        index.push((t, at));
+        at += ((if (30.0..90.0).contains(&t) { 15e6 } else { 1e6 }) * 2.0 / 8.0) as u64;
+    }
+    let info = probe::MediaInfo { duration: 600.0, keyframes, byte_index: index, ..probed };
+    let resolved = crate::scout::Resolved {
+        url: "http://127.0.0.1:9/h264.mkv".into(),
+        head: bytes,
+        size: Some(at),
+        client: crate::state::source_client(Duration::from_secs(1), Duration::from_secs(1)),
+    };
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    let key = format!("{}/0/h264.mkv", crate::auth::install_id(&format!("{origin}/cfg")));
+    state.opened().put(key, &resolved, &info, Instant::now());
+    let body = format!(
+        r#"{{"imdb":"tt0000014","scout":"{origin}/cfg","playable":{{"h264":51}},"maxBitrate":10000000,"player":"hls.js"}}"#
+    );
+    let r = call(&state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    state.end_all("test").await;
+    let j = r.json();
+    assert_eq!(
+        (j["release"]["filename"].as_str(), j["video"]["transcoded"].as_bool()),
+        (Some("h264.mkv"), Some(false))
+    );
+    let (wait, lead) = (j["prebuffer"].as_f64().unwrap(), j["prebufferLead"].as_f64().unwrap());
+
+    let demand: Vec<(f64, f64)> = j["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s[0].as_f64().unwrap(), s[1].as_f64().unwrap()))
+        .collect();
+    let segs: Vec<Segment> = demand
+        .iter()
+        .enumerate()
+        .map(|(i, (start, _))| Segment { start: *start, end: demand.get(i + 1).map_or(600.0, |d| d.0) })
+        .collect();
+    let seg_bytes: Vec<f64> = demand.iter().map(|d| d.1).collect();
+    // `LINK_HEADROOM` of the link, and hls.js's buffer as `buffer_of` names it.
+    let rate = 10e6 * 0.8;
+    let buffer = Buffer { secs: 120.0, bytes: Some(150_000_000) };
+    let plays_through =
+        |m: usize| needed_rate(&segs, &seg_bytes, m + 1, segs[m].end - segs[0].start, buffer) <= rate;
+    let fewest = (0..segs.len()).find(|&m| plays_through(m)).unwrap();
+    assert!((lead - segs[fewest].end).abs() < 0.11, "lead {lead}, needed_rate's {}: {j}", segs[fewest].end);
+    assert!(lead > wait + 5.0, "a light opening buffers more media than the wait: {wait} s against {lead} s");
+    // Held for the wait's seconds of media instead, the player starts short and runs dry in the heavy minute.
+    let early = (0..segs.len()).find(|&m| segs[m].end >= wait).unwrap();
+    assert!(!plays_through(early), "{wait} s of media buffered would play through");
+}
+
 /// A conversion reads its whole source in real time, so the source it is made from is the cheapest to read that
 /// is within `TRANSCODE_SOURCE_MARGIN` of the link — never a release far above it. The case behind it: a 3818 s episode
 /// on a 30 Mbit/s link, whose first-ranked 4K Dolby Vision WEB-DL (105 GB, 220 Mbit/s on average) was converted from

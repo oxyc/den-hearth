@@ -24,7 +24,7 @@ POST   /remux/session                   {imdb, season?, episode?, filename?, sco
                                          exclude?, transcode?: "never", fitsOnly?, replaces?} (a full scout install,
                                          or browser cookie/bearer) → 201
                                         {sid, playlist, release:{label,filename,size}, duration, prebuffer, need,
-                                         segments:[[start,bytes],…], expiresAt,
+                                         prebufferLead, segments:[[start,bytes],…], expiresAt,
                                          video:{codec: h264|hevc|av1|vp9, transcoded}, audioTrack, audioChannels,
                                          audioTracks:[{language,name,channels,commentary}], subtitles}
                                         401 not_logged_in · 403 scout_refused/not_your_session · 409 replacement_pending
@@ -189,10 +189,12 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   50 MB, Safari and anything unnamed thirty seconds), so every stretch of the film must come in within that lead plus
   its own length. A file with no such index is taken to need its average and half again, and the log says so. A release that plays
   as it is but needs more than the link is kept aside while one that fits is looked for, in rank order as before.
-  The session's answer carries `prebuffer`: the seconds the player should buffer, on its link, before it starts;
+  The session's answer carries `prebuffer`: the seconds the player should wait, on its link, before it starts;
+  `prebufferLead`, the seconds of media it should have buffered ahead by then, which is what it holds for (a light
+  opening buffers more media than the seconds waited, so holding for `prebuffer` seconds of media lets go too early);
   `need`; and `segments`, each segment's start and bytes as sent, so a player can work the bucket out again at the
   rate it is actually getting. With none that fits, in order: the best-ranked copy that needs a head start of at most
-  60 s (a hard cap: the player holds, with a countdown, until `prebuffer`; for `player: cast`, which shows no
+  60 s (a hard cap: the player holds, with a countdown, until `prebufferLead` is buffered; for `player: cast`, which shows no
   countdown, 20 s); a transcode, of a release that plays only converted,
   else of an HEVC one that plays as it is; the copy that starves least; and else a refusal. A transcode is sized to
   the link, resolution kept before bitrate: 1080p from 8 Mbit/s down to 4, then 720p down to 2, then 540p down to 1,

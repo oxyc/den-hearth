@@ -873,6 +873,11 @@ where
                     // Seconds to buffer before playing, on the link the player named, so a copy then plays through
                     // without running dry; null where that isn't known.
                     "prebuffer": s.prebuffer.map(|p| (p * 10.0).ceil() / 10.0),
+                    // What that wait stands for, and what the player holds for: seconds of media buffered ahead. A
+                    // light opening buffers more media than the seconds waited, so the wait itself is only the
+                    // countdown; null where `prebuffer` is, and for a transcode. Rounded down: it ends on a segment's
+                    // end, which a player's buffer reaches exactly, and rounded up it would wait for the next one.
+                    "prebufferLead": s.prebuffer_lead.map(|p| (p * 10.0).floor() / 10.0),
                     // What a copy needs of a link, bits a second, to start within 10 s and never run dry — and each
                     // segment's `[start, bytes]` as the session sends it, from which a player can work that out again at
                     // the rate it is getting.

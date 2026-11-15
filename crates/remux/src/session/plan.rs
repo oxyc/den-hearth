@@ -374,11 +374,18 @@ pub(crate) fn need(info: &MediaInfo, delivery: &Delivery) -> Option<Need> {
 /// (`playlist::startup_delay`): what it can take as its pre-buffer target. `None` without a link or a byte index, and
 /// where no wait would do.
 pub(crate) fn prebuffer(info: &MediaInfo, delivery: &Delivery, max_bitrate: Option<u64>) -> Option<f64> {
+    head_start(info, delivery, max_bitrate).map(|(wait, _)| wait)
+}
+
+/// `prebuffer`'s wait, and the seconds of media to have buffered ahead that it stands for (`playlist::startup_lead`):
+/// what the player holds for, the wait being only what it shows while it does.
+fn head_start(info: &MediaInfo, delivery: &Delivery, max_bitrate: Option<u64>) -> Option<(f64, f64)> {
     let rate = max_bitrate.filter(|r| *r > 0)? as f64;
     let segs = playlist::segments(&info.keyframes, info.duration, playlist::TARGET_SECS);
     let bytes = playlist::segment_bytes(&segs, &info.byte_index, delivery.bytes)?;
     let from = start_segment(&segs, delivery.start_at);
-    Some(playlist::startup_delay(&segs, &bytes, from, rate, delivery.buffer)).filter(|w| w.is_finite())
+    let wait = playlist::startup_delay(&segs, &bytes, from, rate, delivery.buffer);
+    wait.is_finite().then(|| (wait, playlist::startup_lead(&segs, &bytes, from, rate, delivery.buffer)))
 }
 
 /// The share of the player's `maxBitrate` a copy may need and still count as fitting. A link is a measurement, taken
@@ -531,6 +538,7 @@ pub(crate) struct PlaybackPlan {
     pub audio_copy: Option<&'static str>,
     pub audio_out: job::AudioOut,
     pub prebuffer: Option<f64>,
+    pub prebuffer_lead: Option<f64>,
     pub need: Option<Need>,
     pub demand: Option<Vec<(f64, u64)>>,
 }
@@ -554,17 +562,20 @@ impl PlaybackPlan {
                 audio_copy,
                 audio_out,
                 prebuffer: usable_bitrate.map(|rate| preset.head_start(rate)),
+                prebuffer_lead: None,
                 need: None,
                 demand: None,
             };
         }
         let delivery = Delivery::of(info, size, want);
         let bytes = playlist::segment_bytes(segments, &info.byte_index, delivery.bytes);
+        let head_start = head_start(info, &delivery, usable_bitrate);
         Self {
             output,
             audio_copy,
             audio_out,
-            prebuffer: prebuffer(info, &delivery, usable_bitrate),
+            prebuffer: head_start.map(|(wait, _)| wait),
+            prebuffer_lead: head_start.map(|(_, lead)| lead),
             need: need(info, &delivery),
             demand: bytes.map(|bytes| {
                 segments
