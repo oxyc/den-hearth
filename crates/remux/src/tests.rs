@@ -1071,6 +1071,17 @@ fn video_packets(file: &Path) -> Vec<(f64, bool)> {
         .collect()
 }
 
+/// `(pts, dts)` of every video packet.
+fn video_packet_timestamps(file: &Path) -> Vec<(f64, f64)> {
+    ffprobe(&["-select_streams", "v:0", "-show_entries", "packet=pts_time,dts_time", "-of", "csv=p=0"], file)
+        .lines()
+        .filter_map(|line| {
+            let (pts, dts) = line.split_once(',')?;
+            Some((pts.parse().ok()?, dts.parse().ok()?))
+        })
+        .collect()
+}
+
 /// The boxes directly inside `b`, as `(type, body)`.
 fn mp4_boxes(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
     let mut out = Vec::new();
@@ -1659,6 +1670,60 @@ async fn av1_sdr_matroska_end_to_end() {
         &file,
     );
     assert_eq!(stream.trim(), "av1,bt709", "the init alone describes AV1 in BT.709");
+}
+
+/// Matroska stores PTS but not DTS. At an x265 open-GOP CRA, the first packets are the CRA followed in decode order
+/// by its leading RASL pictures. A copy started directly on that CRA therefore gives ffmpeg no preceding reorder
+/// history: it writes the CRA late and clamps the RASLs to nearly identical DTS. Starting one GOP earlier must make
+/// the wanted (second) GOP's decode timestamps identical to a continuous run's. This is the job seam Chrome's
+/// VideoToolbox decoder reported as kVTVideoDecoderReferenceMissingErr (-17694).
+#[test]
+#[ignore = "needs ffmpeg"]
+fn an_open_hevc_matroska_restart_preserves_the_wanted_gops_decode_timestamps() {
+    let source = testdata("open-gop.mkv");
+    let input = source.to_str().unwrap();
+    let run = |seek: Option<f64>| {
+        let dir = temp_dir();
+        let spec = crate::job::Spec {
+            input,
+            seek,
+            video: crate::job::Video::Copy { tag: Some("hvc1"), dovi: crate::job::Dovi::Absent },
+            audio: 0,
+            audio_out: crate::job::AudioOut::Stereo,
+            text: &[],
+            dir: &dir,
+        };
+        let out = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg"))
+            .args(crate::job::args(&spec, None))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        dir
+    };
+    let packet_times = |dir: &Path, gop: usize| {
+        let file = dir.join(format!("joined-{gop}.mp4"));
+        let init = std::fs::read(dir.join("init.mp4")).unwrap();
+        let media = std::fs::read(dir.join(format!("g{gop}.m4s"))).unwrap();
+        std::fs::write(&file, [init, media].concat()).unwrap();
+        video_packet_timestamps(&file)
+    };
+
+    let keyframes = [0.0, 3.0, 6.0, 9.0];
+    let segments = crate::playlist::segments(&keyframes, 12.0, crate::playlist::TARGET_SECS);
+    let (_, direct_seek) = crate::session::restart_point(&segments, &keyframes, 12.0, false, false, 1);
+    let (primed_start, primed_seek) =
+        crate::session::restart_point(&segments, &keyframes, 12.0, false, true, 1);
+    let continuous = packet_times(&run(None), 2);
+    let direct = packet_times(&run(direct_seek), 0);
+    let primed = packet_times(&run(primed_seek), ((6.0 - primed_start) / 3.0) as usize);
+
+    assert_eq!(primed, continuous, "the wanted GOP must retain the source run's PTS and DTS");
+    assert_ne!(direct, continuous, "the fixture must expose the direct seek's damaged DTS");
+    let direct_steps: Vec<f64> = direct[..4].windows(2).map(|w| w[1].1 - w[0].1).collect();
+    assert!(
+        direct_steps.iter().all(|step| *step < 0.001),
+        "ffmpeg should have clamped the CRA/RASL DTS closely enough to reproduce the defect: {direct_steps:?}"
+    );
 }
 
 /// A run from the start of the file re-encoding the audio to AAC, as `job::args` has it: its audio begins at or after
