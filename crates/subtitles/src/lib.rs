@@ -125,6 +125,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
             &parts.method,
             &parts.headers,
             Some(state.cfg.metrics_token.as_str()),
+            httputil::not_found,
             || metrics::render(&state),
         ),
         // A CORS preflight is answered for application paths before routing. Metrics is an operational

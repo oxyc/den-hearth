@@ -3,7 +3,7 @@
 use http::header::{HeaderMap, HeaderValue, ALLOW, CACHE_CONTROL, CONTENT_TYPE};
 use http::{Method, Response, StatusCode};
 
-use crate::{full, metrics_authorized, not_found, Body};
+use crate::{full, metrics_authorized, Body};
 
 const PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -17,10 +17,11 @@ pub fn metrics_response(
     method: &Method,
     headers: &HeaderMap,
     token: Option<&str>,
+    concealed: impl FnOnce() -> Response<Body>,
     render: impl FnOnce() -> String,
 ) -> Response<Body> {
     if !metrics_authorized(headers, token) {
-        return not_found();
+        return concealed();
     }
 
     match *method {
@@ -69,14 +70,14 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             "sample 1\n".to_string()
         };
-        let get = metrics_response(&Method::GET, &authorized(), Some("secret"), render);
+        let get = metrics_response(&Method::GET, &authorized(), Some("secret"), crate::not_found, render);
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(get.headers()[CONTENT_TYPE], PROMETHEUS);
         assert_eq!(get.headers()[CACHE_CONTROL], "no-store");
         assert_eq!(get.into_body().collect().await.unwrap().to_bytes(), "sample 1\n");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let head = metrics_response(&Method::HEAD, &authorized(), Some("secret"), render);
+        let head = metrics_response(&Method::HEAD, &authorized(), Some("secret"), crate::not_found, render);
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(head.headers()[CONTENT_TYPE], PROMETHEUS);
         assert_eq!(head.headers()[CACHE_CONTROL], "no-store");
@@ -87,13 +88,16 @@ mod tests {
     #[tokio::test]
     async fn authorization_is_concealed_before_the_method_contract() {
         for (headers, token) in [(HeaderMap::new(), Some("secret")), (authorized(), None)] {
-            let response = metrics_response(&Method::POST, &headers, token, || panic!("must not render"));
+            let response = metrics_response(&Method::POST, &headers, token, crate::not_found, || {
+                panic!("must not render")
+            });
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
-        let response = metrics_response(&Method::POST, &authorized(), Some("secret"), || {
-            panic!("an unsupported method must not render")
-        });
+        let response =
+            metrics_response(&Method::POST, &authorized(), Some("secret"), crate::not_found, || {
+                panic!("an unsupported method must not render")
+            });
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()[ALLOW], "GET, HEAD");
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");

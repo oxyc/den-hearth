@@ -389,6 +389,7 @@ where
             &parts.method,
             &parts.headers,
             state.cfg.metrics_token.as_deref(),
+            httputil::not_found,
             || metrics_body(state),
         ),
         "/remux/speed" if get && !state.admit(visitor(state, parts)) => {

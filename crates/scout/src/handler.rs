@@ -1429,6 +1429,7 @@ impl Inner {
                 req.method(),
                 req.headers(),
                 Some(&self.deps.metrics_token),
+                || error(StatusCode::NOT_FOUND, "not_found"),
                 || metrics().render(cache_persistent_gauge(&*self.deps.cache)),
             );
         }

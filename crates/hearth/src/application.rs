@@ -249,7 +249,7 @@ where
 /// bearer token and a plain 404 without it, so nobody is told there is something to poke at; the series
 /// are low-cardinality by construction (two lanes, two media classes), never per-route or per-peer.
 fn metrics(hearth: &Hearth, method: &hyper::Method, headers: &hyper::HeaderMap) -> Response<Body> {
-    den_http::metrics_response(method, headers, hearth.metrics_token.as_deref(), || {
+    den_http::metrics_response(method, headers, hearth.metrics_token.as_deref(), den_http::not_found, || {
         let mut text = String::with_capacity(4096);
         hearth.admission.render(&mut text);
         hearth.media.render(&mut text);

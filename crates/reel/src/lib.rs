@@ -485,9 +485,13 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     let log = state.cfg.log_requests;
     let (parts, _body) = req.into_parts();
     let mut resp = if parts.uri.path() == "/metrics" {
-        den_http::metrics_response(&parts.method, &parts.headers, state.cfg.metrics_token.as_deref(), || {
-            metrics_body(&state)
-        })
+        den_http::metrics_response(
+            &parts.method,
+            &parts.headers,
+            state.cfg.metrics_token.as_deref(),
+            httputil::not_found,
+            || metrics_body(&state),
+        )
     } else if parts.method == hyper::Method::OPTIONS {
         // CORS preflight on application paths: everything there is credential-free, and a browser-based
         // client asks before it sends anything with a header of its own. Metrics has its narrower contract above.
