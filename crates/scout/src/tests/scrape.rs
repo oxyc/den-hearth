@@ -526,6 +526,139 @@ mod beyond_the_go_suite {
         assert!(res.any_ok);
     }
 
+    #[tokio::test]
+    async fn a_known_down_indexer_is_skipped_without_becoming_an_empty_vote() {
+        struct Dead(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Scraper for Dead {
+            fn id(&self) -> Indexer {
+                Indexer("torrentio".into())
+            }
+            async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        struct Healthy;
+        #[async_trait]
+        impl Scraper for Healthy {
+            fn id(&self) -> Indexer {
+                Indexer("comet".into())
+            }
+            async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+                Ok(vec![RawStream { info_hash: "a".repeat(40), ..Default::default() }])
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scrapers: Vec<Arc<dyn Scraper>> = vec![Arc::new(Dead(calls.clone())), Arc::new(Healthy)];
+        let runtime = crate::runtime::ScoutRuntime::new();
+        for episode in 1..=crate::indexer_health::DOWN_AFTER {
+            let q = ScrapeQuery { imdb: format!("tt{episode}"), ..movie("tt1") };
+            let res = crate::runtime::scope(runtime.clone(), async {
+                scrape_covered(&scrapers, &q, Duration::from_millis(15), None, Duration::ZERO).await
+            })
+            .await;
+            assert_eq!(res.sources[0].outcome, OUTCOME_TIMEOUT);
+            assert_eq!(res.sources[1].outcome, OUTCOME_ANSWERED);
+        }
+
+        let res = tokio::time::timeout(
+            Duration::from_millis(250),
+            crate::runtime::scope(runtime.clone(), async {
+                scrape_covered(&scrapers, &movie("tt999"), Duration::from_secs(1), None, Duration::ZERO).await
+            }),
+        )
+        .await
+        .expect("known-down indexer consumed the one-second scrape budget");
+        assert_eq!(calls.load(Ordering::SeqCst), crate::indexer_health::DOWN_AFTER as usize);
+        assert_eq!(res.sources[0].outcome, OUTCOME_UNREACHABLE, "skipped source disappeared from quorum");
+        assert_eq!(res.sources[1].outcome, OUTCOME_ANSWERED);
+        assert!(!res.complete, "a skipped indexer made a partial list complete");
+        assert!(res.any_ok, "the healthy indexer's release was discarded");
+        assert!(
+            runtime
+                .metrics()
+                .render(-1)
+                .contains(r#"scout_indexer_circuit_avoided_total{indexer="torrentio"} 1"#),
+            "the avoided upstream call was not observable"
+        );
+    }
+
+    /// Deterministic production-path measurement for the issue's season-opening workload: sixteen distinct cold
+    /// episode lists (the process list-build ceiling), one blackholed origin and one immediately healthy origin.
+    /// Tokio's paused clock makes the measured scrape deadlines exact rather than machine-load dependent. The
+    /// blackhole reaches the twelve-request per-origin ceiling; the other twelve global permits remain available
+    /// to the healthy origin. Two simultaneous blackholes may transiently fill all 24 until the circuit opens.
+    #[tokio::test(start_paused = true)]
+    async fn season_blackhole_burst_latency_with_and_without_early_answer() {
+        struct Dead(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Scraper for Dead {
+            fn id(&self) -> Indexer {
+                Indexer("torrentio".into())
+            }
+            async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+        struct Healthy;
+        #[async_trait]
+        impl Scraper for Healthy {
+            fn id(&self) -> Indexer {
+                Indexer("comet".into())
+            }
+            async fn scrape(&self, _q: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+                Ok(vec![RawStream { info_hash: "b".repeat(40), ..Default::default() }])
+            }
+        }
+
+        async fn measure(grace: Option<Duration>) -> (Duration, usize) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let scrapers: Vec<Arc<dyn Scraper>> = vec![Arc::new(Dead(calls.clone())), Arc::new(Healthy)];
+            let runtime = crate::runtime::ScoutRuntime::new();
+            let started = tokio::time::Instant::now();
+            crate::runtime::scope(runtime, async {
+                futures_util::future::join_all((1..=crate::runtime::MAX_CONCURRENT_LIST_BUILDS).map(
+                    |episode| {
+                        let scrapers = scrapers.clone();
+                        async move {
+                            let query = ScrapeQuery {
+                                kind: "series".into(),
+                                imdb: "tt1234567".into(),
+                                season: 1,
+                                episode: episode as i64,
+                                has_ep: true,
+                                ..Default::default()
+                            };
+                            crate::scrape::scrape_covered_until(
+                                &scrapers,
+                                &query,
+                                Duration::from_secs(8),
+                                tokio::time::Instant::now() + Duration::from_secs(8),
+                                None,
+                                Duration::ZERO,
+                                grace,
+                            )
+                            .await
+                        }
+                    },
+                ))
+                .await;
+            })
+            .await;
+            (started.elapsed(), calls.load(Ordering::SeqCst))
+        }
+
+        let (full_latency, full_calls) = measure(None).await;
+        let (early_latency, early_calls) = measure(Some(crate::scrape::LATE_GRACE)).await;
+        assert_eq!(full_latency, Duration::from_secs(8));
+        assert_eq!(early_latency, crate::scrape::LATE_GRACE);
+        assert_eq!(full_calls, crate::runtime::MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN);
+        assert_eq!(early_calls, crate::runtime::MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN);
+    }
+
     // The cache is shared with the Go build across a redeploy, so an answer one wrote must read in the other: Go's
     // untagged struct writes its field names as they are, a nil slice as `null`.
     #[tokio::test]

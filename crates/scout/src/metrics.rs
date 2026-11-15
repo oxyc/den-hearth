@@ -118,6 +118,8 @@ pub struct MetricSet {
     // a counter that appears only after the first request is a counter you cannot alert on.
     indexer_requests: Series,
     indexer_failures: Series,
+    /// Calls avoided because an origin is known down. Separate from failures: no upstream request was made.
+    indexer_circuit_avoided: Series,
     /// Releases each indexer answered with, before dedupe: whether one that answers is also one that adds anything.
     indexer_releases: Series,
     /// How each configured source figured in a list build's coverage, by outcome. Unlike the request counters
@@ -180,6 +182,7 @@ pub fn new_metric_set() -> MetricSet {
         torbox_avoided: fixed_series(&METRIC_TORBOX_AVOIDED),
         indexer_requests: fixed_series(&metric_indexers().collect::<Vec<_>>()),
         indexer_failures: fixed_series(&metric_indexers().collect::<Vec<_>>()),
+        indexer_circuit_avoided: fixed_series(&metric_indexers().collect::<Vec<_>>()),
         indexer_releases: fixed_series(&metric_indexers().collect::<Vec<_>>()),
         source_coverage: metric_indexers().map(|id| (id, fixed_series(&SOURCE_OUTCOMES))).collect(),
         release_codec: fixed_series(&METRIC_CODECS),
@@ -231,6 +234,12 @@ impl MetricSet {
             if let Some(c) = self.indexer_failures.get(id) {
                 c.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    pub fn indexer_circuit_avoided(&self, id: &str) {
+        if let Some(c) = self.indexer_circuit_avoided.get(id) {
+            c.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -432,6 +441,12 @@ impl MetricSet {
             "scout_indexer_failures_total",
             "Scrape attempts that did not answer, per indexer.",
             &per_indexer(&self.indexer_failures),
+        );
+        counter(
+            &mut b,
+            "scout_indexer_circuit_avoided_total",
+            "Scrapes avoided while an indexer origin is known down.",
+            &per_indexer(&self.indexer_circuit_avoided),
         );
         counter(
             &mut b,

@@ -92,6 +92,13 @@ scout_indexer_failures_total{indexer="comet"} 0
 scout_indexer_failures_total{indexer="mediafusion"} 0
 scout_indexer_failures_total{indexer="torz"} 0
 scout_indexer_failures_total{indexer="own"} 0
+# HELP scout_indexer_circuit_avoided_total Scrapes avoided while an indexer origin is known down.
+# TYPE scout_indexer_circuit_avoided_total counter
+scout_indexer_circuit_avoided_total{indexer="torrentio"} 0
+scout_indexer_circuit_avoided_total{indexer="comet"} 0
+scout_indexer_circuit_avoided_total{indexer="mediafusion"} 0
+scout_indexer_circuit_avoided_total{indexer="torz"} 0
+scout_indexer_circuit_avoided_total{indexer="own"} 0
 # HELP scout_indexer_releases_total Releases each indexer answered with, before dedupe.
 # TYPE scout_indexer_releases_total counter
 scout_indexer_releases_total{indexer="torrentio"} 0

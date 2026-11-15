@@ -1,5 +1,6 @@
 //! Mutable state shared by every Scout handler hosted in one Hearth process.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -9,6 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::addbudget::{AddBudget, ADD_BUDGET_LIMIT, ADD_BUDGET_WINDOW};
+use crate::indexer_health::IndexerHealth;
 use crate::metrics::{new_metric_set, MetricSet};
 use crate::publication::{Authority, Publication, PublicationFence};
 use crate::scrape::Doer;
@@ -31,6 +33,12 @@ pub(crate) const MAX_CONCURRENT_LIST_BUILDS: usize = 16;
 /// admission bounds keep its waiter set finite.
 pub(crate) const MAX_CONCURRENT_SCRAPER_REQUESTS: usize = 24;
 
+/// One origin may use at most half of the process-wide response-body ceiling. The per-origin permit is acquired
+/// first, so requests queued behind one blackholed origin hold no global capacity and another origin retains twelve
+/// slots. Twelve also keeps a healthy 24-episode season to two waves rather than imposing three under one deadline.
+pub(crate) const MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN: usize = 12;
+const MAX_TRACKED_SCRAPER_ORIGINS: usize = 256;
+
 /// Maximum number of post-response late-source diagnostics retained by one hosted Scout runtime.
 ///
 /// These tasks are observation only: they await sources the viewer did not wait for, cache-check the bounded
@@ -49,6 +57,8 @@ pub struct ScoutRuntime {
     metrics: Arc<MetricSet>,
     list_builds: Arc<Semaphore>,
     scraper_requests: Arc<Semaphore>,
+    scraper_origins: Mutex<HashMap<String, Arc<Semaphore>>>,
+    pub(crate) indexer_health: IndexerHealth,
     publications: Arc<PublicationFence>,
     late_diagnostics: Arc<Semaphore>,
     pub(crate) torbox: TorboxRuntime,
@@ -74,6 +84,7 @@ pub(crate) struct ListBuildAdmission {
 /// One scraper request admitted process-wide. It covers the response read and decode performed by `scrape`.
 pub(crate) struct ScraperRequestAdmission {
     _permit: OwnedSemaphorePermit,
+    _origin_permit: Option<OwnedSemaphorePermit>,
     metrics: Arc<MetricSet>,
 }
 
@@ -135,6 +146,8 @@ impl ScoutRuntime {
             metrics: Arc::new(new_metric_set()),
             list_builds: Arc::new(Semaphore::new(list_build_limit)),
             scraper_requests: Arc::new(Semaphore::new(scraper_request_limit)),
+            scraper_origins: Mutex::new(HashMap::new()),
+            indexer_health: IndexerHealth::default(),
             publications: Arc::new(PublicationFence::default()),
             late_diagnostics: Arc::new(Semaphore::new(late_diagnostic_limit)),
             torbox,
@@ -150,12 +163,13 @@ impl ScoutRuntime {
         Duration::from_millis(self.rebuild_cooloff_ms.load(Ordering::Relaxed))
     }
 
-    /// Shortens the cool-off after a degraded build and TorBox's recovery-probe window, so a dependant's outage test
-    /// can watch recovery in seconds instead of waiting out the production minute.
+    /// Shortens the cool-off after a degraded build and both recovery-probe windows, so a dependant's outage test
+    /// can watch recovery in seconds instead of waiting out the production minute and half-minute.
     #[cfg(feature = "test-support")]
     pub fn shorten_recovery_for_test(&self, rebuild_cooloff: Duration, torbox_probe_every: Duration) {
         self.rebuild_cooloff_ms.store(rebuild_cooloff.as_millis() as u64, Ordering::Relaxed);
         self.torbox.health.set_probe_every(torbox_probe_every);
+        self.indexer_health.set_probe_every(torbox_probe_every);
     }
 
     /// Report every episode play this runtime's handlers serve to `observer`. Set once; a later call is ignored.
@@ -201,15 +215,55 @@ impl ScoutRuntime {
     /// from Tokio's FIFO queue; dropping the guard returns the permit on success, error, timeout, panic, or abort.
     pub(crate) async fn admit_scraper_request_until(
         &self,
+        origin: &str,
         deadline: Instant,
     ) -> Option<ScraperRequestAdmission> {
+        let origin_slots = {
+            let mut origins = self.scraper_origins.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(slots) = origins.get(origin) {
+                Some(Arc::clone(slots))
+            } else {
+                // Only evict an idle semaphore: owned permits and queued acquisitions retain another Arc. If all
+                // tracked origins are live, the uncommon overflow falls back to the global ceiling rather than
+                // growing memory or creating two independent semaphores for one origin.
+                if origins.len() >= MAX_TRACKED_SCRAPER_ORIGINS {
+                    if let Some(idle) = origins
+                        .iter()
+                        .find(|(_, slots)| Arc::strong_count(slots) == 1)
+                        .map(|(key, _)| key.clone())
+                    {
+                        origins.remove(&idle);
+                    }
+                }
+                if origins.len() < MAX_TRACKED_SCRAPER_ORIGINS {
+                    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN));
+                    origins.insert(origin.to_owned(), Arc::clone(&slots));
+                    Some(slots)
+                } else {
+                    None
+                }
+            }
+        };
+        let origin_permit = match origin_slots {
+            Some(slots) => Some(
+                tokio::time::timeout_at(deadline, slots.acquire_owned())
+                    .await
+                    .ok()?
+                    .expect("the scraper origin semaphore is never closed"),
+            ),
+            None => None,
+        };
         let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.scraper_requests).acquire_owned())
             .await
             .ok()?
             .expect("the scraper request semaphore is never closed");
         self.metrics.scraper_request_admitted.fetch_add(1, Ordering::Relaxed);
         self.metrics.scraper_request_active.fetch_add(1, Ordering::Relaxed);
-        Some(ScraperRequestAdmission { _permit: permit, metrics: Arc::clone(&self.metrics) })
+        Some(ScraperRequestAdmission {
+            _permit: permit,
+            _origin_permit: origin_permit,
+            metrics: Arc::clone(&self.metrics),
+        })
     }
 
     /// Nonblocking admission for a new, distinct list build. The caller must first check whether its key already
@@ -469,19 +523,22 @@ mod tests {
     async fn scraper_admission_recovers_after_wait_timeout_and_owner_cancellation() {
         let runtime = ScoutRuntime::new_with_limits(MAX_CONCURRENT_LIST_BUILDS, 1);
         let held = runtime
-            .admit_scraper_request_until(Instant::now() + Duration::from_secs(1))
+            .admit_scraper_request_until("one.example", Instant::now() + Duration::from_secs(1))
             .await
             .expect("the first scraper request is admitted");
 
         assert!(
-            runtime.admit_scraper_request_until(Instant::now() + Duration::from_millis(10)).await.is_none(),
+            runtime
+                .admit_scraper_request_until("one.example", Instant::now() + Duration::from_millis(10))
+                .await
+                .is_none(),
             "a queued scraper request outlived its deadline"
         );
         assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 1);
 
         drop(held);
         let recovered = runtime
-            .admit_scraper_request_until(Instant::now() + Duration::from_secs(1))
+            .admit_scraper_request_until("one.example", Instant::now() + Duration::from_secs(1))
             .await
             .expect("the timed-out waiter leaked or stole the only permit");
         assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 1);
@@ -494,7 +551,7 @@ mod tests {
             let entered = entered.clone();
             async move {
                 let _permit = runtime
-                    .admit_scraper_request_until(Instant::now() + Duration::from_secs(1))
+                    .admit_scraper_request_until("one.example", Instant::now() + Duration::from_secs(1))
                     .await
                     .expect("the cancellable owner is admitted");
                 entered.wait().await;
@@ -511,9 +568,84 @@ mod tests {
             "canceling admitted work leaked its permit"
         );
         let final_request = runtime
-            .admit_scraper_request_until(Instant::now() + Duration::from_secs(1))
+            .admit_scraper_request_until("one.example", Instant::now() + Duration::from_secs(1))
             .await
             .expect("the canceled owner leaked the only permit");
         drop(final_request);
+    }
+
+    #[tokio::test]
+    async fn one_origin_cannot_occupy_the_global_scraper_ceiling() {
+        let runtime =
+            ScoutRuntime::new_with_limits(MAX_CONCURRENT_LIST_BUILDS, MAX_CONCURRENT_SCRAPER_REQUESTS);
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN {
+            held.push(
+                runtime
+                    .admit_scraper_request_until("dead.example", deadline())
+                    .await
+                    .expect("the per-origin allowance was not admitted"),
+            );
+        }
+
+        let queued = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.admit_scraper_request_until("dead.example", deadline()).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished(), "the dead origin exceeded its own ceiling");
+
+        let mut healthy = Vec::new();
+        for _ in 0..MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN {
+            healthy.push(
+                runtime
+                    .admit_scraper_request_until("healthy.example", deadline())
+                    .await
+                    .expect("the dead origin consumed a healthy origin's reserved half"),
+            );
+        }
+        assert_eq!(
+            runtime.metrics().scraper_request_active.load(Ordering::SeqCst),
+            MAX_CONCURRENT_SCRAPER_REQUESTS as i64
+        );
+        drop(healthy);
+        queued.abort();
+        assert!(matches!(queued.await, Err(error) if error.is_cancelled()));
+        drop(held);
+        assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn two_blackholed_origins_can_transiently_fill_the_global_pool() {
+        let runtime =
+            ScoutRuntime::new_with_limits(MAX_CONCURRENT_LIST_BUILDS, MAX_CONCURRENT_SCRAPER_REQUESTS);
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        let mut held = Vec::new();
+        for origin in ["dead-one.example", "dead-two.example"] {
+            for _ in 0..MAX_CONCURRENT_SCRAPER_REQUESTS_PER_ORIGIN {
+                held.push(
+                    runtime
+                        .admit_scraper_request_until(origin, deadline())
+                        .await
+                        .expect("the per-origin allowance was not admitted"),
+                );
+            }
+        }
+
+        assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 24);
+        let healthy = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.admit_scraper_request_until("healthy.example", deadline()).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!healthy.is_finished(), "two saturated origins unexpectedly left a global permit");
+
+        drop(held.pop());
+        let healthy =
+            healthy.await.expect("healthy admission task panicked").expect("healthy admission timed out");
+        drop(healthy);
+        drop(held);
+        assert_eq!(runtime.metrics().scraper_request_active.load(Ordering::SeqCst), 0);
     }
 }

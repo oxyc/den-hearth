@@ -30,7 +30,7 @@ async fn health_flip_is_logged_once_each_way() {
     let out = LogCapture::start();
     let healthy = Arc::new(AtomicBool::new(false));
     let flag = healthy.clone();
-    let h = new_handler(test_deps(move |d| {
+    let deps = test_deps(move |d| {
         let flag = flag.clone();
         d.make_scrapers = Arc::new(move |_| {
             let flag = flag.clone();
@@ -45,7 +45,9 @@ async fn health_flip_is_logged_once_each_way() {
                 })
             })]
         });
-    }));
+    });
+    let runtime = deps.runtime.clone();
+    let h = new_handler(deps);
     let build = |i: i32| {
         let h = &h;
         async move {
@@ -58,6 +60,7 @@ async fn health_flip_is_logged_once_each_way() {
     let want = format!("health: ok → degraded (indexers): {INDEXERS_DOWN_DETAIL}");
     let n = out.text().matches(&want).count();
     assert_eq!(n, 1, "going degraded logged {n} times, want 1:\n{}", out.text());
+    runtime.indexer_health.set_probe_every(std::time::Duration::ZERO);
     healthy.store(true, Ordering::SeqCst);
     build(80).await;
     build(81).await;
