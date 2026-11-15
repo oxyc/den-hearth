@@ -224,6 +224,13 @@ COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /opt/ffmpeg/bin/ffprobe /usr/local/bin
 COPY . .
 RUN cargo test --locked -p den-remux -- --include-ignored
 
+# ---- test: Remux's ffmpeg alone, at the runtime image's path --------------------------------------------
+# The cross-repo playback e2e (den-edge `web/e2e-stack/ci.sh`) copies /usr/local/bin/ffmpeg-remux out of an image.
+# CI hands it this stage, built from the same checkout as the Hearth under test, so Remux's arguments always meet
+# the ffmpeg build they were written for, not the last release's.
+FROM debian:trixie-slim AS stack-ffmpeg
+COPY --from=ffmpeg /opt/ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg-remux
+
 # ---- release metadata ---------------------------------------------------------------------------------
 # The runtime copies this marker, so a build without a valid DEN_VERSION fails before an image can be pushed.
 # The version only reaches the final image's configuration and never invalidates the Rust or tool builds.

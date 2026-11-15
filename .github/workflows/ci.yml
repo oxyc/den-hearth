@@ -194,6 +194,12 @@ jobs:
     timeout-minutes: 20
     outputs:
       edge: ${{ steps.edge.outputs.tag }}
+    # A throwaway registry for this checkout's Remux ffmpeg: den-edge's ci.sh pulls the image it is given.
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
     steps:
       # Beside den-edge's checkout, not around it: nested, Cargo takes den-edge for a member of this workspace.
       - uses: actions/checkout@v7
@@ -230,7 +236,28 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: den-edge/web/package-lock.json
+      # Remux's ffmpeg from this checkout's Dockerfile, not the last release's: a change to its build (a new bitstream
+      # filter, a new version) is tested with the Remux code that needs it.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: |
+            image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build Remux's ffmpeg
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          workdir: den-hearth
+          source: .
+          files: docker-bake.hcl
+          targets: stack-ffmpeg
+          set: |
+            stack-ffmpeg.output=type=image,name=localhost:5000/den-hearth-ffmpeg:stack,push=true,registry.insecure=true
       - name: Playback through den-hearth and den-edge ${{ steps.edge.outputs.tag }}
+        env:
+          DEN_HEARTH_IMAGE: localhost:5000/den-hearth-ffmpeg:stack
         run: den-edge/web/e2e-stack/ci.sh den-edge den-hearth
       - name: Retain failure evidence
         if: failure()

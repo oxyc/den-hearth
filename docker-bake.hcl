@@ -37,6 +37,14 @@ target "hearth" {
   ]
 }
 
+# Remux's ffmpeg alone, for the cross-repo playback e2e. The workflow names where it is pushed (`*.output`).
+target "stack-ffmpeg" {
+  inherits   = ["common"]
+  target     = "stack-ffmpeg"
+  cache-from = ["type=gha,scope=stack-ffmpeg", "type=gha,scope=e2e", "type=gha,scope=release-image"]
+  cache-to   = ["type=gha,mode=max,scope=stack-ffmpeg"]
+}
+
 # Remux's #[ignore]d end-to-end tests against the image's own ffmpeg. Nothing is exported but the cache.
 target "e2e" {
   inherits   = ["common"]
