@@ -4168,13 +4168,13 @@ async fn a_copy_within_sixty_seconds_then_a_transcode_then_the_least_starving_co
     let state = test_state(&origin, 4, Duration::from_secs(600));
     state.transcode_ok.store(true, Relaxed);
     let key = format!("{}/0/h264.mkv", crate::auth::install_id(&format!("{origin}/cfg")));
-    let start = |heavy: f64, link: u64| {
+    let start_as = |heavy: f64, link: u64, player: &'static str| {
         let (state, origin, key) = (state.clone(), origin.clone(), key.clone());
         let (resolved, info) = seeded(heavy);
         async move {
             state.opened().put(key, &resolved, &info, std::time::Instant::now());
             let body = format!(
-                r#"{{"imdb":"tt0000014","scout":"{origin}/cfg","playable":{{"h264":51}},"maxBitrate":{link}}}"#
+                r#"{{"imdb":"tt0000014","scout":"{origin}/cfg","playable":{{"h264":51}},"maxBitrate":{link}{player}}}"#
             );
             let r = call(&state, "POST", "/remux/session", None, &body).await;
             assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
@@ -4182,6 +4182,7 @@ async fn a_copy_within_sixty_seconds_then_a_transcode_then_the_least_starving_co
             r.json()
         }
     };
+    let start = |heavy: f64, link: u64| start_as(heavy, link, "");
     let picked = |j: &serde_json::Value| {
         (j["release"]["filename"].as_str().map(String::from), j["video"]["transcoded"].as_bool())
     };
@@ -4190,6 +4191,9 @@ async fn a_copy_within_sixty_seconds_then_a_transcode_then_the_least_starving_co
     let j = start(11e6, 10_000_000).await;
     assert_eq!(picked(&j), (Some("h264.mkv".into()), Some(false)), "{j}");
     assert!(j["prebuffer"].as_f64().is_some_and(|p| (20.0..=60.0).contains(&p)), "{j}");
+    // A Cast receiver shows no countdown: the same 29 s is past what it covers, so the conversion plays there.
+    let j = start_as(11e6, 10_000_000, r#","player":"cast""#).await;
+    assert_eq!(picked(&j), (Some("hevc.mkv".into()), Some(true)), "{j}");
     // 12 Mbit/s: no head start carries it, and a 1080p conversion at the link's rate does.
     let j = start(12e6, 6_600_000).await;
     assert_eq!(picked(&j), (Some("hevc.mkv".into()), Some(true)), "{j}");

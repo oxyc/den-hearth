@@ -191,8 +191,9 @@ itself is never logged. Brave on iOS sends Safari's User-Agent, so it reads as S
   as it is but needs more than the link is kept aside while one that fits is looked for, in rank order as before.
   The session's answer carries `prebuffer`: the seconds the player should buffer, on its link, before it starts;
   `need`; and `segments`, each segment's start and bytes as sent, so a player can work the bucket out again at the
-  rate it is actually getting. With none that fits, in order: a copy that needs a head start of at most 30 s (a hard
-  cap: the player holds, with a countdown, until `prebuffer`); a transcode, of a release that plays only converted,
+  rate it is actually getting. With none that fits, in order: the best-ranked copy that needs a head start of at most
+  60 s (a hard cap: the player holds, with a countdown, until `prebuffer`; for `player: cast`, which shows no
+  countdown, 20 s); a transcode, of a release that plays only converted,
   else of an HEVC one that plays as it is; the copy that starves least; and else a refusal. A transcode is sized to
   the link, resolution kept before bitrate: 1080p from 8 Mbit/s down to 4, then 720p down to 2, then 540p down to 1,
   each with a peak of 1.5 times its average that has to fit the link beside the audio. A transcode that fits no size
