@@ -486,7 +486,10 @@ mod legacy {
             }
             let mut res = "";
             if !allowed.is_empty() || !f.prefer_resolution.is_empty() {
-                res = detect_resolution_lower(&lower);
+                res = match detect_resolution_lower(&lower) {
+                    "2160p" if starved_4k(&lower, s) => "1080p",
+                    r => r,
+                };
             }
             if !allowed.is_empty() && !res.is_empty() && !allowed.contains(res) {
                 drop_n(&mut debug, "resolution", 1);

@@ -158,6 +158,16 @@ pub(crate) fn resolution_bucket(t: &ReleaseTraits) -> &'static str {
     }
 }
 
+/// The resolution a release ranks at: its title's, except a "2160p" that is 4K in name only (`starved_4k`), which
+/// ranks as the 1080p it is. The resolutions filter and the preferred-resolution sink read this, so a starved "4K"
+/// cannot ride a 2160p preference to the top of a list its score already put it below.
+pub(crate) fn ranked_resolution(t: &ReleaseTraits, s: &RawStream) -> &'static str {
+    match resolution_bucket(t) {
+        "2160p" if starved_4k(t, s) => "1080p",
+        bucket => bucket,
+    }
+}
+
 /// Go `detectResolution`: "" when the title names none.
 #[cfg(test)]
 pub(crate) fn detect_resolution(title: &str) -> &'static str {
@@ -733,7 +743,7 @@ pub(crate) fn rank_streams_debug(
         // Computed once for both the hard filter and the soft preference, and only when one is set.
         let mut res = "";
         if !allowed.is_empty() || !f.prefer_resolution.is_empty() {
-            res = resolution_bucket(t);
+            res = ranked_resolution(t, s);
         }
         if !allowed.is_empty() && !res.is_empty() && !allowed.contains(res) {
             drop_n(&mut debug, "resolution", 1);
