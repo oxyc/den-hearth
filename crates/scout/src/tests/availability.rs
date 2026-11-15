@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use crate::availability::{verdict_prefix, MAX_AVAILABILITY_IDS, VERDICT_UNDETERMINED};
-use crate::config::DebridService;
+use crate::config::{DebridService, Indexer};
 use crate::deps::Deps;
 use crate::handler::new_handler;
 use crate::rank::RawStream;
-use crate::scrape::{DoError, ScrapeQuery};
+use crate::scrape::{DoError, ScrapeQuery, Scraper};
 use crate::seal::{seal, SealKeyring, SEALED_VERSION};
 use crate::stores::{ResolveTarget, Store, StoreError};
 use crate::tests::handler::{
@@ -75,6 +75,22 @@ fn counting_scraper(
     })
 }
 
+struct QueryScraper {
+    seen: mpsc::Sender<ScrapeQuery>,
+}
+
+#[async_trait]
+impl Scraper for QueryScraper {
+    fn id(&self) -> Indexer {
+        Indexer("torrentio".to_owned())
+    }
+
+    async fn scrape(&self, query: &ScrapeQuery) -> Result<Vec<RawStream>, DoError> {
+        let _ = self.seen.send(query.clone());
+        Ok(test_seeds())
+    }
+}
+
 /// A cache-check store that counts its checks and answers with nothing.
 struct AvailabilityCountingStore {
     checks: Arc<AtomicI32>,
@@ -134,6 +150,38 @@ async fn availability_checks_behind_the_reply() {
     let h = new_handler(test_deps(|_| {}));
     assert_eq!(availability_of(&h, &valid_blob(), "tt1234567").await, "unknown", "first ask");
     wait_for_verdict(&h, &valid_blob(), "tt1234567", "available").await;
+}
+
+/// Episode ids use the ordinary series-query contract and keep their verdict distinct from every other episode.
+#[tokio::test]
+async fn availability_checks_a_resolved_series_episode() {
+    let (sent, seen) = mpsc::channel();
+    let deps = test_deps(move |d| {
+        let sent = sent.clone();
+        d.make_scrapers = Arc::new(move |_| vec![Box::new(QueryScraper { seen: sent.clone() })]);
+    });
+    let cache = deps.cache.clone();
+    let h = new_handler(deps);
+
+    assert_eq!(availability_of(&h, &valid_blob(), "tt1234567:2:3").await, "unknown");
+    wait_for_verdict(&h, &valid_blob(), "tt1234567:2:3", "available").await;
+    let query = seen.recv_timeout(Duration::from_secs(1)).expect("the episode was scraped");
+    assert_eq!(
+        query,
+        ScrapeQuery {
+            kind: "series".to_owned(),
+            imdb: "tt1234567".to_owned(),
+            season: 2,
+            episode: 3,
+            has_ep: true,
+            ..ScrapeQuery::default()
+        }
+    );
+
+    let config = crate::config::decode_config(None, &valid_blob()).expect("the valid config decodes");
+    let prefix = verdict_prefix(&config);
+    assert!(cache.get(&format!("{prefix}tt1234567")).is_none(), "episode leaked to movie key");
+    assert!(cache.get(&format!("{prefix}tt1234567:2:4")).is_none(), "episode leaked to sibling key");
 }
 
 #[tokio::test]
@@ -231,6 +279,25 @@ async fn availability_a_stream_list_records_the_verdict() {
     );
     assert_eq!(availability_of(&h, &valid_blob(), "tt1234567").await, "available", "after the stream list");
     assert_eq!(scrapes.load(Ordering::SeqCst), 1, "scrapes");
+}
+
+#[tokio::test]
+async fn availability_an_episode_stream_list_records_only_that_episode() {
+    let scrapes = Arc::new(AtomicI32::new(0));
+    let deps = test_deps(|d| d.make_scrapers = counting_scraper(scrapes.clone(), test_seeds(), None));
+    let cache = deps.cache.clone();
+    let h = new_handler(deps);
+    assert_eq!(
+        get(&h, &format!("/{}/stream/series/tt1234567:2:3.json", valid_blob()), &[]).await.status(),
+        200,
+        "episode stream"
+    );
+    assert_eq!(availability_of(&h, &valid_blob(), "tt1234567:2:3").await, "available");
+    assert_eq!(scrapes.load(Ordering::SeqCst), 1, "availability repeated the episode scrape");
+
+    let config = crate::config::decode_config(None, &valid_blob()).expect("the valid config decodes");
+    let prefix = verdict_prefix(&config);
+    assert!(cache.get(&format!("{prefix}tt1234567:2:4")).is_none(), "sibling episode inherited verdict");
 }
 
 /// A nonempty partial scrape may become empty after filtering. The missing indexer could still have a playable
@@ -340,7 +407,7 @@ async fn availability_the_scoped_config() {
 }
 
 #[tokio::test]
-async fn availability_refuses_what_is_not_a_page_of_movie_ids() {
+async fn availability_refuses_what_is_not_a_page_of_supported_ids() {
     let h = new_handler(test_deps(|_| {}));
     let path = format!("/{}/availability", valid_blob());
     let r = get(&h, &path, &[]).await;
@@ -354,7 +421,10 @@ async fn availability_refuses_what_is_not_a_page_of_movie_ids() {
         ("not json", "ids".to_owned()),
         ("too many", format!(r#"{{"ids":[{}]}}"#, ids.join(","))),
         ("not an imdb id", r#"{"ids":["tt1","1234"]}"#.to_owned()),
-        ("an episode", r#"{"ids":["tt1:1:1"]}"#.to_owned()),
+        ("an incomplete episode", r#"{"ids":["tt1:1"]}"#.to_owned()),
+        ("an episode with an extra part", r#"{"ids":["tt1:1:1:1"]}"#.to_owned()),
+        ("a movie route suffix", r#"{"ids":["tt1.json"]}"#.to_owned()),
+        ("an episode route suffix", r#"{"ids":["tt1:1:1.json"]}"#.to_owned()),
     ] {
         assert_eq!(post_json(&h, &path, &body).await.status(), 400, "{name}");
     }

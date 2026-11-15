@@ -339,7 +339,15 @@ impl Inner {
         // order, while later admission orders two builds with the same authority.
         let publication =
             (!debug).then(|| self.deps.runtime.begin_publication("list", &job.cache_key, job.fresh));
-        self.build_stream_list(deadline, &job, debug, publication).await
+        // Stream-list read-through also seeds availability. Give that separate cache key the same admission-time
+        // authority as the list: a stale ordinary completion must not overwrite a fresh episode verdict merely
+        // because its list publication is fenced later.
+        let availability_publication = (!debug && job.client.is_none()).then(|| {
+            let key = format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid));
+            let publication = self.deps.runtime.begin_publication("availability", &key, job.fresh);
+            (key, publication)
+        });
+        self.build_stream_list(deadline, &job, debug, publication, availability_publication).await
     }
 
     /// Go `sf.Do`: concurrent callers of one key share one run of the build and its result. The build runs on a task
@@ -534,6 +542,7 @@ impl Inner {
         job: &ListJob,
         debug: bool,
         publication: Option<crate::publication::Publication>,
+        availability_publication: Option<(String, crate::publication::Publication)>,
     ) -> BuildResult {
         let mut dbg = debug.then(RankDebug::default);
         let opts = RankOpts {
@@ -546,11 +555,14 @@ impl Inner {
             answer_early: job.early && !debug,
         };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
-        // A movie's list answers the availability route's question too, so a title someone opened needs no
-        // check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
-        // one ranked for a browser, whose cap may have kept different releases.
-        if job.sid.kind == "movie" && list.degraded.is_empty() && dbg.is_none() && job.client.is_none() {
-            self.record_list_verdict(&format!("{}{}", verdict_prefix(&job.config), job.sid.imdb), &list);
+        // A movie or resolved episode list answers the availability route's exact question too, so a title someone
+        // opened needs no check of its own there. Not from a degraded build, which knows nothing either way, nor a
+        // debug one, nor one ranked for a browser, whose cap may have kept different releases. Its own publication
+        // fence keeps an overlapping stale ordinary list from replacing a fresh verdict.
+        if list.degraded.is_empty() {
+            if let Some((key, publication)) = availability_publication {
+                publication.publish(|| self.record_list_verdict(&key, &list));
+            }
         }
         self.finish_stream_list(job, dbg, list, publication).await
     }
