@@ -249,11 +249,11 @@ jobs:
       - name: Build Remux's ffmpeg
         uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
         with:
-          workdir: den-hearth
           source: .
-          files: docker-bake.hcl
+          files: den-hearth/docker-bake.hcl
           targets: stack-ffmpeg
           set: |
+            stack-ffmpeg.context=den-hearth
             stack-ffmpeg.output=type=image,name=localhost:5000/den-hearth-ffmpeg:stack,push=true,registry.insecure=true
       - name: Playback through den-hearth and den-edge ${{ steps.edge.outputs.tag }}
         env:
