@@ -1537,7 +1537,7 @@ async fn health_degraded_on_scrape_outage() {
 async fn health_coverage_partial_while_a_source_keeps_missing() {
     let comet_down = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let down = comet_down.clone();
-    let h = new_handler(test_deps(move |d| {
+    let deps = test_deps(move |d| {
         let down = down.clone();
         d.make_scrapers = Arc::new(move |_| {
             let down = down.clone();
@@ -1555,7 +1555,9 @@ async fn health_coverage_partial_while_a_source_keeps_missing() {
                 }),
             ]
         });
-    }));
+    });
+    let runtime = deps.runtime.clone();
+    let h = new_handler(deps);
     let health = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap_or(serde_json::Value::Null);
     let first = get(&h, "/health", &[]).await;
     assert!(
@@ -1575,6 +1577,7 @@ async fn health_coverage_partial_while_a_source_keeps_missing() {
         "health after partial builds = {raw}"
     );
     assert!(!raw.contains("comet") && !raw.contains("torrentio"), "/health names a source: {raw}");
+    runtime.indexer_health.set_probe_every(Duration::ZERO);
     comet_down.store(false, Ordering::SeqCst);
     get(&h, &format!("/{}/stream/movie/tt9.json", valid_blob()), &[]).await;
     assert_eq!(

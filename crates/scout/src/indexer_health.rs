@@ -6,6 +6,7 @@
 //! per recovery window is allowed through to close the circuit on the first answer.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ pub(crate) enum CallOutcome {
 
 pub(crate) struct IndexerHealth {
     origins: Mutex<HashMap<String, Origin>>,
-    probe_every: Duration,
+    probe_every_ms: AtomicU64,
 }
 
 struct Origin {
@@ -55,7 +56,23 @@ impl Default for IndexerHealth {
 
 impl IndexerHealth {
     pub(crate) fn new(probe_every: Duration) -> Self {
-        Self { origins: Mutex::new(HashMap::new()), probe_every }
+        Self {
+            origins: Mutex::new(HashMap::new()),
+            probe_every_ms: AtomicU64::new(probe_every.as_millis().try_into().unwrap_or(u64::MAX)),
+        }
+    }
+
+    fn probe_every(&self) -> Duration {
+        Duration::from_millis(self.probe_every_ms.load(Ordering::Relaxed))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_probe_every(&self, every: Duration) {
+        self.probe_every_ms.store(every.as_millis().try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
+        let next = Instant::now() + every;
+        for origin in self.lock().values_mut().filter(|origin| origin.down) {
+            origin.next_probe = next;
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Origin>> {
@@ -74,7 +91,7 @@ impl IndexerHealth {
             return Ok(CallPermit { probe_at: None });
         }
         if now >= origin.next_probe {
-            origin.next_probe = now + self.probe_every;
+            origin.next_probe = now + self.probe_every();
             origin.probe_at = now;
             return Ok(CallPermit { probe_at: Some(now) });
         }
@@ -132,9 +149,9 @@ impl IndexerHealth {
                     if !origin.down {
                         origin.down = true;
                         origin.probe_at = now;
-                        origin.next_probe = now + self.probe_every;
+                        origin.next_probe = now + self.probe_every();
                     } else if started >= origin.probe_at {
-                        origin.next_probe = now + self.probe_every;
+                        origin.next_probe = now + self.probe_every();
                     }
                 }
             }

@@ -163,12 +163,13 @@ impl ScoutRuntime {
         Duration::from_millis(self.rebuild_cooloff_ms.load(Ordering::Relaxed))
     }
 
-    /// Shortens the cool-off after a degraded build and TorBox's recovery-probe window, so a dependant's outage test
-    /// can watch recovery in seconds instead of waiting out the production minute.
+    /// Shortens the cool-off after a degraded build and both recovery-probe windows, so a dependant's outage test
+    /// can watch recovery in seconds instead of waiting out the production minute and half-minute.
     #[cfg(feature = "test-support")]
     pub fn shorten_recovery_for_test(&self, rebuild_cooloff: Duration, torbox_probe_every: Duration) {
         self.rebuild_cooloff_ms.store(rebuild_cooloff.as_millis() as u64, Ordering::Relaxed);
         self.torbox.health.set_probe_every(torbox_probe_every);
+        self.indexer_health.set_probe_every(torbox_probe_every);
     }
 
     /// Report every episode play this runtime's handlers serve to `observer`. Set once; a later call is ignored.
