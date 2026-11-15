@@ -758,6 +758,7 @@ async fn origin_handle<B>(
             "tt0000013" => "surround.mkv",
             "tt0000015" => "subs.mkv",
             "tt0000019" => "forced-first.mkv",
+            "tt0000098" => "hold/hevc-parking.mkv",
             "tt0000040" => "resume40/h264.mkv",
             "tt0000041" => "resume41/h264.mkv",
             "tt0000042" => "resume42/hevc.mkv",
@@ -858,7 +859,11 @@ async fn origin_handle<B>(
     // MPEG-TS sync bytes and nothing else: no program a probe could read.
     let data = match name {
         "mpegts" => vec![0x47; 300 * 1024],
-        _ => match std::fs::read(testdata(name)) {
+        _ => match std::fs::read(if name == "hevc-parking.mkv" {
+            HEVC_PARKING_SOURCE.get().unwrap().clone()
+        } else {
+            testdata(name)
+        }) {
             Ok(data) => data,
             Err(_) => return origin_full(404, ""),
         },
@@ -898,9 +903,12 @@ async fn origin_handle<B>(
             .enumerate()
             .map(|(i, c)| (start + i * 32 * 1024 + c.len(), Bytes::copy_from_slice(c)))
             .collect();
+        let hevc_parking = name == "hevc-parking.mkv";
         let stream = futures_util::stream::unfold(chunks.into_iter(), move |mut it| async move {
             let (end, c) = it.next()?;
-            while end > held_from && !HELD_COPY_OPEN.load(Relaxed) {
+            while end > held_from
+                && !if hevc_parking { HEVC_PARKING_OPEN.load(Relaxed) } else { HELD_COPY_OPEN.load(Relaxed) }
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             Some((Ok::<_, Infallible>(hyper::body::Frame::data(c)), it))
@@ -5513,4 +5521,186 @@ async fn subtitle_resync_deadline_drops_pending_alignment_without_ending_playbac
         StatusCode::NOT_FOUND
     );
     f.state.end_all("test").await;
+}
+
+static HEVC_PARKING_OPEN: AtomicBool = AtomicBool::new(true);
+static HEVC_PARKING_SOURCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Exercise published GOPs before and after SIGSTOP/parking, including a fresh producer across the tail.
+#[tokio::test]
+#[ignore = "needs ffmpeg with libx265"]
+async fn open_hevc_parking_preserves_every_video_packet() {
+    let dir = temp_dir();
+    let source = dir.join("source.mkv");
+    let encoded = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg"))
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", "120", "-c:v", "libx265", "-preset", "medium",
+            "-force_key_frames", "0,2.958333,3,5.958333,6,9,11.958333,12,19,25,30,35,42,47,52,59,60,65,72,79,83,90,97,101,108,115",
+            "-x265-params", "keyint=240:min-keyint=1:scenecut=0:bframes=8:ref=6:open-gop=1:pools=1:frame-threads=1:log-level=error",
+            "-pix_fmt", "yuv420p10le", "-c:a", "aac", "-b:a", "64k"])
+        .arg(&source).output().unwrap();
+    assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+    HEVC_PARKING_SOURCE.set(source.clone()).unwrap();
+    let origin = origin().await;
+    let mut cfg = test_config(&origin, 2, Duration::from_secs(600), Some(SCOUT_KEY));
+    cfg.producer_idle = Duration::from_secs(1);
+    let state = state_from(cfg);
+    let cookie = login(&state, "phone-key").await;
+    let r = call(
+        &state,
+        "POST",
+        "/remux/session",
+        Some(&cookie),
+        r#"{"imdb":"tt0000098","player":"hls.js","playable":{"hevcMain10":153,"aacMultichannel":true}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let created = r.json();
+    let sid = created["sid"].as_str().unwrap();
+    let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8");
+    let playlist = call(&state, "GET", &format!("{base}media.m3u8"), None, "").await.text();
+    let count = playlist.lines().filter(|line| line.starts_with("#EXTINF:")).count();
+    HEVC_PARKING_OPEN.store(false, Relaxed);
+    let mut joined = call(&state, "GET", &format!("{base}init.mp4"), None, "").await.body.to_vec();
+    let first = call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await;
+    assert_eq!(first.status, StatusCode::OK);
+    joined.extend_from_slice(&first.body);
+    for _ in 0..600 {
+        if state.session(sid).unwrap().job_pid().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(state.session(sid).unwrap().job_pid().is_none(), "job was not parked");
+    assert_eq!(state.jobs_started.load(Relaxed), 1);
+    HEVC_PARKING_OPEN.store(true, Relaxed);
+    for n in 1..count {
+        let segment = call(&state, "GET", &format!("{base}seg{n}.m4s"), None, "").await;
+        assert_eq!(segment.status, StatusCode::OK, "segment {n}");
+        joined.extend_from_slice(&segment.body);
+    }
+    assert!(state.jobs_started.load(Relaxed) >= 2, "did not cross the parked tail");
+    state.end_all("test").await;
+    let served = dir.join("served.mp4");
+    std::fs::write(&served, joined).unwrap();
+    let hashes = |file: &Path| {
+        ffprobe(
+            &[
+                "-select_streams",
+                "v:0",
+                "-show_packets",
+                "-show_data_hash",
+                "sha256",
+                "-show_entries",
+                "packet=data_hash",
+                "-of",
+                "csv=p=0",
+            ],
+            file,
+        )
+    };
+    let (actual, expected) = (hashes(&served), hashes(&source));
+    let (actual, expected): (Vec<_>, Vec<_>) = (actual.lines().collect(), expected.lines().collect());
+    assert_eq!(actual.len(), expected.len(), "served packet count");
+    assert!(actual.iter().zip(&expected).all(|(a, b)| a == b), "served packet order or payload changed");
+    let continuous = dir.join("continuous");
+    std::fs::create_dir_all(&continuous).unwrap();
+    let spec = crate::job::Spec {
+        input: source.to_str().unwrap(),
+        seek: None,
+        video: crate::job::Video::Copy { tag: Some("hvc1"), dovi: crate::job::Dovi::Absent },
+        audio: 0,
+        audio_out: crate::job::AudioOut::Copy,
+        text: &[],
+        dir: &continuous,
+    };
+    let remux = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg"))
+        .args(crate::job::args(&spec, None))
+        .output()
+        .unwrap();
+    assert!(remux.status.success());
+    let mut reference = std::fs::read(continuous.join("init.mp4")).unwrap();
+    for (name, _) in crate::job::parse_gops(&std::fs::read_to_string(continuous.join("gops.m3u8")).unwrap()) {
+        reference.extend(std::fs::read(continuous.join(name)).unwrap());
+    }
+    let reference_path = dir.join("reference.mp4");
+    std::fs::write(&reference_path, reference).unwrap();
+    assert_eq!(
+        video_packet_timestamps(&served),
+        video_packet_timestamps(&reference_path),
+        "parking and restart changed video PTS/DTS"
+    );
+    assert_hevc_references_precede_pictures(&served);
+    let decoded = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg"))
+        .args(["-v", "error", "-xerror", "-i"])
+        .arg(&served)
+        .args(["-map", "0:v:0", "-f", "null", "-"])
+        .output()
+        .unwrap();
+    assert!(decoded.status.success(), "{}", String::from_utf8_lossy(&decoded.stderr));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The generated x265 stream uses explicit short-term RPSs and one slice per picture. Resolve each used
+/// negative/positive delta against its full POC (PTS at 24 fps), including POC-LSB wrap, in decode order.
+fn assert_hevc_references_precede_pictures(file: &Path) {
+    let trace = std::process::Command::new(tool("FFMPEG_PATH", "ffmpeg"))
+        .args(["-nostdin", "-hide_banner", "-loglevel", "info", "-copyts", "-i"])
+        .arg(file)
+        .args(["-map", "0:v:0", "-c:v", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+        .output()
+        .unwrap();
+    assert!(trace.status.success());
+    let text = String::from_utf8_lossy(&trace.stderr);
+    let packets: Vec<_> = text.split("Packet:").skip(1).collect();
+    let times = video_packet_timestamps(file);
+    assert_eq!(packets.len(), times.len());
+    let mut seen = std::collections::HashSet::new();
+    let mut references = 0;
+    let mut rasls = 0;
+    for (packet, (pts, _)) in packets.iter().zip(&times) {
+        let poc = ((pts - times[0].0) * 24.0).round() as i64;
+        let fields: Vec<_> = packet
+            .lines()
+            .filter_map(|line| {
+                let (_, field) = line.split_once("] ")?;
+                let mut words = field.split_whitespace();
+                words.next()?;
+                let name = words.next()?;
+                let value = field.rsplit_once(" = ")?.1.parse::<i64>().ok()?;
+                Some((name, value))
+            })
+            .collect();
+        let value = |name: &str| fields.iter().find_map(|(k, v)| (*k == name).then_some(*v));
+        let nal = value("nal_unit_type").unwrap();
+        if matches!(nal, 19 | 20) {
+            assert_eq!(poc, 0);
+        } else {
+            assert_eq!(value("slice_pic_order_cnt_lsb"), Some(poc % 256));
+            assert_eq!(value("short_term_ref_pic_set_sps_flag"), Some(0));
+            assert_eq!(value("inter_ref_pic_set_prediction_flag").unwrap_or(0), 0);
+            assert_eq!(value("num_long_term_pics").unwrap_or(0), 0);
+            for (side, sign) in [(0, -1), (1, 1)] {
+                let mut delta = 0;
+                for n in 0..value(if side == 0 { "num_negative_pics" } else { "num_positive_pics" }).unwrap()
+                {
+                    delta += value(&format!("delta_poc_s{side}_minus1[{n}]")).unwrap() + 1;
+                    if value(&format!("used_by_curr_pic_s{side}_flag[{n}]")).unwrap() == 1 {
+                        let reference = poc + sign * delta;
+                        assert!(
+                            seen.contains(&reference),
+                            "POC {poc} NAL {nal} references absent POC {reference}"
+                        );
+                        references += 1;
+                    }
+                }
+            }
+        }
+        rasls += usize::from(matches!(nal, 8 | 9));
+        assert!(seen.insert(poc), "duplicate POC {poc}");
+    }
+    assert!(rasls > 0 && references > times.len());
+    eprintln!("checked {} pictures, {rasls} RASLs and {references} references", times.len());
 }
