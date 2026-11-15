@@ -1417,13 +1417,6 @@ impl Inner {
     async fn route(self: &Arc<Self>, req: &Request<Bytes>) -> Resp {
         // `%XX` escapes resolved, anything malformed left as it came, `+` left alone.
         let path = den_http::percent_decode_path(req.uri().path());
-        // CONFIG_KEY is set but malformed: nothing that carries an install config (a config segment, a play
-        // ticket, the availability batch, a cancel) can be trusted, sealed or plaintext, so all of it is a 503
-        // until an operator fixes the variable. Only /health, /metrics and /validate (a pasted token,
-        // no config) keep their own handling.
-        if self.deps.config_key_invalid && !matches!(path.as_str(), "/health" | "/metrics" | "/validate") {
-            return config_key_invalid();
-        }
         if path == "/metrics" {
             return den_http::metrics_response(
                 req.method(),
@@ -1437,6 +1430,13 @@ impl Inner {
         // it is an operational bearer endpoint whose complete vocabulary is GET/HEAD, not a browser API.
         if req.method() == Method::OPTIONS {
             return preflight();
+        }
+        // CONFIG_KEY is set but malformed: nothing that carries an install config (a config segment, a play
+        // ticket, the availability batch, a cancel) can be trusted, sealed or plaintext, so all of it is a 503
+        // until an operator fixes the variable. Only /health, /metrics and /validate (a pasted token,
+        // no config) keep their own handling. Application preflights above remain credential-free declarations.
+        if self.deps.config_key_invalid && !matches!(path.as_str(), "/health" | "/validate") {
+            return config_key_invalid();
         }
         // DELETE cancels (or, with ?op=reannounce, reannounces) the release a ticket or a legacy play token
         // names — den#204. Matched ahead of the GET/HEAD-only gate below, which otherwise answers every other
