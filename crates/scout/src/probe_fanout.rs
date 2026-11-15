@@ -15,7 +15,7 @@ use crate::config::{Config, DebridService};
 use crate::id::StreamId;
 use crate::metrics::metrics;
 use crate::probe::Probe;
-use crate::rank::{quality_score_ref, resolution_bucket, RawStream, PREFERENCE_SINK};
+use crate::rank::{quality_score_ref, ranked_resolution, RawStream, PREFERENCE_SINK};
 use crate::stores::{CacheTruth, ResolveTarget};
 
 /// Go `probeTopN`: how many of the ranked releases get probed. The list is already in the order the client will show,
@@ -210,7 +210,7 @@ pub(crate) fn browser_probe_candidates(
         let mut out = quality_score_ref(stream);
         let prefer = &cfg.filters.prefer_resolution;
         if !prefer.is_empty() {
-            let resolution = resolution_bucket(stream.traits());
+            let resolution = ranked_resolution(stream.traits(), stream);
             if !resolution.is_empty() && resolution != prefer {
                 out -= PREFERENCE_SINK;
             }

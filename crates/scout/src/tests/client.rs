@@ -114,6 +114,41 @@ fn rank_a_bigger_release_of_one_resolution_above_a_small_re_encode() {
     assert!(at(&fake_4k) > at(&bluray), "a 9 Mbit/s H.264 “4K” ranks as the 1080p it is: {got:?}");
 }
 
+/// An install that prefers 2160p sank every other resolution below the "2160p H.264" re-encode, so it led the list
+/// although its score ranks it as 1080p (The Sopranos S01E01, 2026-11-15). A starved "4K" is a 1080p release to the
+/// preference and the resolutions filter too, and a real 4K keeps the preference.
+#[test]
+fn a_starved_4k_does_not_ride_a_2160p_preference() {
+    let gb = |n: f64| Some((n * crate::rank::GIB as f64) as i64);
+    let release = |title: &str, size: Option<i64>| {
+        rs(title, |s| {
+            s.info_hash = title.into();
+            s.size_bytes = size;
+        })
+    };
+    let fake = release("The Sopranos S01E01 2160p H.264 (moviesbyrizzoconv).mp4", gb(4.0));
+    let remux = release("The.Sopranos.S01E01.1080p.BluRay.REMUX.AVC.DTS-HD.MA.5.1-NOGRP.mkv", gb(14.3));
+    let real = release("Show.S01E01.2160p.WEB-DL.DDP5.1.HEVC-X.mkv", gb(8.0));
+    let ranked = |all: &[RawStream], prefer: &str, resolutions: Vec<String>| {
+        titles(&rank_streams(
+            all,
+            RankFilters {
+                result_cap: 10,
+                prefer_resolution: prefer.into(),
+                resolutions,
+                client: Some(a_browser(|_| {})),
+                ..Default::default()
+            },
+        ))
+    };
+    let got = ranked(&[fake.clone(), remux.clone()], "2160p", vec![]);
+    assert_eq!(got[0], remux.title, "the starved 4K led under a 2160p preference: {got:?}");
+    let got = ranked(&[remux.clone(), real.clone()], "2160p", vec![]);
+    assert_eq!(got[0], real.title, "a real 4K keeps the preference: {got:?}");
+    let got = ranked(&[fake.clone(), real.clone()], "", vec!["2160p".into()]);
+    assert_eq!(got, vec![real.title.clone()], "only-2160p keeps the real 4K and drops the starved one");
+}
+
 #[test]
 fn a_2160p_release_is_judged_by_its_bitrate_for_the_codec_it_names() {
     use crate::rank::starved_4k;
