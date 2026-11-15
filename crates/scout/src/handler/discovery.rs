@@ -343,16 +343,11 @@ impl Inner {
         // authority as the list: a stale ordinary completion must not overwrite a fresh episode verdict merely
         // because its list publication is fenced later.
         let availability_publication = (!debug && job.client.is_none()).then(|| {
-            let key = format!(
-                "{}{}",
-                verdict_prefix(&job.config),
-                crate::availability::verdict_id(&job.sid)
-            );
+            let key = format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid));
             let publication = self.deps.runtime.begin_publication("availability", &key, job.fresh);
             (key, publication)
         });
-        self.build_stream_list(deadline, &job, debug, publication, availability_publication)
-            .await
+        self.build_stream_list(deadline, &job, debug, publication, availability_publication).await
     }
 
     /// Go `sf.Do`: concurrent callers of one key share one run of the build and its result. The build runs on a task
