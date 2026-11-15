@@ -45,6 +45,24 @@ pub(crate) fn redact_path(p: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
+/// What kind of `/p/<ticket>` request a line is, as a suffix to its redacted path: `?probe` (a readiness poll, which
+/// answers 200 and starts nothing), `?prefetch`, or nothing for a play — whose answer is the 302 to the debrid, after
+/// which the player reads past this service. Without it a poll every few seconds reads as a viewer streaming. Only
+/// these two flags are read from the query; nothing else of it reaches the log.
+pub(crate) fn ticket_kind(path: &str, query: Option<&str>) -> &'static str {
+    if !path.starts_with(&format!("/{TICKET_ROUTE}/")) {
+        return "";
+    }
+    let flag = |name: &str| query.is_some_and(|q| q.split('&').any(|kv| kv == format!("{name}=1")));
+    if flag("probe") {
+        "?probe"
+    } else if flag("prefetch") {
+        "?prefetch"
+    } else {
+        ""
+    }
+}
+
 /// Go `url.PathEscape`: escapes one path segment. Unreserved characters and `$&+:=@` stay as they are, and every
 /// other byte of the UTF-8 is written as an uppercase `%XX`.
 fn path_segment_escape(s: &str) -> String {
