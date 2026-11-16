@@ -2427,39 +2427,45 @@ async fn an_idle_session_is_ended_and_its_ffmpeg_does_not_outlive_it() {
     // One second of idleness, far below the env floor: only a test can ask for it.
     let state = test_state(&origin, 2, Duration::from_secs(1));
     let cookie = login(&state, "phone-key").await;
-    let created =
-        call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000009"}"#).await.json();
-    let sid = created["sid"].as_str().unwrap().to_string();
-    let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
-    // Segment 0 arrives while the trickling source keeps ffmpeg busy with the rest.
-    assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::OK);
-    let pid = state
-        .session(&sid)
-        .and_then(|s| s.job_pid())
-        .expect("ffmpeg should still be reading the slow source");
-    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0, "the premise: ffmpeg is alive");
+    // Repeat the lifecycle: this used to fail only when the supervisor yielded after removing the session but
+    // before `Session::end` had finished `Job::stop`'s bounded kill-and-wait.
+    for _ in 0..3 {
+        let created =
+            call(&state, "POST", "/remux/session", Some(&cookie), r#"{"imdb":"tt0000009"}"#).await.json();
+        let sid = created["sid"].as_str().unwrap().to_string();
+        let base = created["playlist"].as_str().unwrap().trim_end_matches("master.m3u8").to_string();
+        // Segment 0 arrives while the trickling source keeps ffmpeg busy with the rest.
+        assert_eq!(call(&state, "GET", &format!("{base}seg0.m4s"), None, "").await.status, StatusCode::OK);
+        let pid = state
+            .session(&sid)
+            .and_then(|s| s.job_pid())
+            .expect("ffmpeg should still be reading the slow source");
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0, "the premise: ffmpeg is alive");
 
-    let mut gone = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if state.session(&sid).is_none() {
-            gone = true;
-            break;
+        let mut gone = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if state.session(&sid).is_none() {
+                gone = true;
+                break;
+            }
         }
-    }
-    assert!(gone, "the session outlived its idle window");
-    // Killed AND reaped: not even a zombie holds the pid.
-    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "ffmpeg {pid} outlived its session");
-    assert_eq!(call(&state, "GET", &format!("{base}seg1.m4s"), None, "").await.status, StatusCode::GONE);
-    // The session leaves the map first; its directory goes once ffmpeg is reaped, off the runtime thread.
-    let dir = state.cfg.scratch_dir.join(format!("s-{sid}"));
-    for _ in 0..50 {
-        if !dir.exists() {
-            break;
+        assert!(gone, "the session outlived its idle window");
+        // Map removal makes the URLs gone immediately; cleanup intentionally continues asynchronously. The
+        // process itself is the authoritative producer-lifetime signal. This bounded wait still fails on a real
+        // leak, while allowing `Session::end` to finish `wait()`-reaping the killed child.
+        crate::job::wait_gone(pid as i32, &format!("ffmpeg {pid} outlived its session")).await;
+        assert_eq!(call(&state, "GET", &format!("{base}seg1.m4s"), None, "").await.status, StatusCode::GONE);
+        // Its directory goes after the producer is reaped, off the runtime thread.
+        let dir = state.cfg.scratch_dir.join(format!("s-{sid}"));
+        for _ in 0..50 {
+            if !dir.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!dir.exists(), "the session's scratch outlived it");
     }
-    assert!(!dir.exists(), "the session's scratch outlived it");
 }
 
 /// den-scout's contract for a scope=availability config: it lists and plays only for the service key.
