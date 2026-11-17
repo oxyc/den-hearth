@@ -736,7 +736,15 @@ where
             }),
             &[],
         ),
-        Err(e) => api_error(&e),
+        Err(e) => {
+            // A refused install URL is as much the request's mistake as a bad body, and the access line alone cannot
+            // tell it from one; said the way `bad_title_request` says it.
+            if e.status == StatusCode::BAD_REQUEST {
+                let rid = redact::request_id(&parts.headers).map(|r| format!(" rid={r}")).unwrap_or_default();
+                eprintln!("POST /remux/releases: refused the request: {}: {}{rid}", e.code, e.detail);
+            }
+            api_error(&e)
+        }
     }
 }
 
