@@ -89,25 +89,37 @@ fn managed_audio_rank(stream: &RawStream, wanted: &[String]) -> u8 {
 
 /// The probe keeps audio languages in container-track order. It is safe to turn that position into TorBox's index
 /// only when every preceding track was tagged; otherwise its `audio` vector is shorter than the actual track list.
-pub(super) fn managed_audio_track(
+///
+/// The probe's `audio` is a de-duplicated set of languages, so its positions are the track indices only when every
+/// track is tagged and no language repeats. `audio_order` lists every track in container order and is what a track
+/// is chosen from whenever the probe has it; a probe cached before that field is trusted only as before.
+/// The reason is what the `event=audio_track` line says.
+pub(super) fn managed_audio_choice(
     stream: &RawStream,
     wanted: &[String],
     selected: Option<i64>,
-) -> Option<i64> {
-    let probe = stream.probe.as_ref()?;
-    if probe.untagged_audio != 0 {
-        return None;
+) -> (Option<i64>, &'static str) {
+    let Some(probe) = stream.probe.as_ref() else {
+        return (None, "no probe for this release");
+    };
+    let exact = !probe.audio_order.is_empty();
+    let tracks = if exact { &probe.audio_order } else { &probe.audio };
+    if !exact && probe.untagged_audio != 0 {
+        return (None, "untagged tracks in an old probe");
     }
-    if let Some(selected) = selected.filter(|index| *index >= 0 && (*index as usize) < probe.audio.len()) {
-        return Some(selected);
+    if let Some(selected) = selected.filter(|index| *index >= 0 && (*index as usize) < tracks.len()) {
+        return (Some(selected), "explicit track");
     }
-    wanted.iter().find_map(|wanted| {
-        probe
-            .audio
+    let found = wanted.iter().find_map(|wanted| {
+        tracks
             .iter()
             .position(|language| wanted_language(language, std::slice::from_ref(wanted)))
             .map(|index| index as i64)
-    })
+    });
+    match found {
+        Some(index) => (Some(index), "preferred language"),
+        None => (None, "no wanted language in the probe"),
+    }
 }
 
 impl Inner {
@@ -1211,14 +1223,49 @@ mod managed_audio_tests {
 
     #[test]
     fn audio_track_uses_preference_order_only_when_probe_indices_are_exact() {
+        let track = |stream: &RawStream, wanted: &[&str], selected| {
+            let wanted: Vec<String> = wanted.iter().map(|language| (*language).to_owned()).collect();
+            managed_audio_choice(stream, &wanted, selected).0
+        };
         let english_second = stream("release", &["ru", "eng", "sv"], 0);
-        assert_eq!(
-            managed_audio_track(&english_second, &["en-GB".to_owned(), "sv".to_owned()], None),
-            Some(1)
-        );
-        assert_eq!(managed_audio_track(&english_second, &["en".to_owned()], Some(2)), Some(2));
+        assert_eq!(track(&english_second, &["en-GB", "sv"], None), Some(1));
+        assert_eq!(track(&english_second, &["en"], Some(2)), Some(2));
 
         let shifted = stream("release", &["ru", "en"], 1);
-        assert_eq!(managed_audio_track(&shifted, &["en".to_owned()], None), None);
+        assert_eq!(track(&shifted, &["en"], None), None);
+    }
+
+    fn ordered(order: &[&str]) -> RawStream {
+        let mut stream = stream("release", &[], 0);
+        let audio_order: Vec<String> = order.iter().map(|language| (*language).to_owned()).collect();
+        let mut audio: Vec<String> = Vec::new();
+        for language in order.iter().filter(|language| !language.is_empty()) {
+            if !audio.iter().any(|seen| seen == language) {
+                audio.push((*language).to_owned());
+            }
+        }
+        stream.probe = Some(Probe {
+            untagged_audio: order.iter().filter(|language| language.is_empty()).count() as i32,
+            audio,
+            audio_order,
+            ..Default::default()
+        });
+        stream
+    }
+
+    // The Sopranos S02E12 release: Russian first, English second. An untagged track, or a repeated language, made
+    // the probe's de-duplicated set a wrong list of indices, and the choice fell back to TorBox's track 0 (Russian).
+    #[test]
+    fn a_wanted_language_is_found_by_track_position_despite_untagged_or_repeated_tracks() {
+        let wanted = ["en".to_owned()];
+        let untagged = ordered(&["ru", "", "en"]);
+        assert_eq!(managed_audio_choice(&untagged, &wanted, None), (Some(2), "preferred language"));
+        let repeated = ordered(&["ru", "ru", "en"]);
+        assert_eq!(managed_audio_choice(&repeated, &wanted, None), (Some(2), "preferred language"));
+        let plain = ordered(&["ru", "en"]);
+        assert_eq!(managed_audio_choice(&plain, &wanted, None), (Some(1), "preferred language"));
+        assert_eq!(managed_audio_choice(&plain, &wanted, Some(0)), (Some(0), "explicit track"));
+        let none = ordered(&["ru", ""]);
+        assert_eq!(managed_audio_choice(&none, &wanted, None).0, None);
     }
 }

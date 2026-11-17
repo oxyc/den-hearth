@@ -150,6 +150,23 @@ fn parse_mp4_video_shape() {
     }
 }
 
+// `audio` is a de-duplicated set of languages; `audio_order` is one entry per audio track, so its position is the
+// track index a player or TorBox is asked for.
+#[test]
+fn parse_matroska_audio_order_keeps_every_track() {
+    let audio = |language: &[u8]| {
+        ebml(
+            ID_TRACK_ENTRY,
+            &[ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[language.to_vec()])],
+        )
+    };
+    let tracks = ebml(ID_TRACKS, &[audio(b"rus"), audio(b"rus"), audio(b"und"), audio(b"eng")]);
+    let p = parse_matroska_tracks(&ebml(ID_SEGMENT, &[tracks])).expect("parse");
+    assert_eq!(p.audio_order, ["ru", "ru", "", "en"]);
+    assert_eq!(p.audio, ["ru", "en"]);
+    assert_eq!(p.untagged_audio, 1);
+}
+
 #[test]
 fn parse_matroska_video_shape() {
     let video = ebml(
