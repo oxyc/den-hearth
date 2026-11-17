@@ -260,10 +260,11 @@ impl TorBoxManagedHls {
             cache: Some(self.cache.clone()),
             api: TORBOX_API.to_owned(),
         };
-        let (torrent_id, file_id, direct_file) = prepare_when_settled(&store, target)
-            .await
-            .map_err(classify_store_error)
-            .map_err(report_resolution_failure)?;
+        let (torrent_id, file_id, direct_file) =
+            prepare_when_settled(&store, target).await.map_err(|error| {
+                let reason = store_reason(&error);
+                report_resolution_failure(reason, classify_store_error(error))
+            })?;
 
         let sidecar_key = subtitle.map(|ordinal| {
             format!(
@@ -485,12 +486,35 @@ fn report_probe_failure(error: ManagedHlsError) -> ManagedHlsError {
     error
 }
 
-fn report_resolution_failure(error: ManagedHlsError) -> ManagedHlsError {
+fn report_resolution_failure(reason: &'static str, error: ManagedHlsError) -> ManagedHlsError {
     log_limited(
-        error.code(),
-        &format!("managed HLS: TorBox item preparation failed: cause={}", error.code()),
+        &format!("{}-{reason}", error.code()),
+        &format!("managed HLS: TorBox item preparation failed: cause={} store={reason}", error.code()),
     );
     error
+}
+
+/// A fixed word for which store answer ended item preparation, since `ManagedHlsError::Unavailable` alone cannot
+/// tell a pending add from a backoff or a failed add. Never carries the store's own text, which can name a hash.
+fn store_reason(error: &StoreError) -> &'static str {
+    use crate::stores::torbox::support::no_file_list;
+    match error {
+        StoreError::AddInFlight => "add_in_flight",
+        StoreError::AddQueued => "add_queued",
+        StoreError::TorrentGone => "torrent_gone",
+        StoreError::Cancelled => "cancelled",
+        StoreError::ScoutSide(_) | StoreError::PlayReserve(_) => "budget",
+        StoreError::Unavailable(unavailable) if unavailable.reason.ends_with("(backing off)") => {
+            "backing_off"
+        }
+        StoreError::Unavailable(unavailable) if unavailable.status == 401 || unavailable.status == 403 => {
+            "account"
+        }
+        StoreError::Unavailable(unavailable) if unavailable.status == 429 => "rate_limited",
+        StoreError::Unavailable(_) if *error == no_file_list() => "mylist_unusable",
+        StoreError::Unavailable(_) | StoreError::DeadLink(_) => "add_failed",
+        StoreError::Other(_) => "other",
+    }
 }
 
 #[async_trait]
@@ -890,6 +914,39 @@ mod tests {
             report_sidecar_skipped("direct_file_unavailable", Some(2));
         });
         assert!(captured.contains("outcome=skipped reason=direct_file_unavailable selected=2"), "{captured}");
+    }
+
+    #[test]
+    fn item_preparation_log_names_which_store_answer_ended_it_and_nothing_else() {
+        use crate::stores::{dead_link, unavailable};
+        let backoff =
+            unavailable(DebridService::TorBox, "createtorrent http 400 secret-detail (backing off)", 0);
+        let cases = [
+            (StoreError::AddInFlight, "add_in_flight"),
+            (StoreError::AddQueued, "add_queued"),
+            (backoff, "backing_off"),
+            (dead_link("torbox createtorrent http 400 secret-detail"), "add_failed"),
+            (unavailable(DebridService::TorBox, "mylist gave no usable answer", 0), "mylist_unusable"),
+            (
+                StoreError::ScoutSide(crate::stores::StoreUnavailableError {
+                    service: DebridService::TorBox,
+                    reason: "secret-detail".to_owned(),
+                    status: 0,
+                }),
+                "budget",
+            ),
+        ];
+        for (error, word) in cases {
+            let captured = crate::loglimit::capture(|| {
+                let reason = store_reason(&error);
+                report_resolution_failure(reason, classify_store_error(error.clone()));
+            });
+            assert!(
+                captured.contains(&format!("cause=torbox_unavailable store={word}")),
+                "{word}: {captured}"
+            );
+            assert!(!captured.contains("secret-detail"), "{captured}");
+        }
     }
 
     #[test]
