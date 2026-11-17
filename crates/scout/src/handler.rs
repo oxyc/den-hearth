@@ -9,7 +9,7 @@
 mod discovery;
 mod playback;
 mod presentation;
-use discovery::{managed_audio_track, managed_candidates};
+use discovery::{managed_audio_choice, managed_candidates};
 #[cfg(test)]
 pub(crate) use presentation::queued_body;
 pub(crate) use presentation::{write_queued, write_queued_body};
@@ -1373,7 +1373,8 @@ impl Inner {
             return Err(ManagedHlsError::DebridDown { retry_after: down.retry_after });
         }
         for candidate in managed_candidates(&list, request)? {
-            let audio_track = managed_audio_track(candidate, &request.audio, request.audio_track);
+            let (audio_track, audio_reason) =
+                managed_audio_choice(candidate, &request.audio, request.audio_track);
             let target = ResolveTarget {
                 info_hash: candidate.info_hash.clone(),
                 file_idx: candidate.file_idx,
@@ -1387,6 +1388,31 @@ impl Inner {
             };
             match resolver.resolve(config, &target, request.subtitle).await {
                 Ok(prepared) => {
+                    let language = audio_track
+                        .and_then(|index| {
+                            let probe = candidate.probe.as_ref()?;
+                            let tracks =
+                                if probe.audio_order.is_empty() { &probe.audio } else { &probe.audio_order };
+                            tracks.get(usize::try_from(index).ok()?).cloned()
+                        })
+                        .filter(|language| !language.is_empty())
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    log_limited(
+                        "managed-audio",
+                        &play_decision(
+                            "audio_track",
+                            "served",
+                            &format!(
+                                "{audio_reason} idx={} lang={language} wanted={}",
+                                audio_track.unwrap_or(0),
+                                request.audio.join(",")
+                            ),
+                            "torbox",
+                            Duration::ZERO,
+                            "",
+                            &target,
+                        ),
+                    );
                     return Ok(ManagedHlsResult {
                         url: prepared.url,
                         subtitles: prepared.subtitles,
@@ -1399,8 +1425,25 @@ impl Inner {
                         audio_tracks: candidate
                             .probe
                             .as_ref()
-                            .filter(|probe| probe.untagged_audio == 0)
-                            .map(|probe| probe.audio.clone())
+                            .map(|probe| {
+                                if !probe.audio_order.is_empty() {
+                                    probe
+                                        .audio_order
+                                        .iter()
+                                        .map(|language| {
+                                            if language.is_empty() {
+                                                "und".to_owned()
+                                            } else {
+                                                language.clone()
+                                            }
+                                        })
+                                        .collect()
+                                } else if probe.untagged_audio == 0 {
+                                    probe.audio.clone()
+                                } else {
+                                    Vec::new()
+                                }
+                            })
                             .unwrap_or_default(),
                         audio_track: audio_track.unwrap_or(0),
                     });

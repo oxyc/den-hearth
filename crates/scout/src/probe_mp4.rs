@@ -45,6 +45,7 @@ pub(crate) fn parse_mp4(head: &[u8]) -> (Probe, bool) {
         }
         match &kind {
             b"soun" => {
+                p.audio_order.push(lang.to_string());
                 if lang.is_empty() {
                     p.untagged_audio += 1;
                 } else {

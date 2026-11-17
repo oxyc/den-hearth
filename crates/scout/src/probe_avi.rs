@@ -64,7 +64,10 @@ fn walk(buf: &[u8], start: usize, end: usize, depth: usize, p: &mut Probe, last_
                         p.video_codec = codec_from_four_cc(fourcc).to_string();
                     }
                     // No language to read, but the track exists and the viewer should know it does.
-                    b"auds" => p.untagged_audio += 1,
+                    b"auds" => {
+                        p.untagged_audio += 1;
+                        p.audio_order.push(String::new());
+                    }
                     _ => {}
                 }
                 *last_kind = kind;
