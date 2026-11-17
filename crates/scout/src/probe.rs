@@ -65,6 +65,16 @@ pub struct Probe {
     pub audio: Vec<String>,
     #[serde(rename = "subtitleLanguages", default, deserialize_with = "null_default")]
     pub subtitles: Vec<String>,
+    /// Every audio track in container order, `""` for one with no usable language. Unlike `audio` (a de-duplicated set
+    /// of languages) its position IS the track index, so it is what a track can be chosen from. Empty on a probe
+    /// cached before the field existed.
+    #[serde(
+        rename = "audioTrackOrder",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "null_default"
+    )]
+    pub audio_order: Vec<String>,
     /// How many tracks carried no language at all.
     #[serde(rename = "untaggedAudioTracks", default)]
     pub untagged_audio: i32,
@@ -176,6 +186,9 @@ pub(crate) fn parse_matroska_tracks(head: &[u8]) -> Result<Probe, &'static str> 
         if id == mkv::TRACK_ENTRY {
             read_track_facts(body, &mut out);
             let (kind, lang) = parse_track_entry(body);
+            if kind == TRACK_TYPE_AUDIO {
+                out.audio_order.push(if lang == "und" { String::new() } else { lang.to_string() });
+            }
             if lang.is_empty() {
                 // A track with no language is not a claim about the language.
             } else if kind == TRACK_TYPE_AUDIO && lang == "und" {
