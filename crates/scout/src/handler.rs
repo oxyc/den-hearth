@@ -1397,9 +1397,11 @@ impl Inner {
                         })
                         .filter(|language| !language.is_empty())
                         .unwrap_or_else(|| "unknown".to_owned());
-                    log_limited(
-                        "managed-audio",
-                        &play_decision(
+                    // One line per managed play, not rate-limited: a viewer switching back and forth within a minute
+                    // is exactly when the choice needs reading, and plays are few enough to log each.
+                    eprintln!(
+                        "{}",
+                        play_decision(
                             "audio_track",
                             "served",
                             &format!(
@@ -1411,7 +1413,7 @@ impl Inner {
                             Duration::ZERO,
                             "",
                             &target,
-                        ),
+                        )
                     );
                     return Ok(ManagedHlsResult {
                         url: prepared.url,
