@@ -6099,13 +6099,15 @@ fn a_finished_download_leaves_nothing_in_the_kill_registry() {
 async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
     let dir = temp_dir();
     let slow = dir.join("slow-cmd");
-    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    let pid_file = dir.join("slow.pid");
+    std::fs::write(&slow, "#!/bin/sh\necho $$ > \"$1\"\nsleep 30\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let pgid = {
         let mut cmd = tokio::process::Command::new(&slow);
-        cmd.stdin(std::process::Stdio::null())
+        cmd.arg(&pid_file)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             // Every production caller sets this; without it the drop path under test is not theirs,
@@ -6119,23 +6121,20 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
         );
         tokio::pin!(fut);
 
-        tokio::select! {
-            _ = &mut fut => panic!("the fake exited immediately; this test proves nothing"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
-        }
-        // The child is ours and still running; its pid is its pgid (process_group(0)).
-        let out = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(slow.to_string_lossy().as_ref())
-            .output()
-            .unwrap();
-        let pid: u32 = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .expect("the fake is running")
-            .trim()
-            .parse()
-            .unwrap();
+        // The fake writes its own pid (its pgid, via process_group(0)) once it is running. Wait for
+        // that as a condition, within a bounded budget, rather than guessing how long a loaded
+        // machine takes to exec it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse().ok()) {
+                break pid;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the fake never reported its pid");
+            tokio::select! {
+                _ = &mut fut => panic!("the fake exited immediately; this test proves nothing"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        };
         assert!(crate::ytdlp::is_group_live(pid), "a running subprocess was not registered");
         pid
         // `fut` is dropped here — the cancellation the client hangup causes.
