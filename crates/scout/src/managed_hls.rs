@@ -27,6 +27,10 @@ const CREATE_STREAM_URL: &str = "https://api.torbox.app/v1/api/stream/createstre
 const CREATE_BODY_LIMIT: usize = 64 << 10;
 const PLAYLIST_BODY_LIMIT: usize = 256 << 10;
 const PLAYLIST_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a managed request waits for an add that is still settling (see `prepare_when_settled`), and how often it
+/// looks again. The same eight seconds Scout gives a status read (`DEFAULT_STATUS_BUDGET`).
+const ITEM_SETTLE_WAIT: Duration = Duration::from_secs(8);
+const ITEM_SETTLE_POLL: Duration = Duration::from_secs(1);
 const SUBTITLE_SIDECAR_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// TorBox's published managed-stream CDN base domains. Keep this an explicit list: accepting an arbitrary
 /// `tb-cdn.*` suffix would turn TorBox's signed URL into an open redirect to a lookalike domain.
@@ -256,8 +260,7 @@ impl TorBoxManagedHls {
             cache: Some(self.cache.clone()),
             api: TORBOX_API.to_owned(),
         };
-        let (torrent_id, file_id, direct_file) = store
-            .prepare_managed_item(target)
+        let (torrent_id, file_id, direct_file) = prepare_when_settled(&store, target)
             .await
             .map_err(classify_store_error)
             .map_err(report_resolution_failure)?;
@@ -426,6 +429,28 @@ fn stub_cdn(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     let Some((host, addr)) = stub.split_once('=') else { return builder };
     let Ok(addr) = addr.parse::<std::net::SocketAddr>() else { return builder };
     builder.resolve(host, addr).danger_accept_invalid_certs(true)
+}
+
+/// `prepare_managed_item`, waiting a bounded time for an add that is still settling. `AddInFlight` (an add of ours
+/// is out and unanswered) and `AddQueued` (TorBox parked the add) both mean the release IS being fetched into this
+/// account, so an immediate refusal only makes the viewer press again; the answer usually lands within seconds, when
+/// the pending add settles and records the torrent id. Every other error is a fact about the request (a rejected key,
+/// a refusal, a missing item, a backoff) that waiting cannot change, so it is returned at once.
+async fn prepare_when_settled(
+    store: &TorBoxStore,
+    target: &ResolveTarget,
+) -> Result<(i64, Option<i64>, Option<String>), StoreError> {
+    let deadline = tokio::time::Instant::now() + ITEM_SETTLE_WAIT;
+    loop {
+        match store.prepare_managed_item(target).await {
+            Err(StoreError::AddInFlight | StoreError::AddQueued)
+                if tokio::time::Instant::now() + ITEM_SETTLE_POLL <= deadline =>
+            {
+                tokio::time::sleep(ITEM_SETTLE_POLL).await;
+            }
+            settled => return settled,
+        }
+    }
 }
 
 fn report_sidecar_skipped(reason: &'static str, selected: Option<i64>) {
@@ -1104,6 +1129,125 @@ mod tests {
         let query: std::collections::HashMap<_, _> = create.query_pairs().into_owned().collect();
         assert_eq!(query.get("id").map(String::as_str), Some("42"));
         assert_eq!(query.get("file_id").map(String::as_str), Some("7"));
+    }
+
+    const SETTLE_HASH: &str = "89abcdef0123456789abcdef0123456789abcdef";
+    const SETTLE_TOKEN: &str = "settle-wait-test";
+
+    /// A managed adapter over a stubbed TorBox that holds the torrent once an add settles. `createtorrent`
+    /// answers `add_status`; the managed stream itself answers ITEM_NOT_FOUND, which is enough to show a request got
+    /// past item preparation without a real CDN.
+    struct Settling {
+        adapter: TorBoxManagedHls,
+        cache: Arc<dyn Cache>,
+        adds: Arc<std::sync::atomic::AtomicUsize>,
+        config: Config,
+        target: ResolveTarget,
+    }
+
+    fn settling(add_status: u16) -> Settling {
+        let adds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = adds.clone();
+        let doer = Arc::new(MockDoer(move |request| {
+            let path = request.url().path().to_owned();
+            if path.ends_with("/stream/createstream") {
+                return Ok(response(500, std::str::from_utf8(NOT_FOUND).unwrap()));
+            }
+            if path.ends_with("/torrents/createtorrent") {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(response(add_status, "{}"));
+            }
+            if path.ends_with("/torrents/requestdl") {
+                return Ok(response(200, r#"{"success":true,"data":"https://download.example/file.mkv"}"#));
+            }
+            Ok(response(200, r#"{"success":true,"data":[]}"#))
+        }));
+        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+        Settling {
+            adapter: TorBoxManagedHls::new(doer, cache.clone()).unwrap(),
+            cache,
+            adds,
+            config: Config {
+                debrid: vec![DebridAccount {
+                    service: DebridService::TorBox,
+                    token: SETTLE_TOKEN.to_owned(),
+                }],
+                ..Default::default()
+            },
+            target: ResolveTarget { info_hash: SETTLE_HASH.to_owned(), ..Default::default() },
+        }
+    }
+
+    fn identity() -> String {
+        crate::stores::refusal::torbox_account_identity(TORBOX_API, SETTLE_TOKEN)
+    }
+
+    // Production, 2026-11: a guest who had just added their own TorBox was refused `torbox_unavailable` on three
+    // presses over a minute, each in under a second, and played on the fourth. An add of theirs was out and
+    // unanswered; the request now waits for it to settle instead of refusing at the first not-ready answer.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_still_settling_is_waited_for_not_refused() {
+        let held = settling(200);
+        crate::stores::refusal::note_add_attempt(
+            held.cache.as_ref(),
+            DebridService::TorBox,
+            &identity(),
+            SETTLE_HASH,
+        );
+        let cache = held.cache.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            crate::stores::refusal::settle_add_attempt(
+                cache.as_ref(),
+                DebridService::TorBox,
+                &identity(),
+                SETTLE_HASH,
+            );
+            cache.put(
+                &crate::stores::refusal::torrent_id_key(&identity(), SETTLE_HASH),
+                "42",
+                Duration::from_secs(60),
+            );
+        });
+        let started = tokio::time::Instant::now();
+        let answer = held.adapter.resolve_target(&held.config, &held.target, None).await;
+        // Past item preparation: the managed stream was asked for, and TorBox said it has no such item.
+        assert_eq!(answer, Err(ManagedHlsError::NotFound));
+        assert!(started.elapsed() >= Duration::from_secs(3) && started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            held.adds.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the pending add must not be repeated"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_add_that_never_settles_is_refused_after_the_bounded_wait() {
+        let held = settling(200);
+        crate::stores::refusal::note_add_attempt(
+            held.cache.as_ref(),
+            DebridService::TorBox,
+            &identity(),
+            SETTLE_HASH,
+        );
+        let started = tokio::time::Instant::now();
+        let answer = held.adapter.resolve_target(&held.config, &held.target, None).await;
+        assert_eq!(answer, Err(ManagedHlsError::Unavailable));
+        assert!(
+            started.elapsed() >= Duration::from_secs(7) && started.elapsed() <= ITEM_SETTLE_WAIT,
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_real_refusal_is_not_waited_for() {
+        let held = settling(403);
+        let started = tokio::time::Instant::now();
+        let answer = held.adapter.resolve_target(&held.config, &held.target, None).await;
+        assert_eq!(answer, Err(ManagedHlsError::Authentication));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(held.adds.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
