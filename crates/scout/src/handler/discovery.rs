@@ -805,7 +805,7 @@ impl Inner {
         let known_sizes = self.hydrate_known_sizes(config, &mut seeds, Some(sid));
         // Whatever neither pass above corrected keeps the indexer's number only where the title itself backs
         // it as this episode's; otherwise it becomes a labelled pack rather than a wrong plain size.
-        hydrate_pack_only_sizes(&mut seeds, Some(sid));
+        hydrate_pack_only_sizes(&mut seeds, Some(sid), &known_sizes);
         let episode = sid.has_ep.then_some([sid.season, sid.episode]);
         let candidates = seeds.len() as i64;
         let rank_start = Instant::now();
