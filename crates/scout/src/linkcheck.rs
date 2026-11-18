@@ -9,7 +9,7 @@ use crate::scrape::Doer;
 use crate::season::TorrentFile;
 use crate::stores::realdebrid::rd_torrent_key;
 use crate::stores::refusal::transport_kind;
-use crate::stores::{short_hash, ResolveTarget};
+use crate::stores::ResolveTarget;
 use crate::util::go_url_parse;
 
 /// How long /play waits on the check of a link it just minted. One ranged GET for a single byte; a CDN
@@ -164,23 +164,16 @@ pub async fn verify_link(
     let release = if rt.season.is_none() && rt.episode.is_none() { rt.release_size } else { 0 };
     let (verdict, reason) = check_link(client, link, size, release).await;
     match verdict {
-        LinkVerdict::Broken => log_limited(
-            "play-link-rejected",
-            &format!("play {}: the minted link failed its check ({reason})", short_hash(&rt.info_hash)),
-        ),
+        LinkVerdict::Broken => {
+            log_limited("play-link-rejected", &format!("play: the minted link failed its check ({reason})"))
+        }
         LinkVerdict::WrongFile => log_limited(
             "play-link-wrong-file",
-            &format!(
-                "play {}: the minted link names another file in the release ({reason})",
-                short_hash(&rt.info_hash)
-            ),
+            &format!("play: the minted link names another file in the release ({reason})"),
         ),
         LinkVerdict::Unverified => log_limited(
             "play-link-unverified",
-            &format!(
-                "play {}: could not check the minted link ({reason}), serving it anyway",
-                short_hash(&rt.info_hash)
-            ),
+            &format!("play: could not check the minted link ({reason}), serving it anyway"),
         ),
         LinkVerdict::Playable => {}
     }

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::cache::{Cache, MemoryCache};
+use crate::decisionlog::set_log_identity;
 use crate::handler::new_handler;
 use crate::loglimit::Capture;
 use crate::play::{encode_play_token, PlayTarget};
@@ -73,6 +74,8 @@ async fn each_episode_logs_its_own_state_changes() {
     }));
     let title = "Rebecka.Martinsson.S02.1080p.AMZN.WEB-DL.DD+2.0.H.264-playWEB";
     let log = Capture::start();
+    // The episode coordinates are identity, off by default: this test reads which episode each line is about.
+    set_log_identity(true);
 
     assert_eq!(get(&h, &probe(&pack, 2, title), &[]).await.status(), 202);
     assert_eq!(get(&h, &probe(&pack, 3, title), &[]).await.status(), 202);
@@ -82,8 +85,11 @@ async fn each_episode_logs_its_own_state_changes() {
     for (line, episode) in first.iter().zip([2, 3]) {
         assert!(line.contains("reason=probe: none -> downloading"), "{line}");
         assert!(line.contains("upstream=torbox"), "{line}");
-        assert!(line.contains(&format!("season=2 episode={episode} ")), "{line}");
-        assert!(line.contains("hash=f7c1a15ae28b"), "{line}");
+        assert!(line.contains(&format!("kind=episode season=2 episode={episode}")), "{line}");
+        assert!(
+            !line.contains("f7c1a15ae28b") && !line.contains("hash="),
+            "the info hash is never logged: {line}"
+        );
     }
 
     // The swarm empties: the episode's next answer is a change, and says what it changed from.
@@ -93,7 +99,7 @@ async fn each_episode_logs_its_own_state_changes() {
     let all = changes(&log.text());
     assert_eq!(all.len(), 3, "{all:#?}");
     assert!(all[2].contains("reason=probe: downloading -> stalled"), "{all:#?}");
-    assert!(all[2].contains("episode=2 "), "{}", all[2]);
+    assert!(all[2].contains("episode=2"), "{}", all[2]);
 }
 
 /// The memory is bounded: past `REMEMBERED` releases the longest-remembered is forgotten, and its next answer is a

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 
-use crate::decisionlog::{decision_line, resolve_identity};
+use crate::decisionlog::{decision_line, resolve_suffix};
 use crate::handler::Resp;
 use crate::loglimit::emit;
 use crate::stores::ResolveTarget;
@@ -93,8 +93,8 @@ fn state_of(resp: &Resp) -> Option<ReleaseAnswer> {
 }
 
 /// Logs `resp` as `rt`'s new state when it differs from the last one this release answered for this episode:
-/// `event=download outcome=changed reason=<route>: <from> -> <to> upstream=<service> … rid=… imdb=… season=…
-/// episode=… hash=… release=… phases="…"`. `route` is `probe` or `play`. `phases` is the answer's Server-Timing
+/// `event=download outcome=changed reason=<route>: <from> -> <to> upstream=<service> … rid=… [kind=episode]
+/// [imdb=… season=… episode=… release=… under LOG_IDENTITY] phases="…"`. `route` is `probe` or `play`. `phases` is the answer's Server-Timing
 /// (each step and each TorBox call it made, see `calltrace`), so a slow first play names the call it waited on.
 pub(crate) fn observe(rt: &ResolveTarget, rid: &str, route: &str, dur: Duration, phases: &str, resp: &Resp) {
     if rt.info_hash.is_empty() {
@@ -103,6 +103,7 @@ pub(crate) fn observe(rt: &ResolveTarget, rid: &str, route: &str, dur: Duration,
     let Some(answer) = state_of(resp) else { return };
     let key = format!("{}:{:?}:{:?}", rt.info_hash, rt.season, rt.episode);
     let Some(from) = with_states(|s| s.change(&key, &answer.state)) else { return };
+    let (class, identity) = resolve_suffix(rt);
     let mut line = decision_line(
         "download",
         "changed",
@@ -110,7 +111,7 @@ pub(crate) fn observe(rt: &ResolveTarget, rid: &str, route: &str, dur: Duration,
         &answer.service,
         dur,
         rid,
-        &resolve_identity(rt),
+        (&class, &identity),
     );
     if !phases.is_empty() {
         line.push_str(&format!(" phases=\"{phases}\""));

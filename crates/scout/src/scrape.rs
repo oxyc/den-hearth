@@ -24,7 +24,7 @@ use crate::coverage::{
     excused_from_quorum, SourceReport, OUTCOME_ANSWERED, OUTCOME_LATE, OUTCOME_MISCONFIGURED,
     OUTCOME_REFUSED, OUTCOME_TIMEOUT, OUTCOME_UNREACHABLE,
 };
-use crate::decisionlog::{decision_line, scrape_identity};
+use crate::decisionlog::{decision_line, scrape_suffix};
 use crate::hostlimit::{new_host_limiter, wait, HostLimiter};
 use crate::indexerconfig::{
     indexer_base_with_config, mint_indexer_configs_enabled, read_capped, UnaskableScraper,
@@ -554,6 +554,7 @@ impl StremioScraper {
                 // outcome is classify_outcome's own vocabulary (unreachable/timeout/refused — coverage.rs), never the
                 // error itself: a transport error can carry the full request URL, which for a debrid-backed
                 // indexer carries the account token in its query string (see token_leak.rs).
+                let (class, identity) = scrape_suffix(q);
                 log_limited(
                     &format!("indexer-unreachable:{}", self.indexer.0),
                     &decision_line(
@@ -563,7 +564,7 @@ impl StremioScraper {
                         &self.name(label),
                         start.elapsed(),
                         &q.rid,
-                        &scrape_identity(q),
+                        (&class, &identity),
                     ),
                 );
                 // A refused address will be refused again; a retry would only spend the budget.
@@ -574,6 +575,7 @@ impl StremioScraper {
         let status = resp.status().as_u16();
         if status != 200 {
             let status_err = HttpStatusError { name: self.name(label), code: status };
+            let (class, identity) = scrape_suffix(q);
             log_limited(
                 &format!("indexer-status:{}", self.indexer.0),
                 &decision_line(
@@ -583,7 +585,7 @@ impl StremioScraper {
                     &self.name(label),
                     start.elapsed(),
                     &q.rid,
-                    &scrape_identity(q),
+                    (&class, &identity),
                 ),
             );
             return (Err(Box::new(status_err)), retryable_scrape_status(status));

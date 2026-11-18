@@ -137,14 +137,14 @@ impl Inner {
                     let _slot = slot;
                     // Per job, and not only on the task above: each job runs on its OWN task, so a recover on the
                     // parent catches nothing that happens here.
-                    let what = format!("probe {}", crate::stores::short_hash(&job.target.info_hash));
+                    let what = "probe";
                     let run = tokio::spawn(crate::runtime::scope(runtime, {
                         let (this, pool, config) = (this.clone(), pool.clone(), config.clone());
                         async move { this.run_probe_job(deadline, &pool, &config, job).await }
                     }));
                     if let Err(e) = run.await {
                         if e.is_panic() {
-                            recover_background(&what, &*e.into_panic());
+                            recover_background(what, &*e.into_panic());
                         }
                     }
                 }));
@@ -181,10 +181,7 @@ impl Inner {
                         };
                         log_limited(
                             "probe-resolve-failed",
-                            &format!(
-                                "probe could not resolve {} to read its size/tracks: {why}",
-                                crate::stores::short_hash(&job.target.info_hash)
-                            ),
+                            &format!("probe could not resolve a release to read its size/tracks: {why}"),
                         );
                         return;
                     }

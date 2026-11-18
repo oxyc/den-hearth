@@ -297,6 +297,12 @@ Subtitles' `CONFIG_KEY` becomes `SUBS_CONFIG_KEY`, Remux's `EDGE_SECRET` becomes
 variables that already begin with `REMUX_` (`REMUX_URL_KEY`, `REMUX_SCOUT_KEY`) keep their names: the prefix is added
 as a second name, not stripped from the first.
 
+Scout's decision lines (`event=rank|scrape|play|probe|cancel|download`) carry the outcome, reason, upstream, timing,
+`rid=` and a class (`type=movie|series`, `kind=episode`, `top_drops=`, `picked_cached=`), and name no title or release
+by default. `LOG_IDENTITY=1` (an explicit opt-in: only `1`, `true`, `on` or `yes`; set it as `SCOUT_LOG_IDENTITY` to
+leave the other services' own default alone) is a short-lived diagnostic that adds the IMDb id, season/episode and
+release names to those lines. The info hash, file index, source URLs and account tokens are never logged.
+
 A bare name with no prefixed twin reaches every service (right for `FFMPEG_PATH`, wrong for `CACHE_DIR`). The
 services' defaults differ (`den-scout-cache`, `den-reel-cache` and `den-subtitles-cache` under the temp dir,
 Remux's scratch at `/cache`), so unset they do not collide.
