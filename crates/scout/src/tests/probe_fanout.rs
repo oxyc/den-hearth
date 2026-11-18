@@ -790,6 +790,8 @@ mod size_recovery {
         NoTotal,
         /// The CDN fails.
         Fails,
+        /// A head none of the parsers can read tracks from, with the file's total when one is given.
+        Unreadable(Option<i64>),
     }
 
     fn mkv_head() -> Vec<u8> {
@@ -807,14 +809,18 @@ mod size_recovery {
             let hash = req.url().path().trim_start_matches('/').trim_end_matches(".mkv").to_owned();
             let serve = files.get(hash.as_str()).copied().unwrap_or(Serve::Fails);
             let mut b = http::Response::builder().header("content-type", "video/x-matroska");
+            let body = match serve {
+                Serve::Unreadable(_) => b"an MP4 whose moov lies past the head".to_vec(),
+                _ => head.clone(),
+            };
             b = match serve {
-                Serve::File(total) => {
-                    b.status(206).header("content-range", format!("bytes 0-{}/{total}", head.len() - 1))
+                Serve::File(total) | Serve::Unreadable(Some(total)) => {
+                    b.status(206).header("content-range", format!("bytes 0-{}/{total}", body.len() - 1))
                 }
-                Serve::NoTotal => b.status(206),
+                Serve::NoTotal | Serve::Unreadable(None) => b.status(206),
                 Serve::Fails => return Ok(resp(500, "")),
             };
-            Ok(reqwest::Response::from(b.body(head.clone()).expect("a valid response")))
+            Ok(reqwest::Response::from(b.body(body).expect("a valid response")))
         }))
     }
 
@@ -1116,6 +1122,177 @@ mod size_recovery {
         let rebuilt = get(&h, &format!("{list}?fresh=1"), &[]).await;
         assert_eq!(titles(&rebuilt), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
         assert_eq!(count(&runtime, "queued"), 3, "want only the failed probe asked again");
+    }
+
+    /// Fails unless `attrs` is free of every field only a read of the file's tracks can give.
+    fn assert_tracks_unknown(attrs: &serde_json::Value) {
+        for field in [
+            "probed",
+            "audioLanguages",
+            "subtitleLanguages",
+            "untaggedAudioTracks",
+            "width",
+            "height",
+            "frameRate",
+        ] {
+            assert!(attrs.get(field).is_none(), "{field} claims a read of tracks nobody read: {attrs}");
+        }
+    }
+
+    // A head whose tracks cannot be read (an MP4 whose moov lies past the first MiB) still came with the CDN's total,
+    // and that total is the file's size. Size recovery settles from it: the 1.1 GB file fits and is listed with its
+    // own size and the pack's as context, the 30 GB one stays out. Its tracks stay unknown in the list, and the fact
+    // keeps both from being resolved or queued again by a later build.
+    #[tokio::test]
+    async fn an_unreadable_head_with_a_stated_total_settles_size_recovery() {
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(TOO_BIG, "Fauda.S01E03.2160p.WEB-DL.x265", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(2 * GIB)),
+            ]
+        }
+        let account = Account::new(&[PACKED, TOO_BIG, SMALL]);
+        let files = HashMap::from([
+            (PACKED, Serve::Unreadable(Some(EPISODE))),
+            (TOO_BIG, Serve::Unreadable(Some(30 * GIB))),
+            (SMALL, Serve::File(2 * GIB)),
+        ]);
+        let (h, runtime) = handler(&account, files, seeds);
+        let list = path(&config(20, 20), "series", EPISODE_PATH);
+
+        assert_eq!(titles(&get(&h, &list, &[]).await), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        assert_eq!(count(&runtime, "queued"), 2);
+        settled(&runtime, 2).await;
+        assert_eq!((count(&runtime, "fits"), count(&runtime, "oversized")), (1, 1));
+
+        let rebuilt = until_listed(&h, &list, "Fauda.S01E03.1080p.WEB-DL.x264").await;
+        assert_eq!(
+            titles(&rebuilt),
+            sorted(&["Fauda.S01E03.1080p.WEB-DL.x264", "Fauda.S01E03.720p.WEB.x264"]),
+            "the 30 GB file stays out"
+        );
+        let packed = &listed(&rebuilt)["Fauda.S01E03.1080p.WEB-DL.x264"];
+        assert!(
+            packed["sizeBytes"] == EPISODE && packed["packSizeBytes"] == PACK_HINT,
+            "want the episode's own size and the pack's as context: {packed}"
+        );
+        let label = packed["label"].as_str().unwrap_or_default();
+        assert!(label.contains("1.1 GB"), "the label does not show the file's own size: {label}");
+        assert_tracks_unknown(packed);
+
+        // The rebuilt list put the file in the frontier, and a fresh build lists it again: neither probes it.
+        let fresh = get(&h, &format!("{list}?fresh=1"), &[]).await;
+        assert!(listed(&fresh).contains_key("Fauda.S01E03.1080p.WEB-DL.x264"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            (account.resolved(PACKED), account.resolved(TOO_BIG)),
+            (1, 1),
+            "a file with a size-only fact was probed again"
+        );
+        assert_eq!(count(&runtime, "queued"), 2, "a release with a size-only fact was queued again");
+    }
+
+    // The ordinary frontier: a served release whose head is unreadable is probed once, not on every rebuild. Its size
+    // corrects the indexer's number, naming the pack where the gap is a pack's and replacing a rounding difference
+    // outright, and its tracks stay unknown.
+    #[tokio::test]
+    async fn a_listed_release_with_an_unreadable_head_is_probed_once_for_its_size() {
+        const LISTED: i64 = 2 * GIB;
+        const SERVED: i64 = 2 * GIB - 4096;
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(LISTED)),
+            ]
+        }
+        let account = Account::new(&[PACKED, SMALL]);
+        let files = HashMap::from([
+            (PACKED, Serve::Unreadable(Some(EPISODE))),
+            (SMALL, Serve::Unreadable(Some(SERVED))),
+        ]);
+        let (h, _runtime) = handler(&account, files, seeds);
+        let list = path(&config(100, 20), "series", EPISODE_PATH);
+
+        let cold = get(&h, &list, &[]).await;
+        assert_eq!(listed(&cold)["Fauda.S01E03.1080p.WEB-DL.x264"]["sizeBytes"], PACK_HINT);
+        wait_for(
+            || account.resolved(PACKED) == 1 && account.resolved(SMALL) == 1,
+            "the frontier was never probed",
+        )
+        .await;
+        // Past the probes' flights, so a fresh build reads their facts rather than joining or restarting a probe.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let rebuilt = loop {
+            let rr = get(&h, &format!("{list}?fresh=1"), &[]).await;
+            if listed(&rr)["Fauda.S01E03.720p.WEB.x264"]["sizeBytes"] == SERVED
+                && listed(&rr)["Fauda.S01E03.1080p.WEB-DL.x264"]["sizeBytes"] == EPISODE
+            {
+                break rr;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sizes were never corrected: {:?}",
+                listed(&rr)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let rebuilt = listed(&rebuilt);
+        let (packed, small) =
+            (&rebuilt["Fauda.S01E03.1080p.WEB-DL.x264"], &rebuilt["Fauda.S01E03.720p.WEB.x264"]);
+        assert_eq!(packed["packSizeBytes"], PACK_HINT, "the gap is a pack's: {packed}");
+        assert!(small.get("packSizeBytes").is_none(), "a rounding difference is not a pack: {small}");
+        assert_tracks_unknown(packed);
+        assert_tracks_unknown(small);
+
+        get(&h, &format!("{list}?fresh=1"), &[]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            (account.resolved(PACKED), account.resolved(SMALL)),
+            (1, 1),
+            "a file with a size-only fact was probed again"
+        );
+    }
+
+    // With no total stated, an unreadable head leaves nothing to keep, exactly as before: size recovery settles as
+    // failed and the list is left alone, and a later build asks again, for the frontier and the recovery alike.
+    #[tokio::test]
+    async fn an_unreadable_head_without_a_total_is_asked_again() {
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(2 * GIB)),
+            ]
+        }
+        let account = Account::new(&[PACKED, SMALL]);
+        let files = HashMap::from([(PACKED, Serve::Unreadable(None)), (SMALL, Serve::Unreadable(None))]);
+        let (h, runtime) = handler(&account, files, seeds);
+        let list = path(&config(20, 20), "series", EPISODE_PATH);
+
+        assert_eq!(titles(&get(&h, &list, &[]).await), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        settled(&runtime, 1).await;
+        assert_eq!(count(&runtime, "failed"), 1);
+        wait_for(|| account.resolved(SMALL) == 1, "the frontier was never probed").await;
+        // Past the probe's flight, so the fresh build below starts its own rather than joining this one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = get(&h, &list, &[]).await;
+        assert!(
+            hdr(&after, "server-timing").starts_with("cache;desc=hit"),
+            "a list was marked stale for a size nobody read: {}",
+            hdr(&after, "server-timing")
+        );
+
+        let rebuilt = get(&h, &format!("{list}?fresh=1"), &[]).await;
+        assert_eq!(titles(&rebuilt), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        assert_tracks_unknown(&listed(&rebuilt)["Fauda.S01E03.720p.WEB.x264"]);
+        assert_eq!(count(&runtime, "queued"), 2, "want the failed recovery probe asked again");
+        wait_for(
+            || account.resolved(PACKED) == 2 && account.resolved(SMALL) == 2,
+            "a probe that kept nothing was not asked again",
+        )
+        .await;
     }
 
     // A movie has no pack for its size to be confused with: the budget drops it on the listed size, as before, and

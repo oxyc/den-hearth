@@ -14,7 +14,7 @@ use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::id::StreamId;
 use crate::metrics::metrics;
-use crate::probe::Probe;
+use crate::probe::ProbeFact;
 use crate::rank::{
     quality_score_ref, rank_streams_debug, ranked_resolution, RankFilters, RawStream, GIB, PREFERENCE_SINK,
 };
@@ -35,6 +35,11 @@ pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(12);
 /// which is what makes a redeploy cheap.
 pub(crate) const PROBE_TTL: Duration = Duration::from_secs(720 * 60 * 60);
 
+/// How long a size-only fact is kept. The size never changes, but the tracks might become readable to a later
+/// parser (an MP4 whose `moov` lies past the head, a container none of the three parsers know), so the file is
+/// read again after a week rather than a month. Until then it is not probed on every rebuild.
+pub(crate) const SIZE_ONLY_PROBE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Go `packSizeRatio` is how much bigger the indexer's number has to be than the probe's before it is worth
 /// naming as a pack. A movie's title size and its probed size routinely differ by a rounding byte or two;
 /// a season pack's differs by the other ninety percent of the torrent.
@@ -52,13 +57,20 @@ pub(crate) fn hydrate_probe_facts(
         if s.info_hash.is_empty() {
             continue;
         }
-        if let Some(raw) = cache.get(&probe_cache_key(s, sid)) {
-            if let Ok(probe) = serde_json::from_str::<Probe>(&raw) {
-                s.probe = Some(probe);
+        let Some(raw) = cache.get(&probe_cache_key(s, sid)) else { continue };
+        match ProbeFact::from_cache(&raw) {
+            Some(ProbeFact::Tracks(probe)) => {
+                s.probe = Some(*probe);
                 apply_probed_size(s, sid);
-                metrics().probe_cache_hit.fetch_add(1, Ordering::Relaxed);
             }
+            // The size only: the tracks stay unknown (`probe` is `None`), as for a file nobody probed.
+            Some(ProbeFact::SizeOnly(size)) => {
+                s.size_only_probe = true;
+                apply_measured_size(s, size, sid);
+            }
+            None => continue,
         }
+        metrics().probe_cache_hit.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -72,6 +84,11 @@ pub(crate) fn hydrate_probe_facts(
 /// confused with.
 pub(crate) fn apply_probed_size(s: &mut RawStream, sid: Option<&StreamId>) {
     let Some(probed) = s.probe.as_ref().map(|p| p.size_bytes).filter(|&n| n > 0) else { return };
+    apply_measured_size(s, probed, sid);
+}
+
+/// `apply_probed_size` for a size a probe read, whether or not it read the tracks too.
+fn apply_measured_size(s: &mut RawStream, probed: i64, sid: Option<&StreamId>) {
     if sid.is_some_and(|sid| sid.has_ep)
         && s.size_bytes.is_some_and(|n| n as f64 >= probed as f64 * PACK_SIZE_RATIO)
     {
@@ -165,7 +182,7 @@ pub(crate) fn size_recovery_candidates(
         .enumerate()
         .filter(|(i, s)| {
             s.size_bytes.is_some_and(|n| n > max_bytes)
-                && s.probe.is_none()
+                && !s.probe_settled()
                 && s.pack_size_bytes.is_none()
                 && !known.contains(i)
                 && s.cached
@@ -262,12 +279,12 @@ pub(crate) fn select_probe_jobs(
     let mut pending = Vec::new();
     for (i, s) in streams.iter().enumerate() {
         if !frontier.contains(&i) {
-            if s.cached && s.probe.is_none() {
+            if s.cached && !s.probe_settled() {
                 metrics().torbox_avoid("probe_frontier");
             }
             continue;
         }
-        if s.probe.is_some() {
+        if s.probe_settled() {
             continue;
         }
         pending.extend(held_probe_job(s, sid, truth));
@@ -306,7 +323,9 @@ pub(crate) fn browser_probe_candidates(
     // (index, optimistic score)
     let mut candidates: Vec<(usize, i64)> = Vec::new();
     for (i, stream) in streams.iter().enumerate() {
-        if stream.probe.is_some() {
+        // A size-only fact is still scored above as unprobed; it is left out only because reading its head again
+        // would not settle anything.
+        if stream.probe_settled() {
             continue;
         }
         if i == 0 {

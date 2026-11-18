@@ -16,7 +16,7 @@ impl Inner {
     /// consulted on the request path — a map lookup, no network.
     pub(crate) fn hydrate_probe_facts(&self, streams: &mut [RawStream], sid: Option<&StreamId>) {
         hydrate_probe_facts(Some(&*self.deps.cache), streams, sid);
-        let hits = streams.iter().filter(|s| s.probe.is_some()).count();
+        let hits = streams.iter().filter(|s| s.probe_settled()).count();
         if hits > 0 {
             metrics().probe_cache_hit.fetch_add(hits as i64, Ordering::Relaxed);
         }
@@ -48,6 +48,7 @@ impl Inner {
             if s.info_hash.is_empty()
                 || s.pack_size_bytes.is_some()
                 || s.probe.as_ref().is_some_and(|p| p.size_bytes > 0)
+                || s.size_only_probe
             {
                 // A ranged probe measured what the playback URL actually serves, so it is more authoritative
                 // than an older store file listing even when their difference was too small to name a pack.
@@ -94,12 +95,12 @@ impl Inner {
         };
         for (i, s) in streams.iter().enumerate() {
             if !frontier.contains(&i) {
-                if s.cached && s.probe.is_none() {
+                if s.cached && !s.probe_settled() {
                     metrics().torbox_avoid("probe_frontier");
                 }
                 continue;
             }
-            if s.probe.is_none() && s.cached && !s.info_hash.is_empty() {
+            if !s.probe_settled() && s.cached && !s.info_hash.is_empty() {
                 metrics().probe_cache_miss.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -200,17 +201,26 @@ impl Inner {
                 if probed.is_ok() || probed.as_ref().is_err_and(|e| e == crate::probe::ERR_NO_TRACKS) {
                     self.links.put(&link_memo_key(config, &job.target), &link, false, SystemTime::now());
                 }
-                if let Ok(p) = probed {
-                    self.deps.cache.put(&job.key, &to_json(&p), PROBE_TTL);
+                if let Ok(fact) = probed {
+                    let ttl = match fact {
+                        ProbeFact::Tracks(_) => PROBE_TTL,
+                        ProbeFact::SizeOnly(_) => {
+                            log_limited(
+                                "probe-size-only",
+                                "probe read no tracks from a file head; kept the size the response stated",
+                            );
+                            SIZE_ONLY_PROBE_TTL
+                        }
+                    };
+                    self.deps.cache.put(&job.key, &fact.to_cache(), ttl);
                 }
             })
             .await;
         // Read back from the probe cache rather than from the run above: a list built for another config or
         // client may have queued the same file, and the one that joined the other's flight never ran its own.
         if let Some(recovery) = &job.recovery {
-            let probed =
-                self.deps.cache.get(&job.key).and_then(|raw| serde_json::from_str::<Probe>(&raw).ok());
-            self.settle_size_recovery(recovery, probed.map(|p| p.size_bytes));
+            let probed = self.deps.cache.get(&job.key).and_then(|raw| ProbeFact::from_cache(&raw));
+            self.settle_size_recovery(recovery, probed.map(|fact| fact.size_bytes()));
         }
     }
 
@@ -218,7 +228,8 @@ impl Inner {
     /// list built without it is marked stale, and the ordinary stale-while-revalidate refresh rebuilds it, where
     /// the probe fact just written gives the release its own size (and its pack's as context). An oversized file,
     /// a probe that gave no size and a failure change nothing; the first two leave a probe fact behind, so the
-    /// release is not selected again, and a failure is tried again only when a later build lists it.
+    /// release is not selected again, and a failure is tried again only when a later build lists it. A head with
+    /// no readable tracks but a stated total settles as fits or oversized from its size-only fact.
     fn settle_size_recovery(&self, recovery: &SizeRecovery, size: Option<i64>) {
         let outcome = match size.filter(|&n| n > 0) {
             None if size.is_none() => "failed",
