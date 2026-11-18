@@ -18,8 +18,7 @@ use crate::stores::realdebrid::{RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{describe, wraps_unavailable};
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
-    dead_link, join_all, short_hash, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError,
-    StoreUnavailableError,
+    dead_link, join_all, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError, StoreUnavailableError,
 };
 
 /// Go `StorePool`: one store per account in service-priority order (TorBox first).
@@ -233,12 +232,7 @@ impl StorePool {
             };
             log_limited(
                 &format!("resolve-failed:{}", st.service().as_str()),
-                &format!(
-                    "{} could not resolve {}: {}",
-                    st.service().as_str(),
-                    short_hash(&t.info_hash),
-                    describe(&err)
-                ),
+                &format!("{} could not resolve a release: {}", st.service().as_str(), describe(&err)),
             );
             cancelled |= matches!(err, StoreError::Cancelled);
             // An add of ours already out for this release outranks any refusal, whichever store said what and

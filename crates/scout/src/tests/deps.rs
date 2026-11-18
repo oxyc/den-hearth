@@ -15,13 +15,14 @@ fn indexer(s: &str) -> Indexer {
 }
 
 #[test]
-fn log_identity_is_off_for_the_shared_off_tokens_only() {
-    for on in ["", "  ", "1", "true", "anything"] {
-        assert!(deps::bool_env_or(on, true), "{on:?} should leave identity logging on");
+fn log_identity_is_on_only_for_an_explicit_opt_in() {
+    for on in ["1", "true", "TRUE", " On ", "yes"] {
+        assert!(deps::opt_in_env(on), "{on:?} should turn identity logging on");
     }
-    for off in ["0", "false", "off", "no", "FALSE", " Off ", "No"] {
-        assert!(!deps::bool_env_or(off, true), "{off:?} should turn identity logging off");
+    for off in ["", "  ", "0", "false", "off", "no", "anything"] {
+        assert!(!deps::opt_in_env(off), "{off:?} should leave identity logging off");
     }
+    assert!(!deps::settings_from_env(|_| String::new()).log_identity, "off by default");
 }
 
 #[test]

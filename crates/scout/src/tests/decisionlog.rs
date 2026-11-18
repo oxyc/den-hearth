@@ -32,7 +32,7 @@ fn decision_line_identity_gating() {
         "torrentio",
         Duration::from_millis(12),
         "req-1",
-        "imdb=tt1 type=movie",
+        ("type=movie", "imdb=tt1"),
     );
     for want in [
         "event=rank",
@@ -41,7 +41,8 @@ fn decision_line_identity_gating() {
         "upstream=torrentio",
         "dur_ms=12",
         "rid=req-1",
-        "imdb=tt1 type=movie",
+        "type=movie",
+        "imdb=tt1",
     ] {
         assert!(on.contains(want), "LOG_IDENTITY=on: line lacks {want:?}: {on}");
     }
@@ -54,19 +55,17 @@ fn decision_line_identity_gating() {
         "torrentio",
         Duration::from_millis(12),
         "req-1",
-        "imdb=tt1 type=movie",
+        ("type=movie", "imdb=tt1"),
     );
-    for want in ["event=rank", "outcome=served", "upstream=torrentio", "dur_ms=12", "rid=req-1"] {
+    for want in ["event=rank", "outcome=served", "upstream=torrentio", "dur_ms=12", "rid=req-1", "type=movie"]
+    {
         assert!(off.contains(want), "LOG_IDENTITY=off: line lost a non-identity field {want:?}: {off}");
     }
-    assert!(
-        !off.contains("imdb=") && !off.contains("type=movie"),
-        "LOG_IDENTITY=off: identity survived: {off}"
-    );
-    set_log_identity(true);
+    assert!(!off.contains("imdb="), "LOG_IDENTITY=off: identity survived: {off}");
+    set_log_identity(false);
 
     // upstream and rid are each omitted on their own when absent — neither forces the other's presence.
-    let bare = decision_line("probe", "skipped", "not queued", "", Duration::ZERO, "", "");
+    let bare = decision_line("probe", "skipped", "not queued", "", Duration::ZERO, "", ("", ""));
     assert!(
         !bare.contains("upstream=") && !bare.contains("rid="),
         "an absent upstream/rid should not print at all: {bare}"
@@ -98,11 +97,10 @@ fn format_pick_labels_a_release() {
         ..Default::default()
     };
     let got = format_pick(&s);
-    for want in
-        [r#""Movie.2024.2160p.BluRay.REMUX""#, &format!("hash={}", "a".repeat(12)), "size_gb=42.0", "cached"]
-    {
+    for want in [r#""Movie.2024.2160p.BluRay.REMUX""#, "size_gb=42.0", "cached"] {
         assert!(got.contains(want), "formatPick missing {want:?}: {got}");
     }
+    assert!(!got.contains("hash=") && !got.contains(&"a".repeat(12)), "the info hash is never logged: {got}");
     assert!(!got.contains("uncached"), "a cached release must not also read uncached: {got}");
     // A release name longer than the cap is cut, never left to grow the log line without bound.
     let long = RawStream {
@@ -126,9 +124,9 @@ fn last_line_containing(buf: &str, needle: &str) -> String {
     }
 }
 
-// Every list build logs its own pick — not just ?debug=1 — with the title id, how many candidates were
-// in contention, the chosen release and its runner-up, and the drop reason that removed the junk one.
-// LOG_IDENTITY off keeps rid but drops all of that.
+// Every list build logs how many candidates were in contention, the drop reason that removed the junk one and
+// whether the pick was cached — always. The title id and the chosen release with its runner-up are the explicit
+// LOG_IDENTITY opt-in; rid is in both.
 #[tokio::test]
 async fn rank_decision_line() {
     set_log_identity(true);
@@ -146,28 +144,34 @@ async fn rank_decision_line() {
         "imdb=tt9000001",
         "type=movie",
         "top_drops=cam:1",
+        "picked_cached=",
         "picked=",
         "runnerup1=",
     ] {
         assert!(got.contains(want), "rank decision line missing {want:?}:\n{got}");
     }
+    assert!(!got.contains("hash="), "the opt-in still names no info hash:\n{got}");
 
     set_log_identity(false);
     forget_logged("rank-decision");
     get(&h, &format!("/{}/stream/movie/tt9000002.json", valid_blob()), &[("X-Request-Id", "req-rank-2")])
         .await;
     let line2 = last_line_containing(&out.text(), "req-rank-2");
-    assert!(line2.contains("rid=req-rank-2"), "rid must survive LOG_IDENTITY=off: {line2}");
-    for leak in ["imdb=", "picked=", "top_drops="] {
-        assert!(!line2.contains(leak), "LOG_IDENTITY=off still carries {leak:?}: {line2}");
+    for keep in
+        ["event=rank", "outcome=served", "rid=req-rank-2", "type=movie", "top_drops=cam:1", "picked_cached="]
+    {
+        assert!(line2.contains(keep), "the default line lost {keep:?}: {line2}");
     }
-    set_log_identity(true);
+    for leak in ["imdb=", "tt9000002", "picked=", "runnerup"] {
+        assert!(!line2.contains(leak), "the default line carries {leak:?}: {line2}");
+    }
 }
 
 // A scrape failure names the indexer, the error CLASS, how long it took and the request/title that hit
 // it — never the indexer's base URL, which for a configured source can carry an encrypted config.
 #[tokio::test]
 async fn scrape_decision_line() {
+    set_log_identity(true);
     let out = LogCapture::start();
 
     forget_logged("indexer-status:torz");

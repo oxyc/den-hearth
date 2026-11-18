@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::handler::go_duration;
-use crate::stores::short_hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How long a torrent sits stalled with no seeds and no progress before its status is held (see `status_ttl`).
@@ -103,9 +102,8 @@ impl TorBoxStore {
         log_limited(
             "torbox-dead-swarm",
             &format!(
-                "torbox {}: stalled with no seeds and no progress for {}; answering from the last status, asking \
-                 again every {}",
-                short_hash(&t.info_hash),
+                "torbox: a release stalled with no seeds and no progress for {}; answering from the last status, \
+                 asking again every {}",
                 go_duration(Duration::from_millis(now - first)),
                 go_duration(DEAD_SWARM_RECHECK)
             ),

@@ -703,7 +703,9 @@ async fn probe_behind_logs_a_failed_resolve() {
     let mut streams = vec![RawStream { info_hash: "held-hash".into(), cached: true, ..Default::default() }];
     h.probe_top(&Config::default(), &mut streams, None, &held_on_torbox(&["held-hash"]));
 
-    wait_for(|| out.text().contains("could not resolve held-hash"), "no failed-resolve line logged").await;
+    wait_for(|| out.text().contains("probe could not resolve a release"), "no failed-resolve line logged")
+        .await;
+    assert!(!out.text().contains("held-hash"), "the failed-resolve line names no hash");
 }
 
 // A panic while probing must cost the probe, not the process.

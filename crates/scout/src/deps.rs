@@ -55,6 +55,8 @@ pub struct Settings {
     /// MINT_INDEXER_CONFIGS: send the debrid token to comet and mediafusion to mint their config segments.
     pub mint_indexer_configs: bool,
     pub log_requests: bool,
+    /// LOG_IDENTITY: off unless explicitly `1`/`true`/`on`/`yes`. A short-lived diagnostic that adds the IMDb id,
+    /// season/episode and release names to the decision lines; the info hash is never logged either way.
     pub log_identity: bool,
     /// REVOKED_INSTALLS (valid install ids), CONFIG_EPOCH, and REQUIRE_INSTALL_ID.
     pub revocation: Revocation,
@@ -154,7 +156,7 @@ pub fn settings_from_env(get: impl Fn(&str) -> String) -> Settings {
         mint_indexer_configs: get("MINT_INDEXER_CONFIGS").eq_ignore_ascii_case("true")
             || get("MINT_INDEXER_CONFIGS") == "1",
         log_requests: flag("LOG_REQUESTS"),
-        log_identity: bool_env_or(&get("LOG_IDENTITY"), true),
+        log_identity: opt_in_env(&get("LOG_IDENTITY")),
         revocation: Revocation::parse(&get("REVOKED_INSTALLS"), Some(&get("CONFIG_EPOCH")), &emit)
             .requiring_install_id(flag("REQUIRE_INSTALL_ID")),
         remux_key: get("REMUX_KEY"),
@@ -539,13 +541,9 @@ fn int_env(v: &str, d: usize) -> usize {
     }
 }
 
-/// Go `boolEnvOr` reads a boolean env var that defaults to ON (unlike LogRequests's off-by-default check):
-/// unset or blank keeps the default, "0", "false", "off" or "no" (any case) is off, anything else is on —
-/// the rule every Den addon reads `LOG_IDENTITY` by.
-pub(crate) fn bool_env_or(v: &str, d: bool) -> bool {
+/// `LOG_IDENTITY` is an explicit opt-in: only "1", "true", "on" or "yes" (any case, trimmed) turns it on. Unset,
+/// blank, "0", "off" or a mistyped value leaves the journal free of titles and releases.
+pub(crate) fn opt_in_env(v: &str) -> bool {
     let v = v.trim();
-    if v.is_empty() {
-        return d;
-    }
-    !["0", "false", "off", "no"].iter().any(|off| v.eq_ignore_ascii_case(off))
+    ["1", "true", "on", "yes"].iter().any(|on| v.eq_ignore_ascii_case(on))
 }

@@ -1015,10 +1015,7 @@ impl Inner {
             let seeds: Vec<RawStream> = candidates.into_iter().map(|candidate| candidate.stream).collect();
             let top = rank_streams_debug(&seeds, filters, None).first().map(|s| s.info_hash.clone());
             let changed = new > 0 && top != served_top;
-            let mut identity = format!("imdb={} type={}", sid.imdb, sid.kind);
-            if sid.has_ep {
-                identity.push_str(&format!(" season={} episode={}", sid.season, sid.episode));
-            }
+            let identity = title_identity(&sid.imdb, sid.has_ep, sid.season, sid.episode);
             let mut line = decision_line(
                 "scrape",
                 "late",
@@ -1026,7 +1023,7 @@ impl Inner {
                 &ids.join(","),
                 Duration::from_millis(u64::try_from(longest).unwrap_or(0)),
                 &rid,
-                &identity,
+                (&title_class(&sid.kind), &identity),
             );
             line.push_str(&format!(
                 " sources={} new={new} top_changed={changed} retained={retained} \

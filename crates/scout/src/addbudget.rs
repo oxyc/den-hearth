@@ -24,7 +24,7 @@ use crate::config::DebridService;
 use crate::loglimit::log_limited;
 use crate::metrics::metrics;
 use crate::stores::refusal::service_account_identity;
-use crate::stores::{short_hash, StoreError, StoreUnavailableError};
+use crate::stores::{StoreError, StoreUnavailableError};
 use crate::util::key_hash;
 
 pub(crate) const ADD_BUDGET_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -309,10 +309,12 @@ pub(crate) fn is_play_reserve(err: &StoreError) -> bool {
 ///
 /// `prefetch` is the caller's intent (`ResolveTarget::prefetch`): a prefetch is refused while only the reserve
 /// is left, with the play-reserve marker so the route can say so apart from a spent budget.
+///
+/// `_info_hash` is the release being added. A refusal line names the service and the reason, never the release.
 pub(crate) fn spend_add(
     svc: DebridService,
     token: &str,
-    info_hash: &str,
+    _info_hash: &str,
     prefetch: bool,
 ) -> Result<AddCharge, StoreError> {
     let refused = match global_add_budget().try_take(&budget_account(svc, token), prefetch) {
@@ -336,10 +338,7 @@ pub(crate) fn spend_add(
         metrics().add_refused_prefetch.fetch_add(1, Ordering::Relaxed);
         log_limited(
             &format!("add-reserve:{svc_name}"),
-            &format!(
-                "{svc_name} add allowance is down to the reserve kept for Play, refusing prefetch {}",
-                short_hash(info_hash)
-            ),
+            &format!("{svc_name} add allowance is down to the reserve kept for Play, refusing a prefetch"),
         );
         return Err(StoreError::PlayReserve(StoreUnavailableError {
             service: svc,
@@ -350,7 +349,7 @@ pub(crate) fn spend_add(
     metrics().add_refused_play.fetch_add(1, Ordering::Relaxed);
     log_limited(
         &format!("add-budget:{svc_name}"),
-        &format!("{svc_name} add budget spent for the hour, refusing {}", short_hash(info_hash)),
+        &format!("{svc_name} add budget spent for the hour, refusing an add"),
     );
     // Wrapped so the refusal memory can tell scout's own ceiling from the service's — see errOurBudget.
     Err(StoreError::ScoutSide(StoreUnavailableError {

@@ -43,7 +43,7 @@ use crate::coverage::{
     decide_answer_kind, excused_from_quorum, quarantined_reports, stale_body, AnswerEnvelope, Coverage,
     ANSWER_ENVELOPE_VERSION, OUTCOME_ANSWERED,
 };
-use crate::decisionlog::{decision_line, log_rank_decision, play_decision};
+use crate::decisionlog::{decision_line, log_rank_decision, play_decision, title_class, title_identity};
 use crate::deps::{Deps, ReqwestDoer};
 use crate::hostlimit::{new_host_limiter, HostLimiter};
 use crate::id::{parse_stream_id, StreamId};

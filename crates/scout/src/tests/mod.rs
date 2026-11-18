@@ -30,6 +30,7 @@ mod hostlimit;
 mod indexerconfig;
 mod linkcheck;
 mod linkmemo;
+mod log_privacy;
 mod loglimit;
 mod metrics;
 mod mock;
