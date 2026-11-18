@@ -802,7 +802,7 @@ impl Inner {
         self.hydrate_probe_facts(&mut seeds, Some(sid));
         // A store's own file list, cached from an earlier resolve attempt, corrects a pack-sized episode for
         // free — and does not depend on the probe fan-out's own resolve succeeding (see hydrateKnownSizes).
-        self.hydrate_known_sizes(config, &mut seeds, Some(sid));
+        let known_sizes = self.hydrate_known_sizes(config, &mut seeds, Some(sid));
         // Whatever neither pass above corrected keeps the indexer's number only where the title itself backs
         // it as this episode's; otherwise it becomes a labelled pack rather than a wrong plain size.
         hydrate_pack_only_sizes(&mut seeds, Some(sid));
@@ -827,6 +827,7 @@ impl Inner {
             languages,
         };
         let seed_count = seeds.len();
+        let size_recovery = size_recovery_candidates(&seeds, &known_sizes, &filters);
         let late_check = late.map(|late| (late, filters.clone()));
         let ranked = rank_streams_debug(&seeds, filters, Some(&mut *log_dbg));
         log_rank_decision(sid, candidates, &ranked, log_dbg, rank_start.elapsed(), rid);
@@ -905,6 +906,7 @@ impl Inner {
             coverage: cov,
             timing,
             answered_early,
+            size_recovery,
         }
     }
 
@@ -1054,15 +1056,9 @@ impl Inner {
             coverage,
             mut timing,
             answered_early,
+            size_recovery,
         } = list;
         let degraded = !degraded_reason.is_empty();
-        // Ask the top few releases what they actually contain. After ranking, so the probe follows the order
-        // the viewer will see; before serialisation, so a cached probe rides along in this same response.
-        let phase = Instant::now();
-        if self.probe_top_for_client(config, &ranked, Some(sid), &truth, client.as_ref()) {
-            timing.push_str(", ");
-            timing.push_str(&den_http::timing("probe", phase.elapsed()));
-        }
 
         let play_url = self.play_urls(config, config_blob, origin);
         let out: Vec<StreamOut> = ranked.iter().map(|s| to_stremio_stream(s, sid, &*play_url)).collect();
@@ -1129,6 +1125,20 @@ impl Inner {
                 publication.publish(|| self.deps.cache.put(cache_key, &value, hold));
             }
         }
+        // Ask the top few releases what they actually contain, after ranking, so the probe follows the order the
+        // viewer will see. A release the size budget dropped on an unconfirmed size is asked too; if its own file
+        // fits, the list just cached is marked stale so its refresh includes it. After the cache write, so that
+        // mark is ordered after this list's publication.
+        let recovery = SizeRecovery {
+            max_bytes: config.filters.max_size_gb.unwrap_or(0).wrapping_mul(GIB),
+            list: (cached && scrape_complete).then(|| (cache_key.clone(), now + hold)),
+        };
+        let recovery = Some((size_recovery.as_slice(), recovery));
+        let phase = Instant::now();
+        if self.probe_top_for_client(config, &ranked, Some(sid), &truth, client.as_ref(), recovery) {
+            timing.push_str(", ");
+            timing.push_str(&den_http::timing("probe", phase.elapsed()));
+        }
         BuildResult { value, degraded: degraded_reason, complete: scrape_complete, timing, answered_early }
     }
 
@@ -1184,6 +1194,7 @@ mod managed_audio_tests {
             coverage: Coverage { complete: true, sources: vec![] },
             timing: String::new(),
             answered_early: false,
+            size_recovery: vec![],
         }
     }
 
