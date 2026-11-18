@@ -82,9 +82,11 @@ POST   /remux/segments/scan             {imdb, season, episode, scout?} → 202
                                         Keyed without scout uses SCOUT_INSTALL_URL: 422 {status: no_install} if unset.
                                         503 {status: busy} (queue full or the daily cap spent) · 400 (bad_scout too) ·
                                         401 bad_key (neither); 404 only while ffmpeg can't do PCM
-GET    /remux/segments/<tt>/<s>/<e>     public: 200 {duration, intro: {start, end}|null, credits: {start, end}|null,
-                                        method: "fingerprint", scanned_at} (seconds) · 202 {status: pending} ·
-                                        404 {status: unknown}
+GET    /remux/segments/<tt>/<s>/<e>     200 {duration, intro: {start, end}|null, credits: {start, end}|null,
+                                        method: "fingerprint-v3"} (seconds) · 202 {status: pending} ·
+                                        404 {status: unknown}; with SEGMENTS_READ_REQUIRE_AUTH on, only for
+                                        X-Den-Segments-Read (den-edge), else 401 {status: unauthorized} for every
+                                        episode alike, before the episode is looked at
 anything else                           404 {"error":"not_found"}
 ```
 
@@ -469,10 +471,11 @@ Every variable is unprefixed; `.env.example` lists them with their defaults.
 | `METRICS_TOKEN` | — | Turns on `/metrics` behind `Authorization: Bearer <token>`; otherwise it is a 404. |
 | `EDGE_SECRET` | — | **Secret**, shared with den-edge (`REMUX_EDGE_SECRET`). With it, a request to `/remux/session` or `/remux/releases` carrying `x-den-edge-secret` and `x-den-owner: grant:<8 hex>` plays as that guest grant: its own cap (`GUEST_MAX_SESSIONS`), never counted against a host; converted for as a host is, on the same one GPU slot. It also turns on `POST /remux/admin/kill {"owner":"grant:<gid>"}` → `{"ended": n}`, which ends that grant's sessions. Unset, the headers are ignored and the admin route is a 404. |
 | `SEGMENTS_KEY` | — | **Secret**, shared with den-edge: `POST /remux/segments/scan` accepts it as `X-Den-Segments-Key` in place of a `scout` install in the body, and then scans through `SCOUT_INSTALL_URL` (422 `no_install` without it). Unset, only a request with a valid `scout` is accepted. |
+| `SEGMENTS_READ_REQUIRE_AUTH` | off | `1` answers `GET /remux/segments/<tt>/<s>/<e>` only for `X-Den-Segments-Read: <hex HMAC-SHA256(SEGMENTS_KEY, "den-remux/segments-read")>`, which den-edge sends; every other read is the same `401 {status: unauthorized}`, whatever the episode. Off, reads stay open (for den-edge releases that do not send it yet). Needs `SEGMENTS_KEY`: on without it, no read is answered. The startup line says `segments_read=auth` or `open`. |
 | `SEGMENTS_DAILY_CAP` | `300` | Episodes fingerprinted per UTC day at most; past it a scan request is `503 busy`. Counted in memory, so a restart resets it. |
 | `GUEST_MAX_SESSIONS` | `2` | Sessions one guest grant plays at once (1–8); past it, its oldest ends. |
 | `LOG_REQUESTS` | off | `1` writes `<METHOD> <path> <status> <ms>ms[ rid=<X-Request-Id>]` per response; `POST /remux/session`'s line also carries `session=<id>` once it creates one. |
-| `LOG_IDENTITY` | on | `0`/`false`/`off`/`no` (case-insensitive) drops the title id, release label, size and the chosen audio/subtitle's language from the audio-track and end-of-session log lines, keeping everything else (session id, `rid`, codecs, channel counts, segment/second counts, end reason). |
+| `LOG_IDENTITY` | on | `0`/`false`/`off`/`no` (case-insensitive) drops the title id, release label, size and the chosen audio/subtitle's language from the audio-track and end-of-session log lines, keeping everything else (session id, `rid`, codecs, channel counts, segment/second counts, end reason). Intro/credits scan lines never carry identity, whatever this says. |
 | `PORT` | `8095` | |
 
 A browser key and its hash: `key=$(head -c 24 /dev/urandom | base64 | tr '+/' '-_'); printf %s "$key" | sha256sum`.
@@ -494,6 +497,11 @@ while picking one, one line naming the audio track chosen and why (`event=audio_
 rate-limited upstream failures. Every session-scoped line carries the session's own short id and, where the
 creating request sent one, its `X-Request-Id` as `rid=`, so one grep over either joins a session's whole life — and
 the request that started it — together. `LOG_IDENTITY=0` keeps all of that except which title and release it was.
+An intro/credits scan logs one line per outcome — `segments: event=scan outcome=done|failed|held`, with a fixed
+`reason=` (`no_install`, `no_release`, `budget`, `scout`, `open`, `decode`, `no_door`, `timeout`, `playing`), whether
+an intro and credits were found, and bucketed bytes read and wall time — and `event=write outcome=failed` with the I/O
+error's kind. None names the episode, release, file, its times or an upstream's error text, `LOG_IDENTITY` or not:
+which episodes a household scans is its viewing history.
 
 ffmpeg is built from a checksummed source tarball (`FFMPEG_VERSION`/`FFMPEG_SHA256` in the Dockerfile);
 dependabot cannot bump it, so bump both lines by hand.

@@ -5,7 +5,8 @@
 //!      MAX_SESSIONS, MAX_SESSIONS_PER_INSTALL, MAX_ACTIVE_REMUXES, PRODUCER_IDLE_SECS, UPLINK_MBPS, SESSION_IDLE_SECS,
 //!      SCRATCH_DIR, SCRATCH_MAX_BYTES, FFMPEG_PATH, MAX_TRANSCODES, VAAPI_DEVICE, TRUSTED_PROXIES, WEB_ORIGINS,
 //!      METRICS_TOKEN, LOG_REQUESTS, LOG_IDENTITY,
-//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL, SEGMENTS_KEY, SEGMENTS_DAILY_CAP.
+//!      EDGE_SECRET, GUEST_MAX_SESSIONS, EDGE_REPORT_URL, SEGMENTS_KEY, SEGMENTS_READ_REQUIRE_AUTH,
+//!      SEGMENTS_DAILY_CAP.
 
 use std::env;
 use std::path::PathBuf;
@@ -98,6 +99,11 @@ pub struct Config {
     /// `X-Den-Segments-Key` (then `SCOUT_INSTALL_URL` is used). Unset, a scan is accepted only with a valid `scout`.
     /// Never logged.
     pub segments_key: Option<String>,
+    /// `SEGMENTS_READ_REQUIRE_AUTH` — off unless set (anything but empty or `0`). On, `GET /segments/<tt>/<s>/<e>`
+    /// answers only a caller presenting `X-Den-Segments-Read` (`auth::segments_read_token` of `SEGMENTS_KEY`); every
+    /// other read is the same 401, whatever the episode. Off, reads stay open for den-edge releases that do not
+    /// send the header yet. On with no `SEGMENTS_KEY`, no read is answered.
+    pub segments_read_require_auth: bool,
     /// `SEGMENTS_DAILY_CAP` — episodes fingerprinted per UTC day at most (default 300).
     pub segments_daily_cap: u32,
 }
@@ -320,6 +326,7 @@ impl Config {
                 .unwrap_or(2),
             edge_report_url: env_opt("EDGE_REPORT_URL").map(|u| u.trim_end_matches('/').to_string()),
             segments_key: env_opt("SEGMENTS_KEY"),
+            segments_read_require_auth: log_requests_on(get("SEGMENTS_READ_REQUIRE_AUTH").as_deref()),
             segments_daily_cap: env_opt("SEGMENTS_DAILY_CAP").and_then(|v| v.parse().ok()).unwrap_or(300),
         }
     }
