@@ -127,6 +127,9 @@ fn mask_body(s: &str) -> String {
     let s = Regex::new(r#""(generatedAt|expiresAt|observedAt)":"[^"]*""#)
         .unwrap()
         .replace_all(&s, "\"$1\":\"*\"");
+    // A source's measured wait is omitted when it rounds to 0 ms and present otherwise, so a slow runner
+    // adds the field. It is timing, not contract: drop it in both cases.
+    let s = Regex::new(r#","latencyMs":\d+"#).unwrap().replace_all(&s, "");
     s.into_owned()
 }
 
