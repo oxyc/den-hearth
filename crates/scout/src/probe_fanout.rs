@@ -119,11 +119,20 @@ pub(crate) fn apply_known_size(s: &mut RawStream, known: i64) {
 /// the episode's, and showing it as a plain "68 GB" states something false. SizeBytes becomes unknown
 /// (None) — which rank.go already treats as "don't know", earning no size bonus and never tripping a
 /// MaxSizeGB budget — rather than wrong, and PackSizeBytes keeps the number as what it actually is.
-pub(crate) fn hydrate_pack_only_sizes(streams: &mut [RawStream], sid: Option<&StreamId>) {
+pub(crate) fn hydrate_pack_only_sizes(
+    streams: &mut [RawStream],
+    sid: Option<&StreamId>,
+    known: &HashSet<usize>,
+) {
     let Some(sid) = sid.filter(|sid| sid.has_ep) else { return };
-    for s in streams.iter_mut() {
+    for (i, s) in streams.iter_mut().enumerate() {
         if s.size_bytes.is_none() || s.pack_size_bytes.is_some() {
             continue; // nothing to demote, or already named a pack by an earlier pass
+        }
+        let measured =
+            s.probe.as_ref().is_some_and(|p| p.size_bytes > 0) || s.size_only_probe || known.contains(&i);
+        if measured {
+            continue; // a probe or a store's file list read this file's own size, whatever the title names
         }
         if crate::season::unresolved_season_pack(&s.title, sid.season, sid.episode) {
             s.pack_size_bytes = s.size_bytes.take();
