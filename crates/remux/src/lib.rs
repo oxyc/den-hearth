@@ -18,7 +18,7 @@
 //!   POST /remux/s/<sid>/<sig>/end           → the same, `navigator.sendBeacon`-compatible (beacon is POST-only),
 //!                        for den-edge to call as the page goes away
 //!   POST /remux/segments/scan {imdb, season, episode} (X-Den-Segments-Key) → queue an intro/credits scan
-//!   GET  /remux/segments/<tt>/<season>/<episode> → what a scan found (`segments`)
+//!   GET  /remux/segments/<tt>/<season>/<episode> (X-Den-Segments-Read) → what a scan found (`segments`)
 //!   GET  /health, /metrics
 //!
 //! A release comes from den-scout — the full install the request names, which is its own credential; for a
@@ -417,7 +417,7 @@ where
         }
         _ => match (path.strip_prefix("/remux/s/"), path.strip_prefix("/remux/segments/")) {
             (Some(rest), _) => session_route(state, parts, rest, body).await,
-            (_, Some(rest)) if get => segments::get_route(state, rest).await,
+            (_, Some(rest)) if get => segments::get_route(state, &parts.headers, rest).await,
             _ => httputil::not_found(),
         },
     }
@@ -1188,7 +1188,7 @@ pub fn startup_line(state: &AppState) -> String {
         "den-remux {} listening on :{} — metrics={} log_requests={} scout_origins={} scout_key={} scout_install={} \
          browser_keys={} url_key={} trusted_proxies={} public_session_proxy={} \
          max_sessions={} per_install={} active_remuxes={} producer_idle={}s uplink={} session_idle={}s scratch={} \
-         scratch_max={} ffmpeg={} transcode={} segments={}",
+         scratch_max={} ffmpeg={} transcode={} segments={} segments_read={}",
         release_version(),
         state.cfg.port,
         on(state.cfg.metrics_token.is_some()),
@@ -1215,5 +1215,6 @@ pub fn startup_line(state: &AppState) -> String {
         } else {
             "off(ffmpeg)".to_string()
         },
+        if state.cfg.segments_read_require_auth { "auth" } else { "open" },
     )
 }

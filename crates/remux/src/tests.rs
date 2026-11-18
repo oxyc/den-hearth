@@ -1007,6 +1007,7 @@ fn test_config(origin: &str, max_sessions: usize, idle: Duration, scout_key: Opt
         guest_max_sessions: 2,
         edge_report_url: None,
         segments_key: None,
+        segments_read_require_auth: false,
         segments_daily_cap: 300,
     }
 }
@@ -4966,6 +4967,133 @@ async fn the_scan_route_wants_its_key_and_a_whole_episode() {
     }
     let r = scan(&state, SEGMENTS_KEY, r#"{"imdb":"tt0000020","season":1,"episode":33}"#).await;
     assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::SERVICE_UNAVAILABLE, "busy".into()));
+}
+
+/// The read credential is HMAC-SHA256(SEGMENTS_KEY, "den-remux/segments-read") in hex; den-edge's skipdb tests pin
+/// the same vector, so the two cannot drift apart unnoticed.
+#[test]
+fn the_segment_read_token_is_the_one_den_edge_sends() {
+    assert_eq!(
+        crate::auth::segments_read_token("test-segments-key"),
+        "c656ffe8a477c793b0dd5308f2aaf68aab202c2773a3c587d5fc42c478b205c3"
+    );
+}
+
+/// A state with one stored result (`tt0000030` S1E1), one pending scan (S1E2) and nothing for S1E3.
+async fn segments_with_results(require_auth: bool, key: Option<&str>) -> Arc<AppState> {
+    let mut cfg = test_config("http://127.0.0.1:9", 2, Duration::from_secs(600), Some(SCOUT_KEY));
+    cfg.segments_key = key.map(String::from);
+    cfg.segments_read_require_auth = require_auth;
+    let state = state_from(cfg);
+    state.segments_ffmpeg.store(true, Relaxed);
+    let stored = crate::segments::Stored {
+        imdb: "tt0000030".into(),
+        season: 1,
+        episode: 1,
+        duration: 2700.0,
+        intro: Some(crate::segments::Span { start: 60.0, end: 150.5 }),
+        credits: None,
+        method: "fingerprint-v3".into(),
+        scanned_at: 1_700_000_000,
+    };
+    let dir = state.cfg.scratch_dir.join("segments");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tt0000030-1-1.json"), serde_json::to_vec(&stored).unwrap()).unwrap();
+    let ep2 = crate::segments::Episode { imdb: "tt0000030".into(), season: 1, episode: 2 };
+    assert!(state.segments.enqueue(ep2, 300, None).is_some());
+    state
+}
+
+async fn read_segments(state: &Arc<AppState>, path: &str, credential: Option<&str>) -> Reply {
+    let headers: Vec<(&str, &str)> = credential.map(|c| ("x-den-segments-read", c)).into_iter().collect();
+    call_with(state, "GET", path, None, &headers, "").await
+}
+
+const STORED: &str = "/remux/segments/tt0000030/1/1";
+const PENDING: &str = "/remux/segments/tt0000030/1/2";
+const UNKNOWN: &str = "/remux/segments/tt0000030/1/3";
+
+/// With `SEGMENTS_READ_REQUIRE_AUTH` on, a read without den-edge's credential — none, a wrong one, the scan key itself,
+/// a token one character off — is the same 401 for a stored, a pending, an unknown and a malformed episode: status,
+/// headers and body alike, so nothing about which episodes this household asked for can be read off it.
+#[tokio::test]
+async fn a_required_segment_read_refuses_every_episode_alike_without_the_credential() {
+    let state = segments_with_results(true, Some(SEGMENTS_KEY)).await;
+    let token = crate::auth::segments_read_token(SEGMENTS_KEY);
+    let mut off_by_one = token.clone();
+    off_by_one.replace_range(..1, if token.starts_with('0') { "1" } else { "0" });
+    let mut refusals = Vec::new();
+    for path in [STORED, PENDING, UNKNOWN, "/remux/segments/../1/1", "/remux/segments/x"] {
+        for credential in [None, Some("wrong"), Some(SEGMENTS_KEY), Some(off_by_one.as_str()), Some("")] {
+            let r = read_segments(&state, path, credential).await;
+            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{path} {credential:?}");
+            assert_eq!(r.json(), serde_json::json!({"status": "unauthorized"}), "{path} {credential:?}");
+            refusals.push((r.headers, r.body));
+        }
+    }
+    // The scan route's header is not a read credential either.
+    let r = call_with(&state, "GET", STORED, None, &[("x-den-segments-key", SEGMENTS_KEY)], "").await;
+    refusals.push((r.headers, r.body));
+    assert!(refusals.windows(2).all(|w| w[0] == w[1]), "every refusal is byte-for-byte the same");
+
+    // The credential: each answer as it was, less `scanned_at`.
+    let r = read_segments(&state, STORED, Some(&token)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.json(),
+        serde_json::json!({
+            "duration": 2700.0, "intro": {"start": 60.0, "end": 150.5}, "credits": null, "method": "fingerprint-v3"
+        })
+    );
+    let r = read_segments(&state, PENDING, Some(&token)).await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "pending".into()));
+    let r = read_segments(&state, UNKNOWN, Some(&token)).await;
+    assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::NOT_FOUND, "unknown".into()));
+
+    // Required with no SEGMENTS_KEY configured: no credential can be right.
+    let keyless = segments_with_results(true, None).await;
+    assert_eq!(read_segments(&keyless, STORED, Some(&token)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(read_segments(&keyless, STORED, Some("")).await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// Off (the default, while older den-edge releases send no credential), reads answer as they did whatever is sent —
+/// only `scanned_at` is gone.
+#[tokio::test]
+async fn an_unrequired_segment_read_answers_with_or_without_a_credential() {
+    let state = segments_with_results(false, Some(SEGMENTS_KEY)).await;
+    let token = crate::auth::segments_read_token(SEGMENTS_KEY);
+    for credential in [None, Some("wrong"), Some(token.as_str())] {
+        let r = read_segments(&state, STORED, credential).await;
+        assert_eq!(r.status, StatusCode::OK, "{credential:?}");
+        assert!(r.json().get("scanned_at").is_none(), "{}", r.text());
+        assert_eq!(r.json()["intro"]["start"], 60.0);
+        let r = read_segments(&state, PENDING, credential).await;
+        assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::ACCEPTED, "pending".into()));
+        let r = read_segments(&state, UNKNOWN, credential).await;
+        assert_eq!((r.status, r.json()["status"].clone()), (StatusCode::NOT_FOUND, "unknown".into()));
+    }
+    assert!(!crate::startup_line(&state).contains("segments_read=auth"));
+    let required = segments_with_results(true, Some(SEGMENTS_KEY)).await;
+    assert!(
+        crate::startup_line(&required).contains(" segments_read=auth"),
+        "{}",
+        crate::startup_line(&required)
+    );
+}
+
+#[test]
+fn segment_reads_are_required_only_when_the_flag_is_set() {
+    let cfg = |v: Option<&str>| {
+        let v = v.map(str::to_owned);
+        crate::config::Config::from_lookup(move |k| {
+            (k == "SEGMENTS_READ_REQUIRE_AUTH").then(|| v.clone()).flatten()
+        })
+        .segments_read_require_auth
+    };
+    assert!(!cfg(None));
+    assert!(!cfg(Some("")));
+    assert!(!cfg(Some("0")));
+    assert!(cfg(Some("1")));
 }
 
 #[tokio::test]
