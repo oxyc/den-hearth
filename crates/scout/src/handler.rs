@@ -1149,8 +1149,8 @@ impl Handler {
         config: &Config,
         streams: &mut [RawStream],
         sid: Option<&StreamId>,
-    ) {
-        self.inner.hydrate_known_sizes(config, streams, sid);
+    ) -> HashSet<usize> {
+        self.inner.hydrate_known_sizes(config, streams, sid)
     }
 
     /// Go `probeTop`.

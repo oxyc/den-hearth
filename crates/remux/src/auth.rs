@@ -101,6 +101,21 @@ pub fn record_key(key: &[u8]) -> [u8; 32] {
     mac(key, "den-remux/session-record", &[])
 }
 
+/// What den-edge presents as `X-Den-Segments-Read` to read a segment result: HMAC-SHA256 of `SEGMENTS_KEY` under its
+/// own domain, in lowercase hex. A read credential seen on the wire is not the key, so it cannot ask for a scan, and
+/// the key itself never travels on a read.
+pub fn segments_read_token(segments_key: &str) -> String {
+    hex(&mac(segments_key.as_bytes(), "den-remux/segments-read", &[]))
+}
+
+/// Is `presented` the read token for `segments_key`? Constant-time; false when there is no key.
+pub fn segments_read_ok(segments_key: Option<&str>, presented: Option<&[u8]>) -> bool {
+    match (segments_key, presented) {
+        (Some(key), Some(p)) => segments_read_token(key).as_bytes().ct_eq(p).into(),
+        _ => false,
+    }
+}
+
 /// A browser's id: the first 8 bytes of its key hash. Stable across logins, names nothing secret, and
 /// stops matching the moment that hash is removed from `BROWSER_KEY_HASHES`.
 pub fn browser_id(hash: &[u8; 32]) -> String {

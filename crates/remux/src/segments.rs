@@ -3,8 +3,13 @@
 //!
 //!   POST /remux/segments/scan {imdb, season, episode, scout?}   X-Den-Segments-Key, or a valid `scout` install
 //!        → 202 {status: queued|running|done|none} | 503 {status: busy} | 422 {status: no_install}
-//!   GET  /remux/segments/<tt>/<season>/<episode>
-//!        → 200 {duration, intro, credits, method, scanned_at} | 202 {status: pending} | 404 {status: unknown}
+//!   GET  /remux/segments/<tt>/<season>/<episode>                X-Den-Segments-Read (`SEGMENTS_READ_REQUIRE_AUTH`)
+//!        → 200 {duration, intro, credits, method} | 202 {status: pending} | 404 {status: unknown}
+//!        | 401 {status: unauthorized}
+//!
+//! Which episodes this household asked about, and whether and when they were scanned, is viewing history, so neither
+//! a read nor a log line gives it away. A read without the credential is refused before the episode is looked at;
+//! every log line here says what happened and roughly what it cost, never which episode, release or file.
 //!
 //! A scan resolves the episode through the scout install the request brought (held in memory, never stored or
 //! logged), else this service's own (`SCOUT_INSTALL_URL`), takes the smallest
@@ -428,8 +433,9 @@ async fn write_json<T: Serialize>(path: &Path, value: &T) {
         tokio::fs::rename(&tmp, path).await
     };
     if let Err(e) = written.await {
+        // The path names the episode; the error's kind is enough to act on.
         crate::log_limited("segments_write", || {
-            format!("segments: {} could not be written: {e}", path.display())
+            logged(format!("segments: event=write outcome=failed reason={:?}", e.kind()))
         });
     }
 }
@@ -680,16 +686,8 @@ pub async fn worker(st: Arc<AppState>) {
         let base = install.clone().or_else(|| st.cfg.scout_install_url.clone());
         match scan(&st, &ep, base).await {
             Some(hold) => {
-                eprintln!(
-                    "segments: {} held: {} is being played, for up to {:.0}s more",
-                    who(&st, &ep),
-                    who(&st, &hold.playing),
-                    st.segments
-                        .lock()
-                        .ready_at(&hold)
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .as_secs_f64(),
-                );
+                // Neither episode, nor how long the play has left (the played episode's runtime).
+                log("segments: event=scan outcome=held reason=playing".into());
                 st.segments.defer(ep, install, hold);
             }
             None => st.segments.release(&ep),
@@ -718,12 +716,13 @@ enum Failure {
     Budget,
     /// A viewer is playing it: nothing was read past the release's head.
     Held(Hold),
-    Failed(String),
+    /// One of a fixed set of reasons, for the log: a free-form error (scout's, ffmpeg's) can name the title, the
+    /// release or a URL.
+    Failed(&'static str),
 }
 
 /// What one episode's fingerprinting cost, for its log line.
 struct Cost {
-    release: String,
     bytes: u64,
     wall: Duration,
 }
@@ -736,7 +735,7 @@ async fn scan(st: &Arc<AppState>, ep: &Episode, base: Option<String>) -> Option<
         return None;
     }
     let Some(base) = base else {
-        eprintln!("segments: {} result=failed (no scout install)", who(st, ep));
+        log("segments: event=scan outcome=failed reason=no_install".into());
         return None;
     };
     let base = base.as_str();
@@ -799,29 +798,56 @@ async fn fingerprint_logged(st: &Arc<AppState>, ep: &Episode, base: &str) -> Res
     let started = Instant::now();
     let got = match tokio::time::timeout(SCAN_TIMEOUT, fingerprint(st, ep, base)).await {
         Ok(got) => got,
-        Err(_) => Err(Failure::Failed(format!("timed out after {}s", SCAN_TIMEOUT.as_secs()))),
+        Err(_) => Err(Failure::Failed("timeout")),
     };
     if let Err(f) = &got {
-        let why = match f {
+        let reason = match f {
             Failure::Held(_) => return got,
-            Failure::NoRelease => "no cached release".to_string(),
-            Failure::Budget => format!("today's budget of {} is spent", st.cfg.segments_daily_cap),
-            Failure::Failed(why) => why.clone(),
+            Failure::NoRelease => "no_release",
+            Failure::Budget => "budget",
+            Failure::Failed(reason) => reason,
         };
-        eprintln!(
-            "segments: {} wall={:.1}s result=failed ({why})",
-            who(st, ep),
-            started.elapsed().as_secs_f64()
-        );
+        log(format!(
+            "segments: event=scan outcome=failed reason={reason} wall={}",
+            wall_bucket(started.elapsed())
+        ));
     }
     got
 }
 
-/// The episode as the log may name it: its id, unless `LOG_IDENTITY` is off.
-fn who(st: &AppState, ep: &Episode) -> String {
-    match st.cfg.log_identity {
-        true => ep.id(),
-        false => "<episode>".into(),
+/// One segment log line, to stderr. Every line here is built from fixed words and coarse buckets only — no episode,
+/// release, file, time inside the episode or upstream error text, whatever `LOG_IDENTITY` says: which episodes a
+/// household scans is its viewing history, and the scan needs only its outcome and cost on record.
+fn log(line: String) {
+    eprintln!("{}", logged(line));
+}
+
+/// `line`, noted for the tests that read what this module logs.
+fn logged(line: String) -> String {
+    #[cfg(test)]
+    tests::LOGGED.with(|l| l.borrow_mut().push(line.clone()));
+    line
+}
+
+/// Bytes read, to the nearest bucket: enough to see what a scan costs the debrid, not which release it read.
+fn read_bucket(bytes: u64) -> &'static str {
+    match bytes / 1_000_000 {
+        0..100 => "<100MB",
+        100..500 => "<500MB",
+        500..1000 => "<1GB",
+        1000..2000 => "<2GB",
+        _ => ">=2GB",
+    }
+}
+
+/// Wall time, to the nearest bucket.
+fn wall_bucket(wall: Duration) -> &'static str {
+    match wall.as_secs() {
+        0..10 => "<10s",
+        10..30 => "<30s",
+        30..60 => "<60s",
+        60..120 => "<120s",
+        _ => ">=120s",
     }
 }
 
@@ -844,16 +870,14 @@ async fn save(st: &AppState, ep: &Episode, p: &Prints, found: Found, cost: &Cost
     if old.as_ref().is_none_or(|o| !current(o) || o.intro != result.intro || o.credits != result.credits) {
         write_json(&episode_path(scratch, ep), &result).await;
     }
-    let span = |s: Option<Span>| s.map_or("none".to_string(), |s| format!("{:.1}-{:.1}", s.start, s.end));
-    eprintln!(
-        "segments: {} release={} read={:.1}MB wall={:.1}s result=intro:{} credits:{}",
-        who(st, ep),
-        cost.release,
-        cost.bytes as f64 / 1e6,
-        cost.wall.as_secs_f64(),
-        span(result.intro),
-        span(result.credits),
-    );
+    let found = |s: Option<Span>| if s.is_some() { "found" } else { "none" };
+    log(format!(
+        "segments: event=scan outcome=done intro={} credits={} read={} wall={}",
+        found(result.intro),
+        found(result.credits),
+        read_bucket(cost.bytes),
+        wall_bucket(cost.wall),
+    ));
 }
 
 /// The releases to read, cheapest first: cached, in a container the probe opens with an index of its own — Matroska or
@@ -883,13 +907,10 @@ const OPEN_MAX: usize = 3;
 
 async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Prints, Cost), Failure> {
     let started = Instant::now();
-    let base = base.to_string();
-    let secrets = [base.clone()];
-    let scrub = |text: &str| crate::redact::scrub(text, &[secrets[0].as_str()]);
-    let src = crate::scout::ScoutSource { base, key: st.cfg.scout_key.clone() };
+    let src = crate::scout::ScoutSource { base: base.to_string(), key: st.cfg.scout_key.clone() };
     let list = crate::scout::list(st.scout_via(), &src, &ep.id(), None, false)
         .await
-        .map_err(|e| Failure::Failed(format!("scout: {}", scrub(&e.detail))))?;
+        .map_err(|_| Failure::Failed("scout"))?;
     let picks = cheapest(&list);
     if picks.is_empty() {
         return Err(Failure::NoRelease);
@@ -897,13 +918,14 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
     if !st.segments.spend(st.cfg.segments_daily_cap) {
         return Err(Failure::Budget);
     }
-    let mut why = String::new();
+    // The last release's reason, as the log said before; the text of the error is not kept (see `Failure`).
+    let mut reason = "open";
     for s in picks.into_iter().take(OPEN_MAX) {
         let opened = open(st, &src, s).await;
         let (resolved, duration, size) = match opened {
             Ok(o) => o,
-            Err(e) => {
-                why = scrub(&e);
+            Err(_) => {
+                reason = "open";
                 continue;
             }
         };
@@ -914,7 +936,7 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
         }
         let door = st.doors.open(resolved.client.clone(), &resolved.url, &resolved.head, size);
         let Some(input) = st.doors.url(&door) else {
-            return Err(Failure::Failed("no loopback door".into()));
+            return Err(Failure::Failed("no_door"));
         };
         let start = credits_start(duration);
         let windows = async {
@@ -923,20 +945,15 @@ async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Pr
         };
         let (intro, credits) = match windows.await {
             Ok(w) => w,
-            Err(e) => {
-                why = scrub(&e);
+            Err(_) => {
+                reason = "decode";
                 continue;
             }
         };
-        let res = s.attributes.resolution.as_deref().unwrap_or("?");
-        let cost = Cost {
-            release: format!("{res}/{:.2}GB", size as f64 / 1e9),
-            bytes: resolved.head.len() as u64 + door.bytes_read(),
-            wall: started.elapsed(),
-        };
+        let cost = Cost { bytes: resolved.head.len() as u64 + door.bytes_read(), wall: started.elapsed() };
         return Ok((Prints { duration, intro, credits, credits_start: start }, cost));
     }
-    Err(Failure::Failed(why))
+    Err(Failure::Failed(reason))
 }
 
 /// Follow a release's play URL and learn its duration, from the probe cache when a session already probed it.
@@ -1243,8 +1260,23 @@ pub async fn scan_route(
     status(StatusCode::ACCEPTED, answer)
 }
 
-/// `GET /segments/<tt>/<season>/<episode>`: what a scan found. Public: times are no secret, and no install is needed.
-pub async fn get_route(st: &AppState, rest: &str) -> Response<Body> {
+/// `GET /segments/<tt>/<season>/<episode>`: what a scan found. The times are no secret, but which episodes have
+/// an answer, or one on the way, is what this household watches: with `SEGMENTS_READ_REQUIRE_AUTH` on, only den-edge
+/// (`X-Den-Segments-Read`) is answered.
+///
+/// Every other read gets one 401, decided before the path is parsed or memory or disk is looked at, so its status,
+/// body and timing are the same for every episode, real or not: nothing to enumerate. It is not the 404 an unknown
+/// episode gets because den-edge asks for a scan of an unknown episode; a refusal it can tell apart is one it can
+/// treat as "unavailable" instead, and an operator sees a key mismatch as one rather than as endless misses.
+pub async fn get_route(st: &AppState, headers: &hyper::HeaderMap, rest: &str) -> Response<Body> {
+    if st.cfg.segments_read_require_auth
+        && !crate::auth::segments_read_ok(
+            st.cfg.segments_key.as_deref(),
+            headers.get("x-den-segments-read").map(|v| v.as_bytes()),
+        )
+    {
+        return status(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
     let mut it = rest.split('/');
     let parsed =
         match (it.next(), it.next().map(str::parse::<u32>), it.next().map(str::parse::<u32>), it.next()) {
@@ -1265,7 +1297,6 @@ pub async fn get_route(st: &AppState, rest: &str) -> Response<Body> {
                 "intro": s.intro,
                 "credits": s.credits,
                 "method": s.method,
-                "scanned_at": s.scanned_at,
             }),
             &[],
         ),
@@ -1276,6 +1307,115 @@ pub async fn get_route(st: &AppState, rest: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Every line `log` wrote on this thread; each `#[tokio::test]` runs on a thread of its own.
+        pub(super) static LOGGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn take_logged() -> Vec<String> {
+        LOGGED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// What must never reach a segment log line: the episode (its id, its number), the release, the install, the
+    /// file a result is kept in, and the exact times and costs a scan saw.
+    const SENTINELS: &[&str] = &[
+        "tt7777777",
+        "7777777",
+        ":13:42",
+        "SENTINEL",
+        "segments/",
+        "1234.5",
+        "1299.2",
+        "2345.6",
+        "777",
+        "77.0",
+    ];
+
+    fn sentinel_state(scratch: &Path, identity: Option<&str>) -> Arc<AppState> {
+        let scratch = scratch.to_string_lossy().into_owned();
+        let identity = identity.map(str::to_owned);
+        AppState::new(crate::config::Config::from_lookup(move |key| match key {
+            "SCRATCH_DIR" => Some(scratch.clone()),
+            "LOG_IDENTITY" => identity.clone(),
+            "REMUX_URL_KEY" => Some("test-url-key".into()),
+            _ => None,
+        }))
+    }
+
+    fn assert_clean(lines: &[String], want: &[&str]) {
+        assert_eq!(lines.len(), want.len(), "{lines:#?}");
+        for (line, want) in lines.iter().zip(want) {
+            assert!(line.starts_with(want), "{line:?} is not {want:?}…");
+            for s in SENTINELS {
+                assert!(!line.contains(s), "{s:?} reached the log: {line}");
+            }
+        }
+    }
+
+    /// The scan's failure, completion and write-failure lines, through the real paths, with every identifying value a
+    /// sentinel: none of them is logged, with `LOG_IDENTITY` at its default (on) or off.
+    #[tokio::test]
+    async fn segment_log_lines_name_no_episode_release_file_or_exact_time() {
+        for identity in [None, Some("1"), Some("0")] {
+            let tag = identity.unwrap_or("unset");
+            let scratch = std::env::temp_dir().join(format!("den-remux-seglog-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&scratch);
+            std::fs::create_dir_all(&scratch).unwrap();
+            let st = sentinel_state(&scratch, identity);
+            let ep = Episode { imdb: "tt7777777".into(), season: 13, episode: 42 };
+            take_logged();
+
+            assert!(scan(&st, &ep, None).await.is_none());
+            // Scout cannot be reached: its error (which names the install URL) stays out of the line.
+            assert!(scan(&st, &ep, Some("http://127.0.0.1:9/SENTINEL-install".into())).await.is_none());
+            let prints = Prints { duration: 2345.678, ..Prints::default() };
+            let found = Found { intro: Some(Span { start: 1234.567, end: 1299.25 }), credits: None };
+            let cost = Cost { bytes: 777_000_000, wall: Duration::from_secs_f64(77.0) };
+            save(&st, &ep, &prints, found, &cost).await;
+            assert_clean(
+                &take_logged(),
+                &[
+                    "segments: event=scan outcome=failed reason=no_install",
+                    "segments: event=scan outcome=failed reason=scout wall=<10s",
+                    "segments: event=scan outcome=done intro=found credits=none read=<1GB wall=<120s",
+                ],
+            );
+            // The result is still kept whole: the log lost the identity, not the store.
+            let kept = stored(&scratch, &ep).await.expect("the result was written");
+            assert_eq!(kept.intro, found.intro);
+            std::fs::remove_dir_all(&scratch).unwrap();
+        }
+
+        // A result that cannot be written: the path (named for the episode) is not in the line, the error's kind is.
+        let blocked =
+            std::env::temp_dir().join(format!("den-remux-seglog-{}-SENTINEL-file", std::process::id()));
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let st = sentinel_state(&blocked, Some("1"));
+        let ep = Episode { imdb: "tt7777777".into(), season: 13, episode: 42 };
+        take_logged();
+        let cost = Cost { bytes: 1, wall: Duration::ZERO };
+        save(&st, &ep, &Prints { duration: 2345.678, ..Prints::default() }, Found::default(), &cost).await;
+        let lines = take_logged();
+        assert!(lines[0].starts_with("segments: event=write outcome=failed reason="), "{lines:#?}");
+        assert_clean(
+            &lines,
+            &[
+                "segments: event=write outcome=failed reason=",
+                "segments: event=scan outcome=done intro=none credits=none read=<100MB wall=<10s",
+            ],
+        );
+        std::fs::remove_file(&blocked).unwrap();
+    }
+
+    #[test]
+    fn cost_buckets_are_coarse() {
+        assert_eq!(read_bucket(0), "<100MB");
+        assert_eq!(read_bucket(1_118_000_000), "<2GB");
+        assert_eq!(read_bucket(5_000_000_000), ">=2GB");
+        assert_eq!(wall_bucket(Duration::from_secs(148)), ">=120s");
+        assert_eq!(wall_bucket(Duration::from_millis(9_999)), "<10s");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

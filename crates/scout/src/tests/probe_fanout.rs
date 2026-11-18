@@ -4,7 +4,7 @@
 //! Go's do on a `*handler`. The probe runs behind the response on a background task, so those are async tests on a
 //! current-thread runtime: the task makes progress whenever the test awaits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -209,7 +209,7 @@ fn hydrate_pack_only_sizes_never_opened_pack_loses_its_size_as_an_episodes() {
         ..Default::default()
     }];
 
-    hydrate_pack_only_sizes(&mut streams, Some(&sid));
+    hydrate_pack_only_sizes(&mut streams, Some(&sid), &HashSet::new());
 
     assert!(
         streams[0].size_bytes.is_none(),
@@ -236,7 +236,7 @@ fn hydrate_pack_only_sizes_a_plain_episode_file_is_left_alone() {
         ..Default::default()
     }];
 
-    hydrate_pack_only_sizes(&mut streams, Some(&sid));
+    hydrate_pack_only_sizes(&mut streams, Some(&sid), &HashSet::new());
 
     assert_eq!(
         streams[0].size_bytes,
@@ -261,7 +261,7 @@ fn hydrate_pack_only_sizes_movie_is_skipped() {
         ..Default::default()
     }];
 
-    hydrate_pack_only_sizes(&mut streams, Some(&sid_movie()));
+    hydrate_pack_only_sizes(&mut streams, Some(&sid_movie()), &HashSet::new());
 
     assert_eq!(
         streams[0].size_bytes,
@@ -269,6 +269,103 @@ fn hydrate_pack_only_sizes_movie_is_skipped() {
         "SizeBytes changed for a movie: {:?}",
         streams[0].size_bytes
     );
+}
+
+// The three size passes in the order the list build runs them, over a season-named release whose indexer gave
+// no size (or one within 1.3x of the measured file): a size a probe or a store's file list measured is the
+// episode's own, so it stays `sizeBytes` and no `packSizeBytes` is invented from it.
+const SEASON_TITLE: &str = "Fauda.S01.COMPLETE.1080p.NF.WEB-DL";
+const EPISODE_SIZE: i64 = 1_136_580_921;
+
+async fn run_size_passes(
+    cache: Arc<dyn Cache>,
+    sid: &StreamId,
+    mut streams: Vec<RawStream>,
+) -> Vec<RawStream> {
+    let h = new_handler(test_deps({
+        let cache = cache.clone();
+        move |d| {
+            d.cache = cache.clone();
+            d.make_stores = torbox_stores("t", &cache);
+        }
+    }));
+    h.hydrate_probe_facts(&mut streams, Some(sid));
+    let known = h.hydrate_known_sizes(&Config::default(), &mut streams, Some(sid));
+    hydrate_pack_only_sizes(&mut streams, Some(sid), &known);
+    streams
+}
+
+fn season_named(size: Option<i64>) -> RawStream {
+    RawStream { info_hash: H.into(), title: SEASON_TITLE.into(), size_bytes: size, ..Default::default() }
+}
+
+#[tokio::test]
+async fn hydrate_pack_only_sizes_keeps_a_probe_measured_size() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let sid = sid_series(1, 3);
+    cache.put(
+        &probe_cache_key(&season_named(None), Some(&sid)),
+        &format!(r#"{{"sizeBytes":{EPISODE_SIZE}}}"#),
+        PROBE_TTL,
+    );
+    let got = run_size_passes(cache, &sid, vec![season_named(None)]).await;
+    assert!(got[0].probe.is_some(), "the full probe fact was not hydrated");
+    assert_eq!(got[0].size_bytes, Some(EPISODE_SIZE));
+    assert_eq!(got[0].pack_size_bytes, None);
+}
+
+#[tokio::test]
+async fn hydrate_pack_only_sizes_keeps_a_size_only_probe_size() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let sid = sid_series(1, 3);
+    cache.put(
+        &probe_cache_key(&season_named(None), Some(&sid)),
+        &crate::probe::ProbeFact::SizeOnly(EPISODE_SIZE).to_cache(),
+        PROBE_TTL,
+    );
+    let got = run_size_passes(cache, &sid, vec![season_named(None)]).await;
+    assert!(got[0].size_only_probe, "the size-only fact was not hydrated");
+    assert_eq!(got[0].size_bytes, Some(EPISODE_SIZE));
+    assert_eq!(got[0].pack_size_bytes, None);
+}
+
+#[tokio::test]
+async fn hydrate_pack_only_sizes_keeps_a_store_file_list_size() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let sid = sid_series(1, 3);
+    cache.put(
+        &resolve_key("t", H),
+        &format!(r#"{{"torrentId":9,"files":[{{"Index":0,"Name":"Fauda.S01E03.WEB-DL.1080p.mkv","SizeBytes":{EPISODE_SIZE}}}]}}"#),
+        RESOLVE_CACHE_TTL,
+    );
+    let got = run_size_passes(cache, &sid, vec![season_named(None)]).await;
+    assert_eq!(got[0].size_bytes, Some(EPISODE_SIZE));
+    assert_eq!(got[0].pack_size_bytes, None);
+}
+
+// An indexer number within 1.3x of the measured file is no pack: the measured size stays the episode's.
+#[tokio::test]
+async fn hydrate_pack_only_sizes_keeps_measured_size_beside_a_close_indexer_size() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let sid = sid_series(1, 3);
+    cache.put(
+        &probe_cache_key(&season_named(None), Some(&sid)),
+        &format!(r#"{{"sizeBytes":{EPISODE_SIZE}}}"#),
+        PROBE_TTL,
+    );
+    let got = run_size_passes(cache, &sid, vec![season_named(Some(EPISODE_SIZE + 50_000_000))]).await;
+    assert_eq!(got[0].size_bytes, Some(EPISODE_SIZE));
+    assert_eq!(got[0].pack_size_bytes, None);
+}
+
+// Nothing measured it, so a season-named release still has its number demoted to the pack's.
+#[tokio::test]
+async fn hydrate_pack_only_sizes_still_demotes_an_unprobed_season_release() {
+    let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new(1 << 20));
+    let sid = sid_series(1, 3);
+    let got = run_size_passes(cache, &sid, vec![season_named(Some(68 << 30))]).await;
+    assert_eq!(got[0].size_bytes, None);
+    assert_eq!(got[0].pack_size_bytes, Some(68 << 30));
 }
 
 // The frontier is decision-directed: it carries the current winner and what could displace it, never more
