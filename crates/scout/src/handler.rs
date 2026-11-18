@@ -56,13 +56,15 @@ use crate::managed_hls::{ManagedHlsError, ManagedHlsRelease, ManagedHlsRequest, 
 use crate::metrics::{cache_persistent_gauge, metrics};
 use crate::play::{decode_play_token, encode_play_token, PlayTarget};
 use crate::playwarm::play_pending_key;
+use crate::probe::Probe;
 use crate::probe_fanout::{
-    browser_probe_candidates, hydrate_pack_only_sizes, hydrate_probe_facts, select_probe_jobs, ProbeJob,
-    PROBE_BUDGET, PROBE_TOP_N, PROBE_TTL,
+    browser_probe_candidates, hydrate_pack_only_sizes, hydrate_probe_facts, select_probe_jobs,
+    select_size_recovery_jobs, size_recovery_candidates, ProbeJob, SizeRecovery, PROBE_BUDGET, PROBE_TOP_N,
+    PROBE_TTL,
 };
 use crate::rank::{
     cap_seeds, rank_streams_debug, real_debrid_blocked, seed_cap_order, title_tokens, RankDebug, RankFilters,
-    RawStream,
+    RawStream, GIB,
 };
 use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;
@@ -840,6 +842,8 @@ pub(crate) struct RankedList {
     pub(crate) timing: String,
     /// Some source was left `late` (an early answer the request asked for).
     pub(crate) answered_early: bool,
+    /// Releases MaxSizeGB dropped on an unconfirmed size, to be probed (`size_recovery_candidates`).
+    pub(crate) size_recovery: Vec<RawStream>,
 }
 
 /// Where a stream list lives: the config segment and title the request named, the origin its play URLs name, and
@@ -1158,7 +1162,7 @@ impl Handler {
         truth: &CacheTruth,
     ) -> bool {
         self.inner.hydrate_probe_facts(streams, sid);
-        self.inner.probe_top_for_client(config, streams, sid, truth, None)
+        self.inner.probe_top_for_client(config, streams, sid, truth, None, None)
     }
 
     /// Go `probeBehind`.

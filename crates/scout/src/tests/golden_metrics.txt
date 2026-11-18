@@ -40,6 +40,13 @@ scout_late_diagnostic_candidates_total{result="cache_checked"} 0
 # TYPE scout_probe_cache_total counter
 scout_probe_cache_total{result="hit"} 0
 scout_probe_cache_total{result="miss"} 0
+# HELP scout_size_recovery_probes_total Probes of episode releases MaxSizeGB dropped on an unconfirmed size, by outcome.
+# TYPE scout_size_recovery_probes_total counter
+scout_size_recovery_probes_total{result="queued"} 0
+scout_size_recovery_probes_total{result="fits"} 0
+scout_size_recovery_probes_total{result="oversized"} 0
+scout_size_recovery_probes_total{result="unknown"} 0
+scout_size_recovery_probes_total{result="failed"} 0
 # HELP scout_background_panics_total Panics recovered on a background goroutine (probe fan-out, stale list rebuild, account listing fetch).
 # TYPE scout_background_panics_total counter
 scout_background_panics_total 0
