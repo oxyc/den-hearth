@@ -403,6 +403,28 @@ pub(crate) fn over(max_bitrate: Option<u64>, need: Option<Need>) -> bool {
     max_bitrate.zip(need).is_some_and(|(max, need)| need.bitrate as f64 > max as f64 * LINK_HEADROOM)
 }
 
+/// Whether a copy that sends at least `bytes` over `duration` seconds, played from `start_at`, is sure to be one
+/// selection only takes once nothing else plays: known from a size and a runtime, before the release is opened. A
+/// copy plays as it is where its `need` is within `LINK_HEADROOM` of `max_bitrate`, or where its `prebuffer` at that
+/// rate is within `countdown` (`MAX_PREBUFFER` or more). Both end with the whole film: `needed_rate` asks at least all
+/// of its bits over `MAX_PREBUFFER` plus the runtime, and `startup_delay` waits at least all of them at the link's rate
+/// less the runtime. So a release whose average is past the link even after `countdown` fails both, whatever its peaks
+/// — peaks only make `need` larger. A bit a second is added to the link for `need`'s rounding. From the start only:
+/// what a resume sends is the rest of the file, which its size alone doesn't tell.
+pub(super) fn beyond_link_by_size(
+    bytes: u64,
+    duration: f64,
+    start_at: f64,
+    max_bitrate: Option<u64>,
+    countdown: f64,
+) -> bool {
+    let Some(link) = max_bitrate else { return false };
+    duration > 0.0
+        && effective_start(start_at, duration) == 0.0
+        && bytes as f64 * 8.0
+            > (link as f64 * LINK_HEADROOM + 1.0) * (duration + countdown.max(MAX_PREBUFFER))
+}
+
 /// How many times the player's link a source may need and still be converted from. A conversion shrinks what the
 /// player downloads, not what the box reads: the whole source comes in at its own rate, in real time, from a debrid
 /// that delivers a fraction of a gigabit (about 13 Mbit/s measured on an uncached TorBox). A 4x margin keeps the

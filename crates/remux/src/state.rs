@@ -290,6 +290,15 @@ impl ProbeCache {
         self.generation += 1;
     }
 
+    /// The duration and video bytes of the one remembered file of exactly `size` bytes; `None` where there is none, or
+    /// more than one.
+    pub fn of_size(&self, size: u64) -> Option<(f64, Option<u64>)> {
+        let prefix = format!("{size}:");
+        let mut matching = self.entries.iter().filter(|(k, _)| k.starts_with(&prefix));
+        let (_, info) = matching.next()?;
+        matching.next().is_none().then_some((info.duration, info.video_bytes))
+    }
+
     fn to_json(&self) -> Vec<u8> {
         let file = StoredProbeFile {
             schema: PROBE_SCHEMA,
@@ -854,6 +863,11 @@ impl AppState {
 
     pub fn probe(&self, key: &str) -> Option<MediaInfo> {
         self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).get(key)
+    }
+
+    /// `ProbeCache::of_size`: what a remembered probe says of the file of exactly `size` bytes, before it is opened.
+    pub fn probe_of_size(&self, size: u64) -> Option<(f64, Option<u64>)> {
+        self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()).of_size(size)
     }
 
     pub fn remember_probe(self: &Arc<Self>, key: String, info: &MediaInfo) {
@@ -1782,6 +1796,20 @@ mod tests {
         assert_eq!(hit.keyframes, info.keyframes);
         assert_eq!(hit.audio, info.audio);
         assert!(restored.get("another-size-or-head").is_none());
+    }
+
+    #[test]
+    fn a_remembered_probe_is_found_by_its_size_only_where_one_file_has_it() {
+        let (_, mut info) = opened("https://debrid/sized");
+        info.duration = 6.0;
+        info.video_bytes = Some(900);
+        let mut cache = ProbeCache::default();
+        cache.put(probe_key(Some(1000), b"one").unwrap(), &info);
+        cache.put(probe_key(Some(10_000), b"other").unwrap(), &info);
+        assert_eq!(cache.of_size(1000), Some((6.0, Some(900))));
+        assert_eq!(cache.of_size(100), None, "1000 starts with 100: the size is matched whole");
+        cache.put(probe_key(Some(1000), b"another file of that size").unwrap(), &info);
+        assert_eq!(cache.of_size(1000), None, "two files of one size: neither is taken for it");
     }
 
     #[test]

@@ -2829,6 +2829,73 @@ mod tests {
         );
     }
 
+    /// What `beyond_link_by_size` rules out unopened, the full check refuses too: over the link within twenty seconds,
+    /// and no head start within the countdown — for files of every shape, from even to all peaks, on links all round
+    /// their averages, in each player. Files right at the bound are judged by their opening instead.
+    #[test]
+    fn what_size_rules_out_the_byte_index_refuses_too() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut ruled_out, mut opened_and_refused) = (0, 0);
+        for duration in [600.0, 3600.0, 8179.0] {
+            for spread in [0.0, 1.0, 4.0, 20.0] {
+                let keyframes: Vec<f64> = (0..(duration / 2.0) as usize).map(|i| i as f64 * 2.0).collect();
+                let mut at = 0u64;
+                let byte_index: Vec<(f64, u64)> = keyframes
+                    .iter()
+                    .map(|&t| {
+                        let here = (t, at);
+                        // 2 s at 10 Mbit/s, scaled by up to `spread` times either way.
+                        at += (2.5e6 * (1.0 + spread * random()) / (1.0 + spread * random())) as u64;
+                        here
+                    })
+                    .collect();
+                let info = crate::probe::MediaInfo {
+                    duration,
+                    keyframes,
+                    byte_index,
+                    ..info(VideoCodec::H264, "avc1.640028", false)
+                };
+                let size = at;
+                let average = average_bitrate(Some(size), duration).unwrap();
+                for player in [None, Some("hls.js"), Some("cast")] {
+                    let countdown = if player == Some("cast") { MAX_PREBUFFER } else { LONG_PREBUFFER };
+                    let d = delivery(size, 0.0, player);
+                    for share in [0.3, 0.6, 0.9, 1.0, 1.1, 1.2, 1.25, 1.3, 1.5, 2.0] {
+                        let link = (average as f64 * share) as u64;
+                        let usable = (link as f64 * LINK_HEADROOM) as u64;
+                        let refused = over(Some(link), need(&info, &d))
+                            && prebuffer(&info, &d, Some(usable)).is_none_or(|w| w > countdown);
+                        if beyond_link_by_size(size, duration, 0.0, Some(link), countdown) {
+                            assert!(
+                                refused,
+                                "{duration}s, spread {spread}, {player:?}, link {share} of the average"
+                            );
+                            ruled_out += 1;
+                        } else if refused {
+                            opened_and_refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            ruled_out > 100 && opened_and_refused > 20,
+            "{ruled_out} ruled out, {opened_and_refused} opened"
+        );
+        // Only from the start, only with a link and a runtime.
+        assert!(beyond_link_by_size(10_000_000_000, 3600.0, 0.0, Some(1_000_000), LONG_PREBUFFER));
+        assert!(beyond_link_by_size(10_000_000_000, 3600.0, 3600.0, Some(1_000_000), LONG_PREBUFFER));
+        assert!(!beyond_link_by_size(10_000_000_000, 3600.0, 60.0, Some(1_000_000), LONG_PREBUFFER));
+        assert!(!beyond_link_by_size(10_000_000_000, 3600.0, 0.0, None, LONG_PREBUFFER));
+        assert!(!beyond_link_by_size(10_000_000_000, 0.0, 0.0, Some(1_000_000), LONG_PREBUFFER));
+    }
+
     #[test]
     fn snapping_pins_drift_to_the_real_keyframes() {
         let kf = [0.0, 2.5, 5.0];
