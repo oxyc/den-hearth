@@ -65,6 +65,10 @@ pub const METRIC_TORBOX_AVOIDED: [&str; 5] = [
     "probe_frontier",
 ];
 
+/// What became of releases MaxSizeGB dropped on an unconfirmed size: probes queued, then how each one that ran
+/// ended — the file fits the budget, is over it, the probe gave no size, or it could not resolve or read.
+pub const METRIC_SIZE_RECOVERY: [&str; 5] = ["queued", "fits", "oversized", "unknown", "failed"];
+
 /// Go `metricIndexers`: the indexer series are every built-in indexer, and one for every household's own sources
 /// together — their hosts are chosen per install, so they are never a label.
 fn metric_indexers() -> impl Iterator<Item = &'static str> {
@@ -112,6 +116,7 @@ pub struct MetricSet {
 
     torbox_calls: HashMap<&'static str, Series>,
     torbox_avoided: Series,
+    size_recovery: Series,
 
     // Fixed keys, populated once at construction and never written again, so concurrent reads need no
     // lock. Every indexer this build knows about gets an entry whether or not any install names it —
@@ -180,6 +185,7 @@ pub fn new_metric_set() -> MetricSet {
             .map(|e| (*e, fixed_series(&METRIC_TORBOX_OUTCOMES)))
             .collect(),
         torbox_avoided: fixed_series(&METRIC_TORBOX_AVOIDED),
+        size_recovery: fixed_series(&METRIC_SIZE_RECOVERY),
         indexer_requests: fixed_series(&metric_indexers().collect::<Vec<_>>()),
         indexer_failures: fixed_series(&metric_indexers().collect::<Vec<_>>()),
         indexer_circuit_avoided: fixed_series(&metric_indexers().collect::<Vec<_>>()),
@@ -219,6 +225,18 @@ impl MetricSet {
         if let Some(c) = self.torbox_avoided.get(reason) {
             c.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Counts `n` size-recovery probes under `outcome`, one of `METRIC_SIZE_RECOVERY`.
+    pub(crate) fn size_recovery(&self, outcome: &str, n: i64) {
+        if let Some(c) = self.size_recovery.get(outcome) {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn size_recovery_count(&self, outcome: &str) -> i64 {
+        self.size_recovery.get(outcome).map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     /// Go `indexerResult` records one scrape attempt and the releases it returned. An indexer that is not in the
@@ -384,6 +402,12 @@ impl MetricSet {
                 (r#"result="hit""#.to_owned(), ld(&self.probe_cache_hit)),
                 (r#"result="miss""#.to_owned(), ld(&self.probe_cache_miss)),
             ],
+        );
+        counter(
+            &mut b,
+            "scout_size_recovery_probes_total",
+            "Probes of episode releases MaxSizeGB dropped on an unconfirmed size, by outcome.",
+            &series(&self.size_recovery, &METRIC_SIZE_RECOVERY, "result"),
         );
         counter(
             &mut b,

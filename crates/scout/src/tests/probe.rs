@@ -170,9 +170,10 @@ async fn probe_tracks_reads_only_the_head_when_range_is_ignored() {
     // The server ignored Range and is sending the whole file: Content-Length IS the file's total size,
     // unlike a 206's (which names only the chunk asked for).
     assert_eq!(
-        p.size_bytes, FILE_SIZE as i64,
+        p.size_bytes(),
+        FILE_SIZE as i64,
         "SizeBytes = {} (the Content-Length of the ignored-Range response)",
-        p.size_bytes
+        p.size_bytes()
     );
 }
 
@@ -195,7 +196,49 @@ async fn probe_tracks_size_bytes_is_the_episode_not_the_pack() {
 
     let client = crate::deps::ReqwestDoer(reqwest::Client::new());
     let p = crate::probe::probe_tracks(&client, &url).await.expect("probe");
-    assert_eq!(p.size_bytes, EPISODE_SIZE, "SizeBytes = {} (the episode's own size)", p.size_bytes);
+    assert!(matches!(p, crate::probe::ProbeFact::Tracks(_)), "the head's tracks were not read: {p:?}");
+    assert_eq!(p.size_bytes(), EPISODE_SIZE, "SizeBytes = {} (the episode's own size)", p.size_bytes());
+}
+
+// A head with no track list this can read (an MP4 whose moov lies past the first MiB, an unknown container) still
+// came with the CDN's stated total. That total is the file's size, so it is kept as a fact of its own; with no
+// total there is nothing to keep and the probe fails as before.
+#[tokio::test]
+async fn probe_tracks_unreadable_head_keeps_the_stated_size() {
+    const EPISODE_SIZE: i64 = 1_136_580_921;
+    let serve = |content_range: &'static str| {
+        serve_once(move |conn| {
+            let head = b"not a container any of the parsers know";
+            let _ = write!(
+                conn,
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = conn.write_all(head);
+        })
+    };
+    let client = crate::deps::ReqwestDoer(reqwest::Client::new());
+
+    let url = serve("bytes 0-38/1136580921");
+    let got = crate::probe::probe_tracks(&client, &url).await;
+    assert_eq!(got, Ok(crate::probe::ProbeFact::SizeOnly(EPISODE_SIZE)));
+
+    let url = serve("bytes 0-38/*");
+    let got = crate::probe::probe_tracks(&client, &url).await;
+    assert_eq!(got, Err(crate::probe::ERR_NO_TRACKS.to_owned()), "no total, nothing to keep");
+}
+
+// A size-only fact never reads back as a `Probe`, here or in a build that predates it: that build would
+// otherwise announce a probe of tracks nobody read.
+#[test]
+fn size_only_fact_is_not_a_probe_in_the_cache() {
+    use crate::probe::{Probe, ProbeFact};
+    let raw = ProbeFact::SizeOnly(1_136_580_921).to_cache();
+    assert!(serde_json::from_str::<Probe>(&raw).is_err(), "an older build reads {raw:?} as a Probe");
+    assert_eq!(ProbeFact::from_cache(&raw), Some(ProbeFact::SizeOnly(1_136_580_921)));
+    let tracks =
+        ProbeFact::Tracks(Box::new(Probe { audio: vec!["it".into()], size_bytes: 5, ..Default::default() }));
+    assert_eq!(ProbeFact::from_cache(&tracks.to_cache()), Some(tracks));
+    assert_eq!(ProbeFact::from_cache("size-only:0"), None);
 }
 
 // AVI's richest-audio rule, which had no test while its MP4 twin did.

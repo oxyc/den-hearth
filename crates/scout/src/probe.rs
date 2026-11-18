@@ -91,9 +91,48 @@ pub(crate) const PROBE_BYTES: usize = 1 << 20;
 /// Go `ErrNoTracks`: a head with no Tracks element, as the error string callers compare against.
 pub(crate) const ERR_NO_TRACKS: &str = "no track information in the file head";
 
+/// What a probe learned about a file.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProbeFact {
+    /// The head was read: tracks, codecs, languages, and the size when the response stated one.
+    Tracks(Box<Probe>),
+    /// The head held no track list this could read (`ERR_NO_TRACKS`), but the response stated the file's total.
+    /// The size is the file's; its tracks stay unknown, so it never becomes a `Probe`.
+    SizeOnly(i64),
+}
+
+/// The cache value of a `ProbeFact::SizeOnly`: deliberately not JSON, so a build that predates size-only facts
+/// cannot read one as a `Probe` (which would announce a probe that read no tracks) and simply probes again.
+const SIZE_ONLY_PREFIX: &str = "size-only:";
+
+impl ProbeFact {
+    /// The file size the probe read, 0 when it read none.
+    pub(crate) fn size_bytes(&self) -> i64 {
+        match self {
+            ProbeFact::Tracks(p) => p.size_bytes,
+            ProbeFact::SizeOnly(n) => *n,
+        }
+    }
+
+    pub(crate) fn to_cache(&self) -> String {
+        match self {
+            ProbeFact::Tracks(p) => crate::handler::to_json(p),
+            ProbeFact::SizeOnly(n) => format!("{SIZE_ONLY_PREFIX}{n}"),
+        }
+    }
+
+    pub(crate) fn from_cache(raw: &str) -> Option<ProbeFact> {
+        match raw.strip_prefix(SIZE_ONLY_PREFIX) {
+            Some(n) => n.parse().ok().filter(|&n: &i64| n > 0).map(ProbeFact::SizeOnly),
+            None => serde_json::from_str(raw).ok().map(ProbeFact::Tracks),
+        }
+    }
+}
+
 /// Go `ProbeTracks`: reads the head of a resolved link and parses it. The size comes from the response's
-/// total, not from the bytes read.
-pub(crate) async fn probe_tracks(client: &dyn Doer, url: &str) -> Result<Probe, String> {
+/// total, not from the bytes read. A head with no readable tracks is still a size fact when the response stated
+/// the total; without one it is `ERR_NO_TRACKS`.
+pub(crate) async fn probe_tracks(client: &dyn Doer, url: &str) -> Result<ProbeFact, String> {
     let target = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
     let mut req = reqwest::Request::new(reqwest::Method::GET, target);
     req.headers_mut().insert(
@@ -126,9 +165,12 @@ pub(crate) async fn probe_tracks(client: &dyn Doer, url: &str) -> Result<Probe, 
             _ => break,
         }
     }
-    let mut p = parse_head(&head).map_err(str::to_string)?;
-    p.size_bytes = probed_total_size(&resp);
-    Ok(p)
+    let size = probed_total_size(&resp);
+    match parse_head(&head) {
+        Ok(p) => Ok(ProbeFact::Tracks(Box::new(Probe { size_bytes: size, ..p }))),
+        Err(ERR_NO_TRACKS) if size > 0 => Ok(ProbeFact::SizeOnly(size)),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Go `probedTotalSize`: reads the FILE's size off the response to the ranged GET `probe_tracks` just made:

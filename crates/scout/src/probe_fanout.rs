@@ -14,8 +14,10 @@ use crate::client::ClientPlayable;
 use crate::config::{Config, DebridService};
 use crate::id::StreamId;
 use crate::metrics::metrics;
-use crate::probe::Probe;
-use crate::rank::{quality_score_ref, ranked_resolution, RawStream, PREFERENCE_SINK};
+use crate::probe::ProbeFact;
+use crate::rank::{
+    quality_score_ref, rank_streams_debug, ranked_resolution, RankFilters, RawStream, GIB, PREFERENCE_SINK,
+};
 use crate::stores::{CacheTruth, ResolveTarget};
 
 /// Go `probeTopN`: how many of the ranked releases get probed. The list is already in the order the client will show,
@@ -32,6 +34,11 @@ pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(12);
 /// Go `probeTTL`: probe results never change for a given file, so they are cached hard. The tier is disk-backed,
 /// which is what makes a redeploy cheap.
 pub(crate) const PROBE_TTL: Duration = Duration::from_secs(720 * 60 * 60);
+
+/// How long a size-only fact is kept. The size never changes, but the tracks might become readable to a later
+/// parser (an MP4 whose `moov` lies past the head, a container none of the three parsers know), so the file is
+/// read again after a week rather than a month. Until then it is not probed on every rebuild.
+pub(crate) const SIZE_ONLY_PROBE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Go `packSizeRatio` is how much bigger the indexer's number has to be than the probe's before it is worth
 /// naming as a pack. A movie's title size and its probed size routinely differ by a rounding byte or two;
@@ -50,13 +57,20 @@ pub(crate) fn hydrate_probe_facts(
         if s.info_hash.is_empty() {
             continue;
         }
-        if let Some(raw) = cache.get(&probe_cache_key(s, sid)) {
-            if let Ok(probe) = serde_json::from_str::<Probe>(&raw) {
-                s.probe = Some(probe);
+        let Some(raw) = cache.get(&probe_cache_key(s, sid)) else { continue };
+        match ProbeFact::from_cache(&raw) {
+            Some(ProbeFact::Tracks(probe)) => {
+                s.probe = Some(*probe);
                 apply_probed_size(s, sid);
-                metrics().probe_cache_hit.fetch_add(1, Ordering::Relaxed);
             }
+            // The size only: the tracks stay unknown (`probe` is `None`), as for a file nobody probed.
+            Some(ProbeFact::SizeOnly(size)) => {
+                s.size_only_probe = true;
+                apply_measured_size(s, size, sid);
+            }
+            None => continue,
         }
+        metrics().probe_cache_hit.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -70,6 +84,11 @@ pub(crate) fn hydrate_probe_facts(
 /// confused with.
 pub(crate) fn apply_probed_size(s: &mut RawStream, sid: Option<&StreamId>) {
     let Some(probed) = s.probe.as_ref().map(|p| p.size_bytes).filter(|&n| n > 0) else { return };
+    apply_measured_size(s, probed, sid);
+}
+
+/// `apply_probed_size` for a size a probe read, whether or not it read the tracks too.
+fn apply_measured_size(s: &mut RawStream, probed: i64, sid: Option<&StreamId>) {
     if sid.is_some_and(|sid| sid.has_ep)
         && s.size_bytes.is_some_and(|n| n as f64 >= probed as f64 * PACK_SIZE_RATIO)
     {
@@ -112,6 +131,19 @@ pub(crate) fn hydrate_pack_only_sizes(streams: &mut [RawStream], sid: Option<&St
     }
 }
 
+/// How many releases one list build may probe because MaxSizeGB dropped them on a size nothing has confirmed.
+/// They join the same fan-out as the frontier's probes (its three slots and its deadline), after them.
+pub(crate) const SIZE_RECOVERY_PROBES: usize = 2;
+
+/// What a size-recovery probe judges once it lands: the budget its release was dropped by, and the cached list
+/// that was built without it.
+#[derive(Debug, Clone)]
+pub(crate) struct SizeRecovery {
+    pub(crate) max_bytes: i64,
+    /// The list's cache key and when its entry stops being held. `None` when the list was not cached.
+    pub(crate) list: Option<(String, std::time::SystemTime)>,
+}
+
 /// Go `probeJob` is a copy, deliberately: the background work must not reach into the response's slice, which
 /// the caller is free to marshal and hand to the client the moment probeTop returns.
 #[derive(Debug, Clone)]
@@ -121,6 +153,108 @@ pub(crate) struct ProbeJob {
     /// would fetch rather than read, which is an add against the quota.
     pub(crate) holders: Vec<DebridService>,
     pub(crate) target: ResolveTarget,
+    /// Set when the probe is for a release the size budget dropped (see `size_recovery_candidates`).
+    pub(crate) recovery: Option<SizeRecovery>,
+}
+
+/// The episode releases MaxSizeGB dropped on the indexer's number alone, best first, at most
+/// `SIZE_RECOVERY_PROBES` of them.
+///
+/// An indexer can attach a season pack's total to a release whose title names exactly this episode (Fauda S1E3:
+/// 68 GB listed, 1.1 GB served), and `hydrate_pack_only_sizes` rightly trusts such a title. Dropped before the
+/// probe, that release could never be probed, so the fact that corrects its size never arrived and the budget
+/// excluded it for good. A release qualifies only while its size is still that unconfirmed number: no probe fact
+/// and no size from a store's file list (`known`, the indices `hydrate_known_sizes` corrected). Only releases a
+/// store holds qualify, under the same rule as every probe. Each is ranked with the list's own filters as though
+/// its size were unknown, so a release another filter drops is not probed for nothing. A movie has no pack for
+/// its size to be confused with and gets none.
+pub(crate) fn size_recovery_candidates(
+    seeds: &[RawStream],
+    known: &HashSet<usize>,
+    filters: &RankFilters,
+) -> Vec<RawStream> {
+    let Some(max_bytes) = filters.max_size_gb.map(|max| max.wrapping_mul(GIB)) else { return Vec::new() };
+    if filters.episode.is_none() {
+        return Vec::new();
+    }
+    let hinted: Vec<RawStream> = seeds
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            s.size_bytes.is_some_and(|n| n > max_bytes)
+                && !s.probe_settled()
+                && s.pack_size_bytes.is_none()
+                && !known.contains(i)
+                && s.cached
+                && !s.info_hash.is_empty()
+        })
+        .map(|(_, s)| RawStream { size_bytes: None, ..s.clone() })
+        .collect();
+    if hinted.is_empty() {
+        return Vec::new();
+    }
+    let mut filters = filters.clone();
+    filters.result_cap = SIZE_RECOVERY_PROBES as i64;
+    rank_streams_debug(&hinted, filters, None)
+}
+
+/// The probe jobs for `size_recovery_candidates`, each carrying what to judge it against.
+pub(crate) fn select_size_recovery_jobs(
+    candidates: &[RawStream],
+    sid: Option<&StreamId>,
+    truth: &CacheTruth,
+    recovery: &SizeRecovery,
+) -> Vec<ProbeJob> {
+    let jobs: Vec<ProbeJob> = candidates
+        .iter()
+        .filter_map(|s| held_probe_job(s, sid, truth))
+        .map(|job| ProbeJob { recovery: Some(recovery.clone()), ..job })
+        .collect();
+    metrics().size_recovery("queued", jobs.len() as i64);
+    jobs
+}
+
+/// The probe job for `s` when a store is confirmed to hold it, `None` otherwise.
+fn held_probe_job(s: &RawStream, sid: Option<&StreamId>, truth: &CacheTruth) -> Option<ProbeJob> {
+    // Only probe what the store ALREADY holds. Probing resolves, and resolving a release the account
+    // does not hold ADDS it — so this read path was queueing up to six torrents per newly-viewed
+    // title, against a sixty-an-hour ceiling. Browsing did it; opening a ten-episode season did it
+    // sixty times. That is where the quota went, and the refusals it produced were then read as dead
+    // releases and blamed on the releases.
+    //
+    // Nothing is lost: probe facts are keyed by infohash and kept for a month, so a release is probed
+    // for free the first time it is listed after it becomes cached. It also self-heals during a
+    // cache-check outage — everything reads as not-held, so nothing is probed, which is precisely
+    // when touching the debrid is least wise.
+    if !s.cached || s.info_hash.is_empty() {
+        return None;
+    }
+    // WHICH services hold it, not just that one does. `s.Cached` is the union across accounts, so on a
+    // two-account install a release only the second holds still reads as cached here — and resolving
+    // it through the pool would reach the first account, which adds it. Carrying the holders lets the
+    // probe resolve read-only.
+    let key = probe_cache_key(s, sid);
+    metrics().probe_cache_miss.fetch_add(1, Ordering::Relaxed);
+    let holders = truth.held_by(&s.info_hash);
+    if holders.is_empty() {
+        return None;
+    }
+    Some(ProbeJob {
+        key,
+        holders,
+        target: ResolveTarget {
+            info_hash: s.info_hash.clone(),
+            file_idx: s.file_idx,
+            season: season_of(sid),
+            episode: episode_of(sid),
+            // Enforced by the store, not promised by this caller. Picking only held releases was not
+            // enough: TorBox's cache check says what TORBOX has, not what this ACCOUNT has, so a
+            // "held" release with no warm resolve entry still went to createtorrent.
+            no_add: true,
+            ..Default::default()
+        },
+        recovery: None,
+    })
 }
 
 /// The part of Go `probeTopForClient` that decides what gets probed: the frontier, then which of its releases are
@@ -145,52 +279,15 @@ pub(crate) fn select_probe_jobs(
     let mut pending = Vec::new();
     for (i, s) in streams.iter().enumerate() {
         if !frontier.contains(&i) {
-            if s.cached && s.probe.is_none() {
+            if s.cached && !s.probe_settled() {
                 metrics().torbox_avoid("probe_frontier");
             }
             continue;
         }
-        if s.probe.is_some() {
+        if s.probe_settled() {
             continue;
         }
-        // Only probe what the store ALREADY holds. Probing resolves, and resolving a release the account
-        // does not hold ADDS it — so this read path was queueing up to six torrents per newly-viewed
-        // title, against a sixty-an-hour ceiling. Browsing did it; opening a ten-episode season did it
-        // sixty times. That is where the quota went, and the refusals it produced were then read as dead
-        // releases and blamed on the releases.
-        //
-        // Nothing is lost: probe facts are keyed by infohash and kept for a month, so a release is probed
-        // for free the first time it is listed after it becomes cached. It also self-heals during a
-        // cache-check outage — everything reads as not-held, so nothing is probed, which is precisely
-        // when touching the debrid is least wise.
-        if !s.cached || s.info_hash.is_empty() {
-            continue;
-        }
-        // WHICH services hold it, not just that one does. `s.Cached` is the union across accounts, so on a
-        // two-account install a release only the second holds still reads as cached here — and resolving
-        // it through the pool would reach the first account, which adds it. Carrying the holders lets the
-        // probe resolve read-only.
-        let key = probe_cache_key(s, sid);
-        metrics().probe_cache_miss.fetch_add(1, Ordering::Relaxed);
-        let holders = truth.held_by(&s.info_hash);
-        if holders.is_empty() {
-            continue;
-        }
-        pending.push(ProbeJob {
-            key,
-            holders,
-            target: ResolveTarget {
-                info_hash: s.info_hash.clone(),
-                file_idx: s.file_idx,
-                season: season_of(sid),
-                episode: episode_of(sid),
-                // Enforced by the store, not promised by this caller. Picking only held releases was not
-                // enough: TorBox's cache check says what TORBOX has, not what this ACCOUNT has, so a
-                // "held" release with no warm resolve entry still went to createtorrent.
-                no_add: true,
-                ..Default::default()
-            },
-        });
+        pending.extend(held_probe_job(s, sid, truth));
     }
     pending
 }
@@ -226,7 +323,9 @@ pub(crate) fn browser_probe_candidates(
     // (index, optimistic score)
     let mut candidates: Vec<(usize, i64)> = Vec::new();
     for (i, stream) in streams.iter().enumerate() {
-        if stream.probe.is_some() {
+        // A size-only fact is still scored above as unprobed; it is left out only because reading its head again
+        // would not settle anything.
+        if stream.probe_settled() {
             continue;
         }
         if i == 0 {

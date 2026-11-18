@@ -272,6 +272,7 @@ async fn probe_behind_fills_the_link_memo_for_play() {
             key: format!("probe:v1:{hash}:0"),
             holders: vec![DebridService::TorBox],
             target: probe_target,
+            recovery: None,
         }],
     );
 

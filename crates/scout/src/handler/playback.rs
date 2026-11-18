@@ -16,7 +16,7 @@ impl Inner {
     /// consulted on the request path — a map lookup, no network.
     pub(crate) fn hydrate_probe_facts(&self, streams: &mut [RawStream], sid: Option<&StreamId>) {
         hydrate_probe_facts(Some(&*self.deps.cache), streams, sid);
-        let hits = streams.iter().filter(|s| s.probe.is_some()).count();
+        let hits = streams.iter().filter(|s| s.probe_settled()).count();
         if hits > 0 {
             metrics().probe_cache_hit.fetch_add(hits as i64, Ordering::Relaxed);
         }
@@ -33,18 +33,22 @@ impl Inner {
     ///
     /// Movie-only guard, same reasoning as applyProbedSize: there is no pack for a movie's title size to have
     /// been confused with, so a movie is never given a lookup at all.
+    ///
+    /// Returns the indices of the streams whose size now comes from a store's file list.
     pub(crate) fn hydrate_known_sizes(
         &self,
         config: &Config,
         streams: &mut [RawStream],
         sid: Option<&StreamId>,
-    ) {
-        let Some(sid) = sid.filter(|sid| sid.has_ep) else { return };
+    ) -> HashSet<usize> {
+        let mut known = HashSet::new();
+        let Some(sid) = sid.filter(|sid| sid.has_ep) else { return known };
         let mut pool: Option<StorePool> = None;
-        for s in streams.iter_mut() {
+        for (i, s) in streams.iter_mut().enumerate() {
             if s.info_hash.is_empty()
                 || s.pack_size_bytes.is_some()
                 || s.probe.as_ref().is_some_and(|p| p.size_bytes > 0)
+                || s.size_only_probe
             {
                 // A ranged probe measured what the playback URL actually serves, so it is more authoritative
                 // than an older store file listing even when their difference was too small to name a pack.
@@ -58,14 +62,18 @@ impl Inner {
                 episode: Some(sid.episode),
                 ..Default::default()
             };
-            if let Some(known) = known_file_size(pool, &target) {
-                crate::probe_fanout::apply_known_size(s, known);
+            if let Some(size) = known_file_size(pool, &target).filter(|&n| n > 0) {
+                crate::probe_fanout::apply_known_size(s, size);
+                known.insert(i);
             }
         }
+        known
     }
 
     /// probeTopForClient: the half of probing that decides what to probe, and starts it behind the reply. It reports
-    /// whether probing is on at all, so Server-Timing names the phase only when there was one.
+    /// whether probing is on at all, so Server-Timing names the phase only when there was one. `recovery` names the
+    /// releases the size budget dropped (`size_recovery_candidates`) and what to judge them against; they are probed
+    /// in the same fan-out, after the frontier.
     pub(crate) fn probe_top_for_client(
         self: &Arc<Self>,
         config: &Config,
@@ -73,6 +81,7 @@ impl Inner {
         sid: Option<&StreamId>,
         truth: &CacheTruth,
         client: Option<&ClientPlayable>,
+        recovery: Option<(&[RawStream], SizeRecovery)>,
     ) -> bool {
         // Opt-in: no client, no probing. Probing costs a debrid RESOLVE per release, so it must never happen
         // by accident — a caller that hasn't asked for it (a test, an embedder) gets the old behaviour
@@ -86,16 +95,19 @@ impl Inner {
         };
         for (i, s) in streams.iter().enumerate() {
             if !frontier.contains(&i) {
-                if s.cached && s.probe.is_none() {
+                if s.cached && !s.probe_settled() {
                     metrics().torbox_avoid("probe_frontier");
                 }
                 continue;
             }
-            if s.probe.is_none() && s.cached && !s.info_hash.is_empty() {
+            if !s.probe_settled() && s.cached && !s.info_hash.is_empty() {
                 metrics().probe_cache_miss.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let pending = select_probe_jobs(streams, config, sid, truth, client);
+        let mut pending = select_probe_jobs(streams, config, sid, truth, client);
+        if let Some((candidates, recovery)) = recovery.filter(|(candidates, _)| !candidates.is_empty()) {
+            pending.extend(select_size_recovery_jobs(candidates, sid, truth, &recovery));
+        }
         if !pending.is_empty() {
             self.probe_behind(config, pending);
         }
@@ -189,11 +201,70 @@ impl Inner {
                 if probed.is_ok() || probed.as_ref().is_err_and(|e| e == crate::probe::ERR_NO_TRACKS) {
                     self.links.put(&link_memo_key(config, &job.target), &link, false, SystemTime::now());
                 }
-                if let Ok(p) = probed {
-                    self.deps.cache.put(&job.key, &to_json(&p), PROBE_TTL);
+                if let Ok(fact) = probed {
+                    let ttl = match fact {
+                        ProbeFact::Tracks(_) => PROBE_TTL,
+                        ProbeFact::SizeOnly(_) => {
+                            log_limited(
+                                "probe-size-only",
+                                "probe read no tracks from a file head; kept the size the response stated",
+                            );
+                            SIZE_ONLY_PROBE_TTL
+                        }
+                    };
+                    self.deps.cache.put(&job.key, &fact.to_cache(), ttl);
                 }
             })
             .await;
+        // Read back from the probe cache rather than from the run above: a list built for another config or
+        // client may have queued the same file, and the one that joined the other's flight never ran its own.
+        if let Some(recovery) = &job.recovery {
+            let probed = self.deps.cache.get(&job.key).and_then(|raw| ProbeFact::from_cache(&raw));
+            self.settle_size_recovery(recovery, probed.map(|fact| fact.size_bytes()));
+        }
+    }
+
+    /// Judges a size-recovery probe by the size it read. Only a file that fits the budget changes anything: the
+    /// list built without it is marked stale, and the ordinary stale-while-revalidate refresh rebuilds it, where
+    /// the probe fact just written gives the release its own size (and its pack's as context). An oversized file,
+    /// a probe that gave no size and a failure change nothing; the first two leave a probe fact behind, so the
+    /// release is not selected again, and a failure is tried again only when a later build lists it. A head with
+    /// no readable tracks but a stated total settles as fits or oversized from its size-only fact.
+    fn settle_size_recovery(&self, recovery: &SizeRecovery, size: Option<i64>) {
+        let outcome = match size.filter(|&n| n > 0) {
+            None if size.is_none() => "failed",
+            None => "unknown",
+            Some(n) if n > recovery.max_bytes => "oversized",
+            Some(_) => "fits",
+        };
+        metrics().size_recovery(outcome, 1);
+        log_limited(
+            "size-recovery",
+            &format!("size recovery: a release the size budget dropped probed outcome={outcome} size_authority=probe"),
+        );
+        if outcome == "fits" {
+            if let Some((key, hold_until)) = &recovery.list {
+                self.expire_list(key, *hold_until);
+            }
+        }
+    }
+
+    /// Marks the complete, fresh list cached under `key` stale, keeping its body and how long it is held. Ordered
+    /// through the list's publication fence: a build that began after this replaces it as usual, and one that
+    /// began before cannot then republish a list built before the probe fact existed. A list that is partial or
+    /// already stale is left alone, since it is rebuilt on the next request anyway.
+    fn expire_list(&self, key: &str, hold_until: SystemTime) {
+        let publication = self.deps.runtime.begin_publication("list", key, false);
+        publication.publish(|| {
+            let Some(hit) = self.deps.cache.get(key) else { return };
+            let (complete, fresh_until, etag, body) = split_cached(&hit);
+            let now = now_unix();
+            if !complete || fresh_until <= now {
+                return;
+            }
+            let Ok(left) = hold_until.duration_since(SystemTime::now()) else { return };
+            self.deps.cache.put(key, &join_cached(true, now, etag, body), left);
+        });
     }
 
     // --- /play ------------------------------------------------------------------------------------------

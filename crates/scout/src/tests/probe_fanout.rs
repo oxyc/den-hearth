@@ -717,3 +717,602 @@ async fn probe_top_marks_its_target_no_add() {
     let target = seen.lock().expect("the lock")[0].clone();
     assert!(target.no_add, "the probe resolved without NoAdd — the store is free to queue the torrent");
 }
+
+// --- MaxSizeGB and a season pack's total on an exact-episode release (#251) ------------------------------------
+//
+// Through /stream from cold caches: the scrape, the cache check, ranking, the probe fan-out behind the reply, the
+// list cache and its refresh.
+
+mod size_recovery {
+    use super::*;
+
+    use async_trait::async_trait;
+
+    use crate::probe::TRACK_TYPE_AUDIO;
+    use crate::runtime::ScoutRuntime;
+    use crate::scrape::{DoError, Doer};
+    use crate::stores::ProviderStatus;
+    use crate::tests::attributes_web::ebml;
+    use crate::tests::handler::{blob, fake_scraper, get, hdr};
+    use den_media::mkv::{
+        LANGUAGE as ID_LANGUAGE, SEGMENT as ID_SEGMENT, TRACKS as ID_TRACKS, TRACK_ENTRY as ID_TRACK_ENTRY,
+        TRACK_TYPE as ID_TRACK_TYPE,
+    };
+
+    const GIB: i64 = 1 << 30;
+    /// What "💾 68 GB" on Fauda S1E3's listing parsed to: the season, not the episode.
+    const PACK_HINT: i64 = 68 * GIB;
+    /// What den-remux actually streamed for it.
+    const EPISODE: i64 = 1_136_580_921;
+    const CDN: &str = "http://cdn.test";
+    const EPISODE_PATH: &str = "tt99:1:3";
+
+    const PACKED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TOO_BIG: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SMALL: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const SEASON: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const UNHELD: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const RANGE: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+    fn release(hash: &str, title: &str, size: Option<i64>) -> RawStream {
+        RawStream {
+            info_hash: hash.into(),
+            title: title.into(),
+            size_bytes: size,
+            seeders: Some(10),
+            file_idx: Some(2),
+            ..Default::default()
+        }
+    }
+
+    /// What the indexer answers for Fauda S1E3, whatever it is asked.
+    fn listing() -> Vec<RawStream> {
+        vec![
+            // The release the budget dropped for good: an exact-episode title carrying the season's total.
+            release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+            // Genuinely bigger than the budget, as its own file.
+            release(TOO_BIG, "Fauda.S01E03.2160p.WEB-DL.x265", Some(30 * GIB)),
+            release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(2 * GIB)),
+            // Titles that name a pack: their number was never the episode's (hydrate_pack_only_sizes).
+            release(SEASON, "Fauda.S01.1080p.WEB-DL.x264", Some(PACK_HINT)),
+            release(RANGE, "Fauda.S01E01-E06.1080p.WEB-DL.x264", Some(40 * GIB)),
+            // Over the budget, but no store holds it: probing it would be an add.
+            release(UNHELD, "Fauda.S01E03.1080p.BluRay.x264", Some(50 * GIB)),
+        ]
+    }
+
+    /// How the CDN answers the ranged probe of one release.
+    #[derive(Clone, Copy)]
+    enum Serve {
+        /// A Matroska head, and the file's total in Content-Range.
+        File(i64),
+        /// A Matroska head with no total stated.
+        NoTotal,
+        /// The CDN fails.
+        Fails,
+        /// A head none of the parsers can read tracks from, with the file's total when one is given.
+        Unreadable(Option<i64>),
+    }
+
+    fn mkv_head() -> Vec<u8> {
+        let audio = ebml(
+            ID_TRACK_ENTRY,
+            &[ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[b"heb".to_vec()])],
+        );
+        ebml(ID_SEGMENT, &[ebml(ID_TRACKS, &[audio])])
+    }
+
+    /// Serves `<CDN>/<hash>.mkv` as `files` says.
+    fn cdn(files: HashMap<&'static str, Serve>) -> Arc<dyn Doer> {
+        let head = mkv_head();
+        Arc::new(MockDoer(move |req: reqwest::Request| -> Result<reqwest::Response, DoError> {
+            let hash = req.url().path().trim_start_matches('/').trim_end_matches(".mkv").to_owned();
+            let serve = files.get(hash.as_str()).copied().unwrap_or(Serve::Fails);
+            let mut b = http::Response::builder().header("content-type", "video/x-matroska");
+            let body = match serve {
+                Serve::Unreadable(_) => b"an MP4 whose moov lies past the head".to_vec(),
+                _ => head.clone(),
+            };
+            b = match serve {
+                Serve::File(total) | Serve::Unreadable(Some(total)) => {
+                    b.status(206).header("content-range", format!("bytes 0-{}/{total}", body.len() - 1))
+                }
+                Serve::NoTotal | Serve::Unreadable(None) => b.status(206),
+                Serve::Fails => return Ok(resp(500, "")),
+            };
+            Ok(reqwest::Response::from(b.body(body).expect("a valid response")))
+        }))
+    }
+
+    /// A TorBox account holding `held`. Every resolve is recorded; one of a `gated` release waits until the gate
+    /// opens.
+    #[derive(Clone)]
+    struct Account {
+        held: Vec<&'static str>,
+        gated: Vec<&'static str>,
+        gate: Arc<tokio::sync::Semaphore>,
+        resolves: Arc<Mutex<Vec<ResolveTarget>>>,
+    }
+
+    impl Account {
+        fn new(held: &[&'static str]) -> Account {
+            Account {
+                held: held.to_vec(),
+                gated: Vec::new(),
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                resolves: Arc::default(),
+            }
+        }
+
+        fn resolved(&self, hash: &str) -> usize {
+            self.resolves.lock().expect("the lock").iter().filter(|t| t.info_hash == hash).count()
+        }
+    }
+
+    #[async_trait]
+    impl Store for Account {
+        fn service(&self) -> DebridService {
+            DebridService::TorBox
+        }
+
+        async fn cache_check(&self, hashes: &[String]) -> Result<HashMap<String, bool>, StoreError> {
+            Ok(hashes.iter().map(|h| (h.clone(), self.held.contains(&h.as_str()))).collect())
+        }
+
+        async fn resolve(&self, t: &ResolveTarget) -> Result<String, StoreError> {
+            self.resolves.lock().expect("the lock").push(t.clone());
+            if self.gated.contains(&t.info_hash.as_str()) {
+                let _open = self.gate.acquire().await;
+            }
+            Ok(format!("{CDN}/{}.mkv", t.info_hash))
+        }
+
+        async fn provider_status(&self, _t: &ResolveTarget) -> ProviderStatus {
+            ProviderStatus::NotFetching
+        }
+    }
+
+    fn handler(
+        account: &Account,
+        files: HashMap<&'static str, Serve>,
+        seeds: fn() -> Vec<RawStream>,
+    ) -> (Handler, Arc<ScoutRuntime>) {
+        let runtime = ScoutRuntime::new();
+        let inspect = runtime.clone();
+        let account = account.clone();
+        let doer = cdn(files);
+        let h = new_handler(test_deps(move |d| {
+            d.runtime = runtime;
+            d.probe_doer = Some(doer);
+            d.make_scrapers = Arc::new(move |_| {
+                vec![fake_scraper("torrentio", move || Box::pin(async move { Ok(seeds()) }))]
+            });
+            d.make_stores = Arc::new(move |_| vec![Box::new(account.clone()) as Box<dyn Store>]);
+        }));
+        (h, inspect)
+    }
+
+    fn config(max_size_gb: i64, result_cap: i64) -> String {
+        blob(&format!(
+            r#"{{"debrid":[{{"service":"torbox","token":"tb-secret"}}],"indexers":["torrentio"],"filters":{{"maxSizeGB":{max_size_gb}}},"resultCap":{result_cap}}}"#
+        ))
+    }
+
+    fn path(config: &str, kind: &str, id: &str) -> String {
+        format!("/{config}/stream/{kind}/{id}.json")
+    }
+
+    /// The listed releases by title, each with its attributes.
+    fn listed(rr: &http::Response<Vec<u8>>) -> HashMap<String, serde_json::Value> {
+        assert_eq!(rr.status(), 200, "list: {}", rr.status());
+        let body: serde_json::Value = serde_json::from_slice(rr.body()).expect("a JSON list");
+        body["streams"]
+            .as_array()
+            .expect("a streams array")
+            .iter()
+            .map(|s| (s["title"].as_str().unwrap_or_default().to_owned(), s["attributes"].clone()))
+            .collect()
+    }
+
+    fn titles(rr: &http::Response<Vec<u8>>) -> Vec<String> {
+        let mut out: Vec<String> = listed(rr).into_keys().collect();
+        out.sort();
+        out
+    }
+
+    fn sorted(titles: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = titles.iter().map(|t| (*t).to_owned()).collect();
+        out.sort();
+        out
+    }
+
+    fn count(runtime: &ScoutRuntime, outcome: &str) -> i64 {
+        runtime.metrics().size_recovery_count(outcome)
+    }
+
+    async fn settled(runtime: &ScoutRuntime, want: usize) {
+        wait_for(
+            || {
+                ["fits", "oversized", "unknown", "failed"].iter().map(|o| count(runtime, o)).sum::<i64>()
+                    == want as i64
+            },
+            "the size-recovery probes never settled",
+        )
+        .await;
+    }
+
+    /// Requests `path` until its list has `title`, failing after five seconds.
+    async fn until_listed(h: &Handler, path: &str, title: &str) -> http::Response<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let rr = get(h, path, &[]).await;
+            if listed(&rr).contains_key(title) {
+                return rr;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{title} never reached the list: {:?}",
+                titles(&rr)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    const EPISODE_TITLES: [&str; 3] =
+        ["Fauda.S01E03.720p.WEB.x264", "Fauda.S01.1080p.WEB-DL.x264", "Fauda.S01E01-E06.1080p.WEB-DL.x264"];
+
+    // The Fauda S1E3 shape with a 20 GB budget. The cold list leaves the pack-sized exact-episode release out — its
+    // only size is an unconfirmed number over the budget — and probes it behind the reply with the frontier, without
+    // an add. Its file is 1.1 GB, so the cached list is marked stale; the viewer after that is served it once while
+    // it refreshes, and from then on the list carries the release with its own size and the pack's as context. The
+    // 30 GB episode file stays out, the unheld release is never resolved, and nothing is probed twice.
+    #[tokio::test]
+    async fn a_pack_sized_exact_episode_is_probed_and_listed_once_its_file_fits() {
+        let account = Account::new(&[PACKED, TOO_BIG, SMALL, SEASON, RANGE]);
+        let files = HashMap::from([
+            (PACKED, Serve::File(EPISODE)),
+            (TOO_BIG, Serve::File(30 * GIB)),
+            (SMALL, Serve::File(2 * GIB)),
+            (SEASON, Serve::File(EPISODE)),
+            (RANGE, Serve::File(EPISODE)),
+        ]);
+        let (h, runtime) = handler(&account, files, listing);
+        let list = path(&config(20, 20), "series", EPISODE_PATH);
+
+        let cold = get(&h, &list, &[]).await;
+        assert_eq!(titles(&cold), sorted(&EPISODE_TITLES), "the cold list");
+        let season = &listed(&cold)["Fauda.S01.1080p.WEB-DL.x264"];
+        assert!(
+            season["sizeBytes"].is_null() && season["packSizeBytes"] == PACK_HINT,
+            "a season-named pack keeps its total as the pack's, never as the episode's: {season}"
+        );
+        assert_eq!(count(&runtime, "queued"), 2, "the two held exact-episode releases over the budget");
+
+        settled(&runtime, 2).await;
+        assert_eq!((count(&runtime, "fits"), count(&runtime, "oversized")), (1, 1));
+
+        let marked = get(&h, &list, &[]).await;
+        assert!(
+            hdr(&marked, "server-timing").starts_with("cache;desc=stale"),
+            "the list built without the release was not marked stale: {}",
+            hdr(&marked, "server-timing")
+        );
+        assert_eq!(titles(&marked), sorted(&EPISODE_TITLES), "a stale list is served as it was built");
+
+        let rebuilt = until_listed(&h, &list, "Fauda.S01E03.1080p.WEB-DL.x264").await;
+        let mut want = EPISODE_TITLES.to_vec();
+        want.push("Fauda.S01E03.1080p.WEB-DL.x264");
+        assert_eq!(titles(&rebuilt), sorted(&want), "the 30 GB and unheld releases stay out");
+        let packed = &listed(&rebuilt)["Fauda.S01E03.1080p.WEB-DL.x264"];
+        assert!(
+            packed["sizeBytes"] == EPISODE && packed["packSizeBytes"] == PACK_HINT,
+            "want the episode's own size and the pack's as context: {packed}"
+        );
+
+        let targets = account.resolves.lock().expect("the lock").clone();
+        assert!(targets.iter().all(|t| t.no_add), "a probe resolved without NoAdd: {targets:?}");
+        // The frontier's own probes may still be landing when the list refreshes, so only the two the budget dropped
+        // are counted exactly: each was probed once, and its fact kept it from being queued again.
+        for hash in [PACKED, TOO_BIG] {
+            assert_eq!(
+                account.resolved(hash),
+                1,
+                "{hash} resolved {} times, want once",
+                account.resolved(hash)
+            );
+        }
+        assert_eq!(account.resolved(UNHELD), 0, "an unheld release was resolved: that is an add");
+        assert_eq!(count(&runtime, "queued"), 2, "a release with a probe fact was queued again");
+    }
+
+    // Two configs (or a TV and a browser list) queue the same file while its probe is still running: the second
+    // joins the first's flight and still settles, so each marks its own list stale. A list of another title is left
+    // alone, and a config built after the probe judges the probed size by its own budget, queueing nothing.
+    #[tokio::test]
+    async fn every_list_that_queued_a_file_is_settled_and_no_other() {
+        let mut account = Account::new(&[PACKED, TOO_BIG, SMALL, SEASON, RANGE]);
+        account.gated = vec![PACKED, TOO_BIG];
+        let files = HashMap::from([
+            (PACKED, Serve::File(EPISODE)),
+            (TOO_BIG, Serve::File(30 * GIB)),
+            (SMALL, Serve::File(2 * GIB)),
+            (SEASON, Serve::File(EPISODE)),
+            (RANGE, Serve::File(EPISODE)),
+        ]);
+        let (h, runtime) = handler(&account, files, listing);
+        let (first, second, strict) = (config(20, 20), config(20, 10), config(1, 20));
+        let first_list = path(&first, "series", EPISODE_PATH);
+        let second_list = path(&second, "series", EPISODE_PATH);
+        let movie = path(&first, "movie", "tt98");
+
+        assert_eq!(titles(&get(&h, &first_list, &[]).await), sorted(&EPISODE_TITLES));
+        assert_eq!(titles(&get(&h, &second_list, &[]).await), sorted(&EPISODE_TITLES));
+        get(&h, &movie, &[]).await;
+        wait_for(
+            || account.resolved(PACKED) == 1 && account.resolved(TOO_BIG) == 1,
+            "the probes never reached the store",
+        )
+        .await;
+        // Both lists queued both; the second waits on the first's probes rather than resolving again.
+        assert_eq!(count(&runtime, "queued"), 4);
+
+        account.gate.add_permits(64);
+        settled(&runtime, 4).await;
+        assert_eq!((count(&runtime, "fits"), count(&runtime, "oversized")), (2, 2));
+        assert_eq!(
+            (account.resolved(PACKED), account.resolved(TOO_BIG)),
+            (1, 1),
+            "a joined probe resolved again"
+        );
+
+        for list in [&first_list, &second_list] {
+            let marked = get(&h, list, &[]).await;
+            assert!(
+                hdr(&marked, "server-timing").starts_with("cache;desc=stale"),
+                "{list} was not marked stale"
+            );
+            until_listed(&h, list, "Fauda.S01E03.1080p.WEB-DL.x264").await;
+        }
+        let other = get(&h, &movie, &[]).await;
+        assert!(
+            hdr(&other, "server-timing").starts_with("cache;desc=hit"),
+            "another title's list was touched: {}",
+            hdr(&other, "server-timing")
+        );
+
+        let strict = get(&h, &path(&strict, "series", EPISODE_PATH), &[]).await;
+        assert!(
+            !listed(&strict).contains_key("Fauda.S01E03.1080p.WEB-DL.x264"),
+            "a 1.1 GB file is over a 1 GB budget: {:?}",
+            titles(&strict)
+        );
+        assert_eq!(count(&runtime, "queued"), 4, "a probed release was queued again under another budget");
+    }
+
+    // A probe that cannot read the file, or reads it with no size, corrects nothing: the release stays out and the
+    // cached list is left as it is. A failure leaves no fact, so a later build may ask once more; a probe that
+    // answered without a size leaves one, so it is not asked again.
+    #[tokio::test]
+    async fn a_probe_without_a_size_leaves_the_list_alone() {
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(TOO_BIG, "Fauda.S01E03.2160p.WEB-DL.x265", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(2 * GIB)),
+            ]
+        }
+        let account = Account::new(&[PACKED, TOO_BIG, SMALL]);
+        let files =
+            HashMap::from([(PACKED, Serve::Fails), (TOO_BIG, Serve::NoTotal), (SMALL, Serve::File(2 * GIB))]);
+        let (h, runtime) = handler(&account, files, seeds);
+        let list = path(&config(20, 20), "series", EPISODE_PATH);
+
+        assert_eq!(titles(&get(&h, &list, &[]).await), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        settled(&runtime, 2).await;
+        assert_eq!((count(&runtime, "failed"), count(&runtime, "unknown")), (1, 1));
+
+        let after = get(&h, &list, &[]).await;
+        assert!(
+            hdr(&after, "server-timing").starts_with("cache;desc=hit"),
+            "a list was marked stale for a size nobody read: {}",
+            hdr(&after, "server-timing")
+        );
+        assert_eq!(titles(&after), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+
+        let rebuilt = get(&h, &format!("{list}?fresh=1"), &[]).await;
+        assert_eq!(titles(&rebuilt), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        assert_eq!(count(&runtime, "queued"), 3, "want only the failed probe asked again");
+    }
+
+    /// Fails unless `attrs` is free of every field only a read of the file's tracks can give.
+    fn assert_tracks_unknown(attrs: &serde_json::Value) {
+        for field in [
+            "probed",
+            "audioLanguages",
+            "subtitleLanguages",
+            "untaggedAudioTracks",
+            "width",
+            "height",
+            "frameRate",
+        ] {
+            assert!(attrs.get(field).is_none(), "{field} claims a read of tracks nobody read: {attrs}");
+        }
+    }
+
+    // A head whose tracks cannot be read (an MP4 whose moov lies past the first MiB) still came with the CDN's total,
+    // and that total is the file's size. Size recovery settles from it: the 1.1 GB file fits and is listed with its
+    // own size and the pack's as context, the 30 GB one stays out. Its tracks stay unknown in the list, and the fact
+    // keeps both from being resolved or queued again by a later build.
+    #[tokio::test]
+    async fn an_unreadable_head_with_a_stated_total_settles_size_recovery() {
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(TOO_BIG, "Fauda.S01E03.2160p.WEB-DL.x265", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(2 * GIB)),
+            ]
+        }
+        let account = Account::new(&[PACKED, TOO_BIG, SMALL]);
+        let files = HashMap::from([
+            (PACKED, Serve::Unreadable(Some(EPISODE))),
+            (TOO_BIG, Serve::Unreadable(Some(30 * GIB))),
+            (SMALL, Serve::File(2 * GIB)),
+        ]);
+        let (h, runtime) = handler(&account, files, seeds);
+        let list = path(&config(20, 20), "series", EPISODE_PATH);
+
+        assert_eq!(titles(&get(&h, &list, &[]).await), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        assert_eq!(count(&runtime, "queued"), 2);
+        settled(&runtime, 2).await;
+        assert_eq!((count(&runtime, "fits"), count(&runtime, "oversized")), (1, 1));
+
+        let rebuilt = until_listed(&h, &list, "Fauda.S01E03.1080p.WEB-DL.x264").await;
+        assert_eq!(
+            titles(&rebuilt),
+            sorted(&["Fauda.S01E03.1080p.WEB-DL.x264", "Fauda.S01E03.720p.WEB.x264"]),
+            "the 30 GB file stays out"
+        );
+        let packed = &listed(&rebuilt)["Fauda.S01E03.1080p.WEB-DL.x264"];
+        assert!(
+            packed["sizeBytes"] == EPISODE && packed["packSizeBytes"] == PACK_HINT,
+            "want the episode's own size and the pack's as context: {packed}"
+        );
+        let label = packed["label"].as_str().unwrap_or_default();
+        assert!(label.contains("1.1 GB"), "the label does not show the file's own size: {label}");
+        assert_tracks_unknown(packed);
+
+        // The rebuilt list put the file in the frontier, and a fresh build lists it again: neither probes it.
+        let fresh = get(&h, &format!("{list}?fresh=1"), &[]).await;
+        assert!(listed(&fresh).contains_key("Fauda.S01E03.1080p.WEB-DL.x264"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            (account.resolved(PACKED), account.resolved(TOO_BIG)),
+            (1, 1),
+            "a file with a size-only fact was probed again"
+        );
+        assert_eq!(count(&runtime, "queued"), 2, "a release with a size-only fact was queued again");
+    }
+
+    // The ordinary frontier: a served release whose head is unreadable is probed once, not on every rebuild. Its size
+    // corrects the indexer's number, naming the pack where the gap is a pack's and replacing a rounding difference
+    // outright, and its tracks stay unknown.
+    #[tokio::test]
+    async fn a_listed_release_with_an_unreadable_head_is_probed_once_for_its_size() {
+        const LISTED: i64 = 2 * GIB;
+        const SERVED: i64 = 2 * GIB - 4096;
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(LISTED)),
+            ]
+        }
+        let account = Account::new(&[PACKED, SMALL]);
+        let files = HashMap::from([
+            (PACKED, Serve::Unreadable(Some(EPISODE))),
+            (SMALL, Serve::Unreadable(Some(SERVED))),
+        ]);
+        let (h, _runtime) = handler(&account, files, seeds);
+        let list = path(&config(100, 20), "series", EPISODE_PATH);
+
+        let cold = get(&h, &list, &[]).await;
+        assert_eq!(listed(&cold)["Fauda.S01E03.1080p.WEB-DL.x264"]["sizeBytes"], PACK_HINT);
+        wait_for(
+            || account.resolved(PACKED) == 1 && account.resolved(SMALL) == 1,
+            "the frontier was never probed",
+        )
+        .await;
+        // Past the probes' flights, so a fresh build reads their facts rather than joining or restarting a probe.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let rebuilt = loop {
+            let rr = get(&h, &format!("{list}?fresh=1"), &[]).await;
+            if listed(&rr)["Fauda.S01E03.720p.WEB.x264"]["sizeBytes"] == SERVED
+                && listed(&rr)["Fauda.S01E03.1080p.WEB-DL.x264"]["sizeBytes"] == EPISODE
+            {
+                break rr;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sizes were never corrected: {:?}",
+                listed(&rr)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let rebuilt = listed(&rebuilt);
+        let (packed, small) =
+            (&rebuilt["Fauda.S01E03.1080p.WEB-DL.x264"], &rebuilt["Fauda.S01E03.720p.WEB.x264"]);
+        assert_eq!(packed["packSizeBytes"], PACK_HINT, "the gap is a pack's: {packed}");
+        assert!(small.get("packSizeBytes").is_none(), "a rounding difference is not a pack: {small}");
+        assert_tracks_unknown(packed);
+        assert_tracks_unknown(small);
+
+        get(&h, &format!("{list}?fresh=1"), &[]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            (account.resolved(PACKED), account.resolved(SMALL)),
+            (1, 1),
+            "a file with a size-only fact was probed again"
+        );
+    }
+
+    // With no total stated, an unreadable head leaves nothing to keep, exactly as before: size recovery settles as
+    // failed and the list is left alone, and a later build asks again, for the frontier and the recovery alike.
+    #[tokio::test]
+    async fn an_unreadable_head_without_a_total_is_asked_again() {
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Fauda.S01E03.1080p.WEB-DL.x264", Some(PACK_HINT)),
+                release(SMALL, "Fauda.S01E03.720p.WEB.x264", Some(2 * GIB)),
+            ]
+        }
+        let account = Account::new(&[PACKED, SMALL]);
+        let files = HashMap::from([(PACKED, Serve::Unreadable(None)), (SMALL, Serve::Unreadable(None))]);
+        let (h, runtime) = handler(&account, files, seeds);
+        let list = path(&config(20, 20), "series", EPISODE_PATH);
+
+        assert_eq!(titles(&get(&h, &list, &[]).await), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        settled(&runtime, 1).await;
+        assert_eq!(count(&runtime, "failed"), 1);
+        wait_for(|| account.resolved(SMALL) == 1, "the frontier was never probed").await;
+        // Past the probe's flight, so the fresh build below starts its own rather than joining this one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = get(&h, &list, &[]).await;
+        assert!(
+            hdr(&after, "server-timing").starts_with("cache;desc=hit"),
+            "a list was marked stale for a size nobody read: {}",
+            hdr(&after, "server-timing")
+        );
+
+        let rebuilt = get(&h, &format!("{list}?fresh=1"), &[]).await;
+        assert_eq!(titles(&rebuilt), sorted(&["Fauda.S01E03.720p.WEB.x264"]));
+        assert_tracks_unknown(&listed(&rebuilt)["Fauda.S01E03.720p.WEB.x264"]);
+        assert_eq!(count(&runtime, "queued"), 2, "want the failed recovery probe asked again");
+        wait_for(
+            || account.resolved(PACKED) == 2 && account.resolved(SMALL) == 2,
+            "a probe that kept nothing was not asked again",
+        )
+        .await;
+    }
+
+    // A movie has no pack for its size to be confused with: the budget drops it on the listed size, as before, and
+    // nothing probes it. A release with no size at all is never dropped by the budget.
+    #[tokio::test]
+    async fn a_movie_over_the_budget_is_dropped_and_never_probed() {
+        fn seeds() -> Vec<RawStream> {
+            vec![
+                release(PACKED, "Film.2019.2160p.REMUX", Some(68 * GIB)),
+                release(SMALL, "Film.2019.1080p.WEB-DL", None),
+            ]
+        }
+        let account = Account::new(&[PACKED, SMALL]);
+        let (h, runtime) = handler(&account, HashMap::from([(SMALL, Serve::File(9 * GIB))]), seeds);
+
+        let rr = get(&h, &path(&config(20, 20), "movie", "tt98"), &[]).await;
+        assert_eq!(titles(&rr), sorted(&["Film.2019.1080p.WEB-DL"]));
+        wait_for(|| account.resolved(SMALL) == 1, "the listed release was never probed").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(account.resolved(PACKED), 0, "a movie over the budget was resolved");
+        assert_eq!(count(&runtime, "queued"), 0);
+    }
+}
