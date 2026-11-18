@@ -688,6 +688,23 @@ async fn origin_handle<B>(
             ]});
             return origin_full(200, body.to_string());
         }
+        if let Some(list) = sized_title(imdb) {
+            // Releases of h264.mkv's head, each claiming its own size (`/f/sized/`); their probes are seeded by the
+            // test (`seed_sized`). A release named `unlisted-…` is listed with no size.
+            let streams: Vec<_> = list
+                .iter()
+                .map(|(name, label, size)| {
+                    let mut attributes = serde_json::json!({"cached": true, "codec": "h264", "label": label});
+                    if !name.starts_with("unlisted-") {
+                        attributes["sizeBytes"] = (*size).into();
+                    }
+                    serde_json::json!({"url": format!("http://{addr}/{p}/sized/{size}/h264.mkv"),
+                                       "attributes": attributes,
+                                       "behaviorHints": {"filename": name}})
+                })
+                .collect();
+            return origin_full(200, serde_json::json!({"streams": streams}).to_string());
+        }
         if imdb == "tt0000010" {
             let body = serde_json::json!({"streams": [
                 {"url": format!("http://{addr}/{p}/counted/h264.mkv"),
@@ -843,6 +860,20 @@ async fn origin_handle<B>(
             .unwrap();
     }
     let Some(rest) = path.strip_prefix("/f/") else { return origin_full(404, "") };
+    // `sized/<bytes>/<fixture>`: the fixture's head as the head of a file of `<bytes>`, which is all a resolve reads.
+    if let Some((size, name)) = rest.strip_prefix("sized/").and_then(|r| r.split_once('/')) {
+        let (Ok(size), Ok(data)) = (size.parse::<u64>(), std::fs::read(testdata(name))) else {
+            return origin_full(404, "");
+        };
+        let head = crate::scout::HEAD_BYTES as usize;
+        return Response::builder()
+            .status(206)
+            .header("content-type", "video/x-matroska")
+            .header("content-range", format!("bytes 0-{}/{size}", head - 1))
+            .header("content-length", head)
+            .body(Full::new(Bytes::copy_from_slice(&data[..head])).boxed())
+            .unwrap();
+    }
     let (metered, rest) = match rest.strip_prefix("metered/") {
         Some(n) => (true, n),
         None => (false, rest),
@@ -4446,6 +4477,152 @@ async fn a_conversion_is_not_made_from_a_release_far_above_the_link() {
     // ...and plays as it is where it can't.
     state.transcode_ok.store(false, Relaxed);
     assert_eq!(start_title("tt0000002", Some(30_000_000)).await, (Some("hevc.mkv".into()), Some(false)));
+}
+
+const GIB: u64 = 1 << 30;
+
+/// The fake scout's titles of `/f/sized/` releases (`seed_sized`), in scout's rank order: name, label, bytes. Sizes are
+/// all different, a size being what a probe is remembered under. `tt0000070` is shaped like a real list for a 4K film
+/// away from home: ten releases far past a 22 Mbit/s link, a 14 GB one whose heavy opening the link doesn't carry,
+/// then a 12 GB one it does.
+fn sized_title(imdb: &str) -> Option<Vec<(&'static str, &'static str, u64)>> {
+    let film = [
+        ("remux-59.mkv", "4K • REMUX • Dolby Vision • Atmos • 59 GB", 59 * GIB),
+        ("remux-53.mkv", "4K • REMUX • Dolby Vision • Atmos • 53 GB", 53 * GIB),
+        ("remux-69.mkv", "4K • REMUX • Dolby Vision • 69 GB", 69 * GIB),
+        ("remux-51.mkv", "4K • REMUX • HDR • Atmos • 51 GB", 51 * GIB),
+        ("remux-61.mkv", "4K • REMUX • Atmos • 61 GB", 61 * GIB),
+        ("remux-62.mkv", "4K • REMUX • Atmos • 62 GB", 62 * GIB),
+        ("peaky-14.mkv", "4K • BluRay • HDR • 14 GB", 14 * GIB),
+        ("bluray-24.mkv", "4K • BluRay • 24 GB", 24 * GIB),
+        ("bluray-23.mkv", "4K • BluRay • Dolby Vision • Atmos • 23 GB", 23 * GIB),
+        ("bluray-32.mkv", "4K • BluRay • HDR • Atmos • 32 GB", 32 * GIB),
+        ("web-24.mkv", "4K • WEB-DL • Dolby Vision • Atmos • 24 GB", 24 * GIB + 7_000_000),
+        ("fits-12.mkv", "4K • BluRay • HDR • Atmos • 12 GB", 12 * GIB),
+    ];
+    match imdb {
+        "tt0000070" => Some(film.to_vec()),
+        // No release the link carries within twenty seconds: the 14 GB one plays after a longer head start.
+        "tt0000071" => Some(vec![film[0], film[6], film[7]]),
+        // The first two listed with no size, and so with no probe of that size to say what they are.
+        "tt0000072" => Some(
+            film.iter()
+                .enumerate()
+                .map(|(i, r)| match i {
+                    0 => ("unlisted-remux-59.mkv", r.1, r.2),
+                    1 => ("unlisted-remux-53.mkv", r.1, r.2),
+                    _ => *r,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+const SIZED_RUNTIME: f64 = 8179.0;
+
+/// Remember a probe of each of `imdb`'s `/f/sized/` releases, as an earlier opening would have: an 8179 s film, a
+/// keyframe every 2 s, at an even rate — or, for `peaky-…`, its first 42 s at 25.5 Mbit/s, which a 22.44 Mbit/s link
+/// (17.95 of it with headroom) takes about 24 s of head start for while its 14.7 Mbit/s average fits.
+async fn seed_sized(state: &Arc<AppState>, imdb: &str) {
+    let bytes = fixture("h264.mkv");
+    let head = &bytes[..crate::scout::HEAD_BYTES as usize];
+    let probed = probe_with_head(&bytes, crate::scout::HEAD_BYTES as usize).await;
+    for (name, _, size) in sized_title(imdb).unwrap() {
+        let keyframes: Vec<f64> = (0..(SIZED_RUNTIME / 2.0) as usize).map(|i| i as f64 * 2.0).collect();
+        let heavy = 25.5e6 * 42.0 / 8.0;
+        let rest = (size as f64 - heavy) / (SIZED_RUNTIME - 42.0);
+        let byte_index: Vec<(f64, u64)> = keyframes
+            .iter()
+            .map(|&t| match name.starts_with("peaky-") {
+                true if t <= 42.0 => (t, (heavy * t / 42.0) as u64),
+                true => (t, (heavy + rest * (t - 42.0)) as u64),
+                false => (t, (size as f64 * t / SIZED_RUNTIME) as u64),
+            })
+            .collect();
+        let info = probe::MediaInfo {
+            duration: SIZED_RUNTIME,
+            keyframes,
+            byte_index,
+            video_bytes: Some(size),
+            ..probed.clone()
+        };
+        state.remember_probe(crate::state::probe_key(Some(size), head).unwrap(), &info);
+    }
+}
+
+/// A session for `imdb` on a `link`: the release it plays, whether converted, its head start, and how many releases
+/// it opened (`Server-Timing`'s `tried`).
+async fn start_sized(
+    state: &Arc<AppState>,
+    origin: &str,
+    imdb: &str,
+    link: u64,
+) -> (String, Option<bool>, Option<f64>, usize) {
+    let body = format!(
+        r#"{{"imdb":"{imdb}","scout":"{origin}/cfg","playable":{{"h264":51}},"maxBitrate":{link},"player":"native"}}"#
+    );
+    let r = call(state, "POST", "/remux/session", None, &body).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{body}: {}", r.text());
+    let timing = r.headers["server-timing"].to_str().unwrap().to_string();
+    let tried = timing.split("desc=\"").nth(1).and_then(|d| d.split(' ').next()).unwrap().parse().unwrap();
+    state.end_all("test").await;
+    let j = r.json();
+    (
+        j["release"]["filename"].as_str().unwrap().to_string(),
+        j["video"]["transcoded"].as_bool(),
+        j["prebuffer"].as_f64(),
+        tried,
+    )
+}
+
+/// Releases whose size alone says they can't play on the link aren't opened. Away from home on 22.44 Mbit/s, the ten
+/// 23–69 GB releases of an 8179 s film average 24–72 Mbit/s: none starts within a minute on 17.95 of it. Opened, they
+/// were twelve opens for the 12 GB release ranked last; now two (the 14 GB one, then it). Where nothing fits the link
+/// at all, every release is opened after all — the copy that needs least is still the one played.
+#[tokio::test]
+async fn releases_too_big_for_the_link_by_size_are_not_opened() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    seed_sized(&state, "tt0000070").await;
+    let (filename, transcoded, _, tried) = start_sized(&state, &origin, "tt0000070", 22_440_000).await;
+    assert_eq!((filename.as_str(), transcoded), ("fits-12.mkv", Some(false)), "the same release as before");
+    assert_eq!(tried, 2, "only the 14 GB and 12 GB releases are opened");
+
+    // 5 Mbit/s: every release is past it by size, so all twelve are opened for the copy that starves least.
+    let (filename, transcoded, _, tried) = start_sized(&state, &origin, "tt0000070", 5_000_000).await;
+    assert_eq!((filename.as_str(), transcoded), ("fits-12.mkv", Some(false)));
+    assert_eq!(tried, 12);
+}
+
+/// A release whose average fits the link but whose heavy opening doesn't is opened and judged by its byte index: the
+/// size rule never decides it. Here it is the copy taken, after a head start of more than twenty seconds; the two
+/// releases past the link by size beside it aren't opened.
+#[tokio::test]
+async fn a_release_whose_average_fits_is_judged_by_its_peaks() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    seed_sized(&state, "tt0000071").await;
+    let (filename, transcoded, prebuffer, tried) =
+        start_sized(&state, &origin, "tt0000071", 22_440_000).await;
+    assert_eq!((filename.as_str(), transcoded), ("peaky-14.mkv", Some(false)));
+    assert!(prebuffer.is_some_and(|p| (20.0..=60.0).contains(&p)), "{prebuffer:?}");
+    assert_eq!(tried, 1, "the 59 GB and 24 GB releases are not opened");
+}
+
+/// A release with no size listed has no remembered probe to say how long it runs, so it is opened as it always was —
+/// and once opened, its own probe says so for the next session, which doesn't open it again.
+#[tokio::test]
+async fn a_release_of_unknown_size_is_opened_until_its_probe_is_known() {
+    let origin = origin().await;
+    let state = test_state(&origin, 4, Duration::from_secs(600));
+    seed_sized(&state, "tt0000072").await;
+    let (filename, _, _, tried) = start_sized(&state, &origin, "tt0000072", 22_440_000).await;
+    assert_eq!(filename, "fits-12.mkv");
+    assert_eq!(tried, 4, "the two unlisted releases, the 14 GB and the 12 GB");
+    let (filename, _, _, tried) = start_sized(&state, &origin, "tt0000072", 22_440_000).await;
+    assert_eq!(filename, "fits-12.mkv");
+    assert_eq!(tried, 2, "the unlisted two are known from their own probes now");
 }
 
 /// A transcode is chosen at selection or not at all: a player replacing a session mid-film says `never` and gets a

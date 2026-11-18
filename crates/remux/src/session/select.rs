@@ -37,6 +37,22 @@ impl CandidateEvidence {
     }
 }
 
+/// What an earlier opening tells of a release before it is opened again: the fewest bytes a session of it sends, and
+/// the seconds they play over. Its own probe by title and name gives its video's bytes (a session sends those and an
+/// audio track); else the one remembered probe of a file of exactly its listed size gives that file's video bytes, or
+/// all of them. `None` where neither is remembered: the release is opened.
+fn size_floor(st: &AppState, imdb: &str, c: &scout::Stream) -> Option<(u64, f64)> {
+    let listed = c.attributes.size_bytes.filter(|n| *n > 0);
+    if let Some(info) = st.known().get(&known_key(imdb, c)) {
+        if let Some(video) = info.video_bytes {
+            return Some((video.min(listed.unwrap_or(u64::MAX)), info.duration));
+        }
+    }
+    let size = listed?;
+    let (duration, video) = st.probe_of_size(size)?;
+    Some((video.unwrap_or(size).min(size), duration))
+}
+
 /// `POST /remux/session`: pick and probe a release, choose its audio track, and set up its session.
 pub async fn create(
     st: &Arc<AppState>,
@@ -154,6 +170,15 @@ pub async fn create(
     let who = if guest { "a guest" } else { "a member" };
     // Set only on the branch that actually converts, for the end-of-session summary line.
     let mut transcode_reason: Option<String> = None;
+    let delivery = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
+        Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want)
+    };
+    let head_start = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
+        prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
+    };
+    // A Cast receiver shows no countdown and its sender returns at once, so nothing covers a wait past the short
+    // budget there: a receiver left on a black screen for a minute reads as broken.
+    let countdown = if want.player == Some("cast") { MAX_PREBUFFER } else { LONG_PREBUFFER };
 
     loop {
         // Left out of `candidates` by their names, which a person reading the log should see was on purpose.
@@ -232,6 +257,10 @@ pub async fn create(
         let source = &source;
         let started = Instant::now();
         let mut queue = ranked.into_iter().peekable();
+        // Releases whose size alone says no copy of them plays within the countdown (`beyond_link_by_size`), in rank
+        // order: opened only where nothing else is taken first, for the rungs below that take a copy too big for the link.
+        let mut deferred: Vec<(Fit, scout::Stream)> = Vec::new();
+        let mut by_size = true;
         let mut opening = FuturesOrdered::new();
         loop {
             while opening.len() < PARALLEL_OPENS
@@ -242,7 +271,25 @@ pub async fn create(
                 if fallback.is_some() && queue.peek().is_some_and(|(f, _)| *f == Fit::Convert) {
                     break;
                 }
-                let Some((_, c)) = queue.next() else { break };
+                let Some((f, c)) = queue.next() else { break };
+                let floor = Some(&c)
+                    .filter(|c| by_size && want.filename != Some(c.filename()))
+                    .and_then(|c| size_floor(st, imdb, c))
+                    .filter(|(bytes, secs)| {
+                        beyond_link_by_size(*bytes, *secs, want.start_at, max_bitrate, countdown)
+                    });
+                if let Some((bytes, secs)) = floor {
+                    eprintln!(
+                        "session {short}: {imdb} \"{}\" needs at least {} kbit/s, its average over {secs:.0}s — more \
+                         than the player's {} kbit/s carries within {countdown:.0}s; ruled out by size before \
+                         opening{rid_suffix}",
+                        c.attributes.label,
+                        average_bitrate(Some(bytes), secs).unwrap_or(0) / 1000,
+                        max_bitrate.unwrap_or(0) / 1000
+                    );
+                    deferred.push((f, c));
+                    continue;
+                }
                 tried += 1;
                 opening.push_back(async move {
                     let opened = tokio::time::timeout(OPEN_TIMEOUT, open(st, source, imdb, &c)).await;
@@ -251,7 +298,24 @@ pub async fn create(
                 });
             }
             // In the order they were started, which is rank order.
-            let Some((c, opened)) = opening.next().await else { break };
+            let Some((c, opened)) = opening.next().await else {
+                // Nothing taken and no copy within the countdown: what follows takes a copy too big for the link, or
+                // decides by whether there is one, so the releases ruled out by size are opened for it as before.
+                if !want.fits_only
+                    && !deferred.is_empty()
+                    && !too_big.iter().any(|t| head_start(t) <= countdown)
+                {
+                    eprintln!(
+                        "session {short}: {imdb} nothing else plays within the link; opening the {} ruled out by \
+                         size{rid_suffix}",
+                        deferred.len()
+                    );
+                    queue = std::mem::take(&mut deferred).into_iter().peekable();
+                    by_size = false;
+                    continue;
+                }
+                break;
+            };
             match opened {
                 // Dolby Vision profile 5 has no base layer to fall back to: stripped or transcoded, its picture is
                 // green and purple. Only a player that shows profile 5 plays it, and only as it is.
@@ -359,18 +423,9 @@ pub async fn create(
         // The transcode the link carries at its peak; none fits a link below the floor's, and one that would starve ranks
         // below the copy that starves least — taken only where no copy plays at all.
         fallback_seen |= fallback.is_some();
-        let delivery = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
-            Delivery::of(&t.1 .1, t.1 .0.size.or(t.0.attributes.size_bytes), want)
-        };
         let bitrate = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
             need(&t.1 .1, &delivery(t)).map(|n| n.bitrate)
         };
-        let head_start = |t: &(scout::Stream, (scout::Resolved, MediaInfo))| {
-            prebuffer(&t.1 .1, &delivery(t), usable).unwrap_or(f64::INFINITY)
-        };
-        // A Cast receiver shows no countdown and its sender returns at once, so nothing covers a wait past the short
-        // budget there: a receiver left on a black screen for a minute reads as broken.
-        let countdown = if want.player == Some("cast") { MAX_PREBUFFER } else { LONG_PREBUFFER };
         if chosen.is_none() && !want.fits_only {
             // The best-ranked copy the countdown covers, not the one with the shortest wait: that is only ever the
             // smallest, and a longer wait at the start is the price of the better picture.
