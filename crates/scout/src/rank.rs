@@ -38,6 +38,12 @@ impl RawStream {
     pub(crate) fn traits(&self) -> &ReleaseTraits {
         self.traits.0.get_or_init(|| ReleaseTraits::parse(&self.title))
     }
+
+    /// Whether a probe fact exists for this file, tracks or only its size. Another probe would read the same head,
+    /// so such a file is not probed again. Whether its tracks are known is `probe.is_some()`, never this.
+    pub(crate) fn probe_settled(&self) -> bool {
+        self.probe.is_some() || self.size_only_probe
+    }
 }
 
 /// Go `RawStream`: one release from one indexer.
@@ -64,6 +70,9 @@ pub struct RawStream {
     /// What the file itself said, when probed. `None` means "not asked", distinct from "asked and it
     /// told us nothing".
     pub probe: Option<Probe>,
+    /// A probe read this file's size but not its tracks (`ProbeFact::SizeOnly`). `size_bytes` holds that size and
+    /// `probe` stays `None`, so nothing reads the tracks as probed; the flag only stops the file being probed again.
+    pub size_only_probe: bool,
     /// The parsed title; see `RawStream::traits`.
     pub traits: TraitsCell,
 }

@@ -56,11 +56,11 @@ use crate::managed_hls::{ManagedHlsError, ManagedHlsRelease, ManagedHlsRequest, 
 use crate::metrics::{cache_persistent_gauge, metrics};
 use crate::play::{decode_play_token, encode_play_token, PlayTarget};
 use crate::playwarm::play_pending_key;
-use crate::probe::Probe;
+use crate::probe::ProbeFact;
 use crate::probe_fanout::{
     browser_probe_candidates, hydrate_pack_only_sizes, hydrate_probe_facts, select_probe_jobs,
     select_size_recovery_jobs, size_recovery_candidates, ProbeJob, SizeRecovery, PROBE_BUDGET, PROBE_TOP_N,
-    PROBE_TTL,
+    PROBE_TTL, SIZE_ONLY_PROBE_TTL,
 };
 use crate::rank::{
     cap_seeds, rank_streams_debug, real_debrid_blocked, seed_cap_order, title_tokens, RankDebug, RankFilters,

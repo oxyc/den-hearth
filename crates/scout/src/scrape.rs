@@ -898,6 +898,8 @@ impl From<CachedStream> for RawStream {
             held: false,
             source: s.source,
             probe: s.probe,
+            // Read from the probe cache for each list, like the probe facts themselves.
+            size_only_probe: false,
             traits: Default::default(),
         }
     }
