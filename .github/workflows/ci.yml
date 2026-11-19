@@ -135,11 +135,6 @@ jobs:
           if-no-files-found: ignore
       - name: Load harness checks
         run: python3 bench/http/test.py
-      - name: Apple TV controller tests
-        run: |
-          python3 -m pip install uv==0.11.28
-          uv sync --directory controller --locked --all-groups
-          uv run --directory controller python -m unittest discover -s tests -v
       # Reel's two resident resolvers. The python one against a stub yt-dlp; the youtubei.js one with the deno the
       # image pins (checked against the Dockerfile's own sum) and the packages its lockfile pins.
       - name: Reel's yt-dlp worker tests
@@ -153,6 +148,16 @@ jobs:
         env:
           DENO_DIR: ${{ runner.temp }}/deno
         run: deno test --frozen --config=deno.json --lock=deno.lock .
+      # Last, because setup-python moves `python3` for every step after it. The controller's Python is the image's
+      # (controller/.python-version); uv 0.11.28 cannot download that patch release, so the runner provides it.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: controller/.python-version
+      - name: Apple TV controller tests
+        run: |
+          python3 -m pip install uv==0.11.28
+          uv sync --directory controller --locked --all-groups
+          uv run --directory controller python -m unittest discover -s tests -v
 
   # Each benchmark once, so a bench that no longer builds or panics fails here rather than at measuring time. The bench
   # profile with the `bench` feature is a second build of the workspace, which on its own runner no longer follows
