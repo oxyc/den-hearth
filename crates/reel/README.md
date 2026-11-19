@@ -199,6 +199,17 @@ public visitor never names the origin Reel itself was reached at; resolve it wit
 there is no valid primary or its preparation failed, so no downloaded capability is emitted for an
 invalid candidate.
 
+With `player=native`, every link also carries `nativeMaster`: the `m/n/<blob>?s=…` HLS master capability
+that candidate's own plan would lead with, minted without resolving anything. A native player (AVPlayer)
+takes a media URL rather than a plan, so this is how it falls back to the next trailer when the primary
+refuses at play time, without a plan round trip that would start an alternate's resolve and index build.
+
+Candidate order is TMDB/KinoCheck/search rank, with any video that has a standing refusal moved behind
+the rest. A refusal is a verdict on the video itself (`unavailable`, `restricted`, `geo_blocked`) learned
+by any route that resolved it, including the native master, and lasts as long as `fail_ttl_ms` gives that
+reason. A title whose every candidate stands refused answers as having no trailer, cached only until the
+soonest refusal lapses. A plan (`/sources`) for a refused video answers that refusal at once.
+
 ### Choosing a route for a browser: mind the index
 
 Ask `/sources` and play what it lists; it already orders forms by what was measured. If you pick a route

@@ -4753,6 +4753,174 @@ async fn prepare_caps_demoted_answers_and_does_not_warm_an_all_dead_list() {
     assert!(warmed.lock().unwrap().is_empty(), "an all-dead list started a direct resolve");
 }
 
+/// The production case (an age-gated search result, 2026-11-19): a native player's master resolve was
+/// refused `restricted`, which only the per-rung direct cache remembered, so every later `/prepare`
+/// still named the refused video first and the Apple TV failed the same trailer every visit.
+#[tokio::test]
+async fn a_refused_master_resolve_moves_the_next_candidate_to_primary() {
+    let dir = temp_dir();
+    let refusal = "echo '{\"ok\": false, \"error\": \"ERROR: [youtube] x: Sign in to confirm your age\"}'";
+    let (fast, _) = fake_worker(&dir, "fast", refusal);
+    let (slow, _) = fake_worker(&dir, "slow", refusal);
+    let mut cfg = test_cfg(dir.clone());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = Some(slow);
+    cfg.deno = "sh".into();
+    cfg.youtubei_worker = Some(fast);
+    let mut state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["ageGated001", "liveSecond1"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    Arc::get_mut(&mut state).unwrap().direct_warm = Box::new(|_state, _id, _cap, _index| {});
+
+    // What the master route (`/m/n/…`) runs when AVPlayer fetches it.
+    let (answer, _) = crate::direct::answer(&state, "ageGated001", None).await;
+    assert_eq!(answer.unwrap_err().reason, "restricted");
+
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        None,
+        "series",
+        "tmdb:83295",
+        "v=2&surface=audible&player=native&intent=play",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["primary"]["id"], "liveSecond1", "the refused trailer was still the primary: {body}");
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert_eq!(links.len(), 2, "the refused trailer was dropped rather than demoted");
+    assert!(links[0]["planUrl"].as_str().unwrap().contains("/sources/liveSecond1.json"));
+}
+
+/// Every candidate refused is no trailer, not a list each client fails through — and that answer is
+/// kept only until the soonest refusal lapses.
+#[tokio::test]
+async fn discovery_names_no_trailer_when_every_candidate_is_refused() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["ageGated001", "ageGated002"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let refused = crate::ytdlp::PlayError {
+        status: 403,
+        reason: "restricted".into(),
+        message: "age-gated".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "ageGated001", &refused);
+    let gone = crate::ytdlp::PlayError { reason: "geo_blocked".into(), status: 451, ..refused.clone() };
+    crate::play::record_failure(&state, "ageGated002", &gone);
+    let soonest = crate::play::fail_ttl_ms("geo_blocked") / 1000;
+
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        None,
+        "movie",
+        "tt0111161",
+        "v=2&surface=audible&player=native&intent=play",
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], format!("public, max-age={soonest}"));
+    assert!(response.headers().get("x-den-degraded").is_none());
+    let body = direct_body(response).await;
+    assert!(body["primary"].is_null(), "a refused trailer was still offered: {body}");
+    assert_eq!(body["meta"]["links"], json!([]));
+
+    let response =
+        crate::addon::handle_meta(&state, &hyper::HeaderMap::new(), None, None, "movie", "tt0111161", "")
+            .await;
+    assert_eq!(response.headers()["cache-control"], format!("public, max-age={soonest}"));
+    let body = direct_body(response).await;
+    assert_eq!(body["meta"]["links"], json!([]));
+}
+
+/// A page reaching a refused alternate's plan is told at once, not handed forms that each fail in turn. The
+/// refusal here was learned at the master's rung; the plan's own peeks are per rung and would miss it.
+#[tokio::test]
+async fn a_plan_for_a_refused_video_answers_its_refusal() {
+    let mut state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let warmed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).unwrap().direct_warm =
+        Box::new(move |_state, id, _cap, _index| seen.lock().unwrap().push(id));
+    let refused = crate::ytdlp::PlayError {
+        status: 403,
+        reason: "restricted".into(),
+        message: "age-gated".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "ageGated001", &refused);
+
+    let response = crate::sources::handle_sources(
+        state.clone(),
+        None,
+        &hyper::HeaderMap::new(),
+        "ageGated001".into(),
+        "v=2&surface=audible&player=native&intent=play",
+    )
+    .await;
+    assert_eq!(response.status(), 403);
+    assert!(warmed.lock().unwrap().is_empty(), "a refused video's resolve was started");
+}
+
+/// A native player falls back by URL: every candidate carries the master it can mount, minted exactly
+/// as its own plan would, so a refused primary is followed by the next trailer without a plan fetch.
+#[tokio::test]
+async fn native_prepare_names_a_master_for_every_candidate() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.play_secret = Some("test-secret-for-native-masters".into());
+    let mut state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["firstTrail1", "secondTrail"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    Arc::get_mut(&mut state).unwrap().direct_warm = Box::new(|_state, _id, _cap, _index| {});
+    let ask = |player: &'static str| {
+        let state = state.clone();
+        async move {
+            let response = crate::prepare::handle_prepare(
+                &state,
+                &hyper::HeaderMap::new(),
+                None,
+                None,
+                "movie",
+                "tt0111161",
+                &format!("v=2&surface=audible&player={player}&intent=play"),
+            )
+            .await;
+            direct_body(response).await
+        }
+    };
+
+    let body = ask("native").await;
+    let links = body["meta"]["links"].as_array().unwrap();
+    for (link, vid) in links.iter().zip(["firstTrail1", "secondTrail"]) {
+        let master = link["nativeMaster"].as_str().unwrap();
+        let (blob, tag) = master.strip_prefix("m/n/").unwrap().split_once("?s=").unwrap();
+        let media = crate::sources::unseal(state.cfg.play_secret.as_deref(), &[], blob, Some(tag))
+            .expect("the master does not verify");
+        assert_eq!((media.v.as_str(), media.f.as_str(), media.n), (vid, "h", true));
+    }
+    // The primary's own plan mints the same master for it.
+    assert!(body["primaryPlan"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["delivery"]["capability"].as_str().is_some_and(|c| c.starts_with("m/n/"))));
+
+    let body = ask("hls.js").await;
+    assert!(body["meta"]["links"].as_array().unwrap().iter().all(|l| l.get("nativeMaster").is_none()));
+}
+
 /// A fake yt-dlp standing in for `--print "%(width)s %(height)s" --print urls`, counting its runs.
 fn fake_resolver(dir: &std::path::Path, name: &str, prints: &str) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt;

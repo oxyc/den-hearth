@@ -364,6 +364,18 @@ pub(crate) fn fail_ttl_ms(reason: &str) -> u64 {
     }
 }
 
+/// A failure that is a verdict on the video itself — removed, private or age-gated, blocked in this
+/// box's region — rather than on this box or on YouTube's mood. Every form of the trailer fails alike
+/// on one of these, so whichever path learns it first records it where discovery's demotion reads.
+pub(crate) fn is_video_verdict(reason: &str) -> bool {
+    matches!(reason, "unavailable" | "restricted" | "geo_blocked")
+}
+
+/// The standing verdict on `vid` itself (`is_video_verdict`), if one is recorded.
+pub(crate) fn standing_verdict(state: &AppState, vid: &str) -> Option<PlayError> {
+    cached_failure(state, vid, (state.clock)()).filter(|e| is_video_verdict(&e.reason))
+}
+
 /// The still-standing failure for `vid`, if any. Cheap: one lock, one lookup, off the hot path for
 /// every cache hit (which returns before this).
 fn cached_failure(state: &AppState, vid: &str, now: u64) -> Option<PlayError> {
@@ -419,6 +431,9 @@ pub struct Demotion {
     /// The candidate the client will play first is itself dead, which after the sort means they all
     /// are. Nothing here is worth a speculative download.
     pub head_dead: bool,
+    /// With `head_dead`: how long until the soonest of those failures lapses and a candidate may be
+    /// worth asking again. Zero otherwise.
+    pub revives_in_ms: u64,
 }
 
 /// Move candidates we currently know are unplayable behind the ones that might work, preserving
@@ -455,7 +470,13 @@ pub fn demote_known_dead(state: &AppState, ids: &mut [String]) -> Demotion {
     if reordered {
         ids.sort_by_key(|id| is_dead(id));
     }
-    Demotion { reordered, head_dead: is_dead(&ids[0]) }
+    let head_dead = is_dead(&ids[0]);
+    let revives_in_ms = if head_dead {
+        ids.iter().filter_map(|id| map.get(id.as_str())).map(|(_, exp)| exp - now).min().unwrap_or(0)
+    } else {
+        0
+    };
+    Demotion { reordered, head_dead, revives_in_ms }
 }
 
 /// Drop a FINISHED download from the in-flight map, so the next `fetch_trailer` starts a new one

@@ -434,6 +434,12 @@ pub(crate) async fn prepare_sources(
         .map_err(|detail| Box::new(httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)))?;
     let (surface, player) = parse_ask(query)
         .map_err(|detail| Box::new(httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)))?;
+    // A video already refused for what it is (removed, age-gated, blocked here) fails in every form, and the
+    // per-rung peeks below would miss a refusal learned at another rung and list forms that can only fail. Said
+    // at once, so a page advances to its next candidate without a media attempt.
+    if let Some(e) = crate::play::standing_verdict(&state, &vid) {
+        return Err(Box::new(httputil::timed(crate::play::play_error(&state, &vid, &e), "cache;desc=hit")));
+    }
     // `intent=warm`: asked because a viewer might open the trailer, not because a surface is about to play it.
     // The legacy `/sources` contract still builds the progressive index a subsequent open needs. Combined
     // `/prepare` passes `cheap_warm`: it starts only the primary direct resolve, never waits for it, builds no
@@ -670,18 +676,7 @@ pub(crate) async fn prepare_sources(
                 Delivery::Reel {
                     capability: seal(
                         signer.as_ref(),
-                        &Media {
-                            v: vid.clone(),
-                            f: "h".into(),
-                            h: None,
-                            a: false,
-                            n: native,
-                            p: report.clone(),
-                            i: iid.clone(),
-                            e: ep,
-                            x: expires,
-                            den,
-                        },
+                        &master_media(&vid, native, report.clone(), iid.clone(), ep, expires, den),
                     ),
                 },
                 true,
@@ -751,6 +746,50 @@ pub(crate) async fn prepare_sources(
     };
     let plan = SourcePlan { v: 2, sources, crop, expires: soonest / 1000 };
     Ok(PreparedSources { id: vid, plan, timing, max_age })
+}
+
+/// The HLS master `Media` a plan's `Form::Hls` entry seals.
+fn master_media(
+    vid: &str,
+    native: bool,
+    report: Option<String>,
+    iid: Option<String>,
+    ep: Option<u64>,
+    expires: u64,
+    den: bool,
+) -> Media {
+    Media {
+        v: vid.to_owned(),
+        f: "h".into(),
+        h: None,
+        a: false,
+        n: native,
+        p: report,
+        i: iid,
+        e: ep,
+        x: expires,
+        den,
+    }
+}
+
+/// The native HLS master capability for `vid`, exactly as a native plan for this request would mint it,
+/// without building that plan: nothing is resolved until the master itself is fetched.
+pub(crate) fn native_master(
+    state: &AppState,
+    signer: Option<&crate::sign::Signer>,
+    report: Option<String>,
+    vid: &str,
+    binding: crate::sign::Binding<'_>,
+    den: bool,
+) -> String {
+    let (iid, ep) = match binding {
+        crate::sign::Binding::Unbound => (None, None),
+        crate::sign::Binding::Install { iid, ep } | crate::sign::Binding::Den { iid, ep } => {
+            (iid.map(str::to_owned), Some(ep))
+        }
+    };
+    let expires = (state.clock)() / 1000 + MEDIA_TTL_SECS;
+    seal(signer, &master_media(vid, true, report, iid, ep, expires, den))
 }
 
 /// A source ladder before its HTTP envelope. Keeping the cache lifetime and timing beside the body

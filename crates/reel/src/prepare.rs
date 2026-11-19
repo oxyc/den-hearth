@@ -57,6 +57,7 @@ pub async fn handle_prepare(
     );
     if contract == crate::sources::Contract::V2 {
         add_plan_urls(&mut meta, query);
+        add_native_masters(state, headers, query, &mut meta, &discovered.yt_ids, binding, den.is_some());
     }
     let Some(primary_id) = discovered.yt_ids.first().cloned() else {
         let body = match contract {
@@ -78,7 +79,11 @@ pub async fn handle_prepare(
                 "intent": intent,
             }),
         };
-        let cache = crate::addon::negative_cache_control(cfg.is_some(), discovered.degraded);
+        let cache = crate::addon::negative_cache_control(
+            cfg.is_some(),
+            discovered.degraded,
+            discovered.all_dead_for_ms,
+        );
         let mut response = httputil::timed(
             httputil::json(StatusCode::OK, &body, &[("cache-control", cache.as_str())]),
             &discovered.timing,
@@ -99,7 +104,8 @@ pub async fn handle_prepare(
         Some(binding),
         den.is_some(),
         warm,
-        !discovered.head_dead,
+        // Discovery never names a known-dead primary, so its resolve is always worth starting.
+        true,
     )
     .await
     {
@@ -227,6 +233,41 @@ fn add_plan_urls(meta: &mut Value, query: &str) {
         link.remove("trailers");
         link.remove("sources");
         link.insert("planUrl".into(), Value::String(plan_url));
+    }
+}
+
+/// For a native player, give every candidate the HLS master capability that player mounts directly.
+///
+/// A native player (AVPlayer) takes a media URL, not a plan, and fetching an alternate's plan before
+/// it can fall back costs a round trip and starts that alternate's resolve and index build whether or
+/// not it is ever played. Minting the master costs a seal and resolves nothing until it is fetched,
+/// so a primary that refuses at play time (age-gated, removed, blocked here) falls through to the
+/// next candidate at once instead of leaving the title with no trailer.
+fn add_native_masters(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &str,
+    meta: &mut Value,
+    yt_ids: &[String],
+    binding: crate::sign::Binding<'_>,
+    den: bool,
+) {
+    if query_param(query, "player").as_deref() != Some("native") {
+        return;
+    }
+    let Some(links) = meta["meta"]["links"].as_array_mut() else {
+        return;
+    };
+    // Derived once, not once per link, as `build_meta` does.
+    let signer = state.cfg.play_secret.as_deref().map(crate::sign::Signer::new);
+    let report = crate::client::raw_report(headers, query);
+    // `build_meta` emits exactly one link per id, in order.
+    for (link, vid) in links.iter_mut().zip(yt_ids) {
+        if let Some(link) = link.as_object_mut() {
+            let master =
+                crate::sources::native_master(state, signer.as_ref(), report.clone(), vid, binding, den);
+            link.insert("nativeMaster".into(), Value::String(master));
+        }
     }
 }
 

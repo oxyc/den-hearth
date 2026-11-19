@@ -448,17 +448,28 @@ pub(crate) struct PreparedDiscovery {
     pub valid: bool,
     pub stale: bool,
     pub reordered: bool,
-    pub head_dead: bool,
+    /// Every candidate is a standing failure, so the answer names none: `Some(ms)` until the soonest of
+    /// those failures lapses, which is as long as that "no trailer" may be kept.
+    pub all_dead_for_ms: Option<u64>,
     pub degraded: Option<&'static str>,
     pub timing: String,
 }
 
 /// Cache a genuine "no trailer" response no longer than the resolve cache fact behind it. A configured
 /// path is an install credential and must remain private; a transient lookup failure has no authoritative
-/// negative fact to cache at all.
-pub(crate) fn negative_cache_control(configured: bool, degraded: Option<&str>) -> String {
+/// negative fact to cache at all. A title whose every candidate is a standing failure has trailers, just
+/// none that plays now, so it is kept only until the soonest failure lapses.
+pub(crate) fn negative_cache_control(
+    configured: bool,
+    degraded: Option<&str>,
+    all_dead_for_ms: Option<u64>,
+) -> String {
     if degraded.is_some() {
         return "no-store".to_owned();
+    }
+    if let Some(ms) = all_dead_for_ms {
+        let scope = if configured { "private" } else { "public" };
+        return format!("{scope}, max-age={}", ms.div_ceil(1000));
     }
     let seconds = YT_NEG_TTL_MS / 1000;
     if configured {
@@ -498,7 +509,7 @@ pub(crate) async fn prepare_discovery(
             valid: false,
             stale: false,
             reordered: false,
-            head_dead: false,
+            all_dead_for_ms: None,
             degraded: None,
             timing: String::new(),
         };
@@ -516,6 +527,13 @@ pub(crate) async fn prepare_discovery(
     let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, &id, ty, &lang).await;
     let mut yt_ids = resolved.ids;
     let demotion = crate::play::demote_known_dead(state, &mut yt_ids);
+    // Every candidate refused: naming them anyway sends each client through a list it can only fail,
+    // and a failure reads to the viewer as a broken trailer rather than none. The resolve entry keeps
+    // the ids, so they come back as soon as a failure lapses.
+    let all_dead_for_ms = demotion.head_dead.then_some(demotion.revives_in_ms);
+    if all_dead_for_ms.is_some() {
+        yt_ids.clear();
+    }
     PreparedDiscovery {
         id,
         base,
@@ -523,7 +541,7 @@ pub(crate) async fn prepare_discovery(
         valid: true,
         stale: resolved.stale,
         reordered: demotion.reordered,
-        head_dead: demotion.head_dead,
+        all_dead_for_ms,
         degraded: resolved.degraded,
         timing: resolved.timing,
     }
@@ -555,26 +573,23 @@ pub async fn handle_meta(
     }
     // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
     // the alternates are downloaded on demand only if that first one fails. After the demotion above,
-    // a primary that is STILL known dead means every candidate is — so there is nothing worth
-    // speculatively fetching, and the permit is better left for a /play someone is waiting on.
+    // a primary is never a known-dead candidate: a list with nothing else in it names none at all.
     if let Some(primary) = prepared.yt_ids.first() {
         let (download, direct, progressive) = prewarm_choice(query_param(query, "prewarm").as_deref());
-        if !prepared.head_dead {
-            if download {
-                (state.prewarm)(state.clone(), primary.clone());
-            }
-            // The resolve as well, which is what a browser asks for next. Prewarming only the
-            // download is what made the direct path feel SLOWER on a title that had been browsed:
-            // `/play` was already a warm file while `/direct` still had a cold yt-dlp run in front
-            // of it. A resolve is a metadata round-trip, so it spends a probe permit rather than a
-            // download slot or room on the cache volume.
-            // At the `?height=` the `/direct` that follows will ask for, or that is a second resolve.
-            if direct {
-                let cap = crate::direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
-                // And `?audio=` as the `/progressive` request will carry it, or the index is for the other file.
-                let index = progressive.then(|| query_param(query, "audio").as_deref() == Some("1"));
-                (state.direct_warm)(state.clone(), primary.clone(), cap, index);
-            }
+        if download {
+            (state.prewarm)(state.clone(), primary.clone());
+        }
+        // The resolve as well, which is what a browser asks for next. Prewarming only the
+        // download is what made the direct path feel SLOWER on a title that had been browsed:
+        // `/play` was already a warm file while `/direct` still had a cold yt-dlp run in front
+        // of it. A resolve is a metadata round-trip, so it spends a probe permit rather than a
+        // download slot or room on the cache volume.
+        // At the `?height=` the `/direct` that follows will ask for, or that is a second resolve.
+        if direct {
+            let cap = crate::direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
+            // And `?audio=` as the `/progressive` request will carry it, or the index is for the other file.
+            let index = progressive.then(|| query_param(query, "audio").as_deref() == Some("1"));
+            (state.direct_warm)(state.clone(), primary.clone(), cap, index);
         }
     }
     let payload =
@@ -610,7 +625,7 @@ pub async fn handle_meta(
         // A configured install's own answer, which only its client keeps: a day, as above.
         "private, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800".to_string()
     } else {
-        negative_cache_control(cfg.is_some(), prepared.degraded)
+        negative_cache_control(cfg.is_some(), prepared.degraded, prepared.all_dead_for_ms)
     };
     // The links are relative (`request_root`), so the body does not depend on the host it was asked at.
     let extra = [("cache-control", cache_control.as_str())];

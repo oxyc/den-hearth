@@ -639,6 +639,15 @@ pub(crate) async fn answer(
                 if !matches!(&answer, Err(e) if e.reason == "throttled") {
                     remember(&st, &k, (answer.clone(), now + ttl_ms(&answer, now)), now);
                 }
+                // This cache is keyed per rung and read only by the media routes. Discovery orders its
+                // candidates by `play_fails`, so a refusal learned here (the native master's resolve,
+                // which never downloads) must land there too, or `/meta` and `/prepare` keep naming the
+                // refused video first and every client rediscovers it.
+                if let Err(e) = &answer {
+                    if crate::play::is_video_verdict(&e.reason) {
+                        crate::play::record_failure(&st, &v, e);
+                    }
+                }
                 answer
             };
             // A panic must become a per-attempt failure instead of poisoning the shared future:
