@@ -133,12 +133,6 @@ jobs:
           name: junit
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
-      # Each benchmark once, so a bench that no longer builds or panics fails here rather than at measuring time.
-      - name: Benchmarks run once
-        run: bench/micro.sh --test
-        env:
-          CARGO_PROFILE_BENCH_LTO: "false"
-          CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
       - name: Load harness checks
         run: python3 bench/http/test.py
       - name: Apple TV controller tests
@@ -159,6 +153,23 @@ jobs:
         env:
           DENO_DIR: ${{ runner.temp }}/deno
         run: deno test --frozen --config=deno.json --lock=deno.lock .
+
+  # Each benchmark once, so a bench that no longer builds or panics fails here rather than at measuring time. The bench
+  # profile with the `bench` feature is a second build of the workspace, which on its own runner no longer follows
+  # clippy and the tests on the run's critical path.
+  benches:
+    needs: scope
+    if: needs.scope.outputs.source_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Benchmarks run once
+        run: bench/micro.sh --test
+        env:
+          CARGO_PROFILE_BENCH_LTO: "false"
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
 
   # Remux's #[ignore]d end-to-end tests, in the Dockerfile's e2e stage: the ffmpeg the image ships, because another
   # version seeks differently and the segment alignment depends on exactly how it seeks. The stage builds no
@@ -268,11 +279,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Preserve the existing required `test` status while the Rust/Python checks and the e2e stage run as separate
-  # jobs that a recorded pass can skip. A failed or skipped scope must not read as a pass. The playback e2e is never
+  # Preserve the existing required `test` status while the Rust/Python checks, the benches and the e2e stage run as
+  # separate jobs that a recorded pass can skip. A failed or skipped scope must not read as a pass. The playback e2e is never
   # reused: wherever it was due it must have run and passed in this run.
   test:
-    needs: [scope, checks, e2e, stack-e2e]
+    needs: [scope, checks, benches, e2e, stack-e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -286,12 +297,13 @@ jobs:
         env:
           SOURCE_CHANGED: ${{ needs.scope.outputs.source_changed }}
           CHECKS: ${{ needs.checks.result }}
+          BENCHES: ${{ needs.benches.result }}
           E2E: ${{ needs.e2e.result }}
         run: |
           if [ "$SOURCE_CHANGED" = false ]; then
-            test "$CHECKS" = skipped && test "$E2E" = skipped
+            test "$CHECKS" = skipped && test "$BENCHES" = skipped && test "$E2E" = skipped
           else
-            test "$CHECKS" = success && test "$E2E" = success
+            test "$CHECKS" = success && test "$BENCHES" = success && test "$E2E" = success
           fi
 
   # Record that this exact source tree passed every blocking job, for a later run on byte-identical source. Only a
@@ -299,10 +311,10 @@ jobs:
   # The playback e2e is recorded beside the tree (`stack`: the den-edge it ran against, or `not-run`) but never reused
   # from it (see `scope`).
   verdict:
-    needs: [scope, checks, e2e, controller-image, build-pr, stack-e2e]
+    needs: [scope, checks, benches, e2e, controller-image, build-pr, stack-e2e]
     if: >-
       always() && needs.scope.outputs.source_changed == 'true' && needs.checks.result == 'success'
-      && needs.e2e.result == 'success'
+      && needs.benches.result == 'success' && needs.e2e.result == 'success'
       && (needs.stack-e2e.result == 'success' || needs.stack-e2e.result == 'skipped')
       && (needs.build-pr.result == 'success' || (github.event_name == 'push' && needs.build-pr.result == 'skipped'))
       && (needs.controller-image.result == 'success' || (github.event_name == 'push' && needs.controller-image.result == 'skipped'))
