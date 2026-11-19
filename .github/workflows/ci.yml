@@ -135,11 +135,6 @@ jobs:
           if-no-files-found: ignore
       - name: Load harness checks
         run: python3 bench/http/test.py
-      - name: Apple TV controller tests
-        run: |
-          python3 -m pip install uv==0.11.28
-          uv sync --directory controller --locked --all-groups
-          uv run --directory controller python -m unittest discover -s tests -v
       # Reel's two resident resolvers. The python one against a stub yt-dlp; the youtubei.js one with the deno the
       # image pins (checked against the Dockerfile's own sum) and the packages its lockfile pins.
       - name: Reel's yt-dlp worker tests
@@ -153,6 +148,16 @@ jobs:
         env:
           DENO_DIR: ${{ runner.temp }}/deno
         run: deno test --frozen --config=deno.json --lock=deno.lock .
+      # Last, because setup-python moves `python3` for every step after it. The controller's Python is the image's
+      # (controller/.python-version); uv 0.11.28 cannot download that patch release, so the runner provides it.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: controller/.python-version
+      - name: Apple TV controller tests
+        run: |
+          python3 -m pip install uv==0.11.28
+          uv sync --directory controller --locked --all-groups
+          uv run --directory controller python -m unittest discover -s tests -v
 
   # Each benchmark once, so a bench that no longer builds or panics fails here rather than at measuring time. The bench
   # profile with the `bench` feature is a second build of the workspace, which on its own runner no longer follows
@@ -407,7 +412,7 @@ jobs:
         id: source
         run: bash .github/scripts/release-metadata.sh version >> "$GITHUB_OUTPUT"
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -495,7 +500,7 @@ jobs:
         continue-on-error: true
         run: trivy convert --format sarif --output trivy.sarif trivy.json
       - name: Upload scan to code scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         # A code-scanning outage must not hold a release.
         continue-on-error: true
         with:
@@ -505,7 +510,7 @@ jobs:
         continue-on-error: true
         run: trivy convert --format sarif --output trivy-controller.sarif trivy-controller.json
       - name: Upload controller scan to code scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         continue-on-error: true
         with:
           sarif_file: trivy-controller.sarif
