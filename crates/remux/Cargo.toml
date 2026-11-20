@@ -13,6 +13,8 @@ den-upstream.workspace = true
 den-http.workspace = true
 # The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file with, shared with Scout.
 den-media.workspace = true
+# den-core's `audio_pick`: the audio track a session plays, by the rule Scout and the Apple players pick with.
+den-sync.workspace = true
 den-process.workspace = true
 # The guarded signal to ffmpeg's process group, shared with Reel.
 den-net.workspace = true

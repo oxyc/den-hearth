@@ -16,6 +16,8 @@ den-http.workspace = true
 den-upstream.workspace = true
 # The EBML elements, ISO-BMFF boxes and codec configuration records the probe reads a file's head with, shared with Remux.
 den-media.workspace = true
+# den-core's `audio_pick`: the audio track TorBox is asked for, by the rule Remux and the Apple players pick with.
+den-sync.workspace = true
 # The request and response bodies the handler serves.
 bytes.workspace = true
 http-body-util.workspace = true
