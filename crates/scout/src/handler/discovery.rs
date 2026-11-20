@@ -110,27 +110,19 @@ pub(super) fn managed_audio_choice(
     if let Some(selected) = selected.filter(|index| *index >= 0 && (*index as usize) < tracks.len()) {
         return (Some(selected), "explicit track");
     }
-    // The rule Remux picks with. The probe keeps no default or commentary flags, so only a language match counts: with
-    // none, TorBox's own default track plays, as it did before a pick existed.
-    let probed: Vec<ProbedTrack> = tracks.iter().map(|language| ProbedTrack(language)).collect();
-    match den_media::lang::pick_audio(&probed, wanted) {
-        (index, den_media::lang::AudioReason::Preferred(_)) => (Some(index as i64), "preferred language"),
+    // den-core's `audio_pick`, the rule Remux picks with. The probe keeps no default, commentary or channel facts, so
+    // only the languages count (`""` when the file gave none): a wanted one, else an untagged track over one tagged
+    // with a language nobody asked for (den-hearth#286). With neither, TorBox's own default track plays, as it did
+    // before a pick existed.
+    let probed: Vec<den_sync::AudioTrack> = tracks
+        .iter()
+        .map(|language| den_sync::AudioTrack { language: Some(language.clone()), ..Default::default() })
+        .collect();
+    use den_sync::AudioReason as Why;
+    match den_sync::audio_pick(&probed, None, wanted).map(|pick| (pick.index as i64, pick.reason)) {
+        Some((index, Why::Kept | Why::Wanted)) => (Some(index), "preferred language"),
+        Some((index, Why::Unlabelled)) => (Some(index), "unlabelled over an unwanted language"),
         _ => (None, "no wanted language in the probe"),
-    }
-}
-
-/// One audio track of a probe, for `den_media::lang::pick_audio`: its language, `""` when the file gave none.
-struct ProbedTrack<'a>(&'a str);
-
-impl den_media::lang::AudioCandidate for ProbedTrack<'_> {
-    fn language(&self) -> Option<&str> {
-        Some(self.0).filter(|language| !language.is_empty())
-    }
-    fn is_default(&self) -> bool {
-        false
-    }
-    fn is_commentary(&self) -> bool {
-        false
     }
 }
 
@@ -1292,7 +1284,20 @@ mod managed_audio_tests {
         let plain = ordered(&["ru", "en"]);
         assert_eq!(managed_audio_choice(&plain, &wanted, None), (Some(1), "preferred language"));
         assert_eq!(managed_audio_choice(&plain, &wanted, Some(0)), (Some(0), "explicit track"));
-        let none = ordered(&["ru", ""]);
-        assert_eq!(managed_audio_choice(&none, &wanted, None).0, None);
+        let tagged = ordered(&["ru", "it"]);
+        assert_eq!(managed_audio_choice(&tagged, &wanted, None).0, None, "TorBox's default track plays");
+    }
+
+    // den-hearth#286: Italian tagged first, the English track untagged. With nothing tagged English, the untagged track
+    // plays rather than TorBox's track 0.
+    #[test]
+    fn an_untagged_track_beats_one_tagged_with_an_unwanted_language() {
+        let wanted = ["en".to_owned()];
+        let release = ordered(&["it", ""]);
+        assert_eq!(
+            managed_audio_choice(&release, &wanted, None),
+            (Some(1), "unlabelled over an unwanted language")
+        );
+        assert_eq!(managed_audio_choice(&release, &["it".to_owned()], None), (Some(0), "preferred language"));
     }
 }
