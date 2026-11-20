@@ -194,6 +194,61 @@ async fn managed_hls_is_title_level_and_keeps_provider_ids_inside_scout() {
     assert!(!targets[0].no_add, "managed playback must reuse the ordinary add-budgeted resolve path");
 }
 
+// A dual-audio release (Italian first, English second) nobody has probed: managed playback reads that one file's
+// head before it chooses, so the wanted English is track 1 and the player is told the tracks it can offer.
+#[tokio::test]
+async fn managed_hls_probes_an_unprobed_release_to_pick_the_wanted_audio_track() {
+    use den_media::mkv::{
+        LANGUAGE as ID_LANGUAGE, SEGMENT as ID_SEGMENT, TRACKS as ID_TRACKS, TRACK_ENTRY as ID_TRACK_ENTRY,
+        TRACK_TYPE as ID_TRACK_TYPE,
+    };
+
+    use crate::probe::TRACK_TYPE_AUDIO;
+    use crate::tests::attributes_web::ebml;
+
+    let track = |language: &[u8]| {
+        ebml(
+            ID_TRACK_ENTRY,
+            &[ebml(ID_TRACK_TYPE, &[vec![TRACK_TYPE_AUDIO]]), ebml(ID_LANGUAGE, &[language.to_vec()])],
+        )
+    };
+    let head = ebml(ID_SEGMENT, &[ebml(ID_TRACKS, &[track(b"ita"), track(b"eng")])]);
+    let reads = Arc::new(AtomicI32::new(0));
+    let counted = reads.clone();
+    let doer: Arc<dyn crate::scrape::Doer> =
+        Arc::new(MockDoer(move |_: reqwest::Request| -> Result<reqwest::Response, DoError> {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let response = http::Response::builder()
+                .status(206)
+                .header("content-range", format!("bytes 0-{}/{}", head.len() - 1, 8 * GIB))
+                .body(head.clone())
+                .expect("a valid response");
+            Ok(reqwest::Response::from(response))
+        }));
+    let resolver = Arc::new(FixedManagedHls::default());
+    let inspect = resolver.clone();
+    let h = new_handler(test_deps(move |deps| {
+        deps.managed_hls = Some(resolver);
+        deps.probe_doer = Some(doer);
+    }));
+    let request = ManagedHlsRequest {
+        imdb: "tt0111161".to_owned(),
+        audio: vec!["en".to_owned()],
+        ..Default::default()
+    };
+
+    let result = h.managed_hls(&valid_blob(), &request).await.expect("managed HLS");
+
+    assert_eq!(result.audio_track, 1, "the English track, not TorBox's first");
+    assert_eq!(result.audio_tracks, ["it", "en"].map(str::to_owned), "the tracks the player may offer");
+    assert_eq!(inspect.targets.lock().unwrap()[0].audio_track, Some(1));
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one ranged read of the chosen file's head");
+
+    // The fact is cached for the next play, which reads nothing.
+    h.managed_hls(&valid_blob(), &request).await.expect("managed HLS again");
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the second play is answered from the probe cache");
+}
+
 // A receiver plays TorBox's stream as it is. A release whose video it can't take — any HEVC one, from TorBox's
 // MPEG-TS — is left to Remux, which can convert it or choose another; one it takes goes to the receiver as TorBox's
 // own. In the page, nothing changes.

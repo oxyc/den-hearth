@@ -11,6 +11,7 @@
 //! * [`mkv`] — the Matroska element ids both probes read.
 //! * [`mp4`] — the boxes of a buffer, and the track boxes both probes read.
 //! * [`codec`] — the `avcC`, `hvcC`, `av1C` and Dolby Vision configuration records.
+//! * [`lang`] — language tags and the audio track a playback picks.
 
 #![forbid(unsafe_code)]
 
@@ -18,5 +19,6 @@ pub mod codec;
 pub mod ebml;
 pub mod indexed_mkv;
 pub mod indexed_mp4;
+pub mod lang;
 pub mod mkv;
 pub mod mp4;

@@ -58,9 +58,9 @@ use crate::play::{decode_play_token, encode_play_token, PlayTarget};
 use crate::playwarm::play_pending_key;
 use crate::probe::ProbeFact;
 use crate::probe_fanout::{
-    browser_probe_candidates, hydrate_pack_only_sizes, hydrate_probe_facts, select_probe_jobs,
-    select_size_recovery_jobs, size_recovery_candidates, ProbeJob, SizeRecovery, PROBE_BUDGET, PROBE_TOP_N,
-    PROBE_TTL, SIZE_ONLY_PROBE_TTL,
+    browser_probe_candidates, held_probe_job, hydrate_pack_only_sizes, hydrate_probe_facts,
+    select_probe_jobs, select_size_recovery_jobs, size_recovery_candidates, ProbeJob, SizeRecovery,
+    PROBE_BUDGET, PROBE_TOP_N, PROBE_TTL, SIZE_ONLY_PROBE_TTL,
 };
 use crate::rank::{
     cap_seeds, rank_streams_debug, real_debrid_blocked, seed_cap_order, title_tokens, RankDebug, RankFilters,
@@ -1376,7 +1376,20 @@ impl Inner {
         if let Err(down) = self.deps.runtime.torbox.health.admit() {
             return Err(ManagedHlsError::DebridDown { retry_after: down.retry_after });
         }
-        for candidate in managed_candidates(&list, request)? {
+        for listed in managed_candidates(&list, request)? {
+            // A release nobody has probed has no track list to choose from, so the player would get TorBox's first
+            // track and no list to pick another. Read that one file's head now, when a language is wanted.
+            let probed;
+            let candidate = if listed.probe.is_none()
+                && !listed.size_only_probe
+                && !request.audio.is_empty()
+                && listed.cached
+            {
+                probed = self.probe_for_audio(config, &sid, &list.truth, listed).await;
+                probed.as_ref().unwrap_or(listed)
+            } else {
+                listed
+            };
             let (audio_track, audio_reason) =
                 managed_audio_choice(candidate, &request.audio, request.audio_track);
             let target = ResolveTarget {

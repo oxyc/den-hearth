@@ -110,15 +110,27 @@ pub(super) fn managed_audio_choice(
     if let Some(selected) = selected.filter(|index| *index >= 0 && (*index as usize) < tracks.len()) {
         return (Some(selected), "explicit track");
     }
-    let found = wanted.iter().find_map(|wanted| {
-        tracks
-            .iter()
-            .position(|language| wanted_language(language, std::slice::from_ref(wanted)))
-            .map(|index| index as i64)
-    });
-    match found {
-        Some(index) => (Some(index), "preferred language"),
-        None => (None, "no wanted language in the probe"),
+    // The rule Remux picks with. The probe keeps no default or commentary flags, so only a language match counts: with
+    // none, TorBox's own default track plays, as it did before a pick existed.
+    let probed: Vec<ProbedTrack> = tracks.iter().map(|language| ProbedTrack(language)).collect();
+    match den_media::lang::pick_audio(&probed, wanted) {
+        (index, den_media::lang::AudioReason::Preferred(_)) => (Some(index as i64), "preferred language"),
+        _ => (None, "no wanted language in the probe"),
+    }
+}
+
+/// One audio track of a probe, for `den_media::lang::pick_audio`: its language, `""` when the file gave none.
+struct ProbedTrack<'a>(&'a str);
+
+impl den_media::lang::AudioCandidate for ProbedTrack<'_> {
+    fn language(&self) -> Option<&str> {
+        Some(self.0).filter(|language| !language.is_empty())
+    }
+    fn is_default(&self) -> bool {
+        false
+    }
+    fn is_commentary(&self) -> bool {
+        false
     }
 }
 

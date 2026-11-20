@@ -224,7 +224,7 @@ pub(crate) fn select_size_recovery_jobs(
 }
 
 /// The probe job for `s` when a store is confirmed to hold it, `None` otherwise.
-fn held_probe_job(s: &RawStream, sid: Option<&StreamId>, truth: &CacheTruth) -> Option<ProbeJob> {
+pub(crate) fn held_probe_job(s: &RawStream, sid: Option<&StreamId>, truth: &CacheTruth) -> Option<ProbeJob> {
     // Only probe what the store ALREADY holds. Probing resolves, and resolving a release the account
     // does not hold ADDS it — so this read path was queueing up to six torrents per newly-viewed
     // title, against a sixty-an-hour ceiling. Browsing did it; opening a ten-episode season did it

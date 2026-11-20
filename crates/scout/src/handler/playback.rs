@@ -221,6 +221,27 @@ impl Inner {
         }
     }
 
+    /// The release with its tracks read, for a managed play that must choose its audio from them. It is the fan-out's
+    /// own job for one file: a held release resolved read-only (`no_add`), a ranged read of its head, bounded by
+    /// `PROBE_BUDGET`, the fact cached for everyone after. `None` when nothing was read (no store holds it, the
+    /// head could not be read, or it has no track list), and the release then plays as it would unprobed.
+    pub(super) async fn probe_for_audio(
+        &self,
+        config: &Config,
+        sid: &StreamId,
+        truth: &CacheTruth,
+        stream: &RawStream,
+    ) -> Option<RawStream> {
+        let job = held_probe_job(stream, Some(sid), truth)?;
+        let key = job.key.clone();
+        let pool = StorePool { stores: (self.deps.make_stores)(config) };
+        self.run_probe_job(TokioInstant::now() + PROBE_BUDGET, &pool, config, job).await;
+        match ProbeFact::from_cache(&self.deps.cache.get(&key)?)? {
+            ProbeFact::Tracks(probe) => Some(RawStream { probe: Some(*probe), ..stream.clone() }),
+            ProbeFact::SizeOnly(_) => None,
+        }
+    }
+
     /// Judges a size-recovery probe by the size it read. Only a file that fits the budget changes anything: the
     /// list built without it is marked stale, and the ordinary stale-while-revalidate refresh rebuilds it, where
     /// the probe fact just written gives the release its own size (and its pack's as context). An oversized file,
