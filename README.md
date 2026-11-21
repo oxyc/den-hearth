@@ -46,6 +46,12 @@ new installs use Hearth's combined `/den` addon rather than Scout's former stand
   `limited`, and `Server-Timing` leads with `fresh;desc=rebuilt` on a rebuild. A client must not cache a fresh
   request's answer in front of Scout; a Scout without this ignores the parameter. On `/play`, `?fresh=1` is a
   different thing: it drops a minted link the client could not open.
+- **A play answered `503 {"error":"store_unavailable","service":…}` names what is refused in `scope`**, on `/p/<ticket>`,
+  its `?probe=1` and the cancel route alike. `"release"` is a backoff for this one release (the debrid turned its
+  add away, or took it and then denied holding it): another release may play at once, so a client moves to the next
+  cached one instead of waiting. `"account"` is a rejected key, fresh or remembered: every release on that service
+  fails the same way, so moving on gains nothing. `Retry-After` is the same either way (the backoff window), and a
+  client that predates `scope` reads `error` and the status as before.
 
 ## Run
 

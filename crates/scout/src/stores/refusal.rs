@@ -14,8 +14,8 @@ use crate::scrape::DoError;
 use crate::stores::pool::StorePool;
 use crate::stores::torbox::TORBOX_API;
 use crate::stores::{
-    dead_link, error_chain_text, is_cancellation_error, ResolveTarget, StoreError, StoreUnavailableError,
-    ERR_CHECK_FAILED, RESOLVE_CACHE_TTL,
+    dead_link, error_chain_text, is_cancellation_error, ResolveTarget, Store, StoreError,
+    StoreUnavailableError, ERR_CHECK_FAILED, RESOLVE_CACHE_TTL,
 };
 use crate::util::key_hash;
 
@@ -620,6 +620,23 @@ pub(crate) fn account_backed_off(cache: &dyn Cache, svc: DebridService, token: &
 /// about what was asked for. Anything else is remembered per release.
 pub(crate) fn refusal_is_about_the_account(err: &StoreError) -> bool {
     as_unavailable(err).is_some_and(|u| u.status == 401 || u.status == 403)
+}
+
+/// The `scope` a `store_unavailable` 503 carries: `"account"` when the refusal is about WHO is asking
+/// (a rejected key, fresh or remembered for the service), `"release"` when it is only about this release
+/// (the per-release backoff, a throttled add). A client moves on to the next release at once on `"release"`
+/// and has nothing to gain from it on `"account"`.
+///
+/// A remembered backoff reaches the route as a status-0 error, so the status alone cannot say which memory it
+/// came from; the service's account key is read instead.
+pub(crate) fn refusal_scope(stores: &[Box<dyn Store>], unavailable: &StoreUnavailableError) -> &'static str {
+    let remembered =
+        stores.iter().any(|st| st.service() == unavailable.service && st.account_refused().is_some());
+    if remembered || unavailable.status == 401 || unavailable.status == 403 {
+        "account"
+    } else {
+        "release"
+    }
 }
 
 /// Go `scoutSideReason` (stores.go:1521): what scout is busy with, for a client that can only show a

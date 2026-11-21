@@ -870,7 +870,11 @@ impl Inner {
             );
             return write_unavailable(
                 STORE_REFUSAL_WAIT,
-                &json!({"error": "store_unavailable", "service": unavailable.service.as_str()}),
+                &json!({
+                    "error": "store_unavailable",
+                    "scope": refusal_scope(&pool.stores, unavailable),
+                    "service": unavailable.service.as_str(),
+                }),
             );
         }
         // The client reads this 404 as "still fetching" and polls for as long as the viewer will sit
@@ -1142,7 +1146,7 @@ impl Inner {
             );
             return write_unavailable(
                 STORE_REFUSAL_WAIT,
-                &json!({"error": "store_unavailable", "service": svc.as_str()}),
+                &json!({"error": "store_unavailable", "scope": "account", "service": svc.as_str()}),
             );
         }
         // A refusal SCOUT made, above the store refusals below because it is ours rather than a service's.
@@ -1196,7 +1200,11 @@ impl Inner {
             );
             return write_unavailable(
                 STORE_REFUSAL_WAIT,
-                &json!({"error": "store_unavailable", "service": refused.service.as_str()}),
+                &json!({
+                    "error": "store_unavailable",
+                    "scope": refusal_scope(&pool.stores, &refused),
+                    "service": refused.service.as_str(),
+                }),
             );
         }
         // A refusal the store recorded moments ago outranks "nothing queued". Without this the probe reports
@@ -1208,9 +1216,10 @@ impl Inner {
                 "probe-refused",
                 &play_decision("probe", "refused", &reason, svc.as_str(), start.elapsed(), rid, rt),
             );
+            // The rejected-key memory was read above, so what is left here is the per-release backoff.
             return write_unavailable(
                 STORE_REFUSAL_WAIT,
-                &json!({"error": "store_unavailable", "service": svc.as_str()}),
+                &json!({"error": "store_unavailable", "scope": "release", "service": svc.as_str()}),
             );
         }
         // With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
@@ -1336,7 +1345,11 @@ impl Inner {
                         );
                         return write_unavailable(
                             STORE_REFUSAL_WAIT,
-                            &json!({"error": "store_unavailable", "service": unavailable.service.as_str()}),
+                            &json!({
+                                "error": "store_unavailable",
+                                "scope": refusal_scope(&stores, unavailable),
+                                "service": unavailable.service.as_str(),
+                            }),
                         );
                     }
                     log_limited(
@@ -1351,7 +1364,10 @@ impl Inner {
                             &rt,
                         ),
                     );
-                    return write_unavailable(STORE_REFUSAL_WAIT, &json!({"error": "store_unavailable"}));
+                    return write_unavailable(
+                        STORE_REFUSAL_WAIT,
+                        &json!({"error": "store_unavailable", "scope": "release"}),
+                    );
                 }
             };
             if outcome.reason == "not_queued" {
