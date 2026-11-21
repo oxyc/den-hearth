@@ -1216,10 +1216,15 @@ impl Inner {
                 "probe-refused",
                 &play_decision("probe", "refused", &reason, svc.as_str(), start.elapsed(), rid, rt),
             );
-            // The rejected-key memory was read above, so what is left here is the per-release backoff.
+            // The memory keeps the reason and no status, so only the release-only reason is told apart.
+            let remembered = StoreUnavailableError { service: svc, reason, status: 0 };
             return write_unavailable(
                 STORE_REFUSAL_WAIT,
-                &json!({"error": "store_unavailable", "scope": "release", "service": svc.as_str()}),
+                &json!({
+                    "error": "store_unavailable",
+                    "scope": refusal_scope(&pool.stores, &remembered),
+                    "service": svc.as_str(),
+                }),
             );
         }
         // With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
@@ -1366,7 +1371,7 @@ impl Inner {
                     );
                     return write_unavailable(
                         STORE_REFUSAL_WAIT,
-                        &json!({"error": "store_unavailable", "scope": "release"}),
+                        &json!({"error": "store_unavailable", "scope": "account"}),
                     );
                 }
             };

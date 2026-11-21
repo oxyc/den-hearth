@@ -471,7 +471,7 @@
 < retry-after: 60
 < server-timing: status;dur=*, resolve;dur=*, total;dur=*
 < timing-allow-origin: *
-{"error":"store_unavailable","scope":"release","service":"torbox"}
+{"error":"store_unavailable","scope":"account","service":"torbox"}
 
 == cancel, legacy route, no store can
 > DELETE /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/play/eyJoIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImYiOjB9

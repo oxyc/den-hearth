@@ -622,20 +622,37 @@ pub(crate) fn refusal_is_about_the_account(err: &StoreError) -> bool {
     as_unavailable(err).is_some_and(|u| u.status == 401 || u.status == 403)
 }
 
-/// The `scope` a `store_unavailable` 503 carries: `"account"` when the refusal is about WHO is asking
-/// (a rejected key, fresh or remembered for the service), `"release"` when it is only about this release
-/// (the per-release backoff, a throttled add). A client moves on to the next release at once on `"release"`
-/// and has nothing to gain from it on `"account"`.
+/// Why a store reported that it created a torrent and then denied holding it: a fact about that one release.
+pub(crate) const DENIED_HOLDING: &str = "created this torrent and then denied holding it";
+
+/// The `scope` a `store_unavailable` 503 carries. `"release"` only when the refusal is positively about this
+/// one release, so a client that moves to the next release is not walking into the same refusal:
+/// a torrent the store created and then denied holding, or a 4xx other than 401, 403 and 429. Everything
+/// else is `"account"`: a rejected key (401, 403, or the remembered account backoff), the add rate limit
+/// (429, which TorBox applies per account) and a 5xx outage. Waiting is never wrong, so any refusal whose
+/// cause cannot be recovered is `"account"` too.
 ///
-/// A remembered backoff reaches the route as a status-0 error, so the status alone cannot say which memory it
-/// came from; the service's account key is read instead.
+/// A remembered per-release backoff reaches the route as a status-0 error whose reason is the stored one plus
+/// " (backing off)"; the cache keeps no status beside it, so only the denied-holding reason is recognised
+/// there, and a remembered 4xx falls to `"account"`.
 pub(crate) fn refusal_scope(stores: &[Box<dyn Store>], unavailable: &StoreUnavailableError) -> &'static str {
-    let remembered =
+    let account_remembered =
         stores.iter().any(|st| st.service() == unavailable.service && st.account_refused().is_some());
-    if remembered || unavailable.status == 401 || unavailable.status == 403 {
-        "account"
-    } else {
+    if account_remembered {
+        return "account";
+    }
+    let release_only = match unavailable.status {
+        0 => {
+            let reason = unavailable.reason.as_str();
+            reason.strip_suffix(" (backing off)").unwrap_or(reason) == DENIED_HOLDING
+        }
+        400..=499 => !matches!(unavailable.status, 401 | 403 | 429),
+        _ => false,
+    };
+    if release_only {
         "release"
+    } else {
+        "account"
     }
 }
 
