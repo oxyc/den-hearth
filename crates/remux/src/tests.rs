@@ -409,6 +409,11 @@ static SELECTION_RETRY_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore:
 /// What the restart tests' titles (`tt000004N`) asked of the fake scout: `list 4N` and `play 4N`.
 static RESUME_CALLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Armed by the cancelled-fetch regression: the next play URL of `tt0000046` is answered by never answering, after
+/// signalling `RESUME_HELD`, so the test cancels a fetch it knows is in flight.
+static RESUME_HOLD_46: AtomicBool = AtomicBool::new(false);
+static RESUME_HELD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+
 fn resume_calls(tag: &str) -> usize {
     RESUME_CALLS.lock().unwrap().iter().filter(|c| c.ends_with(tag)).count()
 }
@@ -828,6 +833,10 @@ async fn origin_handle<B>(
         let rest = match rest.strip_prefix("resume").and_then(|r| r.split_once('/')) {
             Some((n, file)) => {
                 RESUME_CALLS.lock().unwrap().push(format!("play {n}"));
+                if n == "46" && RESUME_HOLD_46.swap(false, Relaxed) {
+                    RESUME_HELD.add_permits(1);
+                    std::future::pending::<()>().await;
+                }
                 file
             }
             None => rest,
@@ -5674,7 +5683,13 @@ async fn a_cancelled_fetch_backs_off_like_a_failed_one() {
     let b = restarted(&a, &origin).await;
     assert_eq!(call(&b, "GET", &master_url, None, "").await.status, StatusCode::OK);
     let s = b.session(&sid).unwrap();
-    assert!(tokio::time::timeout(Duration::ZERO, s.resolve_again(&b)).await.is_err(), "cut short");
+    RESUME_HOLD_46.store(true, Relaxed);
+    let mut fetch = Box::pin(s.resolve_again(&b));
+    tokio::select! {
+        done = &mut fetch => panic!("the fetch finished ({done}) though scout was holding its answer"),
+        held = RESUME_HELD.acquire() => held.unwrap().forget(),
+    }
+    drop(fetch);
     let asked = resume_calls("46");
     assert!(!s.resolve_again(&b).await, "backing off");
     assert_eq!(resume_calls("46"), asked, "nothing asked of scout");
