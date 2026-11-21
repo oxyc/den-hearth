@@ -32,6 +32,10 @@ tempfile = "3"
 tokio = "1"
 tokio-util = "0.7"
 
+# den-core's shared rules, pinned like den-atlas pins them: a rule change reaches Hearth with a bump of this rev.
+den-sync = { git = "https://github.com/oxyc/den-core.git", rev = "2ebf3d71f57aaab5e278d13a2d07d23d37fa4955" }
+den-assistant = { git = "https://github.com/oxyc/den-core.git", rev = "2ebf3d71f57aaab5e278d13a2d07d23d37fa4955" }
+
 den-cache = { path = "crates/cache" }
 den-http = { path = "crates/http" }
 den-media = { path = "crates/media" }

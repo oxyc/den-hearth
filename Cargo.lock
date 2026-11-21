@@ -521,11 +521,12 @@ dependencies = [
 [[package]]
 name = "den-assistant"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?rev=9e1b54edd1fe9837fa0f7831b77e59803cba0701#9e1b54edd1fe9837fa0f7831b77e59803cba0701"
+source = "git+https://github.com/oxyc/den-core.git?rev=2ebf3d71f57aaab5e278d13a2d07d23d37fa4955#2ebf3d71f57aaab5e278d13a2d07d23d37fa4955"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
  "hkdf",
+ "hmac",
  "hpke",
  "miniz_oxide",
  "rand_core 0.10.1",
@@ -651,6 +652,7 @@ dependencies = [
  "den-media",
  "den-net",
  "den-process",
+ "den-sync",
  "den-upstream",
  "divan",
  "dolby_vision",
@@ -684,6 +686,7 @@ dependencies = [
  "den-media",
  "den-net",
  "den-seal",
+ "den-sync",
  "den-upstream",
  "divan",
  "fancy-regex",
@@ -744,7 +747,7 @@ dependencies = [
 [[package]]
 name = "den-sync"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?rev=9e1b54edd1fe9837fa0f7831b77e59803cba0701#9e1b54edd1fe9837fa0f7831b77e59803cba0701"
+source = "git+https://github.com/oxyc/den-core.git?rev=2ebf3d71f57aaab5e278d13a2d07d23d37fa4955#2ebf3d71f57aaab5e278d13a2d07d23d37fa4955"
 dependencies = [
  "argon2",
  "den-assistant",
@@ -1119,12 +1122,13 @@ dependencies = [
 
 [[package]]
 name = "hpke"
-version = "0.14.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
+checksum = "8f512e325a1a71bf3273fb9b7fc9e5d96dac136fb4a95d0e6637001b12ea3e09"
 dependencies = [
  "aead 0.6.1",
  "aes-gcm",
+ "curve25519-dalek 5.0.0",
  "hkdf",
  "hybrid-array",
  "ml-kem",
