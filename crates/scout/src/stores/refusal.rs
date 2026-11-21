@@ -14,8 +14,8 @@ use crate::scrape::DoError;
 use crate::stores::pool::StorePool;
 use crate::stores::torbox::TORBOX_API;
 use crate::stores::{
-    dead_link, error_chain_text, is_cancellation_error, ResolveTarget, StoreError, StoreUnavailableError,
-    ERR_CHECK_FAILED, RESOLVE_CACHE_TTL,
+    dead_link, error_chain_text, is_cancellation_error, ResolveTarget, Store, StoreError,
+    StoreUnavailableError, ERR_CHECK_FAILED, RESOLVE_CACHE_TTL,
 };
 use crate::util::key_hash;
 
@@ -620,6 +620,40 @@ pub(crate) fn account_backed_off(cache: &dyn Cache, svc: DebridService, token: &
 /// about what was asked for. Anything else is remembered per release.
 pub(crate) fn refusal_is_about_the_account(err: &StoreError) -> bool {
     as_unavailable(err).is_some_and(|u| u.status == 401 || u.status == 403)
+}
+
+/// Why a store reported that it created a torrent and then denied holding it: a fact about that one release.
+pub(crate) const DENIED_HOLDING: &str = "created this torrent and then denied holding it";
+
+/// The `scope` a `store_unavailable` 503 carries. `"release"` only when the refusal is positively about this
+/// one release, so a client that moves to the next release is not walking into the same refusal:
+/// a torrent the store created and then denied holding, or a 4xx other than 401, 403 and 429. Everything
+/// else is `"account"`: a rejected key (401, 403, or the remembered account backoff), the add rate limit
+/// (429, which TorBox applies per account) and a 5xx outage. Waiting is never wrong, so any refusal whose
+/// cause cannot be recovered is `"account"` too.
+///
+/// A remembered per-release backoff reaches the route as a status-0 error whose reason is the stored one plus
+/// " (backing off)"; the cache keeps no status beside it, so only the denied-holding reason is recognised
+/// there, and a remembered 4xx falls to `"account"`.
+pub(crate) fn refusal_scope(stores: &[Box<dyn Store>], unavailable: &StoreUnavailableError) -> &'static str {
+    let account_remembered =
+        stores.iter().any(|st| st.service() == unavailable.service && st.account_refused().is_some());
+    if account_remembered {
+        return "account";
+    }
+    let release_only = match unavailable.status {
+        0 => {
+            let reason = unavailable.reason.as_str();
+            reason.strip_suffix(" (backing off)").unwrap_or(reason) == DENIED_HOLDING
+        }
+        400..=499 => !matches!(unavailable.status, 401 | 403 | 429),
+        _ => false,
+    };
+    if release_only {
+        "release"
+    } else {
+        "account"
+    }
 }
 
 /// Go `scoutSideReason` (stores.go:1521): what scout is busy with, for a client that can only show a

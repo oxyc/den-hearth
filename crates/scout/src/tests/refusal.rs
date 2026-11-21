@@ -22,8 +22,8 @@ use crate::stores::premiumize::{PremiumizeStore, PREMIUMIZE_API};
 use crate::stores::realdebrid::{rd_torrent_key, RealDebridStore, REAL_DEBRID_API};
 use crate::stores::refusal::{
     account_refused_key, add_outcome_unknown, already_queued, backed_off, note_add_attempt, pm_queued_key,
-    record_refusal, refused_key, unknown_outcome_key, ADD_GIVE_UP, PENDING_GIVE_UP, QUEUED_TTL,
-    REFUSAL_BACKOFF, UNKNOWN_OUTCOME_TTL,
+    record_refusal, refusal_scope, refused_key, unknown_outcome_key, ADD_GIVE_UP, DENIED_HOLDING,
+    PENDING_GIVE_UP, QUEUED_TTL, REFUSAL_BACKOFF, UNKNOWN_OUTCOME_TTL,
 };
 use crate::stores::torbox::{TorBoxStore, TORBOX_API};
 use crate::stores::{
@@ -1880,5 +1880,102 @@ async fn probe_and_play_agree_that_an_in_flight_add_is_downloading() {
             probe.status(),
             body_str(&probe)
         );
+    }
+}
+
+/// The `/play` and `?probe=1` answers for one TorBox release, over a cache the test has already written to.
+async fn play_and_probe_bodies(cache: &Arc<dyn Cache>, token: &str, hash: &str) -> [(u16, String); 2] {
+    let h = route_handler(cache, torbox(token, cache, answer(200, r#"{"success":true,"data":[]}"#)));
+    let config = blob(&format!(
+        r#"{{"debrid":[{{"service":"torbox","token":"{token}"}}],"indexers":["torrentio"],"resultCap":20}}"#
+    ));
+    let tok = encode_play_token(&PlayTarget { info_hash: hash.to_owned(), ..Default::default() });
+    let play = get(&h, &format!("/{config}/play/{tok}"), &[]).await;
+    let probe = get(&h, &format!("/{config}/play/{tok}?probe=1"), &[]).await;
+    [(play.status().as_u16(), body_str(&play)), (probe.status().as_u16(), body_str(&probe))]
+}
+
+// A backoff for ONE release says so in the body, so a client moves on to the next cached release at once
+// instead of waiting out the window for a release the store created and then denied holding.
+#[tokio::test]
+async fn store_unavailable_names_a_release_scoped_backoff() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
+    let (token, hash) = ("scope-release", "1".repeat(40));
+    let cache = mem();
+    cache.put(&refused_key(DebridService::TorBox, token, &hash), DENIED_HOLDING, REFUSAL_BACKOFF);
+
+    for (route, (status, body)) in
+        ["/play", "?probe=1"].iter().zip(play_and_probe_bodies(&cache, token, &hash).await)
+    {
+        assert_eq!(status, 503, "{route}: {body}");
+        assert_eq!(
+            body.trim(),
+            r#"{"error":"store_unavailable","scope":"release","service":"torbox"}"#,
+            "{route}: a per-release backoff must say it is only this release"
+        );
+    }
+}
+
+// A rejected key fails every release on the account, so the body says "account" and a client gains nothing by
+// trying the next release.
+#[tokio::test]
+async fn store_unavailable_names_an_account_scoped_backoff() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
+    let (token, hash) = ("scope-account", "2".repeat(40));
+    let cache = mem();
+    cache.put(&account_refused_key(DebridService::TorBox, token), "createtorrent http 401", REFUSAL_BACKOFF);
+
+    for (route, (status, body)) in
+        ["/play", "?probe=1"].iter().zip(play_and_probe_bodies(&cache, token, &hash).await)
+    {
+        assert_eq!(status, 503, "{route}: {body}");
+        assert_eq!(
+            body.trim(),
+            r#"{"error":"store_unavailable","scope":"account","service":"torbox"}"#,
+            "{route}: a rejected key must say it is the whole account"
+        );
+    }
+}
+
+// TorBox's add rate limit (429) is per account: the next release would hit the same limit, so a remembered
+// per-release 429 backoff is "account".
+#[tokio::test]
+async fn store_unavailable_names_a_rate_limit_as_the_account() {
+    let _budget = install_budget(HOUR, ADD_BUDGET_LIMIT);
+    let (token, hash) = ("scope-rate-limit", "3".repeat(40));
+    let cache = mem();
+    cache.put(&refused_key(DebridService::TorBox, token, &hash), "createtorrent http 429", REFUSAL_BACKOFF);
+
+    for (route, (status, body)) in
+        ["/play", "?probe=1"].iter().zip(play_and_probe_bodies(&cache, token, &hash).await)
+    {
+        assert_eq!(status, 503, "{route}: {body}");
+        assert_eq!(
+            body.trim(),
+            r#"{"error":"store_unavailable","scope":"account","service":"torbox"}"#,
+            "{route}: a rate limit is the whole account, not this release"
+        );
+    }
+}
+
+// A fresh refusal is classified by its status: only a 4xx that is not about the key or the rate limit is about
+// the release; 5xx is an outage.
+#[test]
+fn refusal_scope_reads_the_status() {
+    let scope = |status: u16| {
+        let u = StoreUnavailableError { service: DebridService::TorBox, reason: "r".into(), status };
+        refusal_scope(&[], &u)
+    };
+    for (status, want) in [
+        (400, "release"),
+        (404, "release"),
+        (401, "account"),
+        (403, "account"),
+        (429, "account"),
+        (500, "account"),
+        (503, "account"),
+        (0, "account"),
+    ] {
+        assert_eq!(scope(status), want, "http {status}");
     }
 }

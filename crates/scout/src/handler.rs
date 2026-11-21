@@ -70,7 +70,7 @@ use crate::releaselog::ReleaseAnswer;
 use crate::reqlog::redact_path;
 use crate::scrape::{scrape_covered_until, Doer, LateAnswers, ScrapeQuery, Scraper, LATE_GRACE};
 use crate::stores::pool::{has_cache_truth, status_outcome_among, StorePool};
-use crate::stores::refusal::{as_unavailable, scout_side_reason};
+use crate::stores::refusal::{as_unavailable, refusal_scope, scout_side_reason};
 use crate::stores::torbox::health::{DebridDown, DebridState};
 use crate::stores::{
     join_all, CacheTruth, ProviderStatus, ResolveTarget, Store, StoreError, StoreStatus,

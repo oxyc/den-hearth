@@ -657,7 +657,7 @@ impl Store for RealDebridStore {
                 svc,
                 &self.token,
                 &t.info_hash,
-                &unavailable(svc, "created this torrent and then denied holding it", 0),
+                &unavailable(svc, crate::stores::refusal::DENIED_HOLDING, 0),
             );
             return Err(dead_link("realdebrid created this torrent and then denied holding it"));
         }
