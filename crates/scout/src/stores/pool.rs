@@ -158,6 +158,13 @@ impl StorePool {
         (truth, truth_ok)
     }
 
+    /// Each store's `warm_for_play`.
+    pub fn warm_for_play(&self) {
+        for st in &self.stores {
+            st.warm_for_play();
+        }
+    }
+
     /// Go `StorePool.KnownFileSize` (linkcheck.go:118) is the first size any store knows for this file. Stores
     /// that hold the same torrent describe the same file, so which one answers does not matter.
     pub fn known_file_size(&self, t: &ResolveTarget) -> Option<i64> {

@@ -67,8 +67,10 @@ impl Drop for Held {
 struct Upstream {
     base: String,
     fault: Arc<watch::Sender<Fault>>,
-    /// Every request that reached it, whatever the switch said.
+    /// Every request that reached it, whatever the switch said, except TorBox's account listing.
     requests: Arc<AtomicUsize>,
+    /// TorBox's account listing, which a list that TorBox answered reads ahead of a play, in the background.
+    listings: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
     connections: Arc<AtomicUsize>,
 }
@@ -79,19 +81,30 @@ impl Upstream {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let fault = Arc::new(watch::channel(Fault::Up).0);
         let gauge = || Arc::new(AtomicUsize::new(0));
-        let (requests, in_flight, connections) = (gauge(), gauge(), gauge());
-        let (f, r, i, c) = (fault.clone(), requests.clone(), in_flight.clone(), connections.clone());
+        let (requests, listings, in_flight, connections) = (gauge(), gauge(), gauge(), gauge());
+        let (f, r, l, i, c) =
+            (fault.clone(), requests.clone(), listings.clone(), in_flight.clone(), connections.clone());
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let open = Held::new(&c);
-                let (fault, requests, in_flight, reply) = (f.clone(), r.clone(), i.clone(), reply.clone());
+                let (fault, requests, listings, in_flight, reply) =
+                    (f.clone(), r.clone(), l.clone(), i.clone(), reply.clone());
                 tokio::spawn(async move {
                     let _open = open;
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let (fault, requests, in_flight, reply) =
-                            (fault.clone(), requests.clone(), in_flight.clone(), reply.clone());
+                        let (fault, requests, listings, in_flight, reply) = (
+                            fault.clone(),
+                            requests.clone(),
+                            listings.clone(),
+                            in_flight.clone(),
+                            reply.clone(),
+                        );
                         async move {
-                            requests.fetch_add(1, Ordering::SeqCst);
+                            if req.uri().path().ends_with("/torrents/mylist") {
+                                listings.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                requests.fetch_add(1, Ordering::SeqCst);
+                            }
                             let _busy = Held::new(&in_flight);
                             let now = *fault.borrow();
                             match now {
@@ -123,7 +136,7 @@ impl Upstream {
                 });
             }
         });
-        Upstream { base, fault, requests, in_flight, connections }
+        Upstream { base, fault, requests, listings, in_flight, connections }
     }
 
     fn set(&self, fault: Fault) {
@@ -132,6 +145,10 @@ impl Upstream {
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    fn listings(&self) -> usize {
+        self.listings.load(Ordering::SeqCst)
     }
 }
 
@@ -496,6 +513,7 @@ async fn torbox_and_the_indexers_recover_independently() {
         assert!(started.elapsed() < Duration::from_millis(500), "a list waited on a TorBox known down");
     }
     assert_eq!(node.torbox.requests(), 3, "TorBox was asked while known down");
+    assert_eq!(node.torbox.listings(), 0, "a list read ahead from a TorBox that was not answering");
 
     // Both out: unknown, as before.
     node.indexers(Fault::Blackhole);
@@ -526,6 +544,7 @@ async fn torbox_and_the_indexers_recover_independently() {
     let latency = restored.elapsed();
     assert_eq!((answer.degraded.as_str(), answer.kind(), answer.streams()), ("", "live", 4), "{answer:?}");
     assert_eq!(node.torbox.requests(), 5, "recovery took more than the one probe");
+    assert!(node.torbox.listings() <= 1, "the lists after recovery read ahead more than once");
     eprintln!("TorBox recovered {latency:?} after it came back (probe window {PROBE_EVERY:?})");
     let health = node.health().await;
     assert_eq!(scout_health(&health)["status"], "ok", "{health}");
@@ -637,6 +656,8 @@ async fn retry_after_is_honoured_and_then_the_upstream_is_asked_again() {
     );
     assert_eq!((answered.0.degraded.as_str(), answered.0.streams()), ("", 4), "{:?}", answered.0);
     assert_eq!(node.torbox.requests(), before + 2, "{n} lists asked the paused TorBox");
+    // The fake's listing always fails, so only the read-ahead's own spacing stops every list asking for it again.
+    assert!(node.torbox.listings() <= 1, "{} listings for {n} lists", node.torbox.listings());
     eprintln!("TorBox asked again {:?} after a {wait}s Retry-After", answered.1);
 
     node.assert_idle().await;

@@ -112,11 +112,36 @@ const STATUS_SLOTS: usize = 128;
 /// read off repeated renders of the same screen.
 const ACCOUNT_SUMMARY_TTL: Duration = Duration::from_secs(30);
 
-/// Go `listingTTL` — how long one account listing answers for. The same fifteen seconds torrentMissKey
-/// already imposes, and deliberately so: a miss is remembered for that long anyway, so memoising the
-/// listing adds no staleness that was not already there. A torrent this process just added is known by id
-/// directly (resolveHeldTorrent writes torrentIDKey), so it never needs the list to find itself.
+/// Go `listingTTL` — how long one account listing answers for without a fresh one being asked for. The same
+/// fifteen seconds torrentMissKey already imposes, and deliberately so: a miss is remembered for that long
+/// anyway, so memoising the listing adds no staleness that was not already there. A torrent this process just
+/// added is known by id directly (resolveHeldTorrent writes torrentIDKey), so it never needs the list to find
+/// itself.
+///
+/// Past it the listing is not dropped: see `LISTING_STALE_TTL`.
 const LISTING_TTL: Duration = Duration::from_secs(15);
+
+/// How long a listing past `LISTING_TTL` still answers, while a fresh one is fetched behind it.
+///
+/// The listing is the slow call on a first play: 2.2–7.7 s on the household's account (the `mylist_account`
+/// phase of every first play in the box's log over two days of November 2026), paid by the status read ahead of
+/// the add, so a 9.5 s first play was 7.3 s of listing. Plays come in clusters minutes apart (a fallback to the
+/// next release, the next episode) and each paid it again, because the memo had lapsed after fifteen seconds. The
+/// stream list also asks for a listing while the list is built (`warm_listing`), so the play that follows a list
+/// finds one.
+///
+/// What an older listing can get wrong, and why each is bounded:
+/// - A torrent this process added since it was taken is not in it. torrentID reads torrentIDKey (written when an
+///   add resolves) and Status the queued-id marker (written when an add is parked) before either looks at it.
+/// - A torrent it names may have been deleted since. The id it gives goes to the by-id mylist read and to
+///   requestdl, and their "gone" forgets the id and re-adds.
+/// - A torrent added to the account some other way (by hand on TorBox's site) since it was taken reads as not
+///   held, so a play adds it and marks it as Scout's: what a hand add inside the old fifteen seconds also got, in
+///   a longer window. Cancel still keeps a finished torrent whoever added it.
+///
+/// Ten minutes covers the list cache's five (`DEFAULT_LIST_TTL`), so a play from a cached list still finds the
+/// listing its build read.
+const LISTING_STALE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Go `maxListingMemoEntries` bounds the memo by TORRENT, summed across accounts — not by account.
 ///
@@ -1111,11 +1136,60 @@ impl TorBoxStore {
     /// this account hold?" has one answer at a time, so it is asked that way.
     ///
     /// The map is shared and read-only: every caller of a memoised listing holds the same one.
+    ///
+    /// A listing past `LISTING_TTL` still answers, without waiting, and a fresh one is fetched behind it.
     pub(crate) async fn account_listing(&self) -> (Arc<HashMap<String, i64>>, bool) {
         let key = torrent_list_key(&self.account_identity());
-        if let Some(ids) = cached_listing(self.cache.as_ref(), &key) {
+        if let Some((ids, fresh)) = cached_listing(self.cache.as_ref(), &key) {
+            if !fresh {
+                self.refresh_listing(key);
+            }
             return (ids, true);
         }
+        self.fetch_listing(&key).await
+    }
+
+    /// Fetches this account's listing in the background unless a fresh one is remembered: the stream list calls it
+    /// for the play that may follow, so that play does not wait for the listing. A store with no cache has nowhere
+    /// to keep the answer, so it fetches nothing.
+    ///
+    /// At most once per `LISTING_TTL` per account, whatever the fetch answers. A failed fetch remembers nothing,
+    /// and a viewer browsing builds a list every few seconds, so without this a listing TorBox kept failing was
+    /// asked for again on every list.
+    pub(crate) fn warm_listing(&self) {
+        let key = torrent_list_key(&self.account_identity());
+        if matches!(cached_listing(self.cache.as_ref(), &key), Some((_, true))) {
+            return;
+        }
+        let warmed = format!("{key}:warmed");
+        if self.cache.is_none() || live(self.cache(), &warmed).is_some() {
+            return;
+        }
+        self.cache().put_class(&warmed, "1", LISTING_TTL, CacheClass::Volatile);
+        self.refresh_listing(key);
+    }
+
+    /// A background `fetch_listing`. Requests that find the same listing stale each start one; they share the
+    /// one fetch the listing flight runs, and one that starts after it has landed finds the listing fresh and asks
+    /// nothing.
+    fn refresh_listing(&self, key: String) {
+        if self.cache.is_none() {
+            return;
+        }
+        let store = self.clone();
+        crate::handler::spawn_background(
+            crate::runtime::current_runtime(),
+            "account listing refresh",
+            async move {
+                if !matches!(cached_listing(store.cache.as_ref(), &key), Some((_, true))) {
+                    store.fetch_listing(&key).await;
+                }
+            },
+        );
+    }
+
+    /// The listing fetched from TorBox, once per account at a time, and remembered.
+    async fn fetch_listing(&self, key: &str) -> (Arc<HashMap<String, i64>>, bool) {
         // A listing this account will keep failing to produce is memoised, briefly. A transient failure is not.
         //
         // The distinction is the whole point, and it is the FAULT that draws it, not the size: too big to
@@ -1177,13 +1251,13 @@ impl TorBoxStore {
         // 20,000 trials, and recovered only for the case ready at the moment the select is evaluated. Here the
         // caller's budget is a timeout around this whole call, which polls the answer before the clock.
         let store = self.clone();
-        let memo_key = key.clone();
+        let memo_key = key.to_owned();
         let runtime = crate::runtime::current_runtime();
         let admitted =
             runtime
                 .torbox
                 .listing_flights
-                .run_admitted(&key, &runtime.torbox.listing_slots, move || async move {
+                .run_admitted(key, &runtime.torbox.listing_slots, move || async move {
                     // A fetch past the shared deadline is no answer: empty, not ok, not a persistent fault.
                     let (ids, ok, persistent) =
                         tokio::time::timeout(SHARED_DEADLINE, store.fetch_account_listing())
@@ -1718,20 +1792,22 @@ fn memo_key(cache: &Arc<dyn Cache>, key: &str) -> (usize, String) {
     (Arc::as_ptr(cache) as *const () as usize, key.to_owned())
 }
 
-/// Go `cachedListing`.
-fn cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str) -> Option<Arc<HashMap<String, i64>>> {
+/// Go `cachedListing`, and whether the listing is still inside `LISTING_TTL` (fresh) or only inside
+/// `LISTING_STALE_TTL`.
+fn cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str) -> Option<(Arc<HashMap<String, i64>>, bool)> {
     let cache = cache?;
     let runtime = crate::runtime::current_runtime();
     let mut memo = lock(&runtime.torbox.listing_memo);
     let k = memo_key(cache, key);
     let e = memo.get(&k)?;
-    if e.at.elapsed() >= LISTING_TTL {
+    let age = e.at.elapsed();
+    if age >= LISTING_STALE_TTL {
         // Dropped here rather than left for the next put. An account nobody asks about again otherwise stays
         // resident until some OTHER account is fetched, which for a single-account install is never.
         memo.remove(&k);
         return None;
     }
-    Some(e.ids.clone())
+    Some((e.ids.clone(), age < LISTING_TTL))
 }
 
 /// Go `putCachedListing`.
@@ -1745,14 +1821,14 @@ fn put_cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str, ids: Arc<HashMa
     memo.remove(&k);
     let mut held = 0;
     memo.retain(|_, e| {
-        if e.at.elapsed() >= LISTING_TTL {
+        if e.at.elapsed() >= LISTING_STALE_TTL {
             return false;
         }
         held += e.ids.len();
         true
     });
     // Expiry alone cannot bound a caller-keyed map — the same reasoning as pruneMintedLocked, which this
-    // deliberately mirrors. Oldest first, since every entry lives the same fifteen seconds and there is no
+    // deliberately mirrors. Oldest first, since every entry lives the same `LISTING_STALE_TTL` and there is no
     // separate last-used clock to prefer.
     while held + ids.len() > MAX_LISTING_MEMO_ENTRIES {
         let Some(oldest) = memo.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) else {
@@ -1763,6 +1839,24 @@ fn put_cached_listing(cache: Option<&Arc<dyn Cache>>, key: &str, ids: Arc<HashMa
         }
     }
     memo.insert(k, ListingMemoEntry { ids, at: Instant::now(), _cache: cache.clone() });
+}
+
+/// How long ago this account's remembered listing was fetched, if one is remembered.
+#[cfg(test)]
+pub(crate) fn listing_memo_age(cache: &Arc<dyn Cache>, identity: &str) -> Option<Duration> {
+    let runtime = crate::runtime::current_runtime();
+    let memo = lock(&runtime.torbox.listing_memo);
+    memo.get(&memo_key(cache, &torrent_list_key(identity))).map(|e| e.at.elapsed())
+}
+
+/// Makes this account's remembered listing `by` older, as if it had been fetched that long ago.
+#[cfg(test)]
+pub(crate) fn age_listing_memo(cache: &Arc<dyn Cache>, identity: &str, by: Duration) {
+    let runtime = crate::runtime::current_runtime();
+    let mut memo = lock(&runtime.torbox.listing_memo);
+    if let Some(e) = memo.get_mut(&memo_key(cache, &torrent_list_key(identity))) {
+        e.at = e.at.checked_sub(by).expect("an instant that far back");
+    }
 }
 
 // --- JSON shapes ---
@@ -2653,6 +2747,11 @@ impl Store for TorBoxStore {
         let files = entry.files();
         let id = select_file_id(&files, t).ok()??;
         size_of(&files, id)
+    }
+
+    /// The account listing, which a first play's status read needs to tell a held pack from one to add.
+    fn warm_for_play(&self) {
+        self.warm_listing();
     }
 
     async fn account_summary(&self) -> Option<Result<super::AccountSummary, StoreError>> {

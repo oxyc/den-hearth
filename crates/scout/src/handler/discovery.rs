@@ -710,6 +710,13 @@ impl Inner {
                     Err(_) => unasked(),
                 }
             };
+            // A list with releases is what a play is chosen from, and the read the first play of a release would
+            // wait on (TorBox's account listing, seconds on a large account) can run while the viewer chooses. In
+            // the background, so the list does not wait for it, and only once the debrid has answered the cache
+            // check: a debrid that is failing it is not given a larger read on top.
+            if truth_ok && !hashes.is_empty() {
+                pool.warm_for_play();
+            }
             timing.push_str(", ");
             timing.push_str(&den_http::timing("cache-check", phase.elapsed()));
             for s in seeds.iter_mut() {

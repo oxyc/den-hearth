@@ -708,6 +708,10 @@ impl Store for SharedStore {
         self.0.known_file_size(t)
     }
 
+    fn warm_for_play(&self) {
+        self.0.warm_for_play();
+    }
+
     async fn account_summary(&self) -> Option<Result<crate::stores::AccountSummary, StoreError>> {
         self.0.account_summary().await
     }
