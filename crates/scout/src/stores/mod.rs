@@ -336,6 +336,11 @@ pub trait Store: Send + Sync {
         None
     }
 
+    /// Starts, in the background, whatever this store reads on a first play and can read ahead of it: the stream
+    /// list calls it so a play chosen from the list does not wait for that read. Returns at once; a store with
+    /// nothing worth reading ahead does nothing.
+    fn warm_for_play(&self) {}
+
     /// Go's `accountSummarizer` (handler.go `accountBody` asserts `*torBoxStore` and calls `AccountSummary`):
     /// the account-wide facts /<config>/account reports. `None` when the store publishes none (Real-Debrid,
     /// Premiumize); `Some(Err)` is a read that failed, which the route degrades on.

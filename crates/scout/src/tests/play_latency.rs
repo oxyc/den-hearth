@@ -16,11 +16,13 @@ use crate::config::DebridService;
 use crate::handler::new_handler;
 use crate::loglimit::Capture;
 use crate::play::{encode_play_token, PlayTarget};
+use crate::rank::RawStream;
+use crate::runtime::{scope, ScoutRuntime};
 use crate::scrape::{DoError, Doer};
 use crate::stores::refusal::{remember_cached, torrent_id_key};
-use crate::stores::torbox::{TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
+use crate::stores::torbox::{age_listing_memo, listing_memo_age, TorBoxStore, RESOLVE_CACHE_TTL, TORBOX_API};
 use crate::stores::Store;
-use crate::tests::handler::{get, shared_stores, test_deps, valid_blob};
+use crate::tests::handler::{fake_scraper, get, hdr, shared_stores, test_deps, valid_blob};
 
 /// What one TorBox (or CDN) call takes. TorBox answers small reads in roughly this from the box; createtorrent and
 /// a large account listing take longer, so the real gap is wider than the one measured here.
@@ -140,14 +142,30 @@ enum Before {
     CachedButQueued,
 }
 
+/// What came before the play on this account.
+#[derive(Clone, Copy, Debug)]
+enum Lead {
+    /// Nothing: the play is the first thing to ask TorBox about the account.
+    Cold,
+    /// The episode's stream list was built a moment ago.
+    StreamList,
+    /// The stream list was built minutes ago, so the listing it read is past its fifteen seconds.
+    StreamListMinutesAgo,
+}
+
 struct Played {
     status: u16,
+    location: String,
     calls: Vec<String>,
     took: Duration,
     log: String,
 }
 
 async fn play(before: Before) -> Played {
+    play_after(before, Lead::Cold).await
+}
+
+async fn play_after(before: Before, lead: Lead) -> Played {
     let upstream = Arc::new(Upstream {
         held: matches!(before, Before::HeldForgotten | Before::HeldRemembered),
         queued: matches!(before, Before::CachedButQueued),
@@ -166,18 +184,72 @@ async fn play(before: Before) -> Played {
     if matches!(before, Before::HeldRemembered) {
         cache.put(&torrent_id_key(&identity, PACK), &ID.to_string(), RESOLVE_CACHE_TTL);
     }
+    let runtime = ScoutRuntime::new();
     let shared: Arc<dyn Store> = store.clone();
-    let (deps_cache, cdn) = (cache.clone(), upstream.clone());
+    let (deps_cache, cdn, deps_runtime) = (cache.clone(), upstream.clone(), runtime.clone());
     let h = new_handler(test_deps(move |d| {
         d.cache = deps_cache.clone();
+        d.runtime = deps_runtime.clone();
         d.make_stores = shared_stores(shared.clone());
         d.probe_doer = Some(Arc::new(Slow(cdn.clone())));
+        d.make_scrapers = Arc::new(|_| {
+            vec![fake_scraper("torrentio", || {
+                Box::pin(async {
+                    Ok(vec![RawStream {
+                        info_hash: PACK.to_owned(),
+                        title: "Show.S01.1080p.WEB-DL".to_owned(),
+                        seeders: Some(10),
+                        ..RawStream::default()
+                    }])
+                })
+            })]
+        });
     }));
+    let shared_cache: Arc<dyn Cache> = cache.clone();
+    if !matches!(lead, Lead::Cold) {
+        let list = get(&h, &format!("/{}/stream/series/tt0000001:1:2.json", valid_blob()), &[]).await;
+        assert_eq!(list.status(), 200, "the stream list");
+        // The list does not wait for the listing; the play that follows a list does not either, but here it has
+        // to have landed for the play to show what it saves.
+        let waited = Instant::now();
+        while scope(runtime.clone(), async { listing_memo_age(&shared_cache, &identity) }).await.is_none() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(5),
+                "the stream list never read the account listing"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(upstream.calls(), ["mylist_account"], "what the stream list asked TorBox");
+        upstream.calls.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+    if matches!(lead, Lead::StreamListMinutesAgo) {
+        scope(runtime.clone(), async {
+            age_listing_memo(&shared_cache, &identity, Duration::from_secs(5 * 60))
+        })
+        .await;
+    }
     let log = Capture::start();
     let start = Instant::now();
     let resp = get(&h, &play_path(), &[]).await;
     let took = start.elapsed();
-    Played { status: resp.status().as_u16(), calls: upstream.calls(), took, log: log.text() }
+    if matches!(lead, Lead::StreamListMinutesAgo) {
+        // The old listing answered the play and a fresh one was asked for behind it.
+        let waited = Instant::now();
+        while scope(runtime.clone(), async { listing_memo_age(&shared_cache, &identity) })
+            .await
+            .is_none_or(|age| age >= Duration::from_secs(60))
+        {
+            assert!(waited.elapsed() < Duration::from_secs(5), "the old listing was never refreshed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    Played {
+        status: resp.status().as_u16(),
+        location: hdr(&resp, "location"),
+        calls: upstream.calls(),
+        took,
+        log: log.text(),
+    }
 }
 
 fn report(before: Before, p: &Played) {
@@ -233,6 +305,68 @@ async fn held_forgotten() {
 async fn held_remembered() {
     let p = play(Before::HeldRemembered).await;
     assert_calls(Before::HeldRemembered, &p, 302, &["mylist_id", "requestdl", "cdn"]);
+}
+
+/// The play's own calls, without the listing refresh that runs beside it and is not waited on. The play line names
+/// only the calls the play waited on, so it must not name the listing.
+fn waited_on(p: &Played) -> Vec<String> {
+    let line = p
+        .log
+        .lines()
+        .find(|l| l.starts_with("event=download outcome=changed reason=play:"))
+        .unwrap_or_else(|| panic!("no play line: {}", p.log));
+    assert!(!line.contains("torbox_mylist_account"), "the play waited on the account listing: {line}");
+    let refreshes = p.calls.iter().filter(|c| *c == "mylist_account").count();
+    assert_eq!(refreshes, 1, "one listing refresh behind the play: {:?}", p.calls);
+    p.calls.iter().filter(|c| *c != "mylist_account").cloned().collect()
+}
+
+/// The same episode played right after its stream list: the list read the account listing while the viewer chose,
+/// so the play does not wait for it. The add is still made only because the listing says the account lacks the
+/// pack, and the episode's file (id 1, S01E02) is the one linked.
+#[tokio::test]
+async fn cached_not_held_after_the_stream_list() {
+    let p = play_after(Before::CachedNotHeld, Lead::StreamList).await;
+    assert_calls(Before::CachedNotHeld, &p, 302, &["createtorrent", "mylist_id", "requestdl", "cdn"]);
+    assert_eq!(p.location, "https://cdn.example/1.mkv");
+}
+
+/// A held pack Scout has forgotten, played after its stream list: the listing the list read finds it, so nothing
+/// is added (no duplicate torrent, no add spent, nothing marked as Scout's own), and the episode is picked from
+/// the status read's file list.
+#[tokio::test]
+async fn held_forgotten_after_the_stream_list() {
+    let p = play_after(Before::HeldForgotten, Lead::StreamList).await;
+    assert_calls(Before::HeldForgotten, &p, 302, &["mylist_id", "requestdl", "cdn"]);
+    assert_eq!(p.location, "https://cdn.example/1.mkv");
+}
+
+/// A queued add is still found when the listing came from the stream list.
+#[tokio::test]
+async fn cached_but_queued_after_the_stream_list() {
+    let p = play_after(Before::CachedButQueued, Lead::StreamList).await;
+    assert_calls(Before::CachedButQueued, &p, 202, &["createtorrent", "getqueued"]);
+}
+
+/// Minutes after the stream list the listing is past its fifteen seconds. It still answers the play, which does
+/// not wait for a new one, and a new one is fetched behind it.
+#[tokio::test]
+async fn cached_not_held_minutes_after_the_stream_list() {
+    let p = play_after(Before::CachedNotHeld, Lead::StreamListMinutesAgo).await;
+    report(Before::CachedNotHeld, &p);
+    assert_eq!(p.status, 302, "{}", p.log);
+    assert_eq!(waited_on(&p), ["createtorrent", "mylist_id", "requestdl", "cdn"]);
+    assert_eq!(p.location, "https://cdn.example/1.mkv");
+}
+
+/// The older listing still names a held pack, so the play adds nothing.
+#[tokio::test]
+async fn held_forgotten_minutes_after_the_stream_list() {
+    let p = play_after(Before::HeldForgotten, Lead::StreamListMinutesAgo).await;
+    report(Before::HeldForgotten, &p);
+    assert_eq!(p.status, 302, "{}", p.log);
+    assert_eq!(waited_on(&p), ["mylist_id", "requestdl", "cdn"]);
+    assert_eq!(p.location, "https://cdn.example/1.mkv");
 }
 
 /// The play's log line names each step and each TorBox call it waited on.
