@@ -844,6 +844,9 @@ pub(crate) struct RankedList {
     pub(crate) answered_early: bool,
     /// Releases MaxSizeGB dropped on an unconfirmed size, to be probed (`size_recovery_candidates`).
     pub(crate) size_recovery: Vec<RawStream>,
+    /// Stable machine reason for an otherwise healthy empty list. Kept separate from `degraded`, which means
+    /// the server could not reach a verdict.
+    pub(crate) unavailability_reason: Option<&'static str>,
 }
 
 /// Where a stream list lives: the config segment and title the request named, the origin its play URLs name, and
@@ -854,6 +857,7 @@ struct ListKey<'a> {
     sid: &'a StreamId,
     origin: &'a str,
     cache_key: &'a str,
+    allow_cinema_recordings: bool,
 }
 
 /// Everything one stream-list build needs, owned, so the build can outlive the request that started it.
@@ -869,6 +873,9 @@ struct ListJob {
     fresh: bool,
     /// The request asked for an early answer (`X_DEN_EARLY_ANSWER`).
     early: bool,
+    /// Explicit recovery request. Ranking still tries the strict list first and only admits cinema recordings
+    /// when every otherwise eligible candidate was excluded for exactly that reason.
+    allow_cinema_recordings: bool,
 }
 
 impl ListJob {
@@ -883,6 +890,7 @@ impl ListJob {
             rid,
             fresh: false,
             early: false,
+            allow_cinema_recordings: key.allow_cinema_recordings,
         }
     }
 
@@ -895,6 +903,7 @@ impl ListJob {
         self.early = true;
         self
     }
+
 }
 
 /// A cached list's entry, taken apart: when it stopped being fresh, and the validator and body it carries.
@@ -918,6 +927,7 @@ pub(crate) struct RankOpts<'a> {
     /// The request asked for an early answer: go out once the indexers that have answered have had `LATE_GRACE` to
     /// be joined, rather than on the slowest (see `scrape_covered_until`, `X_DEN_EARLY_ANSWER`).
     pub(crate) answer_early: bool,
+    pub(crate) allow_cinema_recordings: bool,
 }
 
 /// Go `handler`: the HTTP service the scout routes are served from. Built by `new_handler`.
@@ -1367,6 +1377,7 @@ impl Inner {
                     // The list picks what to play and nothing else: it is not cached, and a miss falls back to
                     // Remux, which asks again for every indexer before saying there is nothing.
                     answer_early: request.early_answer && request.filename.is_none(),
+                    allow_cinema_recordings: false,
                 },
             )
             .await;

@@ -573,7 +573,7 @@
 < cache-control: no-store
 < content-type: application/json
 < timing-allow-origin: *
-{"availability":{"tt1234567":"available"}}
+{"availability":{"tt1234567":"available"},"reasons":{}}
 
 == availability GET
 > GET /eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6InRiLXNlY3JldCJ9XSwiaW5kZXhlcnMiOlsidG9ycmVudGlvIl0sImZpbHRlcnMiOnsiZXhjbHVkZUNhbSI6dHJ1ZX0sImNhY2hlZE9ubHkiOnRydWUsInJlc3VsdENhcCI6MjB9/availability
