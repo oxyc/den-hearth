@@ -903,7 +903,6 @@ impl ListJob {
         self.early = true;
         self
     }
-
 }
 
 /// A cached list's entry, taken apart: when it stopped being fresh, and the validator and body it carries.

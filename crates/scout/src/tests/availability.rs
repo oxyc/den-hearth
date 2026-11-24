@@ -281,6 +281,44 @@ async fn availability_a_stream_list_records_the_verdict() {
     assert_eq!(scrapes.load(Ordering::SeqCst), 1, "scrapes");
 }
 
+/// The ordinary list remains authoritative after a viewer explicitly asks for the cinema-recording fallback.
+/// Recovery gets its own list cache and must not turn the poster-grid verdict into ordinary availability.
+#[tokio::test]
+async fn cinema_recovery_keeps_the_strict_list_and_availability_separate() {
+    let scrapes = Arc::new(AtomicI32::new(0));
+    let h = new_handler(test_deps(|d| {
+        d.make_scrapers = counting_scraper(scrapes.clone(), test_seeds()[2..].to_vec(), None);
+    }));
+    let config = blob(
+        r#"{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":false,"resultCap":20}"#,
+    );
+    let path = format!("/{config}/stream/movie/tt1234567.json");
+
+    let strict = get(&h, &path, &[]).await;
+    let strict_body: serde_json::Value = serde_json::from_slice(strict.body()).expect("strict list is JSON");
+    assert_eq!(strict_body["streams"].as_array().map(Vec::len), Some(0));
+    assert_eq!(strict_body["den"]["unavailabilityReason"], "only_cinema_recordings");
+
+    let availability = post_json(&h, &format!("/{config}/availability"), r#"{"ids":["tt1234567"]}"#).await;
+    let availability_body: serde_json::Value =
+        serde_json::from_slice(availability.body()).expect("availability is JSON");
+    assert_eq!(availability_body["availability"]["tt1234567"], "unavailable");
+    assert_eq!(availability_body["reasons"]["tt1234567"], "only_cinema_recordings");
+
+    let recovery = get(&h, &format!("{path}?allowCinema=1"), &[]).await;
+    let recovery_body: serde_json::Value =
+        serde_json::from_slice(recovery.body()).expect("recovery list is JSON");
+    assert_eq!(recovery_body["streams"].as_array().map(Vec::len), Some(1));
+    assert!(recovery_body["den"].get("unavailabilityReason").is_none());
+
+    let strict_again = get(&h, &path, &[]).await;
+    let strict_again_body: serde_json::Value =
+        serde_json::from_slice(strict_again.body()).expect("cached strict list is JSON");
+    assert_eq!(strict_again_body["streams"].as_array().map(Vec::len), Some(0));
+    assert_eq!(strict_again_body["den"]["unavailabilityReason"], "only_cinema_recordings");
+    assert_eq!(scrapes.load(Ordering::SeqCst), 2, "strict and recovery should each build exactly once");
+}
+
 #[tokio::test]
 async fn availability_an_episode_stream_list_records_only_that_episode() {
     let scrapes = Arc::new(AtomicI32::new(0));

@@ -202,7 +202,7 @@ fn cinema_recovery_admits_only_camera_recordings() {
     let streams = vec![
         rs("Movie.2026.1080p.CAM.x264", |_| {}),
         rs("Movie.2026.1080p.TS.x264", |_| {}),
-        rs("Movie.2026.1080p.TC.x264", |_| {}),
+        rs("Movie.2026.1080p.TELECINE.x264", |_| {}),
         rs("Movie.2026.1080p.SCREENER.x264", |_| {}),
         rs("Movie.2026.1080p.WORKPRINT.x264", |_| {}),
         rs("Movie.2026.1080p.R5.x264", |_| {}),
