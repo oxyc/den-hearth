@@ -218,9 +218,9 @@ fn cinema_recovery_admits_only_camera_recordings() {
         },
     );
     assert_eq!(ranked.len(), 3);
-    assert!(ranked.iter().all(|stream| {
-        matches!(prod::junk_class(&stream.title), "cam" | "telesync" | "telecine")
-    }));
+    assert!(ranked
+        .iter()
+        .all(|stream| { matches!(prod::junk_class(&stream.title), "cam" | "telesync" | "telecine") }));
 }
 
 #[test]

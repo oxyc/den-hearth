@@ -177,13 +177,8 @@ impl Inner {
             // camera recording; every ordinary request must continue to see the configured exclusion.
             cache_key.push_str(":allow-cinema");
         }
-        let list_key = ListKey {
-            config_blob,
-            sid,
-            origin: &origin,
-            cache_key: &cache_key,
-            allow_cinema_recordings,
-        };
+        let list_key =
+            ListKey { config_blob, sid, origin: &origin, cache_key: &cache_key, allow_cinema_recordings };
 
         // ?debug=1 — "where did this list go", answered exactly instead of guessed from a log line.
         //
@@ -370,11 +365,13 @@ impl Inner {
         // Stream-list read-through also seeds availability. Give that separate cache key the same admission-time
         // authority as the list: a stale ordinary completion must not overwrite a fresh episode verdict merely
         // because its list publication is fenced later.
-        let availability_publication = (!debug && job.client.is_none() && !job.allow_cinema_recordings).then(|| {
-            let key = format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid));
-            let publication = self.deps.runtime.begin_publication("availability", &key, job.fresh);
-            (key, publication)
-        });
+        let availability_publication =
+            (!debug && job.client.is_none() && !job.allow_cinema_recordings).then(|| {
+                let key =
+                    format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid));
+                let publication = self.deps.runtime.begin_publication("availability", &key, job.fresh);
+                (key, publication)
+            });
         self.build_stream_list(deadline, &job, debug, publication, availability_publication).await
     }
 
