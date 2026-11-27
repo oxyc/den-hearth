@@ -1,15 +1,37 @@
 # Repository agent instructions
 
-## Standing rule: parity, performance and discoveries
+## What deserves fixing
 
-- These rules apply to every Den addition, fix, removal and behavior-affecting refactor, not only the audit backlog. Default to behavioral and contract parity across iOS/iPadOS, tvOS, browser, LG/webOS and Samsung/Tizen, plus relevant shared services/consumers in the active `den` and `den-*` repositories. Platform-appropriate UI can differ; authority, data semantics, capabilities, notices, recovery and supported outcomes must agree.
-- Inspect the equivalent production paths on every target using current code and relevant PRs/issues. Do not assume a shared helper means each host uses it correctly, or that another platform is the reference implementation. Implement the corresponding change everywhere applicable; a correct counterpart may only need verification. For removals, retire matching affordances/routes/capabilities and handle persisted state, caches and older-client compatibility.
-- Honor explicit, documented product/build/capability exclusions, such as reduced Tizen functionality. Cite the exclusion and preserve an accurate unsupported state or usable handoff. Existing absence is not evidence of an intentional exclusion. If required parity remains unfinished, link the work and report the change as incomplete for those targets; a follow-up issue alone does not establish parity.
-- Review real entry points, caller/model/service/store behavior, role/profile authority, cancellation and stale results, cache keys/invalidation, durable outcomes, localization/accessibility, and success/empty/partial/stale/error states. A missing notice, warning, retry or usable recovery is a functional defect. Check for unreachable/stubbed paths and invented success or fallback logic.
-- Performance is a highest-priority concern alongside correctness and privacy. Raise every credible negative effect and concrete opportunity for a gain, including optimizations present on another platform. Consider latency, frames/scroll/focus, CPU, memory, energy, decoders, network/I/O, caches, duplicate work, hidden/background tasks and service throughput/cost. Do not defer performance as cosmetic cleanup or suppress an opportunity because it is not yet measured.
-- Distinguish reproduced/source-supported defects, investigations, measured gains and proposed optimizations. Record the mechanism, affected workloads/targets and comparison needed; never invent performance savings. Use matched before/after measurements where feasible. Resolve a regression introduced by the change or obtain explicit acceptance of its tradeoff before calling it complete. Follow existing device-recording instructions.
-- Record every additional defect, parity gap, missing meaningful test, performance regression or optimization opportunity discovered while working. Search existing issues/PRs first. Add same-scope findings to the current issue; otherwise update a matching issue or create a focused issue in the owning repository and link it from the originating issue and audit tracker. Include trigger/workload, expected/actual behavior, source evidence, impact, confidence/counterevidence and useful acceptance. File uncertain items as investigations. Creating/linking these issues is explicitly authorized; do not ask permission again. If filing is blocked, retain a complete draft and report the blocker. Keep private implementation evidence out of public issues.
-- Prefer E2E or real production-path integration that verifies visible behavior, failure/retry, cancellation/profile replacement and durable readback. Add focused unit tests for meaningful invariants, not mechanical implementation mirrors. Distinguish source/simulator checks from device, engine and performance qualification.
-- Completion must include a result for every app target (changed/checked, explicit exclusion, not applicable with reason, or unverified with linked work), actual tests and their limits, performance findings/opportunities, and all new/reused follow-up issues. Do not claim app-wide correctness from a bounded feature check. Reporting discoveries does not automatically authorize unrelated features, deployment or paid pipeline runs.
+Den is a household app: one owner, a few family members, one Apple TV, a homelab box. There is no
+adversary inside the household, and diagnostics go to our own already-redacted log collector. Judge
+every finding against that, not against a bank.
 
-The shared completion record and ongoing audit are maintained in [Den tracker #481](https://github.com/oxyc/den/issues/481#standing-implementation-rule). These rules stand on their own when the private tracker is unavailable.
+**Worth fixing (and filing, if you can't fix it now):**
+- A person can hit it in normal use and sees something wrong, missing or stuck: wrong audio
+  language, skip-credits at the wrong time, no next episode, an empty row, a frozen overlay.
+- Data people care about is lost or wrong: watch progress, seen marks, watchlist, library.
+- A security hole reachable from the public internet (den-edge public names, public media listener).
+- Slowness a person can feel, with a measurement or a trace showing it.
+- A failing or flaky gate (`make verify`, Playwright, the dataset daily run).
+
+**Not worth an issue, a PR or a comment** — don't file these, don't fix them in passing:
+- Hypothetical failures of local storage: Keychain/SQLite/UserDefaults/filesystem refusing a write,
+  "verify by readback", "fail closed when unreadable", rollback-of-a-failed-rollback, quarantine.
+- Numeric edge cases nobody hits: overflow, saturation, non-finite values, exhausted clocks/epochs.
+- Races and "fence to the exact profile/authority" work without a reproduced user-visible symptom.
+- Removing identifiers from our own diagnostics.
+- Parity for its own sake. Platforms may differ internally; only a user-visible wrong result counts.
+- Localizing rare error or recovery copy, "qualify on hardware" chores, audit/tracker issues.
+- Performance "opportunities" without a measurement of a felt problem.
+- Bundle-size bookkeeping. Don't write size records into this file or into PRs.
+
+**How to work:**
+- Do the task you were given, then stop. Don't audit neighbouring code looking for more.
+- Note anything else you noticed in one line in your final report. File an issue only if it meets
+  the bar above; at most three per session, after searching for an existing one. Never file batches.
+- Smallest fix for the reported symptom, one PR per issue. A PR over ~400 changed lines, or one
+  touching more than one client, needs the owner's go-ahead first.
+- Don't leave draft PRs behind: finish it to mergeable or close it.
+- Fix the same bug on another client only when that client shows the same user-visible symptom.
+- Tests prove the symptom is fixed (E2E/integration preferred). Don't add tests for the cases in the
+  "not worth it" list.
