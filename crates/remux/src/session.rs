@@ -1169,7 +1169,7 @@ impl Session {
                 Ok(r) => return Ok((r, None)),
                 Err(e) => e,
             };
-        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None, false)
+        let list = scout::list(st.scout_via(), &self.source, &self.imdb, None, false, false)
             .await
             .map_err(|e| format!("{first}; listing the title again: {}", e.detail))?;
         let again = list
@@ -1874,6 +1874,8 @@ pub struct Want<'a> {
     /// indexer. Only to pick what to open: when that incomplete list produces no session, selection asks once more,
     /// waiting for every indexer, before the answer is that nothing plays (`select::create`).
     pub early_answer: bool,
+    /// Ask scout for its cinema-recording recovery list (`allowCinema=1`) rather than the ordinary one.
+    pub allow_cinema: bool,
 }
 
 /// What the player decodes (`playable` in `POST /remux/session`). An HEVC release beyond it is transcoded on the GPU;
@@ -1920,30 +1922,33 @@ async fn scout_list(
     by_install: bool,
     playable: Option<&Playable>,
     early_answer: bool,
+    allow_cinema: bool,
 ) -> Result<Vec<scout::Stream>, ApiError> {
     let secrets = [source.base.as_str()];
-    scout::list(st.scout_via(), source, id, playable, early_answer).await.map_err(|e| match e.status {
-        // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
-        // logged-in browser alone.
-        Some(403) if by_install => api(
-            StatusCode::UNAUTHORIZED,
-            "not_logged_in",
-            "This scout install can't play on its own; log in with this browser's key.",
-        ),
-        // Scout would not open the install: revoked, out of scope, or not one of its own.
-        Some(status @ (400 | 403)) => {
-            crate::log_limited("scout_refused", || format!("scout: refused the install ({status})"));
-            api(
-                StatusCode::FORBIDDEN,
-                "scout_refused",
-                "Scout refused this install: revoked, or one it can't open.",
-            )
-        }
-        _ => {
-            crate::log_limited("scout_list", || {
-                format!("scout: {}", crate::redact::scrub(&e.detail, &secrets))
-            });
-            api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
+    scout::list(st.scout_via(), source, id, playable, early_answer, allow_cinema).await.map_err(|e| {
+        match e.status {
+            // Out of scope: an availability-only install, which plays only with den-remux's key — sent for a
+            // logged-in browser alone.
+            Some(403) if by_install => api(
+                StatusCode::UNAUTHORIZED,
+                "not_logged_in",
+                "This scout install can't play on its own; log in with this browser's key.",
+            ),
+            // Scout would not open the install: revoked, out of scope, or not one of its own.
+            Some(status @ (400 | 403)) => {
+                crate::log_limited("scout_refused", || format!("scout: refused the install ({status})"));
+                api(
+                    StatusCode::FORBIDDEN,
+                    "scout_refused",
+                    "Scout refused this install: revoked, or one it can't open.",
+                )
+            }
+            _ => {
+                crate::log_limited("scout_list", || {
+                    format!("scout: {}", crate::redact::scrub(&e.detail, &secrets))
+                });
+                api(StatusCode::BAD_GATEWAY, "scout_unavailable", "Could not list releases.")
+            }
         }
     })
 }
@@ -2054,7 +2059,7 @@ pub async fn releases(
     };
     let source = scout::ScoutSource { base: scout_base(st, scout)?, key };
     // Without a capability report no AV1 or VP9: nothing says the player decodes them.
-    let list = scout_list(st, &source, id, by_install, playable, false).await?;
+    let list = scout_list(st, &source, id, by_install, playable, false, false).await?;
     let candidates = scout::candidates(
         &list,
         None,
@@ -2492,6 +2497,7 @@ mod tests {
             replaces: None,
             rid: None,
             early_answer: false,
+            allow_cinema: false,
         };
         assert!(!no_picture(want.playable, true, &release), "the BT.2020 base layer has a picture");
     }
@@ -2801,6 +2807,7 @@ mod tests {
             replaces: None,
             rid: None,
             early_answer: false,
+            allow_cinema: false,
         }
     }
 

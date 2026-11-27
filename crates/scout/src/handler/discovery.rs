@@ -171,7 +171,14 @@ impl Inner {
             cache_key.push_str(":playable:");
             cache_key.push_str(&client_key);
         }
-        let list_key = ListKey { config_blob, sid, origin: &origin, cache_key: &cache_key };
+        let allow_cinema_recordings = query_is(req, "allowCinema", "1");
+        if allow_cinema_recordings {
+            // Never let a recovery list hit or replace the strict list. The recovery response can contain a
+            // camera recording; every ordinary request must continue to see the configured exclusion.
+            cache_key.push_str(":allow-cinema");
+        }
+        let list_key =
+            ListKey { config_blob, sid, origin: &origin, cache_key: &cache_key, allow_cinema_recordings };
 
         // ?debug=1 — "where did this list go", answered exactly instead of guessed from a log line.
         //
@@ -358,11 +365,13 @@ impl Inner {
         // Stream-list read-through also seeds availability. Give that separate cache key the same admission-time
         // authority as the list: a stale ordinary completion must not overwrite a fresh episode verdict merely
         // because its list publication is fenced later.
-        let availability_publication = (!debug && job.client.is_none()).then(|| {
-            let key = format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid));
-            let publication = self.deps.runtime.begin_publication("availability", &key, job.fresh);
-            (key, publication)
-        });
+        let availability_publication =
+            (!debug && job.client.is_none() && !job.allow_cinema_recordings).then(|| {
+                let key =
+                    format!("{}{}", verdict_prefix(&job.config), crate::availability::verdict_id(&job.sid));
+                let publication = self.deps.runtime.begin_publication("availability", &key, job.fresh);
+                (key, publication)
+            });
         self.build_stream_list(deadline, &job, debug, publication, availability_publication).await
     }
 
@@ -569,6 +578,7 @@ impl Inner {
             fresh: job.fresh,
             // A debug build is a diagnostic of the whole scrape.
             answer_early: job.early && !debug,
+            allow_cinema_recordings: job.allow_cinema_recordings,
         };
         let list = self.rank_list(deadline, &job.config, &job.sid, dbg.as_mut(), opts).await;
         // A movie or resolved episode list answers the availability route's exact question too, so a title someone
@@ -595,7 +605,7 @@ impl Inner {
         dbg: Option<&mut RankDebug>,
         opts: RankOpts<'_>,
     ) -> RankedList {
-        let RankOpts { client, check_cache, rid, audio, fresh, answer_early } = opts;
+        let RankOpts { client, check_cache, rid, audio, fresh, answer_early, allow_cinema_recordings } = opts;
         let q = ScrapeQuery {
             kind: sid.kind.clone(),
             imdb: sid.imdb.clone(),
@@ -822,6 +832,7 @@ impl Inner {
         let rank_start = Instant::now();
         let filters = RankFilters {
             exclude_cam: config.filters.exclude_cam,
+            allow_cinema_recordings: false,
             resolutions: config.filters.resolutions.clone(),
             prefer_resolution: config.filters.prefer_resolution.clone(),
             hdr_only: config.filters.hdr_only,
@@ -840,7 +851,31 @@ impl Inner {
         let seed_count = seeds.len();
         let size_recovery = size_recovery_candidates(&seeds, &known_sizes, &filters);
         let late_check = late.map(|late| (late, filters.clone()));
-        let ranked = rank_streams_debug(&seeds, filters, Some(&mut *log_dbg));
+        let cinema_before: i64 = ["cam", "telesync", "telecine"]
+            .iter()
+            .map(|key| log_dbg.dropped_by.get(*key).copied().unwrap_or_default())
+            .sum();
+        let pre_rank_dbg = log_dbg.clone();
+        let strict_ranked = rank_streams_debug(&seeds, filters.clone(), Some(&mut *log_dbg));
+        let cinema_after: i64 = ["cam", "telesync", "telecine"]
+            .iter()
+            .map(|key| log_dbg.dropped_by.get(*key).copied().unwrap_or_default())
+            .sum();
+        let cinema_only = strict_ranked.is_empty()
+            && candidates > 0
+            && cinema_after.saturating_sub(cinema_before) == candidates;
+        let ranked = if allow_cinema_recordings && cinema_only {
+            let mut recovery_filters = filters;
+            recovery_filters.allow_cinema_recordings = true;
+            // The strict pass above exists only as the safety gate. Re-account the list that is actually served.
+            // Non-debug requests still use this accounting for the decision log.
+            let mut recovery_dbg = pre_rank_dbg;
+            let ranked = rank_streams_debug(&seeds, recovery_filters, Some(&mut recovery_dbg));
+            *log_dbg = recovery_dbg;
+            ranked
+        } else {
+            strict_ranked
+        };
         log_rank_decision(sid, candidates, &ranked, log_dbg, rank_start.elapsed(), rid);
         if let Some((late, filters)) = late_check {
             let top = ranked.first().map(|s| s.info_hash.clone());
@@ -918,6 +953,8 @@ impl Inner {
             timing,
             answered_early,
             size_recovery,
+            unavailability_reason: (cinema_only && !allow_cinema_recordings)
+                .then_some("only_cinema_recordings"),
         }
     }
 
@@ -1065,6 +1102,7 @@ impl Inner {
             mut timing,
             answered_early,
             size_recovery,
+            unavailability_reason,
         } = list;
         let degraded = !degraded_reason.is_empty();
 
@@ -1101,6 +1139,7 @@ impl Inner {
             v: ANSWER_ENVELOPE_VERSION,
             answer_kind: decide_answer_kind(out.len() as i64, scrape_complete, &degraded_reason).to_owned(),
             degraded: degraded_reason.clone(),
+            unavailability_reason: unavailability_reason.map(str::to_owned),
             generated_at: Some(whole_seconds(now)),
             expires_at: cached.then(|| whole_seconds(now + ttl)),
             coverage,
@@ -1203,6 +1242,7 @@ mod managed_audio_tests {
             timing: String::new(),
             answered_early: false,
             size_recovery: vec![],
+            unavailability_reason: None,
         }
     }
 

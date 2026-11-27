@@ -52,6 +52,7 @@ const MAX_AVAILABILITY_CHECKS: usize = 4;
 // Cached verdicts. verdictUndetermined is a check that could not tell, kept for availabilityRetryAfter.
 const VERDICT_AVAILABLE: &str = "1";
 const VERDICT_UNAVAILABLE: &str = "0";
+const VERDICT_ONLY_CINEMA_RECORDINGS: &str = "c";
 /// Go `verdictUndetermined`: the marker a failed or partial check leaves, which holds off the next check.
 pub(crate) const VERDICT_UNDETERMINED: &str = "?";
 
@@ -169,11 +170,16 @@ impl Inner {
         };
         let prefix = verdict_prefix(&config);
         let mut out: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut reasons: BTreeMap<&str, &str> = BTreeMap::new();
         for (id, sid) in ids.iter().zip(parsed) {
             let key = format!("{prefix}{}", verdict_id(&sid));
             let verdict = match self.deps.cache.get(&key).as_deref() {
                 Some(VERDICT_AVAILABLE) => "available",
                 Some(VERDICT_UNAVAILABLE) => "unavailable",
+                Some(VERDICT_ONLY_CINEMA_RECORDINGS) => {
+                    reasons.insert(id, "only_cinema_recordings");
+                    "unavailable"
+                }
                 Some(VERDICT_UNDETERMINED) => "unknown",
                 _ => {
                     self.check_behind(&config, sid, &key);
@@ -182,7 +188,7 @@ impl Inner {
             };
             out.insert(id, verdict);
         }
-        json_response(StatusCode::OK, &json!({ "availability": out }))
+        json_response(StatusCode::OK, &json!({ "availability": out, "reasons": reasons }))
     }
 
     fn record_verdict(&self, key: &str, available: bool) {
@@ -205,7 +211,16 @@ impl Inner {
             );
             return;
         }
-        self.record_verdict(key, !list.ranked.is_empty());
+        if list.unavailability_reason == Some("only_cinema_recordings") {
+            self.deps.cache.put_class(
+                key,
+                VERDICT_ONLY_CINEMA_RECORDINGS,
+                UNAVAILABLE_TTL,
+                CacheClass::Volatile,
+            );
+        } else {
+            self.record_verdict(key, !list.ranked.is_empty());
+        }
     }
 
     /// checkBehind starts a background check of one movie or resolved episode, unless one is already running for it or the ceiling
@@ -252,6 +267,7 @@ impl Inner {
             audio: &[],
             fresh: false,
             answer_early: false,
+            allow_cinema_recordings: false,
         };
         if !config.cached_only || !has_cache_truth(config) {
             return self.rank_list(deadline, config, sid, None, opts()).await;

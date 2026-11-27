@@ -908,7 +908,7 @@ const OPEN_MAX: usize = 3;
 async fn fingerprint(st: &Arc<AppState>, ep: &Episode, base: &str) -> Result<(Prints, Cost), Failure> {
     let started = Instant::now();
     let src = crate::scout::ScoutSource { base: base.to_string(), key: st.cfg.scout_key.clone() };
-    let list = crate::scout::list(st.scout_via(), &src, &ep.id(), None, false)
+    let list = crate::scout::list(st.scout_via(), &src, &ep.id(), None, false, false)
         .await
         .map_err(|_| Failure::Failed("scout"))?;
     let picks = cheapest(&list);

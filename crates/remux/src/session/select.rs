@@ -135,7 +135,7 @@ pub async fn create(
     // A viewer waiting on Play may be answered from a list scout sent before its slowest indexer — but not for a
     // release they named, which only a complete list is sure to hold.
     let early = want.early_answer && want.filename.is_none();
-    let mut list = scout_list(st, &source, imdb, by_install, want.playable, early).await?;
+    let mut list = scout_list(st, &source, imdb, by_install, want.playable, early, want.allow_cinema).await?;
     let mut resolve_ms = resolve_started.elapsed().as_millis() as u64;
     let av1 = want.playable.is_some_and(Playable::takes_av1);
     let vp9 = want.playable.is_some_and(Playable::takes_vp9);
@@ -515,7 +515,7 @@ pub async fn create(
             "session {short}: {imdb} early list produced no session; asking once for every source{rid_suffix}"
         );
         let retry_started = Instant::now();
-        list = scout_list(st, source, imdb, by_install, want.playable, false).await?;
+        list = scout_list(st, source, imdb, by_install, want.playable, false, want.allow_cinema).await?;
         resolve_ms = resolve_ms.saturating_add(retry_started.elapsed().as_millis() as u64);
         list.retain(|stream| !rejected.contains(&CandidateEvidence::of(stream)));
         asked_complete = true;

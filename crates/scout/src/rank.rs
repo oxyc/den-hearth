@@ -84,6 +84,9 @@ pub(crate) const GIB: i64 = 1_073_741_824;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RankFilters {
     pub exclude_cam: bool,
+    /// Admit only camera/telesync/telecine releases when an explicit recovery request has first established
+    /// that the ordinary ranking has no survivor. Other junk classes remain excluded.
+    pub allow_cinema_recordings: bool,
     pub cached_only: bool,
     pub hdr_only: bool,
     pub result_cap: i64,
@@ -727,7 +730,8 @@ pub(crate) fn rank_streams_debug(
     for (i, s) in streams.iter().enumerate() {
         let t = s.traits();
         let junk = t.junk_class();
-        if f.exclude_cam && !junk.is_empty() {
+        let cinema = matches!(junk, "cam" | "telesync" | "telecine");
+        if f.exclude_cam && !junk.is_empty() && !(f.allow_cinema_recordings && cinema) {
             drop_n(&mut debug, junk, 1);
             continue;
         }

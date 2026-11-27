@@ -72,6 +72,9 @@ pub struct AnswerEnvelope {
     /// Degraded is the X-Den-Degraded value the list was served with, "" when none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub degraded: String,
+    /// Why an otherwise healthy list is empty. Older clients ignore it.
+    #[serde(rename = "unavailabilityReason", default, skip_serializing_if = "Option::is_none")]
+    pub unavailability_reason: Option<String>,
     #[serde(rename = "generatedAt", with = "rfc3339_nanos")]
     pub generated_at: Option<SystemTime>,
     /// ExpiresAt is when the list stops being fresh. Absent on a list that is not cached at all.

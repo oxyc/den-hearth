@@ -198,6 +198,32 @@ fn detect_resolution() {
 }
 
 #[test]
+fn cinema_recovery_admits_only_camera_recordings() {
+    let streams = vec![
+        rs("Movie.2026.1080p.CAM.x264", |_| {}),
+        rs("Movie.2026.1080p.TS.x264", |_| {}),
+        rs("Movie.2026.1080p.TELECINE.x264", |_| {}),
+        rs("Movie.2026.1080p.SCREENER.x264", |_| {}),
+        rs("Movie.2026.1080p.WORKPRINT.x264", |_| {}),
+        rs("Movie.2026.1080p.R5.x264", |_| {}),
+        rs("Movie.2026.1080p.UPSCALED.x264", |_| {}),
+    ];
+    let ranked = prod::rank_streams(
+        &streams,
+        RankFilters {
+            exclude_cam: true,
+            allow_cinema_recordings: true,
+            result_cap: 20,
+            ..Default::default()
+        },
+    );
+    assert_eq!(ranked.len(), 3);
+    assert!(ranked
+        .iter()
+        .all(|stream| { matches!(prod::junk_class(&stream.title), "cam" | "telesync" | "telecine") }));
+}
+
+#[test]
 fn rank_streams() {
     // CacheKnown on all three: the check ran and answered for each of them. cachedOnly drops what is
     // KNOWN not to be cached — see below for what it must not drop.
