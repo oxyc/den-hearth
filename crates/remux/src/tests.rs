@@ -2771,8 +2771,8 @@ async fn a_list_and_a_resolve_are_the_same_in_process_and_over_http() {
     for (config, id) in
         [("cfg", "tt0000001"), (SCOPED, "tt0000005"), ("cfg", "tt0000004:1:2"), ("cfg", "tt9")]
     {
-        let a = list(over_http.scout_via(), &source(config), id, None, false).await.ok().unwrap();
-        let b = list(in_process.scout_via(), &source(config), id, None, false).await.ok().unwrap();
+        let a = list(over_http.scout_via(), &source(config), id, None, false, false).await.ok().unwrap();
+        let b = list(in_process.scout_via(), &source(config), id, None, false, false).await.ok().unwrap();
         let names = |l: &[crate::scout::Stream]| {
             l.iter().map(|s| (s.url.clone(), s.filename().to_string())).collect::<Vec<_>>()
         };
@@ -2790,15 +2790,15 @@ async fn a_list_and_a_resolve_are_the_same_in_process_and_over_http() {
     // Refusals carry the same status both ways: a scoped config without the key, and a config scout won't open.
     for (config, key) in [(SCOPED, None), ("bad", Some(SCOUT_KEY))] {
         let src = ScoutSource { base: format!("{}/{config}", fake.url), key: key.map(String::from) };
-        let a = list(over_http.scout_via(), &src, "tt0000001", None, false).await.err().unwrap();
-        let b = list(in_process.scout_via(), &src, "tt0000001", None, false).await.err().unwrap();
+        let a = list(over_http.scout_via(), &src, "tt0000001", None, false, false).await.err().unwrap();
+        let b = list(in_process.scout_via(), &src, "tt0000001", None, false, false).await.err().unwrap();
         assert_eq!((a.status, a.detail), (b.status, b.detail), "{config}");
     }
     let http_connections = fake.connections.load(Relaxed);
     assert!(http_connections > 0);
 
     // Only the in-process side again: not one more connection.
-    list(in_process.scout_via(), &source("cfg"), "tt0000001", None, false).await.ok().unwrap();
+    list(in_process.scout_via(), &source("cfg"), "tt0000001", None, false, false).await.ok().unwrap();
     assert_eq!(fake.connections.load(Relaxed), http_connections);
 }
 

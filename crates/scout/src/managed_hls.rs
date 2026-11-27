@@ -122,6 +122,8 @@ pub struct ManagedHlsRequest {
     /// A viewer pressed Play and is waiting (`X-Den-Early-Answer`): the release list may go out before the slowest
     /// indexer (`LATE_GRACE`). Not for a release named by `filename`, which only a complete list is sure to hold.
     pub early_answer: bool,
+    /// The viewer chose Play anyway on a title with only cinema recordings (`allowCinema=1` on the stream list).
+    pub allow_cinema_recordings: bool,
 }
 
 /// Non-secret release metadata returned beside a managed URL.

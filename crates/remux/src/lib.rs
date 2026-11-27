@@ -877,6 +877,7 @@ where
             .headers
             .get(scout::EARLY_ANSWER_HEADER)
             .is_some_and(|value| value.as_bytes() == b"1"),
+        allow_cinema: req.allow_cinema.unwrap_or(false),
     };
     let public = public_session_request(state, parts);
     let created = session::create(state, admission, &want, public).await;

@@ -44,6 +44,9 @@ pub struct PlaybackRequest {
     pub fits_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaces: Option<String>,
+    /// The viewer chose Play anyway on a title with only cinema recordings: scout's recovery list (`allowCinema=1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_cinema: Option<bool>,
 }
 
 impl PlaybackRequest {

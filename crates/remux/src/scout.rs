@@ -366,10 +366,14 @@ pub async fn list(
     imdb: &str,
     playable: Option<&crate::session::Playable>,
     early_answer: bool,
+    allow_cinema: bool,
 ) -> Result<Vec<Stream>, ListError> {
     let fail = |status: Option<u16>, detail: String| ListError { status, detail };
-    let url = reqwest::Url::parse(&stream_list_url(&src.base, imdb))
+    let mut url = reqwest::Url::parse(&stream_list_url(&src.base, imdb))
         .map_err(|_| fail(None, "the scout URL does not parse".into()))?;
+    if allow_cinema {
+        url.query_pairs_mut().append_pair("allowCinema", "1");
+    }
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(k) = &src.key {
         headers.insert(

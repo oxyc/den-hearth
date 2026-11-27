@@ -194,6 +194,37 @@ async fn managed_hls_is_title_level_and_keeps_provider_ids_inside_scout() {
     assert!(!targets[0].no_add, "managed playback must reuse the ordinary add-budgeted resolve path");
 }
 
+// Play anyway on a title with only a camera recording: the ordinary Play finds nothing, the recovery Play opens it.
+#[tokio::test]
+async fn managed_hls_plays_a_cinema_recording_only_when_asked() {
+    let resolver = Arc::new(FixedManagedHls::default());
+    let h = new_handler(test_deps(move |deps| {
+        deps.managed_hls = Some(resolver);
+        deps.make_scrapers = Arc::new(|_| {
+            vec![fake_scraper("torrentio", || {
+                Box::pin(async {
+                    Ok(vec![RawStream {
+                        info_hash: "a".repeat(40),
+                        title: "Movie 1080p HDCAM".to_owned(),
+                        size_bytes: Some(2 * GIB),
+                        seeders: Some(3),
+                        file_idx: Some(0),
+                        ..RawStream::default()
+                    }])
+                })
+            })]
+        });
+    }));
+    let request = ManagedHlsRequest { imdb: "tt0111161".to_owned(), ..Default::default() };
+
+    assert!(h.managed_hls(&valid_blob(), &request).await.is_err(), "the ordinary Play stays strict");
+    let recovered = h
+        .managed_hls(&valid_blob(), &ManagedHlsRequest { allow_cinema_recordings: true, ..request })
+        .await
+        .expect("the recovery Play opens the camera recording");
+    assert_eq!(recovered.release.filename, "Movie 1080p HDCAM");
+}
+
 // A dual-audio release (Italian first, English second) nobody has probed: managed playback reads that one file's
 // head before it chooses, so the wanted English is track 1 and the player is told the tracks it can offer.
 #[tokio::test]

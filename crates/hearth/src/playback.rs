@@ -697,6 +697,7 @@ fn managed_request(
         platform: object.get("platform").and_then(Value::as_str).map(str::to_owned),
         subtitle,
         early_answer: false,
+        allow_cinema_recordings: object.get("allowCinema").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 

@@ -1376,7 +1376,7 @@ impl Inner {
                     // The list picks what to play and nothing else: it is not cached, and a miss falls back to
                     // Remux, which asks again for every indexer before saying there is nothing.
                     answer_early: request.early_answer && request.filename.is_none(),
-                    allow_cinema_recordings: false,
+                    allow_cinema_recordings: request.allow_cinema_recordings,
                 },
             )
             .await;
